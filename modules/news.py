@@ -16,6 +16,13 @@ NEWS_TEMPLATES = {
 }
 
 MAX_DEDUP_ATTEMPTS = 8
+MAX_NEWS_AGE_DAYS = 5   # articles older than this many game days are stale — retired on roll
+
+
+async def _game_day(session_id: int) -> int:
+    return await Database.fetchval(
+        "SELECT COALESCE(game_day, 1) FROM maya_rp.sessions WHERE id=$1", session_id
+    ) or 1
 
 
 async def _existing_headlines(session_id: int) -> set[str]:
@@ -28,6 +35,7 @@ async def _existing_headlines(session_id: int) -> set[str]:
 
 async def generate(session_id: int | None = None) -> list[dict]:
     if session_id is None: session_id = Config.SESSION_ID
+    gd = await _game_day(session_id)
     systems = await Database.fetch("SELECT system_name FROM maya_rp.territory WHERE session_id=$1 ORDER BY RANDOM() LIMIT 3", session_id)
     factions = await Database.fetch("SELECT name FROM maya_rp.factions WHERE session_id=$1 ORDER BY RANDOM() LIMIT 3", session_id)
     existing = await _existing_headlines(session_id)
@@ -46,25 +54,36 @@ async def generate(session_id: int | None = None) -> list[dict]:
             continue  # all candidates exhausted — skip, don't duplicate
         existing.add(headline)
         tick = await Database.fetchval("SELECT COALESCE(MAX(tick_number),0)+1 FROM maya_rp.news_articles WHERE session_id=$1", session_id) or 1
-        await Database.execute("INSERT INTO maya_rp.news_articles (session_id, tick_number, headline, category, read) VALUES ($1,$2,$3,$4,false)", session_id, tick, headline, category)
-        articles.append({"headline": headline, "category": category})
+        await Database.execute("INSERT INTO maya_rp.news_articles (session_id, tick_number, headline, category, read, game_day) VALUES ($1,$2,$3,$4,false,$5)", session_id, tick, headline, category, gd)
+        articles.append({"headline": headline, "category": category, "game_day": gd})
     return articles
 
 
 async def roll_news(session_id: int | None = None, limit: int = 5) -> list[dict]:
-    """Fetch unread news (a 'news roll'). Marks them read so they never return on a later roll."""
+    """Fetch fresh unread news (a 'news roll'). Stale articles (older than
+    MAX_NEWS_AGE_DAYS) are retired as read — they never return. Fresh ones
+    are marked read so they won't reappear on a later roll either."""
     if session_id is None: session_id = Config.SESSION_ID
+    gd = await _game_day(session_id)
+    cutoff = gd - MAX_NEWS_AGE_DAYS
+    # Retire anything unread that is older than the freshness window.
+    await Database.execute(
+        "UPDATE maya_rp.news_articles SET read = true "
+        "WHERE session_id=$1 AND read = false AND game_day IS NOT NULL AND game_day < $2",
+        session_id, cutoff,
+    )
     rows = await Database.fetch(
-        "SELECT id, headline, category, importance FROM maya_rp.news_articles "
-        "WHERE session_id=$1 AND read = false ORDER BY tick_number DESC, id DESC LIMIT $2",
-        session_id, limit,
+        "SELECT id, headline, category, importance, game_day FROM maya_rp.news_articles "
+        "WHERE session_id=$1 AND read = false AND (game_day IS NULL OR game_day >= $2) "
+        "ORDER BY game_day DESC NULLS LAST, id DESC LIMIT $3",
+        session_id, cutoff, limit,
     )
     if rows:
         ids = [r["id"] for r in rows]
         await Database.execute(
             "UPDATE maya_rp.news_articles SET read = true WHERE id = ANY($1::int[])", ids
         )
-    return [{"headline": r["headline"], "category": r["category"], "importance": r["importance"]} for r in rows]
+    return [{"headline": r["headline"], "category": r["category"], "importance": r["importance"], "game_day": r["game_day"]} for r in rows]
 
 
 async def mark_read(session_id: int | None = None, article_id: int | None = None, headline: str | None = None) -> bool:

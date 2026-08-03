@@ -263,6 +263,50 @@ async def cmd_roll():
         return
     print(f"Unparsed: {expr} — try '100 +50 vs 90' or '3d6'")
 
+async def cmd_templates():
+    """templates [category] — list stream templates, optionally by category."""
+    await Database.init()
+    if len(sys.argv) > 2:
+        rows = await Database.fetch(
+            "SELECT trigger_tag, category FROM maya_rp.stream_templates "
+            "WHERE category=$1 ORDER BY trigger_tag", sys.argv[2])
+    else:
+        rows = await Database.fetch(
+            "SELECT trigger_tag, category FROM maya_rp.stream_templates ORDER BY category, trigger_tag")
+    if not rows:
+        print("No templates.")
+        return
+    print(f"\n{'Tag':<28} {'Category'}")
+    print("-" * 42)
+    for r in rows:
+        print(f"{r['trigger_tag']:<28} {r['category']}")
+
+async def cmd_stream():
+    """stream — demo: run a mock LLM stream through the StreamInterceptor."""
+    await Database.init()
+    import asyncio
+    from core.stream_interceptor import StreamInterceptor
+
+    async def mock_llm_stream():
+        tokens = [
+            "Maya walks onto the bridge. ",
+            "[ENV: BRIDGE]\n",
+            "She squeezes the trigger. ",
+            "[HIT: RAILGUN_KINETIC] ",
+            "The squad advanced. ",
+            "[SENSE: MISSIONARY]\n",
+            "And then the pool. [ENV: HEAVEN_POOL]\n",
+        ]
+        for t in tokens:
+            await asyncio.sleep(0.05)
+            yield t
+
+    print("--- Intercepted CLI Output Stream ---")
+    interceptor = StreamInterceptor()
+    async for chunk in interceptor.process_stream(mock_llm_stream()):
+        print(chunk, end="", flush=True)
+    print("\n--- Stream Complete ---")
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python3 scripts/cli.py {status|tick|save|export|config|health|modules|run|query} [args]")
@@ -289,5 +333,9 @@ if __name__ == "__main__":
         asyncio.run(cmd_romance())
     elif cmd == "roll":
         asyncio.run(cmd_roll())
+    elif cmd == "templates":
+        asyncio.run(cmd_templates())
+    elif cmd == "stream":
+        asyncio.run(cmd_stream())
     else:
-        print(f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll")
+        print(f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream")

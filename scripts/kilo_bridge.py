@@ -417,6 +417,17 @@ async def handle(action: str, params: dict = None) -> dict:
             if domain == "combat":
                 from modules.battle import resolve_intent
                 outcome = await resolve_intent(sid, intent_action, target, fleet_name)
+                # Forced-tag pipeline: engine resolves the math, LLM writes around the tag.
+                if isinstance(outcome, dict):
+                    wt = str(outcome.get("weapon_type") or outcome.get("weapon")
+                             or outcome.get("hit_type") or "RAILGUN_KINETIC").upper()
+                    tag = f"[HIT: {wt}]"
+                    outcome["forced_tag"] = tag
+                    outcome["gm_instruction"] = (
+                        f"ENGINE RESULT: {tag}. You MUST include this exact tag in your response. "
+                        "Do NOT describe the physical impact — the engine expands the tag. "
+                        "Focus your prose on character reaction, tactical movement, and dialogue."
+                    )
                 result["data"] = outcome
                 result["status"] = "ok"
             elif domain == "economy":

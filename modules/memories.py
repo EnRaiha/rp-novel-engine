@@ -117,3 +117,88 @@ async def run_tick(session_id: int = None) -> dict:
     except Exception as e:
         info("memories", f"Error: {e}")
         return {"error": str(e)}
+
+
+# ─── Memory Consolidation ("Sleep Cycle") — 2026-08-03 ─────────
+
+def _extractive_gist(contents: list[str]) -> str:
+    """Fallback summarizer: first sentence of each old memory, joined."""
+    gist = []
+    for c in contents:
+        first = c.split(".")[0].strip()
+        if first:
+            gist.append(first)
+    return ". ".join(gist[:6]) + "."
+
+
+async def _summarize(contents: list[str]) -> str:
+    """Summarize via local Ollama (qwen3.5:4b); extractive fallback."""
+    text = "\n".join(f"- {c}" for c in contents)
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post("http://localhost:11434/api/chat", json={
+                "model": "qwen3.5:4b",
+                "messages": [{"role": "user", "content":
+                    "Summarize these minor events into ONE concise high-level memory "
+                    "paragraph (3-4 sentences, narrative voice, no bullet points):\n\n" + text}],
+                "stream": False,
+            })
+            data = resp.json()
+            summary = data.get("message", {}).get("content", "").strip()
+            if summary:
+                return summary
+    except Exception as e:
+        info("memories", f"Summarizer unavailable ({e}) — extractive fallback")
+    return _extractive_gist(contents)
+
+
+async def consolidate_memories(session_id: int = None, character_id: int | None = None,
+                               age_days: int = 14, min_count: int = 10) -> dict:
+    """
+    Sleep-cycle consolidation: roll up old low-recall memories (>= age_days old,
+    recalled < 3 times) into one 'consolidated' memory per character; archive the
+    originals. Mimics human memory — the gist survives, the granular detail fades.
+    """
+    if session_id is None:
+        session_id = Config.SESSION_ID
+    try:
+        game_day = await Database.fetchval(
+            "SELECT COALESCE(game_day, 1) FROM maya_rp.sessions WHERE id=$1", session_id) or 1
+
+        old = await Database.fetch(
+            "SELECT id, character_id, content FROM maya_rp.character_memories "
+            "WHERE session_id=$1 AND memory_type != 'consolidated' "
+            "AND created_at_game_day IS NOT NULL AND created_at_game_day < $2::int - $3::int "
+            "AND COALESCE(recalled_count, 0) < 3 "
+            "ORDER BY character_id, created_at_game_day",
+            session_id, game_day, age_days)
+
+        # Group by character
+        by_char: dict[int, list[dict]] = {}
+        for m in old:
+            by_char.setdefault(m["character_id"], []).append(m)
+
+        consolidated = 0
+        archived = 0
+        for cid, mems in by_char.items():
+            if len(mems) < min_count:
+                continue
+            summary = await _summarize([m["content"] for m in mems])
+            await Database.execute(
+                "INSERT INTO maya_rp.character_memories "
+                "(session_id, character_id, memory_type, content, created_at_game_day, emotional_weight) "
+                "VALUES ($1, $2, 'consolidated', $3, $4, 8)",
+                session_id, cid, summary, game_day)
+            await Database.execute(
+                "DELETE FROM maya_rp.character_memories WHERE id = ANY($1::int[])",
+                [m["id"] for m in mems])
+            consolidated += 1
+            archived += len(mems)
+            info("memories", f"Consolidated {len(mems)} memories -> char {cid} (day {game_day})")
+
+        return {"characters": len(by_char), "consolidated": consolidated, "archived": archived,
+                "game_day": game_day, "age_days": age_days, "min_count": min_count}
+    except Exception as e:
+        info("memories", f"Error: {e}")
+        return {"error": str(e)}

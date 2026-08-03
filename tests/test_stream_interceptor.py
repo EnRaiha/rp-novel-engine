@@ -5,10 +5,18 @@ import asyncio
 from core.stream_interceptor import StreamInterceptor
 import pytest
 
+def entry(text):
+    return {"expanded_text": text, "readable_hint": None, "required_context": []}
+
+
 CACHE = {
-    "[ENV: HEAVEN_POOL]": "The pool glows.",
-    "[HIT: RAILGUN_KINETIC]": "THE WET CRUNCH",
-    "[SENSE: PILEDRIVER]": "Gravity does the work.",
+    "[ENV: HEAVEN_POOL]": entry("The pool glows."),
+    "[HIT: RAILGUN_KINETIC]": entry("THE WET CRUNCH"),
+    "[SENSE: PILEDRIVER]": entry("Gravity does the work."),
+}
+
+CACHE_INTERP = {
+    "[HIT: RAILGUN_KINETIC]": entry("The rod fired by {attacker_name} hit {target_name} whose {target_armor_type} armor was paper."),
 }
 
 
@@ -36,6 +44,27 @@ class TestExpandText:
     def test_cache_injection_skips_db(self):
         si = StreamInterceptor(cache=CACHE)
         assert si.cache_loaded is True  # no DB call in unit tests
+
+
+class TestInterpolation:
+    def test_placeholders_filled_with_context(self):
+        si = StreamInterceptor(cache=CACHE_INTERP, context_state={
+            "attacker_name": "Legion Vanguard", "target_name": "Balor Ironhand",
+            "target_armor_type": "heavy composite"})
+        out = si.expand_text("[HIT: RAILGUN_KINETIC]")
+        assert "Legion Vanguard" in out and "Balor Ironhand" in out
+        assert "heavy composite" in out and "{attacker_name}" not in out
+
+    def test_raw_fallback_when_context_missing(self):
+        si = StreamInterceptor(cache=CACHE_INTERP)
+        out = si.expand_text("[HIT: RAILGUN_KINETIC]")
+        assert "{attacker_name}" in out  # raw template survives
+
+    def test_partial_context_leaves_missing_keys(self):
+        si = StreamInterceptor(cache=CACHE_INTERP, context_state={"attacker_name": "Shadow Wing"})
+        out = si.expand_text("[HIT: RAILGUN_KINETIC]")
+        assert "Shadow Wing" in out
+        assert "{target_name}" in out
 
 
 class TestProcessStream:

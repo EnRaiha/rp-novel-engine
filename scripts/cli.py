@@ -269,12 +269,12 @@ async def cmd_templates():
     if len(sys.argv) > 2 and sys.argv[2] == "embed":
         from core.memory import _embed
         rows = await Database.fetch(
-            "SELECT id, trigger_tag FROM maya_rp.stream_templates WHERE trigger_tag_embed IS NULL")
+            "SELECT id, trigger_tag, readable_hint FROM maya_rp.stream_templates WHERE trigger_tag_embed IS NULL")
         if not rows:
             print("All templates already embedded.")
             return
         for r in rows:
-            readable = r["trigger_tag"].replace("[", "").replace("]", "").replace("_", " ").lower()
+            readable = r["readable_hint"] or r["trigger_tag"].replace("[", "").replace("]", "").replace("_", " ").lower()
             vec = await _embed(readable)
             vstr = "[" + ",".join(map(str, vec)) + "]"
             await Database.execute(
@@ -324,6 +324,22 @@ async def cmd_stream():
         print(chunk, end="", flush=True)
     print("\n--- Stream Complete ---")
 
+async def cmd_memories():
+    """memories consolidate [character_id] — sleep-cycle memory consolidation."""
+    await Database.init()
+    sub = sys.argv[2] if len(sys.argv) > 2 else ""
+    if sub != "consolidate":
+        print("Usage: cli.py memories consolidate [character_id]")
+        return
+    cid = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else None
+    from modules.memories import consolidate_memories
+    r = await consolidate_memories(SID, character_id=cid)
+    if "error" in r:
+        print(f"Error: {r['error']}")
+        return
+    print(f"Consolidation (day {r['game_day']}): {r['consolidated']} summaries from {r['archived']} archived memories "
+          f"across {r['characters']} characters (age>{r['age_days']}d, min {r['min_count']}).")
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python3 scripts/cli.py {status|tick|save|export|config|health|modules|run|query} [args]")
@@ -354,5 +370,7 @@ if __name__ == "__main__":
         asyncio.run(cmd_templates())
     elif cmd == "stream":
         asyncio.run(cmd_stream())
+    elif cmd == "memories":
+        asyncio.run(cmd_memories())
     else:
-        print(f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream")
+        print(f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories")

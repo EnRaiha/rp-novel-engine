@@ -340,6 +340,29 @@ async def cmd_memories():
     print(f"Consolidation (day {r['game_day']}): {r['consolidated']} summaries from {r['archived']} archived memories "
           f"across {r['characters']} characters (age>{r['age_days']}d, min {r['min_count']}).")
 
+async def cmd_intimacy():
+    """intimacy gen <position> [target_desc] | intimacy text <prompt> — local abliterated generation."""
+    await Database.init()
+    if len(sys.argv) < 4:
+        print("Usage: cli.py intimacy {gen <position> [target_desc...] | text <prompt...>}")
+        return
+    from modules.local_gen import generate, generate_intimacy_template, upsert_template
+    sub = sys.argv[2]
+    if sub == "text":
+        print(await generate(" ".join(sys.argv[3:])))
+    elif sub == "gen":
+        position = sys.argv[3].lower().replace(" ", "_")
+        target_desc = " ".join(sys.argv[4:]) if len(sys.argv) > 4 else ""
+        print(f"Generating [SENSE: {position.upper()}] locally... (8B on 1060, ~1 t/s — be patient)")
+        text = await generate_intimacy_template(position, target_desc=target_desc)
+        print(f"\n--- GENERATED ---\n{text}\n------------------")
+        hint = f"sensual intimacy {position} position"
+        await upsert_template(f"[SENSE: {position.upper()}]", text,
+                              category="intimacy", readable_hint=hint)
+        print(f"✅ Template [SENSE: {position.upper()}] upserted — interceptor will serve it.")
+    else:
+        print("Unknown intimacy subcommand: gen|text")
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python3 scripts/cli.py {status|tick|save|export|config|health|modules|run|query} [args]")
@@ -372,5 +395,7 @@ if __name__ == "__main__":
         asyncio.run(cmd_stream())
     elif cmd == "memories":
         asyncio.run(cmd_memories())
+    elif cmd == "intimacy":
+        asyncio.run(cmd_intimacy())
     else:
-        print(f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories")
+        print(f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy")

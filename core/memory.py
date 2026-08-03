@@ -10,10 +10,15 @@ from core.log import info
 EMBED_URL = "http://localhost:11434/api/embeddings"
 EMBED_MODEL = "nomic-embed-text"
 
-async def _embed(text: str) -> list[float]:
-    """Generate embedding via local Ollama on GTX 1060. ~50ms per call."""
+async def _embed(text: str, keep_alive: str = "30m") -> list[float]:
+    """Generate embedding via local Ollama on GTX 1060. ~50ms per call when hot.
+
+    keep_alive 30m: keeps nomic-embed-text resident so the interceptor's
+    semantic tier never pays cold-load latency (contends with 8B generator).
+    """
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(EMBED_URL, json={"model": EMBED_MODEL, "prompt": text})
+        resp = await client.post(EMBED_URL, json={
+            "model": EMBED_MODEL, "prompt": text, "keep_alive": keep_alive})
         return resp.json()["embedding"]
 
 # Public alias — used by wiki_ingest.py, kilo_bridge.py, and any external script

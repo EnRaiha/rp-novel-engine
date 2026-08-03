@@ -323,6 +323,11 @@ async def cmd_stream():
     async for chunk in interceptor.process_stream(mock_llm_stream()):
         print(chunk, end="", flush=True)
     print("\n--- Stream Complete ---")
+    st = interceptor.stats
+    print(f"[interceptor stats] lines={st['lines_processed']} exact={st['exact_hits']} "
+          f"semantic_attempts={st['semantic_attempts']} semantic_hits={st['semantic_hits']} "
+          f"skipped={st['semantic_skipped']} breaker={st['breaker_engaged']} "
+          f"semantic_ms={st['semantic_total_ms']:.0f}")
 
 async def cmd_memories():
     """memories consolidate [character_id] — sleep-cycle memory consolidation."""

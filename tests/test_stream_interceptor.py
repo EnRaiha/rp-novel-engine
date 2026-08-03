@@ -99,3 +99,49 @@ class TestProcessStream:
             return out
 
         assert asyncio.run(run()) == "[UNKNOWN: TAG]\n"
+
+
+class TestSemanticTier:
+    def test_no_vectors_fast_fail(self):
+        # Injected cache without vectors -> returns None with NO DB/embed call
+        si = StreamInterceptor(cache=CACHE)
+        out = asyncio.run(si._semantic_swap("plasma bolt scorched the hull"))
+        assert out is None
+
+    def test_prefilter_gate(self):
+        si = StreamInterceptor(cache=CACHE)
+        assert si._is_hint_like("plasma bolt scorched the hull") is True
+        assert si._is_hint_like("short") is False                # < 8 chars
+        assert si._is_hint_like("The fleet assembled at the jump") is False  # prose opener
+        assert si._is_hint_like("the crew celebrates tonight.") is False     # terminal punctuation
+        long = "a " * 40
+        assert si._is_hint_like(long) is False                   # > 60 chars
+
+    def test_breaker_disables_after_two_failures(self, monkeypatch):
+        import numpy as np
+        si = StreamInterceptor(cache=CACHE)
+        si._tag_vectors = [("[HIT: X]", np.ones(768) / np.sqrt(768))]
+
+        async def boom(text, keep_alive="30m"):
+            raise RuntimeError("ollama down")
+
+        monkeypatch.setattr("core.memory._embed", boom)
+        out = asyncio.run(si._semantic_swap("plasma bolt scorched the hull"))
+        assert out is None
+        out2 = asyncio.run(si._semantic_swap("plasma bolt scorched the hull"))
+        assert out2 is None
+        assert si._semantic_disabled is True
+        assert si.stats["breaker_engaged"] is True
+
+    def test_breaker_shortcircuits(self, monkeypatch):
+        import numpy as np
+        si = StreamInterceptor(cache=CACHE)
+        si._tag_vectors = [("[HIT: X]", np.ones(768) / np.sqrt(768))]
+        si._semantic_disabled = True  # already tripped
+
+        async def boom(text, keep_alive="30m"):
+            raise AssertionError("should not be called after breaker")
+
+        monkeypatch.setattr("core.memory._embed", boom)
+        out = asyncio.run(si._semantic_swap("plasma bolt scorched the hull"))
+        assert out is None

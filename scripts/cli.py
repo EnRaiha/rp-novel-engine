@@ -264,8 +264,25 @@ async def cmd_roll():
     print(f"Unparsed: {expr} — try '100 +50 vs 90' or '3d6'")
 
 async def cmd_templates():
-    """templates [category] — list stream templates, optionally by category."""
+    """templates [category] | templates embed — list or embed stream templates."""
     await Database.init()
+    if len(sys.argv) > 2 and sys.argv[2] == "embed":
+        from core.memory import _embed
+        rows = await Database.fetch(
+            "SELECT id, trigger_tag FROM maya_rp.stream_templates WHERE trigger_tag_embed IS NULL")
+        if not rows:
+            print("All templates already embedded.")
+            return
+        for r in rows:
+            readable = r["trigger_tag"].replace("[", "").replace("]", "").replace("_", " ").lower()
+            vec = await _embed(readable)
+            vstr = "[" + ",".join(map(str, vec)) + "]"
+            await Database.execute(
+                "UPDATE maya_rp.stream_templates SET trigger_tag_embed=$1::vector WHERE id=$2",
+                vstr, r["id"])
+            print(f"Embedded: {r['trigger_tag']}")
+        print(f"Done — {len(rows)} templates embedded.")
+        return
     if len(sys.argv) > 2:
         rows = await Database.fetch(
             "SELECT trigger_tag, category FROM maya_rp.stream_templates "

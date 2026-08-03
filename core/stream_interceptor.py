@@ -48,6 +48,28 @@ class StreamInterceptor:
         """Sync convenience — expand all tags in a complete string."""
         return self.expand_line(text)
 
+    async def _semantic_swap(self, line: str) -> str | None:
+        """
+        Tier 2 fallback: embed a short LLM hint and find the nearest
+        template by cosine distance (pgvector HNSW). Fail-soft.
+        """
+        try:
+            from core.memory import _embed
+            vec = await _embed(line.strip())
+            vstr = "[" + ",".join(map(str, vec)) + "]"
+            row = await Database.fetchrow(
+                "SELECT trigger_tag, expanded_text FROM maya_rp.stream_templates "
+                "WHERE trigger_tag_embed IS NOT NULL "
+                "AND trigger_tag_embed <=> $1::vector < 0.35 "
+                "ORDER BY trigger_tag_embed <=> $1::vector LIMIT 1",
+                vstr)
+            if row:
+                info("interceptor", f"Semantic swap: '{line.strip()[:40]}' -> {row['trigger_tag']}")
+                return row["expanded_text"]
+        except Exception as e:
+            info("interceptor", f"Semantic embed failed (passthrough): {e}")
+        return None
+
     async def process_stream(self, token_generator: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
         """Consume an async token stream, expanding completed lines."""
         await self.load_cache()
@@ -57,8 +79,28 @@ class StreamInterceptor:
             if "\n" in self.line_buffer:
                 lines = self.line_buffer.split("\n")
                 for complete in lines[:-1]:
-                    yield self.expand_line(complete + "\n")
+                    async for chunk in self._evaluate_line(complete + "\n"):
+                        yield chunk
                 self.line_buffer = lines[-1]
 
         if self.line_buffer:
-            yield self.expand_line(self.line_buffer)
+            async for chunk in self._evaluate_line(self.line_buffer):
+                yield chunk
+
+    async def _evaluate_line(self, line: str) -> AsyncGenerator[str, None]:
+        """Tier 1: exact tag match. Tier 2: semantic fallback for short hints."""
+        # Tier 1 — exact regex + cache
+        expanded = self.expand_line(line)
+        if expanded != line or self.TAG_PATTERN.search(line):
+            yield expanded
+            return
+
+        # Tier 2 — semantic: only for short hint-like lines (< 60 chars)
+        stripped = line.strip()
+        if 0 < len(stripped) < 60 and not stripped.endswith("."):
+            swap = await self._semantic_swap(stripped)
+            if swap is not None:
+                yield swap
+                return
+
+        yield line

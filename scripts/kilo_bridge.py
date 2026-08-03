@@ -252,13 +252,15 @@ async def handle(action: str, params: dict = None) -> dict:
                     vstr, sid, current_day)
 
             data = []
+            from core.context_sentinel import scan_text
             for r in rows:
                 sim = r["sim"]
                 if sim is not None and sim >= threshold:
+                    safe = scan_text(r["content"], source=f"pg:wiki_articles#{r['title']}")
                     data.append({
                         "title": r["title"],
                         "category": r["category"],
-                        "content": r["content"],
+                        "content": safe.sanitized,
                         "similarity": round(sim, 3),
                     })
             result["data"] = data if data else "No specific lore found. Use general knowledge or ask the player."

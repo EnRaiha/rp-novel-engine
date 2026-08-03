@@ -196,6 +196,14 @@ async def ingest_file(filepath: str, category: str, force: bool = False) -> int:
     inserted = 0
 
     for i, chunk in enumerate(chunks):
+        # Context Sentinel: sanitize chunk BEFORE embedding/storage so
+        # injection patterns never get baked into the RAG database.
+        from core.context_sentinel import scan_text
+        scan = scan_text(chunk['content'], source=f"file:{filepath}")
+        if not scan.is_clean:
+            info("sentinel", f"  ⚠️ Sanitized {len(scan.findings)} injection pattern(s) in '{chunk['title']}'")
+        chunk['content'] = scan.sanitized
+
         # Build embedding text — title + content
         embed_text_input = f"{chunk['title']}. {chunk['content']}"
 

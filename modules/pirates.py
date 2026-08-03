@@ -1,0 +1,279 @@
+"""Pirate War Machine + Loot — aggressive spawning, attacks, salvage, artifacts."""
+import random, json
+from datetime import datetime, timezone
+from core.db import Database
+from core.events import EventBus
+from core.utils import calc_game_days
+
+# ── WAR MACHINE ──
+
+async def run_tick(session_id: int = 3):
+    """Main pirate tick — spawn, move, attack, alert, hoard income."""
+    try:
+        await _spawn(session_id)
+        await _attack(session_id)
+        await _alerts(session_id)
+        await _hoard_tick(session_id)
+        await _den_feeding(session_id)
+    except Exception as e:
+        print(f"  Pirates: {e}")
+
+# HARTA KARUN: the Den's treasure floor. No upper limit — the longer a
+# hoard lives, the fatter it gets. Every faction strong enough can feed.
+HOARD_FLOOR = 40_000_000
+
+async def _hoard_tick(session_id: int):
+    """Den treasure engine — grow, floor, rebuild."""
+    # 1. Faction-level floor: the Den itself always holds >= 40M.
+    await Database.execute(
+        "UPDATE maya_rp.factions SET treasury = GREATEST(treasury, $1) "
+        "WHERE is_pirate=true AND (status='active' OR status IS NULL)",
+        HOARD_FLOOR)
+
+    # 2. Base growth (1% per tick, min 5K) + base floor.
+    bases = await Database.fetch(
+        "SELECT id, treasury FROM maya_rp.pirate_bases WHERE status='active'")
+    for b in bases:
+        growth = max(5000, int((b["treasury"] or 0) * 0.01))
+        await Database.execute(
+            "UPDATE maya_rp.pirate_bases SET treasury = GREATEST($1, treasury+$2) WHERE id=$3",
+            HOARD_FLOOR, growth, b["id"])
+
+    # 3. Rebuild: destroyed bases return — the Den always crawls back,
+    #    and the new base starts consolidated at the 40M floor.
+    destroyed = await Database.fetchval(
+        "SELECT COUNT(*) FROM maya_rp.pirate_bases WHERE faction_id=6 AND status='destroyed'") or 0
+    if destroyed > 0 and random.random() < 0.15:
+        zone = await Database.fetchrow(
+            "SELECT system_id FROM pirate_zones WHERE active=true AND protected=false ORDER BY random() LIMIT 1")
+        if zone:
+            await Database.execute(
+                "UPDATE maya_rp.pirate_bases SET status='active', treasury=$1, hidden=TRUE, defenses=50 "
+                "WHERE id=(SELECT id FROM maya_rp.pirate_bases WHERE faction_id=6 AND status='destroyed' "
+                "ORDER BY id LIMIT 1)",
+                HOARD_FLOOR)
+            await Database.execute(
+                "INSERT INTO pirate_alerts (session_id, message, severity) VALUES ($1,$2,2)",
+                session_id, "DEN REBUILT: a razed base is active again — hoard restored to 40M.")
+
+async def _den_feeding(session_id: int):
+    """The sector eats the Den — every faction strong enough feeds on the hoard.
+    Only the excess above the 40M floor is takeable; the floor always holds."""
+    den = await Database.fetchrow(
+        "SELECT id FROM maya_rp.factions WHERE is_pirate=true AND status='active' LIMIT 1")
+    if not den:
+        return
+    bases = await Database.fetch(
+        "SELECT id, treasury FROM maya_rp.pirate_bases WHERE faction_id=$1 AND status='active'",
+        den["id"])
+    if not bases:
+        return
+    feeders = await Database.fetch(
+        "SELECT id, name, economic_strength FROM maya_rp.factions "
+        "WHERE is_pirate=false AND status='active' AND name != 'Setia Empire'")
+    for f in feeders:
+        if random.random() >= 0.03 + float(f["economic_strength"] or 0) * 0.03:
+            continue
+        bite = random.randint(2_000_000, 8_000_000)
+        target = random.choice(bases)
+        # Only the excess above the floor is takeable.
+        actual = min(bite, (target["treasury"] or 0) - HOARD_FLOOR)
+        if actual <= 0:
+            continue
+        await Database.execute(
+            "UPDATE maya_rp.pirate_bases SET treasury=treasury-$1 WHERE id=$2",
+            actual, target["id"])
+        await Database.execute(
+            "UPDATE maya_rp.factions SET treasury=treasury+$1 WHERE id=$2",
+            actual, f["id"])
+        await Database.execute(
+            "INSERT INTO pirate_alerts (session_id, message, severity) VALUES ($1,$2,2)",
+            session_id, f"{f['name']} raided a Den hoard — {actual:,}C taken.")
+
+async def _spawn(session_id: int):
+    # King's rule: pirates pop up ANYWHERE — but never near the capital.
+    # Protected zones (capital vicinity) never spawn pirate fleets.
+    zones = await Database.fetch("SELECT * FROM pirate_zones WHERE active=true AND protected=false")
+    for z in zones:
+        if random.random() < z["danger_level"] * 0.03:  # 3-15% per tick
+            tl = "patrol" if z["danger_level"] <= 2 else "raiding" if z["danger_level"] <= 3 else "invasion"
+            t = await Database.fetchrow(
+                "SELECT * FROM pirate_fleet_templates WHERE threat_level=$1 ORDER BY random() LIMIT 1", tl)
+            if t: await _spawn_fleet(session_id, z["system_id"], t["name"])
+
+async def _spawn_fleet(session_id: int, system_id: int, template: str):
+    t = await Database.fetchrow("SELECT * FROM pirate_fleet_templates WHERE name=$1", template)
+    if not t: return
+    ship_ids = []
+    comp = json.loads(t["composition"]) if isinstance(t["composition"], str) else (t["composition"] or {})
+    for cls, cnt in comp.items():
+        for _ in range(cnt):
+            sc = await Database.fetchrow("SELECT * FROM pirate_ship_classes WHERE name=$1", cls)
+            if not sc: continue
+            sid = await Database.fetchval(
+                "INSERT INTO ships (session_id, name, ship_type, hull, hull_current, speed, tier, location, status) "
+                "VALUES ($1,$2,$3,$4,$4,$5,5,$6,'hostile') RETURNING id",
+                session_id,
+                f"Pirate {cls} #{random.randint(1000,9999)}", cls, sc["hull"], sc["speed"], f"System {system_id}")
+            ship_ids.append(sid)
+    # Store in faction treasury as "fleet"
+    pf = await Database.fetchrow("SELECT id FROM factions WHERE is_pirate=true ORDER BY random() LIMIT 1")
+    if not pf: return
+    await Database.execute("UPDATE factions SET pirate_fleet_power=pirate_fleet_power+$1 WHERE id=$2", t["total_power"], pf["id"])
+    await Database.execute(
+        "INSERT INTO pirate_alerts (session_id, message, severity) VALUES ($1,$2,$3)",
+        session_id, f"Pirate {t['name']} detected (system {system_id})!", 2)
+
+async def _attack(session_id: int):
+    # Simple attack: pick a target, roll, generate loot.
+    # King's rule: the capital (TKG Mastika) is never a raid target.
+    targets = await Database.fetch(
+        "SELECT id, system_name, population FROM territory WHERE session_id=$1 AND controlling_faction='Setia Empire' "
+        "AND system_name != 'TKG Mastika'",
+        session_id)
+    if not targets: return
+    t = random.choice(targets)
+    pf = await Database.fetchrow("SELECT id, pirate_fleet_power FROM factions WHERE is_pirate=true ORDER BY pirate_fleet_power DESC NULLS LAST LIMIT 1")
+    if not pf or (pf["pirate_fleet_power"] or 0) < 50: return
+    # Defense capped at 5000+50 — canon-scale worlds (hundreds of millions)
+    # can't become raid-proof; the Den can still strike, just never the capital.
+    defense = min(int(t["population"] / 1000), 5000) + 50
+    success = random.random() < pf["pirate_fleet_power"] / (pf["pirate_fleet_power"] + defense)
+    loot = await _generate_loot("raiding", 0)
+    loot_c = loot.get("credits", random.randint(25000, 100000)) if success else 0
+    await Database.execute(
+        "INSERT INTO pirate_raids (pirate_faction_id, target_territory_id, raid_type, loot_credits, outcome, description) "
+        "VALUES ($1,$2,'colony',$3,$4,$5)",
+        pf["id"], t["id"], loot_c, "success" if success else "failure",
+        f"Raid on {t['system_name']}: {'+' if success else '-'}{loot_c}C")
+    if success:
+        await Database.execute("UPDATE resources SET credits=credits-$1 WHERE session_id=$2", loot_c, session_id)
+        # HARTA KARUN: 40% goes to Den faction treasury, 60% into their
+        # active base hoards — so every raid on us grows the treasure
+        # we can take back by smashing their bases.
+        den_share = int(loot_c * 0.4)
+        hoard_share = loot_c - den_share
+        await Database.execute("UPDATE factions SET treasury=treasury+$1 WHERE id=$2", den_share, pf["id"])
+        base = await Database.fetchrow(
+            "SELECT id FROM maya_rp.pirate_bases WHERE faction_id=$1 AND status='active' "
+            "ORDER BY random() LIMIT 1", pf["id"])
+        if base:
+            await Database.execute(
+                "UPDATE maya_rp.pirate_bases SET treasury=treasury+$1 WHERE id=$2",
+                hoard_share, base["id"])
+        # Loot items too
+        if loot.get("items") or loot.get("artifacts"):
+            await _apply_loot(session_id, loot)
+    else:
+        loss = int(pf["pirate_fleet_power"] * 0.1)
+        await Database.execute("UPDATE factions SET pirate_fleet_power=GREATEST(0,pirate_fleet_power-$1) WHERE id=$2", loss, pf["id"])
+
+async def _alerts(session_id: int):
+    total = await Database.fetchrow("SELECT COALESCE(SUM(pirate_fleet_power),0) AS t FROM factions WHERE is_pirate=true")
+    if total and total["t"] > 5000:
+        await Database.execute("INSERT INTO pirate_alerts (session_id, message, severity) VALUES ($1,$2,4)",
+            session_id, "CRISIS: Pirate armada detected! Over 5000 power.")
+
+# ── LOOT ──
+
+LOOT_TABLES = {
+    "patrol": {"credits": (5000,25000), "resources": {"Alloys":(50,200),"Fuel":(30,150)}, "chance": 0.6},
+    "raiding": {"credits": (25000,100000), "resources": {"Alloys":(200,800),"Fuel":(100,400),"Rare Earth Elements":(5,20)}, "chance": 0.8},
+    "invasion": {"credits": (100000,500000), "resources": {"Alloys":(500,2000),"Fuel":(300,1000),"Aetherium":(2,10),"Orichalcum":(1,5)}, "chance": 0.9},
+    "armada": {"credits": (500000,2000000), "resources": {"Alloys":(2000,8000),"Fuel":(1000,4000),"Starsteel":(1,5),"Dream Essence":(1,3),"Void Crystal":(1,2)}, "chance": 1.0},
+}
+
+async def _generate_loot(threat: str, fleet_id: int = 0) -> dict:
+    lt = LOOT_TABLES.get(threat, LOOT_TABLES["patrol"])
+    loot = {"credits": 0, "resources": {}, "items": [], "artifacts": []}
+    if random.random() < lt["chance"]:
+        loot["credits"] = random.randint(*lt["credits"])
+        for rn, (mn, mx) in lt.get("resources", {}).items():
+            loot["resources"][rn] = random.randint(mn, mx)
+    # Artifacts
+    art_chance = {"invasion": 0.2, "armada": 0.5}.get(threat, 0)
+    if random.random() < art_chance:
+        art = await Database.fetchrow("SELECT * FROM pirate_artifacts ORDER BY random() LIMIT 1")
+        if art: loot["artifacts"].append(dict(art))
+    return loot
+
+async def _apply_loot(session_id: int, loot: dict):
+    if loot.get("credits", 0) > 0:
+        await Database.execute("UPDATE resources SET credits=credits+$1 WHERE session_id=$2", loot["credits"], session_id)
+    for rn, amt in loot.get("resources", {}).items():
+        await Database.execute(
+            "INSERT INTO resource_inventory (resource_id, quantity) SELECT id, $1 FROM strategic_resources WHERE name=$2 "
+            "ON CONFLICT (resource_id) DO UPDATE SET quantity=resource_inventory.quantity+EXCLUDED.quantity",
+            amt, rn)
+    for art in loot.get("artifacts", []):
+        await Database.execute("INSERT INTO events (session_id, event_type, title, description, importance, tags) "
+            "VALUES ($1,'loot',$2,$3,4,$4)",
+            session_id, f"Artifact: {art['name']}", f"{art['rarity']}: {art['description']}", json.dumps(["artifact", art["rarity"]]))
+
+async def salvage_ship(ship_class: str) -> dict:
+    """Salvage a destroyed pirate ship."""
+    t = await Database.fetchrow("SELECT salvage_pool, capture_chance FROM pirate_salvage_templates WHERE ship_class=$1", ship_class)
+    if not t: return {"credits": 0, "resources": {}, "components": [], "captured": False}
+    sp = json.loads(t["salvage_pool"]) if isinstance(t["salvage_pool"], str) else (t["salvage_pool"] or {})
+    if random.random() < float(t["capture_chance"]):
+        return {"credits": random.randint(10000,100000), "resources": {}, "components": [f"{ship_class}_intact"], "captured": True}
+    return {
+        "credits": random.randint(*sp.get("credits", (0,0))) if "credits" in sp else 0,
+        "resources": {rn: random.randint(*rv) for rn, rv in sp.get("resources", {}).items()} if random.random() < 0.7 else {},
+        "components": [c for c in sp.get("components", []) if random.random() < 0.7],
+        "captured": False,
+    }
+
+async def claim_bounty(session_id: int, pirate_faction_id: int) -> dict:
+    b = await Database.fetchrow("SELECT bounty_amount FROM pirate_bounties WHERE pirate_faction_id=$1 AND claimed_by IS NULL", pirate_faction_id)
+    if not b: return {"success": False, "error": "No bounty available."}
+    f = await Database.fetchrow("SELECT status FROM factions WHERE id=$1 AND is_pirate=true", pirate_faction_id)
+    if f and f["status"] != "defeated": return {"success": False, "error": "Pirates still active."}
+    await Database.execute("UPDATE resources SET credits=credits+$1 WHERE session_id=$2", b["bounty_amount"], session_id)
+    await Database.execute("UPDATE pirate_bounties SET claimed_by=(SELECT id FROM factions WHERE name='Setia Empire'), last_updated=NOW() WHERE pirate_faction_id=$1", pirate_faction_id)
+    return {"success": True, "credits": b["bounty_amount"]}
+
+
+async def raid_pirate_base(session_id: int, base_id: int, attack_power: int = 50000) -> dict:
+    """Strike a Den base and seize its hoard. attack_power = fleet power sent.
+
+    Success → treasury seized into the realm coffer, base destroyed,
+    Den fleet power takes a hit. Failure → base goes to ground, Den
+    fortifies, fleet power bleeds on both sides.
+    """
+    base = await Database.fetchrow(
+        "SELECT pb.*, f.pirate_fleet_power FROM maya_rp.pirate_bases pb "
+        "JOIN maya_rp.factions f ON f.id = pb.faction_id "
+        "WHERE pb.id=$1 AND pb.status='active'", base_id)
+    if not base:
+        return {"success": False, "error": "Base not found or already destroyed."}
+
+    attack_power = max(1000, attack_power)
+    defense_power = (base["defenses"] or 0) * 500 + (base["pirate_fleet_power"] or 0) * 0.3
+    odds = attack_power / (attack_power + defense_power)
+    success = random.random() < odds
+
+    if success:
+        hoard = base["treasury"] or 0
+        await Database.execute(
+            "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2",
+            hoard, session_id)
+        await Database.execute(
+            "UPDATE maya_rp.pirate_bases SET status='destroyed', treasury=0 WHERE id=$1",
+            base_id)
+        await Database.execute(
+            "UPDATE maya_rp.factions SET pirate_fleet_power=GREATEST(0,pirate_fleet_power-$1) WHERE id=$2",
+            int(base["pirate_fleet_power"] * 0.15), base["faction_id"])
+        await Database.execute(
+            "INSERT INTO maya_rp.pirate_alerts (session_id, message, severity) VALUES ($1,$2,3)",
+            session_id, f"DEN BASE SMASHED: {base['name']} — {hoard:,}C seized!")
+        return {"success": True, "base": base["name"], "hoard_seized": hoard,
+                "odds": round(odds, 2), "message": f"{base['name']} destroyed. {hoard:,}C to the coffer."}
+    else:
+        await Database.execute(
+            "UPDATE maya_rp.pirate_bases SET hidden=TRUE WHERE id=$1", base_id)
+        await Database.execute(
+            "INSERT INTO maya_rp.pirate_alerts (session_id, message, severity) VALUES ($1,$2,2)",
+            session_id, f"DEN BASE RAID REPULSED: {base['name']} went to ground.")
+        return {"success": False, "base": base["name"], "odds": round(odds, 2),
+                "message": f"Raid on {base['name']} repulsed. Base went dark."}

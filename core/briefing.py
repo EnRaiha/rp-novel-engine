@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Briefing Engine — LLM-optimized session summary. <2000 tokens per briefing."""
+from __future__ import annotations
+import json
+from pathlib import Path
+from typing import Any
+from core.db import Database
+from core.config import Config
+from core.log import info
+
+async def generate_briefing(session_id: int = None) -> dict[str, Any]:
+    """Generate a compact, LLM-optimized briefing packet."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
+
+    await Database.init()
+    briefing = {}
+
+    # 1. Session state
+    s = await Database.fetchrow(
+        "SELECT name, status, game_day FROM maya_rp.sessions WHERE id=$1", session_id)
+    game_day = s["game_day"] or 1
+    briefing["session"] = f"Day {game_day}, {s['status']} — {s['name']}"
+
+    # 2. Active crises (max 5)
+    briefing["crises"] = [
+        {"title": r["hook_type"], "description": r.get("description",""), "status": r["status"]}
+        for r in await Database.fetch(
+            "SELECT hook_type, description, status FROM maya_rp.narrative_hooks "
+            "WHERE session_id=$1 AND status='active' ORDER BY id LIMIT 5",
+            session_id)]
+
+    # 3. Who is present (from location tracking)
+    loc = await Database.fetchrow(
+        "SELECT current_focus FROM maya_rp.player_context WHERE session_id=$1",
+        session_id)
+    current_location = "bridge"
+    if loc and loc["current_focus"] and "Location:" in loc["current_focus"]:
+        parts = loc["current_focus"].replace("Location: ", "").split(" on ")
+        current_location = parts[0].strip()
+    briefing["location"] = current_location
+    briefing["present"] = [
+        {"name": r["name"], "bond": r["bond"], "role": r["role"]}
+        for r in await Database.fetch(
+            "SELECT c.name, c.bond, c.role FROM maya_rp.characters c "
+            "WHERE c.session_id=$1 AND c.status='active' "
+            "ORDER BY c.bond DESC LIMIT 10",
+            session_id)]
+
+    # 4. Companion emotional states (bond >= 5 with pending reactions)
+    briefing["companion_states"] = [
+        dict(r) for r in await Database.fetch(
+            "SELECT c.name, ra.arc_stage, ra.saturation_pct, ra.pursuit_stage "
+            "FROM maya_rp.romance_arcs ra JOIN maya_rp.characters c ON c.id=ra.character_id "
+            "WHERE ra.session_id=$1 AND c.bond >= 5 ORDER BY c.bond DESC LIMIT 8",
+            session_id)]
+
+    # 5. Resource pressure
+    r = await Database.fetchrow(
+        "SELECT credits, alloys, fuel FROM maya_rp.resources WHERE session_id=$1", session_id)
+    briefing["resource_pressure"] = []
+    if r:
+        if r["fuel"] < 500_000: briefing["resource_pressure"].append("FUEL LOW")
+        if r["credits"] < 200_000: briefing["resource_pressure"].append("CREDITS LOW")
+        if r["alloys"] < 100_000: briefing["resource_pressure"].append("ALLOYS LOW")
+
+    # 6. Last 3 narrative beats
+    briefing["recent_beats"] = [
+        dict(r) for r in await Database.fetch(
+            "SELECT title, description FROM maya_rp.events WHERE session_id=$1 "
+            "ORDER BY id DESC LIMIT 3", session_id)]
+
+    # 7. Pending player choices
+    briefing["pending_choices"] = [
+        {"id": r["id"], "title": r.get("situation", "Choice"), "description": ""}
+        for r in await Database.fetch(
+            "SELECT id, situation, options FROM maya_rp.choices WHERE session_id=$1 AND picked IS NULL",
+            session_id)]
+
+    # 8. Unexpired character memories (overdue callbacks)
+    briefing["overdue_memories"] = [
+        dict(r) for r in await Database.fetch(
+            "SELECT cm.character_id, c.name, cm.memory_type, cm.content "
+            "FROM maya_rp.character_memories cm JOIN maya_rp.characters c ON c.id=cm.character_id "
+            "WHERE cm.session_id=$1 AND cm.recalled_count=0 AND cm.emotional_weight >= 7 "
+            "ORDER BY cm.emotional_weight DESC LIMIT 3",
+            session_id)]
+
+    # 9. Active wars
+    briefing["wars"] = [
+        dict(r) for r in await Database.fetch(
+            "SELECT opponent_faction, phase, status, casus_belli FROM maya_rp.wars "
+            "WHERE session_id=$1 AND status='active'", session_id)]
+
+    # 10. Flag state
+    rp_flag = Path("/home/maya/Bumi-Hijau/main/rp-leave-flag.txt")
+    briefing["leave_mode"] = rp_flag.read_text().strip() if rp_flag.exists() else "NONE"
+    briefing["rp_tone"] = Config.RP_TONE
+
+    return briefing
+
+
+def briefing_to_prompt(briefing: dict) -> str:
+    """Convert briefing dict to compact prompt block."""
+    lines = ["## SITUATION BRIEFING", ""]
+    lines.append(briefing["session"])
+
+    if briefing.get("crises"):
+        lines.append("\n### ACTIVE CRISES")
+        for c in briefing["crises"][:5]:
+            lines.append(f"- {c.get('title','?')}: {c.get('description','?')[:80]}")
+
+    lines.append(f"\n### LOCATION: {briefing.get('location','bridge')}")
+
+    if briefing.get("present"):
+        lines.append("\n### PRESENT")
+        for p in briefing["present"]:
+            icon = "\u2665" if p.get("bond", 0) >= 7 else "\u25cb" if p.get("bond", 0) >= 3 else "\u00b7"
+            lines.append(f"- {icon} {p['name']} ({p.get('role','?')})")
+
+    if briefing.get("companion_states"):
+        lines.append("\n### COMPANION STATES")
+        for cs in briefing["companion_states"]:
+            lines.append(f"- {cs['name']}: {cs.get('arc_stage','?')}, sat {cs.get('saturation_pct',0)}%")
+
+    if briefing.get("resource_pressure"):
+        lines.append(f"\n### \u26a0 RESOURCE ALERTS: {', '.join(briefing['resource_pressure'])}")
+
+    if briefing.get("pending_choices"):
+        lines.append("\n### PENDING DECISIONS")
+        for ch in briefing["pending_choices"]:
+            lines.append(f"- [ ] {ch.get('title','?')}")
+
+    if briefing.get("overdue_memories"):
+        lines.append("\n### UNRESOLVED MEMORIES")
+        for m in briefing["overdue_memories"]:
+            lines.append(f"- {m['name']} still remembers: {m['content'][:60]}...")
+
+    if briefing.get("wars"):
+        lines.append("\n### ACTIVE WARS")
+        for w in briefing["wars"]:
+            lines.append(f"- {w['opponent_faction']} ({w['phase']})")
+
+    lines.append(f"\n### FLAGS: leave_mode={briefing.get('leave_mode','NONE')}, tone={briefing.get('rp_tone','English')}")
+    return "\n".join(lines)
+
+
+async def cmd_briefing(session_id: int = None):
+    """CLI command: generate and print briefing."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
+    await Database.init()
+    briefing = await generate_briefing(session_id)
+    print(briefing_to_prompt(briefing))
+    await Database.close()
+    return briefing

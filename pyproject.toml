@@ -1,0 +1,15 @@
+[project]
+name = "rp-engine"
+version = "2.0.0"
+description = "TKG RP Engine — unified async Python game engine"
+requires-python = ">=3.11"
+dependencies = ["asyncpg>=0.29"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+ignore_missing_imports = true

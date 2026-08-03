@@ -363,6 +363,22 @@ async def cmd_intimacy():
     else:
         print("Unknown intimacy subcommand: gen|text")
 
+async def cmd_roll100():
+    """roll100 [days] [--dry-run] — roll N game days with transparent overrides."""
+    await Database.init()
+    import subprocess
+    subprocess.run([sys.executable, "scripts/roll100.py"] + sys.argv[2:])
+
+async def cmd_schema():
+    """schema [schema_name] [outfile] — export PG schema to markdown (default wiki/rp-dev/schema.md)."""
+    import subprocess
+    subprocess.run([sys.executable, "scripts/export_schema.py"] + sys.argv[2:])
+
+async def cmd_sync_pack():
+    """sync-pack [--dry-run] — refresh wiki/rp-dev canon copies + regenerate one-file."""
+    import subprocess
+    subprocess.run([sys.executable, "scripts/sync_pack.py"] + sys.argv[2:])
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python3 scripts/cli.py {status|tick|save|export|config|health|modules|run|query} [args]")
@@ -397,5 +413,11 @@ if __name__ == "__main__":
         asyncio.run(cmd_memories())
     elif cmd == "intimacy":
         asyncio.run(cmd_intimacy())
+    elif cmd == "roll100":
+        asyncio.run(cmd_roll100())
+    elif cmd == "schema":
+        asyncio.run(cmd_schema())
+    elif cmd == "sync-pack":
+        asyncio.run(cmd_sync_pack())
     else:
-        print(f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy")
+        print(f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack")

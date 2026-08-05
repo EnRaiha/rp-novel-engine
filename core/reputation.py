@@ -14,6 +14,15 @@ IMPACTS = {
     "defeat": {"standard": {"fame": -5, "moral": -3, "brutality": 0}},
     "diplomacy": {"standard": {"fame": 3, "moral": 2, "brutality": -1}},
     "betrayal": {"standard": {"fame": -10, "moral": -8, "brutality": 5}},
+    # Novel adaptation — "Ruthless but Fair" (novel bab 51):
+    # hapus khianat = brutal tapi adil; lepaskan neutral = mercy bermoral tinggi
+    "execute_leader": {"standard": {"fame": -3, "moral": -10, "brutality": 12},
+                       "justified": {"fame": 3, "moral": -2, "brutality": 5},
+                       "unjust": {"fame": -12, "moral": -18, "brutality": 20}},
+    "spare_leader": {"standard": {"fame": 6, "moral": 6, "brutality": -5},
+                     "risky": {"fame": 2, "moral": 3, "brutality": -2}},
+    "family_spared": {"standard": {"fame": 8, "moral": 8, "brutality": -6}},
+    "family_executed": {"standard": {"fame": -6, "moral": -12, "brutality": 15}},
 }
 
 _TITLE_MAP = {

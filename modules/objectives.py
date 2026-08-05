@@ -46,3 +46,82 @@ async def run_tick(session_id: int = None) -> dict:
     except Exception as e:
         info("objectives", f"Error: {e}")
         return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# NOVEL ADAPTATION — QUARTERLY TASK SYSTEM (novel bab 499)
+# Setiap 90 hari: 4 misi berjadual → reward Tier Blueprint (gacha draw)
+# ═══════════════════════════════════════════════════════════════
+
+QUARTERLY_TASK_POOL = [
+    {"title": "Fleet Exercise", "objective": "Sweep X hostiles di sempadan", "target": 10, "kind": "kills"},
+    {"title": "Survey Push", "objective": "Survey X planets baru", "target": 4, "kind": "survey"},
+    {"title": "Trade Dominance", "objective": "Raise trade income ke X", "target": 15000000, "kind": "trade"},
+    {"title": "Treasury Growth", "objective": "Treasury melebihi X credits", "target": 950000000, "kind": "credits"},
+    {"title": "Duel Champion", "objective": "Menang X formal duels", "target": 3, "kind": "duels"},
+    {"title": "Wreck Recovery", "objective": "Kumpul X wrecks", "target": 5, "kind": "wrecks"},
+    {"title": "Territory Dev", "objective": "Development X sistem ke tier 3", "target": 2, "kind": "dev"},
+    {"title": "Crew Pipeline", "objective": "Recruit X crew baru", "target": 10, "kind": "crew"},
+]
+
+BLUEPRINT_TIERS = [1, 2, 3, 4]  # gacha draw weights: rare = high tier
+
+
+async def generate_quarterly_tasks(session_id: int = None) -> dict:
+    """Generate 4 quarterly tasks untuk quarter semasa (game_day // 90)."""
+    if session_id is None: session_id = Config.SESSION_ID
+    gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id)
+    quarter = (gd or 1) // 90
+    existing = await Database.fetchval(
+        "SELECT COUNT(*) FROM maya_rp.quarterly_tasks WHERE session_id=$1 AND quarter=$2 AND status='active'",
+        session_id, quarter)
+    if existing:
+        return {"quarter": quarter, "already_active": existing}
+
+    import random
+    tasks = random.sample(QUARTERLY_TASK_POOL, 4)
+    for i, t in enumerate(tasks, start=1):
+        # Gacha blueprint reward: tier weight (rare = high tier)
+        tier = random.choices(BLUEPRINT_TIERS, weights=[50, 30, 15, 5])[0]
+        reward_val = {1: 250000, 2: 750000, 3: 2000000, 4: 6000000}[tier]
+        await Database.execute(
+            """INSERT INTO maya_rp.quarterly_tasks
+               (session_id, quarter, task_index, title, objective, target_value, reward_type, reward_value)
+               VALUES ($1, $2, $3, $4, $5, $6, 'blueprint', $7)""",
+            session_id, quarter, i, t["title"], t["objective"], t["target"], reward_val)
+    return {"quarter": quarter, "generated": len(tasks)}
+
+
+async def update_quarterly_progress(session_id: int = None, kind: str = None, amount: int = 1) -> dict:
+    """Kemaskini progress tasks ikut kind (kills/survey/trade/credits/duels/wrecks/dev/crew)."""
+    if session_id is None: session_id = Config.SESSION_ID
+    if not kind:
+        return {"error": "kind required (kills/survey/trade/credits/duels/wrecks/dev/crew)"}
+    tasks = await Database.fetch(
+        "SELECT id, title, target_value, progress, reward_value FROM maya_rp.quarterly_tasks "
+        "WHERE session_id=$1 AND status='active' AND objective ILIKE '%'||$2||'%'", session_id, kind)
+    completed = []
+    for t in tasks:
+        np_ = (t["progress"] or 0) + amount
+        done = np_ >= t["target_value"]
+        await Database.execute(
+            "UPDATE maya_rp.quarterly_tasks SET progress=$1, status=$2, completed_at=CASE WHEN $2='completed' THEN NOW() ELSE completed_at END WHERE id=$3",
+            np_, "completed" if done else "active", t["id"])
+        if done:
+            # Gacha blueprint reward → research project unlocked (simulated)
+            await Database.execute(
+                "UPDATE maya_rp.resources SET research_points=research_points+$1 WHERE session_id=$2",
+                t["reward_value"] // 1000, session_id)
+            completed.append({"title": t["title"], "reward": t["reward_value"]})
+    return {"updated": len(tasks), "completed": completed}
+
+
+async def quarterly_tasks_view(session_id: int = None) -> dict:
+    """View aktif quarterly tasks (format novel 【Quarterly Tasks】)."""
+    if session_id is None: session_id = Config.SESSION_ID
+    gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id)
+    quarter = (gd or 1) // 90
+    tasks = await Database.fetch(
+        "SELECT task_index, title, objective, target_value, progress, status, reward_value "
+        "FROM maya_rp.quarterly_tasks WHERE session_id=$1 AND quarter=$2 ORDER BY task_index", session_id, quarter)
+    return {"quarter": quarter, "tasks": [dict(t) for t in tasks]}

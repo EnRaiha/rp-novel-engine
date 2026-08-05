@@ -115,6 +115,13 @@ class BattleEngine:
         rep = 10 if outcome == "player_victory" else -10
         await Database.execute("INSERT INTO battle_aftermath (battle_id, loot_credits, reputation_change, narrative) VALUES ($1,$2,$3,$4)",
             state.battle_id, loot, rep, f"Battle resolved: {outcome}")
+        # Novel adaptation — Ship Legacy (bab 7, 35): kapal veteran dapat battle_honors + legacy_score
+        if outcome == "player_victory" and state.player.ships:
+            await Database.execute(
+                "UPDATE maya_rp.ships SET battle_honors=battle_honors+1, "
+                "legacy_score=legacy_score+GREATEST(1, LEAST(10, power_rating/50000)) "
+                "WHERE session_id=$1 AND id = ANY($2::int[])",
+                state.session_id, state.player.ships)
         await EventBus.emit("battle_completed", {"battle_id": state.battle_id, "outcome": outcome})
         return state
 

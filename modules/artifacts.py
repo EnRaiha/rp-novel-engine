@@ -35,3 +35,45 @@ async def equip(artifact_id: int, target_id: int, session_id: int | None = None)
 async def run_tick(session_id: int = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
     return {"status": "artifacts_ready"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# NOVEL ADAPTATION — MEDALS & HONOR (novel bab 211, 601, 692)
+# "This is the medal I earned with my love's life."
+# Medal tiers: merit → sacrifice → resurrection. Setiap medal bawa backstory.
+# ═══════════════════════════════════════════════════════════════
+
+MEDAL_TIERS = {
+    "merit": {"label": "Medal of Merit", "bonus": 5, "desc": "Untuk perkhidmatan cemerlang"},
+    "sacrifice": {"label": "Medal of Sacrifice", "bonus": 10, "desc": "Untuk pengorbanan — dibayar dengan nyawa cinta"},
+    "resurrection": {"label": "Resurrection Medal", "bonus": 15, "desc": "Untuk yang bangkit semula dari kegagalan"},
+}
+
+
+async def award_medal(session_id: int | None, recipient: str, tier: str = "merit",
+                      backstory: str = "") -> dict:
+    """Anugerah medal — dengan sacrifice backstory (novel: medal = cerita korban)."""
+    if session_id is None: session_id = Config.SESSION_ID
+    if tier not in MEDAL_TIERS:
+        return {"error": f"Tier mesti: {list(MEDAL_TIERS.keys())}"}
+    conf = MEDAL_TIERS[tier]
+    name = f"{conf['label']} — {recipient}"
+    desc = conf["desc"] if not backstory else backstory
+    aid = await Database.fetchval(
+        """INSERT INTO maya_rp.artifacts (session_id, name, type, rarity, description, bonus, sacrifice_backstory, award_recipient)
+           VALUES ($1, $2, 'medal', $3, $4, $5, $6, $7) RETURNING id""",
+        session_id, name, tier, desc, conf["bonus"], backstory or None, recipient)
+    await Database.execute(
+        "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance) "
+        "VALUES ($1, 'honor', $2, $3, 4)",
+        session_id, f"MEDAL AWARDED: {conf['label']}",
+        f"{recipient} menerima {conf['label']}. {desc}")
+    return {"medal_id": aid, "name": name, "tier": tier, "bonus": conf["bonus"]}
+
+
+async def list_medals(session_id: int | None = None) -> list[dict]:
+    if session_id is None: session_id = Config.SESSION_ID
+    rows = await Database.fetch(
+        "SELECT id, name, rarity, bonus, sacrifice_backstory, award_recipient FROM maya_rp.artifacts "
+        "WHERE session_id=$1 AND type='medal' ORDER BY bonus DESC", session_id)
+    return [dict(r) for r in rows]

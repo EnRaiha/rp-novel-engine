@@ -27,6 +27,7 @@ from modules import meanwhile, conversation_log, physical_state, chekhov, world_
 from modules import logistics, geopolitics, crew_career, ideology
 from modules import auto_queue, corporations
 from modules import collapse as collapse_mod
+from modules import wreck_assembly, duel
 from core import consequences as consequences_mod
 from core.pacing import PacingDirector
 
@@ -376,6 +377,7 @@ MODULE_MAP = {
     "logistics": logistics, "geopolitics": geopolitics,
     "crew_career": crew_career, "ideology": ideology,
     "corporations": corporations, "collapse": collapse_mod,
+    "wreck_assembly": wreck_assembly, "duel": duel,
 }
 
 async def run_single(session_id: int, module_name: str):

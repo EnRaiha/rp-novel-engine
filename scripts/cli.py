@@ -241,6 +241,53 @@ async def cmd_romance():
     else:
         print("Unknown romance subcommand: arcs|roll")
 
+async def cmd_assembly():
+    """assembly list | assembly add <name> <tier> <hull> <power> <sub_class> | assembly assemble <name> <wreck_ids> [skill]"""
+    await Database.init()
+    from modules.wreck_assembly import cmd as wa_cmd
+    sub = sys.argv[2] if len(sys.argv) > 2 else ""
+    if sub == "list":
+        r = await wa_cmd(SID, "list", {})
+        print(f"\nWrecks available: {len(r.get('wrecks', []))}")
+        for w in r.get("wrecks", []):
+            print(f"  #{w['id']} {w['name']} — T{w['tier']} hull {w['hull']:,} power {w['power_rating']:,} ({w['sub_class']})")
+    elif sub == "add" and len(sys.argv) >= 7:
+        r = await wa_cmd(SID, "add", {"name": sys.argv[3], "tier": int(sys.argv[4]), "hull": int(sys.argv[5]),
+                                      "power": int(sys.argv[6]), "sub_class": sys.argv[7] if len(sys.argv) > 7 else "Wreck"})
+        print(f"ADDED: {r}")
+    elif sub == "assemble" and len(sys.argv) >= 5:
+        ids = [int(x) for x in sys.argv[4].split(",")]
+        skill = int(sys.argv[5]) if len(sys.argv) > 5 else 5
+        r = await wa_cmd(SID, "assemble", {"name": sys.argv[3], "wreck_ids": ids, "skill": skill})
+        print(f"ASSEMBLE: {r}")
+    else:
+        print("Usage: cli.py assembly {list|add <name> <tier> <hull> <power> <sub_class>|assemble <name> <wreck_ids> [skill]}")
+
+async def cmd_duel():
+    """duel challenge <ship_id> <opp_name> <tier> <hull> <power> [stakes_type] [stakes_value] | duel resolve <id> | duel list"""
+    await Database.init()
+    from modules.duel import cmd as duel_cmd
+    sub = sys.argv[2] if len(sys.argv) > 2 else ""
+    if sub == "challenge" and len(sys.argv) >= 7:
+        r = await duel_cmd(SID, "challenge", {
+            "player_ship_id": int(sys.argv[3]),
+            "opponent": {"name": sys.argv[4], "tier": int(sys.argv[5]), "hull": int(sys.argv[6]),
+                         "power": int(sys.argv[7])},
+            "stakes": {"type": sys.argv[8] if len(sys.argv) > 8 else "favor",
+                       "value": int(sys.argv[9]) if len(sys.argv) > 9 and sys.argv[8] == "credits" else 0},
+            "venue": "Open Space",
+        })
+        print(f"CHALLENGE: {r}")
+    elif sub == "resolve" and len(sys.argv) >= 4:
+        r = await duel_cmd(SID, "resolve", {"duel_id": int(sys.argv[3])})
+        print(f"RESOLVE: {r}")
+    elif sub == "list":
+        r = await duel_cmd(SID, "list", {})
+        for d in r.get("duels", []):
+            print(f"  #{d['id']} {d['opponent_name']} — {d['stakes_type']} — {d['status']} {d.get('result') or ''}")
+    else:
+        print("Usage: cli.py duel {challenge <ship_id> <opp_name> <tier> <hull> <power> [stakes_type] [value]|resolve <id>|list}")
+
 async def cmd_roll():
     """Generic dice: 'roll 100 +50 vs 90' | 'roll 3d6' | 'roll d20'"""
     expr = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
@@ -408,6 +455,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_query(" ".join(sys.argv[2:])))
     elif cmd == "romance":
         asyncio.run(cmd_romance())
+    elif cmd == "assembly": asyncio.run(cmd_assembly())
+    elif cmd == "duel": asyncio.run(cmd_duel())
     elif cmd == "roll":
         asyncio.run(cmd_roll())
     elif cmd == "templates":

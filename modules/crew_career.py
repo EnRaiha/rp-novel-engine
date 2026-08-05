@@ -35,3 +35,67 @@ async def run_tick(session_id: int = None) -> dict:
     except Exception:
         pass
     return {"processed":True}
+
+
+# ═══════════════════════════════════════════════════════════════
+# NOVEL ADAPTATION — CREW PROMOTION + SPECIALIZATION (novel bab 171, 1252)
+# "Oops! We are short of talent" — bottleneck bukan kapal, tapi orang.
+# Artisan/planner/navigator specialization + promotion ranks.
+# ═══════════════════════════════════════════════════════════════
+
+SPECIALIZATIONS = ["artisan", "planner", "navigator", "officer", "engineer"]
+
+
+async def assign_specialization(crew_id: int, specialization: str, session_id: int = None) -> dict:
+    if session_id is None: session_id = Config.SESSION_ID
+    if specialization not in SPECIALIZATIONS:
+        return {"error": f"Specialization mesti salah satu: {SPECIALIZATIONS}"}
+    await Database.execute(
+        "UPDATE maya_rp.crew_roster SET specialization=$1 WHERE id=$2 AND session_id=$3",
+        specialization, crew_id, session_id)
+    return {"crew_id": crew_id, "specialization": specialization}
+
+
+async def promote_crew(crew_id: int, session_id: int = None) -> dict:
+    """Manual promotion check — naik rank bila XP cukup, buka skill specialization."""
+    if session_id is None: session_id = Config.SESSION_ID
+    cr = await Database.fetchrow(
+        "SELECT id, xp, level, rank, specialization FROM maya_rp.crew_roster WHERE id=$1 AND session_id=$2",
+        crew_id, session_id)
+    if not cr:
+        return {"error": "Crew not found"}
+    needed = (cr["level"] or 1) * 100
+    if (cr["xp"] or 0) < needed:
+        return {"leveled": False, "need": needed - (cr["xp"] or 0)}
+    nl = (cr["level"] or 1) + 1
+    nr = RANKS[min(nl - 1, len(RANKS) - 1)]
+    # Specialization skill unlock: artisan → weapons/hull, planner → logistics, navigator → ftl
+    spec_skills = {"artisan": ["weapons", "hull"], "planner": ["logistics", "strategy"],
+                   "navigator": ["ftl"], "officer": ["leadership"], "engineer": ["reactor", "ftl"]}
+    skills = spec_skills.get(cr["specialization"] or "officer", ["tactics"])
+    await Database.execute(
+        "UPDATE maya_rp.crew_roster SET level=$1, rank=$2, xp=COALESCE(xp,0)-$3, promotion_source='novel_promotion' WHERE id=$4",
+        nl, nr, needed, crew_id)
+    for sk in skills:
+        await Database.execute(
+            "INSERT INTO maya_rp.crew_skills (crew_id, session_id, skill_name, proficiency) "
+            "VALUES ($1, $2, $3, 1) ON CONFLICT (crew_id, skill_name) DO UPDATE SET proficiency=crew_skills.proficiency+1",
+            crew_id, session_id, sk)
+    await Database.execute(
+        "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance) "
+        "VALUES ($1, 'career', $2, $3, 2)",
+        session_id, f"Crew Promoted: {cr['id']}",
+        f"Rank {cr['rank']} → {nr} (Level {nl}). Skills: {', '.join(skills)}. Specialization: {cr['specialization'] or 'officer'}")
+    return {"leveled": True, "new_rank": nr, "level": nl, "skills": skills}
+
+
+async def talent_shortage(session_id: int = None) -> dict:
+    """Novel bab 171 — talent shortage arc: kalau crew < kapal aktif, bottleneck."""
+    if session_id is None: session_id = Config.SESSION_ID
+    crew = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.crew_roster WHERE session_id=$1 AND status='active'", session_id)
+    ships = await Database.fetchval(
+        "SELECT COUNT(*) FROM maya_rp.ships WHERE session_id=$1 AND status='active' AND ship_type NOT IN ('light_dockyard','heavy_shipyard')",
+        session_id)
+    shortage = (ships or 0) - (crew or 0)
+    return {"crew": crew, "ships": ships, "shortage": max(0, shortage),
+            "status": "SHORTAGE" if shortage > 0 else "balanced"}

@@ -800,3 +800,75 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
     except Exception as e:
         info("council", f"Error: {e}")
         return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# NOVEL ADAPTATION — IMPERIAL TITLE PRESSURE (novel bab 7, 51)
+# "Ruthless but fair": governor kena deliver, atau title ditarik.
+# ═══════════════════════════════════════════════════════════════
+
+async def check_title_revocation(session_id: int | None = None) -> dict:
+    """Scan territories untuk revocation risk.
+    Risk naik bila: crisis_level > 5, takde governor, development rendah.
+    Risk turun bila: performance bagus (dev naik, crisis sifar)."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
+    territories = await Database.fetch(
+        "SELECT id, system_name, crisis_level, development_level, governor_name, "
+        "revocation_risk, title_performance FROM maya_rp.territory WHERE session_id=$1",
+        session_id,
+    )
+    flagged = []
+    for t in territories:
+        risk = t["revocation_risk"] or 0
+        perf = t["title_performance"] or 0
+        crisis = t["crisis_level"] or 0
+
+        # Faktor naik risiko
+        if crisis > 5:
+            risk += 3
+        if not t["governor_name"]:
+            risk += 2
+        if (t["development_level"] or 0) <= 0:
+            risk += 1
+
+        # Faktor turun (performance)
+        if crisis == 0 and t["governor_name"]:
+            perf += 1
+        if (t["development_level"] or 0) >= 3:
+            perf += 1
+        risk = max(0, risk - (perf // 3))
+
+        if risk != (t["revocation_risk"] or 0):
+            await Database.execute(
+                "UPDATE maya_rp.territory SET revocation_risk=$1, title_performance=$2 WHERE id=$3",
+                risk, perf, t["id"],
+            )
+        if risk >= 10:
+            flagged.append({"system": t["system_name"], "risk": risk, "crisis": crisis})
+
+    return {"checked": len(territories), "flagged": flagged,
+            "revocation_ready": [f for f in flagged if f["risk"] >= 15]}
+
+
+async def revoke_title(session_id: int, system_name: str, reason: str = "") -> dict:
+    """Cabut title governor — Imperial authority. Kos reputasi moral (ruthless but fair)."""
+    t = await Database.fetchrow(
+        "SELECT id, system_name, governor_name FROM maya_rp.territory WHERE session_id=$1 AND system_name=$2",
+        session_id, system_name,
+    )
+    if not t or not t["governor_name"]:
+        return {"error": "Territory tak wujud atau takde governor"}
+    gov = t["governor_name"]
+    await Database.execute(
+        "UPDATE maya_rp.territory SET governor_name=NULL, revocation_risk=0, title_performance=0 WHERE id=$1",
+        t["id"],
+    )
+    await Database.execute(
+        "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance) "
+        "VALUES ($1, 'decree', $2, $3, 4)",
+        session_id, f"TITLE REVOKED: {system_name}",
+        f"Governor {gov} dibuang dari {system_name}. {'Alasan: ' + reason if reason else 'Gagal deliver performance.'} "
+        f"Imperial authority ditegakkan — ruthless but fair.",
+    )
+    return {"revoked": system_name, "governor": gov, "reason": reason or "underperformance"}

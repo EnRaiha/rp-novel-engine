@@ -180,3 +180,50 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
     except Exception as e:
         error("corporations", f"Tick error: {e}")
         return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# NOVEL ADAPTATION — BLUEPRINT MARKET (novel bab 22-23, 171)
+# Jual tech yang dah unlocked → modal. Data redacted = buyer kena R&D sendiri.
+# ═══════════════════════════════════════════════════════════════
+
+async def list_saleable_blueprints(session_id: int | None = None) -> list[dict]:
+    rows = await Database.fetch(
+        "SELECT id, name, field, effect_type, effect_value, blueprint_price FROM maya_rp.research_projects "
+        "WHERE unlocked=true AND saleable=true ORDER BY blueprint_price DESC")
+    return [dict(r) for r in rows]
+
+
+async def sell_blueprint(session_id: int | None, project_id: int, buyer: str = "Iron Concord",
+                         markdown_pct: float = 0.20) -> dict:
+    """Jual blueprint (80% data, redacted) ke faction. Buyer bayar; kita simpan tech.
+    Redacted = buyer dapat tech, tapi perlu R&D sendiri untuk full spec (novel bab 23)."""
+    if session_id is None: session_id = Config.SESSION_ID
+    proj = await Database.fetchrow(
+        "SELECT id, name, blueprint_price, saleable, unlocked FROM maya_rp.research_projects "
+        "WHERE id=$1", project_id)
+    if not proj or not proj["unlocked"] or not proj["saleable"]:
+        return {"error": "Blueprint tak saleable / belum unlocked"}
+
+    price = int(proj["blueprint_price"] * (1 - markdown_pct))  # redacted discount
+    # Buyer (faction) bayar → treasury naik
+    await Database.execute(
+        "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2", price, session_id)
+    # Faction gain tech (faction_tech flag — simulated via faction treasury deduction)
+    await Database.execute(
+        "UPDATE maya_rp.factions SET treasury=GREATEST(0, treasury-$1) WHERE session_id=$2 AND name=$3",
+        price, session_id, buyer)
+    # Log contract
+    cid = await Database.fetchval(
+        """INSERT INTO maya_rp.corporate_contracts (session_id, corp_id, contract_type, target_system,
+           payout_credits, duration_days, days_remaining, status)
+           VALUES ($1, (SELECT id FROM maya_rp.corporations WHERE session_id=$2 AND name='BHI' LIMIT 1),
+           'blueprint_sale', $3, $4, 30, 30, 'active') RETURNING id""",
+        session_id, session_id, buyer, price)
+    await Database.execute(
+        "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance, tags) "
+        "VALUES ($1, 'trade', $2, $3, 3, '[\"blueprint\",\"trade\"]'::jsonb)",
+        session_id, f"Blueprint Sold: {proj['name']}",
+        f"80% data redacted blueprint {proj['name']} dijual ke {buyer} untuk {price:,}C. "
+        f"Buyer perlu R&D sendiri untuk full spec.")
+    return {"sold": proj["name"], "buyer": buyer, "price": price, "contract_id": cid}

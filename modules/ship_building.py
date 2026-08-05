@@ -106,3 +106,87 @@ async def build_ship(class_name: str, tier: int, ship_type: str, name: str, loca
 async def run_tick(session_id: int = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
     return {"status": "ship_building_ready"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# NOVEL ULTIMATE #1 — TALENT SHORTAGE (Bottleneck Logik)
+# Novel: masalah utama bukan kapal, tapi CREW. "Oops! We are short of talent."
+# Kapal undercrewed = liability (power drop + status undercrewed).
+# ═══════════════════════════════════════════════════════════════
+
+async def check_crew_capacity(session_id: int, required_crew: int) -> bool:
+    """Betulkan: ada cukup crew unassigned untuk kapal baru?"""
+    available = await Database.fetchval(
+        "SELECT COUNT(*) FROM maya_rp.crew_roster WHERE session_id=$1 AND ship_id IS NULL AND status='active'",
+        session_id,
+    ) or 0
+    return available >= required_crew
+
+
+async def assign_crew_to_ship(session_id: int, ship_id: int, required_crew: int) -> dict:
+    """Assign crew ke kapal. Deficit = undercrewed state (Stakes Integrity: liability)."""
+    # Semak spec kapal dulu
+    ship = await Database.fetchrow(
+        "SELECT id, name, power_rating, hull FROM maya_rp.ships WHERE id=$1 AND session_id=$2",
+        ship_id, session_id,
+    )
+    if not ship:
+        return {"error": "Ship not found"}
+
+    available = await Database.fetchval(
+        "SELECT COUNT(*) FROM maya_rp.crew_roster WHERE session_id=$1 AND ship_id IS NULL AND status='active'",
+        session_id,
+    ) or 0
+
+    deficit = max(0, required_crew - available)
+    if deficit > 0:
+        # Stakes Integrity: undercrewed ship = liability
+        penalty = round(deficit / max(1, required_crew), 3)
+        await Database.execute(
+            "UPDATE maya_rp.ships SET crew_current=$1, crew_required=$2, undercrewed_penalty=$3, "
+            "status='undercrewed' WHERE id=$4",
+            available, required_crew, penalty, ship_id,
+        )
+        await Database.execute(
+            "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance) "
+            "VALUES ($1, 'warning', $2, $3, 3)",
+            session_id, f"UNDERCREWED: {ship['name']}",
+            f"Kapal dilancarkan dengan kekurangan {deficit} crew. Combat efficiency -{penalty*100:.0f}%. "
+            f"Novel bab 171: 'Oops! We are short of talent.'",
+        )
+        return {"warning": True, "deficit": deficit, "penalty": penalty,
+                "status": "undercrewed"}
+
+    # Crew cukup — assign
+    await Database.execute(
+        """UPDATE maya_rp.crew_roster SET ship_id=$1
+           WHERE id IN (SELECT id FROM maya_rp.crew_roster
+                        WHERE session_id=$2 AND ship_id IS NULL AND status='active' LIMIT $3)""",
+        ship_id, session_id, required_crew,
+    )
+    await Database.execute(
+        "UPDATE maya_rp.ships SET crew_current=$1, crew_required=$2, undercrewed_penalty=0, status='active' WHERE id=$3",
+        required_crew, required_crew, ship_id,
+    )
+    return {"warning": False, "crew": required_crew, "status": "active"}
+
+
+async def crew_shortage_report(session_id: int = None) -> dict:
+    """Novel bab 171 arc: talent shortage dashboard."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
+    crew_total = await Database.fetchval(
+        "SELECT COUNT(*) FROM maya_rp.crew_roster WHERE session_id=$1 AND status='active'", session_id) or 0
+    crew_unassigned = await Database.fetchval(
+        "SELECT COUNT(*) FROM maya_rp.crew_roster WHERE session_id=$1 AND ship_id IS NULL AND status='active'",
+        session_id) or 0
+    ships_active = await Database.fetchval(
+        "SELECT COUNT(*) FROM maya_rp.ships WHERE session_id=$1 AND status IN ('active','undercrewed')",
+        session_id) or 0
+    undercrewed = await Database.fetchval(
+        "SELECT COUNT(*) FROM maya_rp.ships WHERE session_id=$1 AND status='undercrewed'", session_id) or 0
+    shortage = max(0, ships_active - crew_unassigned)
+    return {"crew_total": crew_total, "crew_unassigned": crew_unassigned,
+            "ships_active": ships_active, "undercrewed": undercrewed,
+            "shortage": shortage,
+            "status": "SHORTAGE" if shortage > 0 else "balanced"}

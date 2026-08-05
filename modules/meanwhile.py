@@ -12,6 +12,24 @@ async def generate(session_id: int = None) -> dict | None:
     from core.pacing import PacingDirector
     pm = await PacingDirector.get_mode(session_id)
     if pm["mode"] in ("intimate","downtime"): return None
+
+    # NOVEL ULTIMATE #3 — DUAL POV INTEL: undetected incoming raids = actionable threat
+    # Novel kerap tukar POV ke musuh (Lilith, Marshal, Pirates) untuk dramatic irony.
+    raid = await Database.fetchrow(
+        "SELECT faction_name, target_system, enemy_power, ticks_remaining FROM maya_rp.incoming_raids "
+        "WHERE session_id=$1 AND detected=false AND ticks_remaining <= 5 "
+        "ORDER BY ticks_remaining ASC LIMIT 1", session_id)
+    if raid:
+        await Database.execute(
+            "UPDATE maya_rp.incoming_raids SET detected=true WHERE session_id=$1 AND faction_name=$2 AND target_system=$3",
+            session_id, raid["faction_name"], raid["target_system"])
+        return {"type":"enemy_pov","location":f"{raid['faction_name']} Command",
+                "characters":[f"{raid['faction_name']} admiral"],
+                "narrative":f"Meanwhile, in the void... {raid['faction_name']} fleet drops out of FTL. "
+                            f"Target: {raid['target_system']}. Power: {raid['enemy_power']:,}. "
+                            f"Impact in {raid['ticks_remaining']} ticks.",
+                "relevance":"Intel revealed. Defensive deployment required."}
+
     from modules.secrets import get_dramatic_irony
     ironies = await get_dramatic_irony(session_id)
     if ironies:

@@ -31,4 +31,21 @@ async def run_tick(session_id: int = None) -> dict:
             if desc:
                 await Database.execute("INSERT INTO maya_rp.events(session_id,happened_at,event_type,title,description,tags,importance) VALUES($1,NOW(),'geopolitics',$2,$3,$4,$5)", session_id,desc[:80],desc,'["geopolitics","background"]',imp)
                 events += 1
+
+    # NOVEL ULTIMATE #3 — Dual POV Intel: faction power spike → schedule incoming raid
+    # Novel: "Meanwhile, the enemy fleet drops out of FTL..." — POV musuh = ancaman nyata.
+    for fa in factions:
+        power = fa["pirate_fleet_power"] or 0
+        if power > 5000 and fa["standing"] == "hostile" and random.random() < 0.3:
+            target = await Database.fetchval(
+                "SELECT system_name FROM maya_rp.territory WHERE session_id=$1 AND controlling_faction='Setia Empire' "
+                "ORDER BY RANDOM() LIMIT 1", session_id)
+            if target:
+                eta = random.randint(3, 10)
+                await Database.execute(
+                    "INSERT INTO maya_rp.incoming_raids (session_id, faction_name, target_system, enemy_power, "
+                    "ticks_remaining, detected) VALUES ($1,$2,$3,$4,$5,false) "
+                    "ON CONFLICT DO NOTHING",
+                    session_id, fa["name"], target, int(power * random.uniform(0.6, 1.0)), eta)
+                events += 1
     return {"events_generated":events}

@@ -96,7 +96,7 @@ async def get_upcoming(session_id: int, lookahead: int = 30) -> list[dict]:
     return events[:10]
 
 async def run_tick(session_id: int = None) -> dict:
-    """Calendar tick: advance day, apply holiday, check upcoming."""
+    """Calendar tick: advance day, apply holiday, check upcoming, quarterly tasks."""
     if session_id is None:
         session_id = Config.SESSION_ID
     try:
@@ -105,6 +105,15 @@ async def run_tick(session_id: int = None) -> dict:
             return {"error": str(date)}
         await apply_holiday(date, session_id)
         upcoming = await get_upcoming(session_id, 7)
+        # NOVEL ULTIMATE #2 — Quarterly tasks: setiap 90 hari jana 4 misi baru
+        qt = {}
+        try:
+            gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id)
+            if gd and gd % 90 == 0:
+                from modules.objectives import generate_quarterly_tasks
+                qt = await generate_quarterly_tasks(session_id)
+        except Exception as e:
+            info("calendar", f"Quarterly tasks check error: {e}")
         info("calendar", f"{date.get('formatted','?')} | Season: {date.get('season','?')} | Upcoming: {len(upcoming)}")
         return {
             "date": date["formatted"],

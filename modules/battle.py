@@ -118,10 +118,43 @@ class BattleEngine:
         # Novel adaptation — Ship Legacy (bab 7, 35): kapal veteran dapat battle_honors + legacy_score
         if outcome == "player_victory" and state.player.ships:
             await Database.execute(
-                "UPDATE maya_rp.ships SET battle_honors=battle_honors+1, "
+                "UPDATE maya_rp.ships SET battle_honors=battle_honors+1, veteran_kills=veteran_kills+1, "
                 "legacy_score=legacy_score+GREATEST(1, LEAST(10, power_rating/50000)) "
                 "WHERE session_id=$1 AND id = ANY($2::int[])",
                 state.session_id, state.player.ships)
+            # NOVEL ULTIMATE #5 — Rank naik + procedural scars untuk near-death survivor
+            for ship_id in state.player.ships:
+                row = await Database.fetchrow(
+                    "SELECT name, veteran_kills, hull, hull_current, scars_jsonb, ship_rank FROM maya_rp.ships WHERE id=$1",
+                    ship_id)
+                if not row:
+                    continue
+                kills = row["veteran_kills"] or 0
+                rank = row["ship_rank"] or "Standard"
+                new_rank = rank
+                if kills >= 50:
+                    new_rank = "Legendary"
+                elif kills >= 10:
+                    new_rank = "Veteran"
+                if new_rank != rank:
+                    await Database.execute(
+                        "UPDATE maya_rp.ships SET ship_rank=$1 WHERE id=$2", new_rank, ship_id)
+                    await Database.execute(
+                        "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance) "
+                        "VALUES ($1, 'honor', $2, $3, 4)",
+                        state.session_id, f"SHIP PROMOTED: {row['name']} → {new_rank}",
+                        f"{row['name']} mencapai {kills} kills. Kini berpangkat {new_rank}.")
+                # Procedural scar: survive dengan <15% hull = near-death experience
+                hc = row["hull_current"] or row["hull"]
+                hull = row["hull"] or 1
+                if 0 < hc <= hull * 0.15:
+                    scar = {"scar": "Critical Survivor",
+                            "effect": "evasion +5%, max_hull -5%",
+                            "story": f"Survived with {hc}/{hull} hull ({(hc/hull)*100:.0f}%)"}
+                    await Database.execute(
+                        "UPDATE maya_rp.ships SET scars_jsonb = scars_jsonb || $1::jsonb, "
+                        "hull = GREATEST(1, hull * 0.95) WHERE id=$2",
+                        json.dumps(scar), ship_id)
         await EventBus.emit("battle_completed", {"battle_id": state.battle_id, "outcome": outcome})
         return state
 

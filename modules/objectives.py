@@ -125,3 +125,65 @@ async def quarterly_tasks_view(session_id: int = None) -> dict:
         "SELECT task_index, title, objective, target_value, progress, status, reward_value "
         "FROM maya_rp.quarterly_tasks WHERE session_id=$1 AND quarter=$2 ORDER BY task_index", session_id, quarter)
     return {"quarter": quarter, "tasks": [dict(t) for t in tasks]}
+
+
+# ═══════════════════════════════════════════════════════════════
+# NOVEL ULTIMATE #2b — EVENTBUS AUTO-TRACKING
+# Quarterly tasks update progress secara automatik via events.
+# ═══════════════════════════════════════════════════════════════
+
+async def _register_event_listeners() -> None:
+    """Daftar listeners untuk auto-update quarterly progress."""
+    from core.events import EventBus
+
+    async def _on_ship_built(data):
+        ship = data.get("ship") or {}
+        sid = data.get("session_id") or ship.get("session_id")
+        if sid:
+            await _bump_kind(sid, "build", 1)
+
+    async def _on_duel(data):
+        sid = data.get("session_id")
+        if sid:
+            await _bump_kind(sid, "duels", 1)
+
+    async def _on_battle(data):
+        sid = data.get("session_id")
+        if sid:
+            await _bump_kind(sid, "kills", 1)
+
+    for evt, cb in [("ship_built", _on_ship_built), ("duel_resolved", _on_duel),
+                    ("battle_completed", _on_battle)]:
+        try:
+            EventBus.on(evt, cb)
+        except Exception:
+            pass
+
+
+async def _bump_kind(session_id: int, kind: str, amount: int = 1) -> dict:
+    """Kemaskini progress tasks ikut kind (kills/survey/trade/credits/duels/wrecks/dev/crew/build)."""
+    tasks = await Database.fetch(
+        "SELECT id, task_type, objective, title, target_value, current_progress, required_amount, reward_blueprint, progress "
+        "FROM maya_rp.quarterly_tasks WHERE session_id=$1 AND status='active'", session_id)
+    completed = []
+    for t in tasks:
+        matches = False
+        if kind == "duels" and (t.get("task_type") == "duels" or (t.get("objective") or "").lower().find("duel") >= 0):
+            matches = True
+        elif kind == "kills" and (t.get("task_type") == "kill_pirates" or (t.get("objective") or "").lower().find("kill") >= 0):
+            matches = True
+        elif kind == "build" and (t.get("task_type") == "build_tier" or (t.get("objective") or "").lower().find("build") >= 0):
+            matches = True
+        if not matches:
+            continue
+        cur = (t.get("current_progress") or t.get("progress") or 0) + amount
+        req = t.get("required_amount") or t.get("target_value") or 0
+        done = req > 0 and cur >= req
+        await Database.execute(
+            "UPDATE maya_rp.quarterly_tasks SET current_progress=$1, progress=$1, "
+            "status=$2, completed_at=CASE WHEN $2='completed' THEN NOW() ELSE completed_at END WHERE id=$3",
+            cur, "completed" if done else "active", t["id"])
+        if done:
+            rw = t.get("reward_blueprint") or t.get("reward_value") or 0
+            completed.append({"title": t.get("title") or t.get("objective"), "reward": rw})
+    return {"updated": len(tasks), "completed": completed}

@@ -15,6 +15,9 @@ async def generate(session_id: int = None) -> str:
     g._cache_session = None
     blocks = []
 
+    # 0. NOVEL ULTIMATE #4 — SYSTEM UI DASHBOARD (Spec Clarity: angka nyata sebelum LLM narrate)
+    blocks.append(await _generate_ui_dashboard(session_id))
+
     # 1. Session Open
     from core.session_rituals import generate_open
     blocks.append(await generate_open(session_id))
@@ -162,3 +165,51 @@ async def generate(session_id: int = None) -> str:
     # Wrap everything
     result = "<gm_brain>\n" + content + "\n</gm_brain>"
     return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# NOVEL ULTIMATE #4 — SYSTEM UI DASHBOARD + VETERAN HULLS
+# Spec Clarity: angka nyata dari DB sebelum LLM narrate. Tiada hallucination.
+# ═══════════════════════════════════════════════════════════════
+
+async def _generate_ui_dashboard(session_id: int) -> str:
+    """【 SYSTEM DASHBOARD 】— angka sebenar dari engine, format novel UI."""
+    try:
+        res = await Database.fetchrow(
+            "SELECT credits, alloys, fuel, population FROM maya_rp.resources WHERE session_id=$1", session_id)
+        fleet = await Database.fetchrow(
+            "SELECT COUNT(*) AS count, COALESCE(AVG(tier),0) AS avg_tier FROM maya_rp.ships "
+            "WHERE session_id=$1 AND status='active'", session_id)
+        crew_unassigned = await Database.fetchval(
+            "SELECT COUNT(*) FROM maya_rp.crew_roster WHERE session_id=$1 AND ship_id IS NULL AND status='active'",
+            session_id) or 0
+        undercrewed = await Database.fetchval(
+            "SELECT COUNT(*) FROM maya_rp.ships WHERE session_id=$1 AND status='undercrewed'", session_id) or 0
+        day = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 0
+
+        lines = ["【 SYSTEM DASHBOARD 】"]
+        if res:
+            lines.append(f"▌ Coffers : {res['credits']:,} Cr | {res['alloys']:,} Al | {res['fuel']:,} Fuel")
+            lines.append(f"▌ Empire  : {res['population']:,} Souls")
+        if fleet:
+            lines.append(f"▌ Fleet   : {fleet['count']} Ships (Avg Tier: T{fleet['avg_tier']:.1f})")
+        lines.append(f"▌ Crew    : {crew_unassigned} Unassigned | {undercrewed} Undercrewed")
+        lines.append(f"▌ Day     : {day}")
+
+        # Veteran hulls — NOVEL ULTIMATE #5: kapal dengan sejarah = named characters
+        vets = await Database.fetch(
+            "SELECT name, veteran_kills, ship_rank, scars_jsonb FROM maya_rp.ships "
+            "WHERE session_id=$1 AND veteran_kills > 0 ORDER BY veteran_kills DESC LIMIT 5", session_id)
+        if vets:
+            lines.append("【 VETERAN HULLS 】")
+            import json as _json
+            for vs in vets:
+                scars = vs["scars_jsonb"] or []
+                if isinstance(scars, str):
+                    try: scars = _json.loads(scars)
+                    except Exception: scars = []
+                scar_names = ", ".join([s.get("scar", "?") for s in scars]) or "Unscathed"
+                lines.append(f"  ⚔ {vs['name']} ({vs['veteran_kills']} kills, {vs['ship_rank']}) | Scars: {scar_names}")
+        return "\n".join(lines)
+    except Exception as e:
+        return "【 SYSTEM DASHBOARD 】\n(unavailable)"

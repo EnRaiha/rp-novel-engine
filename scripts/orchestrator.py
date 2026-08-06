@@ -27,7 +27,7 @@ from modules import meanwhile, conversation_log, physical_state, chekhov, world_
 from modules import logistics, geopolitics, crew_career, ideology
 from modules import auto_queue, corporations
 from modules import collapse as collapse_mod
-from modules import wreck_assembly, duel
+from modules import wreck_assembly, duel, crew_system
 from core import consequences as consequences_mod
 from core.pacing import PacingDirector
 
@@ -97,6 +97,9 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
         # Phase 1: Economy & Resources
         await tick_header("Phase 1/24: Economy")
         if await tick("economy", economy, session_id): modules_ok += 1
+        else: modules_failed += 1
+        # Crew production (novel: crew bottleneck)
+        if await tick("crew_system", crew_system, session_id): modules_ok += 1
         else: modules_failed += 1
 
         # Phase 2: Prison
@@ -377,7 +380,7 @@ MODULE_MAP = {
     "logistics": logistics, "geopolitics": geopolitics,
     "crew_career": crew_career, "ideology": ideology,
     "corporations": corporations, "collapse": collapse_mod,
-    "wreck_assembly": wreck_assembly, "duel": duel,
+    "wreck_assembly": wreck_assembly, "duel": duel, "crew_system": crew_system,
 }
 
 async def run_single(session_id: int, module_name: str):

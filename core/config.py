@@ -51,6 +51,8 @@ class Config:
         # Core state (5)
         "economy": True, "research": True, "diplomacy": True,
         "narrative": True, "victory": True,
+        # Crew system (novel: crew bottleneck)
+        "crew_system": True,
         # Narrative modules (9 JS→Python ports)
         "prison": True, "romance": True, "social": True,
         "mystery": True, "council": True, "celestial": True,

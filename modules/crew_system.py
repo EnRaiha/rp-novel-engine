@@ -171,20 +171,189 @@ async def cmd(sid: int, action: str, params: dict) -> dict:
     if action == "report":
         return await crew_report(sid)
     if action == "produce":
-        return await produce_crew(sid)
+        return await graduation_cycle(sid)   # sekarang = graduation cycle, bukan harian
     if action == "backfill":
         return await backfill_history(sid, params.get("start_day", 26), params.get("end_day"))
     if action == "consume":
         return await consume_crew(sid, params["ship_id"], params.get("required", params.get("crew", 10)))
-    return {"error": f"Unknown action '{action}' (report/produce/backfill/consume)"}
+    if action == "allocate":
+        return await ai_allocate_crew(sid)   # Heaven AI allocation
+    if action == "screen":
+        return await screen_crew(sid, params["crew_id"], params.get("clearance", 5))
+    if action == "set_clearance":
+        return await set_min_clearance(sid, params["ship_id"], params.get("clearance", 5))
+    return {"error": f"Unknown action '{action}' (report/produce/backfill/consume/allocate/screen/set_clearance)"}
 
 
 async def run_tick(session_id: int | None = None) -> dict:
     if session_id is None:
         session_id = Config.SESSION_ID
     try:
-        r = await produce_crew(session_id)
-        return {"produced": r["produced"]}
+        # 1. Graduation cycle (30 hari cohort — bukan harian)
+        g = await graduation_cycle(session_id)
+        # 2. Heaven AI allocation — auto-assign crew ke kapal
+        a = await ai_allocate_crew(session_id)
+        return {"graduated": g["graduated"], "ai_allocated": a["allocated"], "pool_after": a["pool_after"]}
     except Exception as e:
         info("crew_system", f"Tick error: {e}")
         return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# EXPANSION 083 — University per sistem + Graduation Cycle + AI Control
+# 1. University expand ke setiap sistem (37 campuses)
+# 2. Graduation cycle: cohort graduat setiap 30 hari (bukan harian — realistik)
+# 3. AI allocation: Heaven AI urus crew dari Heaven core — 2 sistem kawalan
+# 4. Clearance: C1-C4 market crew OK; C5+ kena loyalty tinggi / screened
+# ═══════════════════════════════════════════════════════════════
+
+async def graduation_cycle(session_id: int | None = None) -> dict:
+    """Cohort graduat: setiap campus graduat pada cycle 30 hari.
+    Bukan harian — realistik macam universiti sebenar."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
+    gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
+    campuses = await Database.fetch(
+        "SELECT id, name, research_rate, level, prestige, graduation_cycle_days, last_graduation_day "
+        "FROM maya_rp.university_campuses")
+    total = 0
+    graduated = []
+    for c in campuses:
+        cycle = c["graduation_cycle_days"] or 30
+        last = c["last_graduation_day"] or 0
+        # Graduat bila gd - last >= cycle (dan dah lulus sekurang-kurangnya satu cycle)
+        if gd - last >= cycle:
+            # Cohort size: prestasi campus (level + prestige + research) — setiap cycle
+            cohort = max(5, int(float(c["research_rate"] or 1.0) * (c["level"] or 1)
+                                * (1 + (c["prestige"] or 0) / 150)))
+            total += cohort
+            graduated.append((c["name"], cohort))
+            await Database.execute(
+                "UPDATE maya_rp.university_campuses SET last_graduation_day=$1 WHERE id=$2",
+                gd, c["id"])
+    if total > 0:
+        await Database.execute(
+            "UPDATE maya_rp.resources SET crew_pool=crew_pool+$1, crew_trained_total=crew_trained_total+$1 "
+            "WHERE session_id=$2", total, session_id)
+        pool = await Database.fetchval("SELECT crew_pool FROM maya_rp.resources WHERE session_id=$1", session_id)
+        for name, amt in graduated:
+            await Database.execute(
+                "INSERT INTO maya_rp.crew_production_log (session_id, game_day, source, amount, pool_after) "
+                "VALUES ($1,$2,$3,$4,$5)", session_id, gd, f"graduation:{name}", amt, pool)
+    return {"day": gd, "graduated": total, "campuses": len(graduated)}
+
+
+async def ai_allocate_crew(session_id: int | None = None) -> dict:
+    """HEAVEN AI CONTROL — urus alokasi crew dari Heaven core.
+    Prioriti: C5+ (tier>=5) crew clearance/loyalty/screened dulu, lepas tu C1-C4 (tier<5).
+    Pool numeric → crew_roster rows diwujudkan (functional crew) semasa allocate."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
+    gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
+    pool = await Database.fetchval("SELECT crew_pool FROM maya_rp.resources WHERE session_id=$1", session_id) or 0
+    if pool <= 0:
+        return {"allocated": 0, "pool": 0, "note": "Pool kosong — tunggu graduation/recruitment"}
+
+    # Semua kapal yang perlukan crew (undercrewed / crew_current < crew), prioriti tier tinggi dulu
+    ships = await Database.fetch(
+        """SELECT id, name, tier, crew, crew_current, min_clearance
+           FROM maya_rp.ships
+           WHERE session_id=$1 AND status IN ('active','undercrewed')
+             AND (crew_current IS NULL OR crew_current < crew)
+           ORDER BY tier DESC, crew DESC""", session_id)
+
+    allocated = 0
+    details = []
+    # Nama generik untuk functional crew
+    first_names = ["Aidil","Bella","Chen","Dewi","Evan","Farah","Gopal","Hana","Ivan","Jia","Kamil","Lina",
+                   "Mira","Naufal","Omar","Priya","Qistina","Ravi","Siti","Tan","Umar","Vani","Wira","Yana","Zul"]
+    for s in ships:
+        if pool <= 0:
+            break
+        need = (s["crew"] or 0) - (s["crew_current"] or 0)
+        if need <= 0:
+            continue
+        min_clr = s["min_clearance"] or (5 if (s["tier"] or 0) >= 5 else 1)
+        # C5+ (tier>=5): kena crew clearance >=5 (screened)
+        if min_clr >= 5:
+            avail = await Database.fetchval(
+                """SELECT COUNT(*) FROM maya_rp.crew_roster
+                   WHERE session_id=$1 AND ship_id IS NULL AND status='active'
+                     AND clearance_level >= 5 AND screened=true""", session_id) or 0
+            take = min(need, avail, pool)
+        else:
+            # C1-C4: mana-mana crew functional — cipta dari pool kalau crew_roster tak cukup
+            avail = await Database.fetchval(
+                """SELECT COUNT(*) FROM maya_rp.crew_roster
+                   WHERE session_id=$1 AND ship_id IS NULL AND status='active'""", session_id) or 0
+            take = min(need, avail, pool)
+        if take <= 0:
+            continue
+        # Jika crew_roster tak cukup (pool numeric > rows), cipta crew rows dari pool
+        rows_needed = take
+        while rows_needed > 0:
+            existing_free = await Database.fetchval(
+                """SELECT COUNT(*) FROM maya_rp.crew_roster WHERE session_id=$1 AND ship_id IS NULL AND status='active'""",
+                session_id) or 0
+            if existing_free <= 0:
+                # Cipta functional crew dari pool
+                clr = min_clr
+                await Database.execute(
+                    """INSERT INTO maya_rp.crew_roster (session_id, name, role, status, loyalty_flag, clearance_level, screened)
+                       VALUES ($1, $2, $3, 'active', 'neutral', $4, $5)""",
+                    session_id, f"{first_names[(allocated + rows_needed) % len(first_names)]} {s['name'][:8]}",
+                    "crew", clr, clr >= 5)
+            rows_needed -= 1
+        # Assign crew (screened dulu untuk C5+)
+        if min_clr >= 5:
+            await Database.execute(
+                """UPDATE maya_rp.crew_roster SET ship_id=$1 WHERE id IN
+                   (SELECT id FROM maya_rp.crew_roster WHERE session_id=$2 AND ship_id IS NULL
+                    AND status='active' AND clearance_level>=5 AND screened=true LIMIT $3)""",
+                s["id"], session_id, take)
+        else:
+            await Database.execute(
+                """UPDATE maya_rp.crew_roster SET ship_id=$1 WHERE id IN
+                   (SELECT id FROM maya_rp.crew_roster WHERE session_id=$2 AND ship_id IS NULL
+                    AND status='active' LIMIT $3)""",
+                s["id"], session_id, take)
+        new_crew = (s["crew_current"] or 0) + take
+        status = "active" if new_crew >= (s["crew"] or 0) else "undercrewed"
+        penalty = 0 if status == "active" else round(((s["crew"] or 1) - new_crew) / (s["crew"] or 1), 3)
+        await Database.execute(
+            "UPDATE maya_rp.ships SET crew_current=$1, status=$2, undercrewed_penalty=$3 WHERE id=$4",
+            new_crew, status, penalty, s["id"])
+        pool -= take
+        allocated += take
+        details.append({"ship": s["name"], "assigned": take, "status": status})
+        await Database.execute(
+            "INSERT INTO maya_rp.crew_allocation_log (session_id, game_day, ship_id, ship_name, crew_assigned, source) "
+            "VALUES ($1,$2,$3,$4,$5,'ai_heaven')", session_id, gd, s["id"], s["name"], take)
+
+    await Database.execute(
+        "UPDATE maya_rp.resources SET crew_pool=$1 WHERE session_id=$2", pool, session_id)
+    return {"allocated": allocated, "pool_after": pool, "ships": details}
+
+
+async def screen_crew(session_id: int | None, crew_id: int, clearance: int = 5) -> dict:
+    """Screen crew untuk C5+ clearance — Kira/Heaven AI vetting."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
+    cr = await Database.fetchrow(
+        "SELECT id, name, loyalty FROM maya_rp.crew_roster WHERE id=$1 AND session_id=$2", crew_id, session_id)
+    if not cr:
+        return {"error": "Crew not found"}
+    await Database.execute(
+        "UPDATE maya_rp.crew_roster SET clearance_level=$1, screened=true WHERE id=$2",
+        clearance, crew_id)
+    return {"screened": cr["name"], "clearance": clearance, "loyalty": cr["loyalty"]}
+
+
+async def set_min_clearance(session_id: int | None, ship_id: int, clearance: int) -> dict:
+    """Tetapkan min clearance untuk kapal (C5+ = 5)."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
+    await Database.execute(
+        "UPDATE maya_rp.ships SET min_clearance=$1 WHERE id=$2 AND session_id=$3",
+        clearance, ship_id, session_id)
+    return {"ship_id": ship_id, "min_clearance": clearance}

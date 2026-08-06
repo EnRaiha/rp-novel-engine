@@ -73,7 +73,8 @@ async def _trigger_revolt(sid: int, tid: int):
     await _log(sid, "crisis", f"Slave Revolt in {t['system_name']}", f"{sz} slaves risen, severity {sev}/10", 4)
 
 async def _generate_market(sid: int, tid: int, count: int = 5, pool: str = None):
-    """Novel adaptation: market dengan price tiers + category pools (gacha pulls)."""
+    """Novel adaptation: market dengan price tiers + category pools (gacha pulls).
+    EXPANSION 083: functional men & women — Setia territory sahaja (tetap via territory filter)."""
     await Database.execute("DELETE FROM slave_market WHERE session_id=$1 AND territory_id=$2", sid, tid)
     for _ in range(count):
         s, i = random.randint(1, 10), random.randint(1, 10)
@@ -86,11 +87,17 @@ async def _generate_market(sid: int, tid: int, count: int = 5, pool: str = None)
         base_price = 500 + (s + i) * 500 + random.randint(0, 5000)
         price = int(base_price * pconf["price_mult"])
         talent = random.choice(HIDDEN_TALENTS) if pool in ("ex_commander", "succubus") else None
+        # Functional role — lelaki & perempuan bekerja (bukan hamba semata)
+        functional_role = random.choice(["deckhand", "engineer", "gunner", "medic", "pilot", "logistics",
+                                         "sensor_op", "cook", "helmsman", "welder"])
+        # Clearance: ex-commander = 5 (screened), succubus = 3, lain = 1 (C1-C4)
+        clr = 5 if pool == "ex_commander" else 3 if pool == "succubus" else 1
         await Database.execute(
             "INSERT INTO slave_market (session_id,territory_id,slave_name,species,gender,age,strength,intelligence,"
-            "price,price_tier,category,hidden_talent) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
-            sid, tid, random.choice(NAMES), species, random.choice(["M", "F"]), random.randint(10, 40), s, i,
-            price, pool, pconf["desc"], talent)
+            "price,price_tier,category,hidden_talent,functional_role,clearance_level) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+            sid, tid, random.choice(NAMES), species, random.choice(["M", "F"]), random.randint(18, 45), s, i,
+            price, pool, pconf["desc"], talent, functional_role, clr)
 
 def _name(): return f"{random.choice(NAMES)} {random.choice(NAMES)}"
 
@@ -125,7 +132,8 @@ async def cmd(sid: int, action: str, params: dict) -> dict:
             return {"error": "No territory available"}
         await _generate_market(sid, t["id"], params.get("count", 5), params.get("pool"))
         market = await Database.fetch(
-            "SELECT id, slave_name, species, price, price_tier, category, hidden_talent "
+            "SELECT id, slave_name, species, gender, price, price_tier, category, hidden_talent, "
+            "functional_role, clearance_level "
             "FROM slave_market WHERE session_id=$1 AND territory_id=$2 AND availability=true ORDER BY price DESC",
             sid, t["id"])
         return {"pools": list(CREW_POOLS.keys()), "territory_id": t["id"],
@@ -138,6 +146,13 @@ async def cmd(sid: int, action: str, params: dict) -> dict:
         await Database.execute("UPDATE resources SET credits=credits-$1 WHERE session_id=$2", m["price"], sid)
         sl_id = (await Database.fetchrow("INSERT INTO slaves (session_id,name,species,gender,age,strength,intelligence,loyalty,health,cost) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,80,$9) RETURNING id",
             sid, m["slave_name"], m["species"], m["gender"], m["age"], m["strength"], m["intelligence"], 50, m["price"]))["id"]
+        # EXPANSION 083: functional crew — masukkan ke crew_roster dengan clearance + role
+        clr = m.get("clearance_level") or 1
+        role = m.get("functional_role") or "deckhand"
+        await Database.execute(
+            """INSERT INTO maya_rp.crew_roster (session_id, name, role, status, loyalty_flag, clearance_level, screened)
+               VALUES ($1, $2, $3, 'active', 'neutral', $4, $5)""",
+            sid, m["slave_name"], role, clr, clr >= 5)
         if m.get("hidden_talent"):
             await Database.execute(
                 "INSERT INTO crew_skills (crew_id, session_id, skill_name, proficiency) "
@@ -146,8 +161,10 @@ async def cmd(sid: int, action: str, params: dict) -> dict:
                 sl_id, sid, m["hidden_talent"])
         await Database.execute("UPDATE slave_market SET availability=false WHERE id=$1", params["market_id"])
         talent_msg = f" | Hidden talent: {m['hidden_talent']}" if m.get("hidden_talent") else ""
-        await _log(sid, "slave", f"Slave Purchased: {m['slave_name']}", f"Cost: {m['price']}C ({m.get('price_tier','common')}){talent_msg}", 2)
-        return {"slave_id": sl_id, "price": m["price"], "tier": m.get("price_tier"), "talent": m.get("hidden_talent")}
+        clr_msg = f" | Clearance: C{clr}" if clr >= 5 else ""
+        await _log(sid, "slave", f"Crew Recruited: {m['slave_name']}", f"Cost: {m['price']}C ({m.get('price_tier','common')}){talent_msg}{clr_msg}", 2)
+        return {"slave_id": sl_id, "price": m["price"], "tier": m.get("price_tier"), "talent": m.get("hidden_talent"),
+                "clearance": clr, "role": role}
     if action == "revolt_risk":
         return {"risk": await _revolt_risk(params["territory_id"])}
     if action == "suppress":

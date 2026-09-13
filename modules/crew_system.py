@@ -264,9 +264,9 @@ async def ai_allocate_crew(session_id: int | None = None) -> dict:
 
     allocated = 0
     details = []
-    # Nama generik untuk functional crew
-    first_names = ["Aidil","Bella","Chen","Dewi","Evan","Farah","Gopal","Hana","Ivan","Jia","Kamil","Lina",
-                   "Mira","Naufal","Omar","Priya","Qistina","Ravi","Siti","Tan","Umar","Vani","Wira","Yana","Zul"]
+    # Nama generik untuk functional crew — gunakan name_gen (unique, first+family, no canon collision)
+    from core.name_gen import NameGenerator
+    _name_gen = NameGenerator(Database.pool if hasattr(Database, "pool") else None)
     for s in ships:
         if pool <= 0:
             break
@@ -296,12 +296,13 @@ async def ai_allocate_crew(session_id: int | None = None) -> dict:
                 """SELECT COUNT(*) FROM maya_rp.crew_roster WHERE session_id=$1 AND ship_id IS NULL AND status='active'""",
                 session_id) or 0
             if existing_free <= 0:
-                # Cipta functional crew dari pool
+                # Cipta functional crew dari pool — unique first+family name
                 clr = min_clr
+                crew_name = await _name_gen.unique_crew_name()
                 await Database.execute(
                     """INSERT INTO maya_rp.crew_roster (session_id, name, role, status, loyalty_flag, clearance_level, screened)
                        VALUES ($1, $2, $3, 'active', 'neutral', $4, $5)""",
-                    session_id, f"{first_names[(allocated + rows_needed) % len(first_names)]} {s['name'][:8]}",
+                    session_id, crew_name,
                     "crew", clr, clr >= 5)
             rows_needed -= 1
         # Assign crew (screened dulu untuk C5+)

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Unified CLI — single entry point for everything RP."""
-import asyncio, sys
-sys.path.insert(0, str(__file__ + "/../../"))
+
+import asyncio, os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.config import Config
 from core.db import Database
@@ -10,28 +12,44 @@ from scripts.orchestrator import run_full_tick, MODULE_MAP
 
 SID = Config.SESSION_ID
 
+
 async def cmd_status():
     await Database.init()
     s = await Database.fetchrow("SELECT name, status FROM sessions WHERE id=$1", SID)
-    r = await Database.fetchrow("SELECT credits, alloys, fuel FROM resources WHERE session_id=$1", SID)
-    t = await Database.fetchval("SELECT COUNT(*) FROM territory WHERE session_id=$1 AND controlling_faction='Setia Empire'", SID)
+    r = await Database.fetchrow(
+        "SELECT credits, alloys, fuel FROM resources WHERE session_id=$1", SID
+    )
+    t = await Database.fetchval(
+        "SELECT COUNT(*) FROM territory WHERE session_id=$1 AND controlling_faction='Setia Empire'",
+        SID,
+    )
     sh = await Database.fetchval("SELECT COUNT(*) FROM ships WHERE session_id=$1", SID)
-    v = await Database.fetchrow("SELECT progress FROM victory_tracking WHERE faction_id=(SELECT id FROM factions WHERE name='Setia Empire') AND victory_type='score'")
+    v = await Database.fetchrow(
+        "SELECT progress FROM victory_tracking WHERE faction_id=(SELECT id FROM factions WHERE name='Setia Empire') AND victory_type='score'"
+    )
     print(f"\n{'RP Engine Status':^50}")
-    print(f"  Session:    {s['name'] if s else 'N/A'} (id={SID}) | Status: {s['status'] if s else 'N/A'}")
-    if r: print(f"  Resources:  {r['credits']:,}C / {r['alloys']:,}A / {r['fuel']:,}F")
+    print(
+        f"  Session:    {s['name'] if s else 'N/A'} (id={SID}) | Status: {s['status'] if s else 'N/A'}"
+    )
+    if r:
+        print(f"  Resources:  {r['credits']:,}C / {r['alloys']:,}A / {r['fuel']:,}F")
     print(f"  Territories: {t or 0:,} | Ships: {sh or 0:,}")
     print(f"  Victory:     {v['progress']:.0f}%" if v else "")
-    print(f"  Modules:     {len(Config.active_modules())} active ({len([k for k,v in Config.MODULES.items() if v])} enabled)")
+    print(
+        f"  Modules:     {len(Config.active_modules())} active ({len([k for k, v in Config.MODULES.items() if v])} enabled)"
+    )
     await Database.close()
+
 
 async def cmd_health():
     await Database.init()
     status = await Database.status()
-    print(f"DB connected: {status['connected']}")
-    print(f"Tables: {status['tables']}")
-    print(f"Session: {status['session']}")
+    connected = status.get("connected", False)
+    print(f"DB connected: {connected}")
+    print(f"Tables: {status.get('tables', 0)}")
+    print(f"Session: {status.get('session')}")
     await Database.close()
+
 
 def cmd_modules():
     print(f"{'Modules':^50}")
@@ -42,14 +60,42 @@ def cmd_modules():
         in_orch = "orchestrator" if name in MODULE_MAP else "standalone"
         print(f"  {active:6} {name:25} {in_orch}")
 
+
 async def cmd_tick():
     await run_full_tick(SID)
+
 
 async def cmd_save(label=""):
     await Database.init()
     fp = await StateManager.save_checkpoint(SID, label)
     print(f"Checkpoint saved: {fp}")
+    # also produce full .sav (game-engine style portable snapshot)
+    from core.savegame import export_sav
+
+    sav = await export_sav(SID)
+    print(f"SAVEGAME saved: {sav}")
     await Database.close()
+
+
+async def cmd_load():
+    """load <file.sav> [--keep-session] — restore PG from a .sav snapshot."""
+    await Database.init()
+    if len(sys.argv) < 3:
+        print("Usage: cli.py load <file.sav> [--keep-session]")
+        await Database.close()
+        return
+    from core.savegame import import_sav
+
+    wipe = "--keep-session" not in sys.argv
+    r = await import_sav(sys.argv[2], wipe=wipe)
+    if not r.get("ok"):
+        print(f"LOAD FAILED: {r.get('error')}")
+    else:
+        print(
+            f"LOADED: {r['restored_rows']} rows → session {r['session_id']} (day {r.get('game_day')})"
+        )
+    await Database.close()
+
 
 async def cmd_export():
     await Database.init()
@@ -57,26 +103,36 @@ async def cmd_export():
     print(md)
     await Database.close()
 
+
 def cmd_config():
     print(Config.summary())
+
 
 async def cmd_briefing():
     await Database.init()
     from core.master_briefing import generate
+
     print(await generate(SID))
     await Database.close()
 
+
 async def cmd_economy_flow():
     await Database.init()
-    r = await Database.fetchrow("SELECT credits, alloys, fuel FROM maya_rp.resources WHERE session_id=$1", SID)
-    print(f"\n{'═'*60}")
+    r = await Database.fetchrow(
+        "SELECT credits, alloys, fuel FROM maya_rp.resources WHERE session_id=$1", SID
+    )
+    print(f"\n{'═' * 60}")
     print(f"  ECONOMY FLOW — Session {SID}")
-    print(f"{'═'*60}")
-    print(f"\n  TREASURY:  {r['credits']:>12,}C  {r['alloys']:>10,}A  {r['fuel']:>10,}F")
+    print(f"{'═' * 60}")
+    print(
+        f"\n  TREASURY:  {r['credits']:>12,}C  {r['alloys']:>10,}A  {r['fuel']:>10,}F"
+    )
     territories = await Database.fetch(
         "SELECT system_name, population, tax_rate, development_level, crisis_level "
         "FROM maya_rp.territory WHERE session_id=$1 AND controlling_faction='Setia Empire' "
-        "ORDER BY population DESC LIMIT 10", SID)
+        "ORDER BY population DESC LIMIT 10",
+        SID,
+    )
     if territories:
         print(f"\n  {'TERRITORY':<25} {'POP':>10} {'TAX':>6} {'TOTAL/DAY':>10}")
         total_tax = 0
@@ -84,40 +140,71 @@ async def cmd_economy_flow():
             pop = t["population"] or 0
             rate = float(t["tax_rate"] or 0.05)
             dev = t["development_level"] or 1
-            daily = int(pop * rate * (1 + (dev-1)*0.1))
+            daily = int(pop * rate * (1 + (dev - 1) * 0.1))
             total_tax += daily
-            print(f"  {t['system_name']:<25} {pop:>10,} {rate*100:>5.0f}% {daily:>10,}C")
+            print(
+                f"  {t['system_name']:<25} {pop:>10,} {rate * 100:>5.0f}% {daily:>10,}C"
+            )
         print(f"  {'TOTAL TAX/DAY':<25} {'':>10} {'':>6} {total_tax:>10,}C")
-    ships_active = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.ships WHERE session_id=$1 AND status='active'", SID) or 0
+    ships_active = (
+        await Database.fetchval(
+            "SELECT COUNT(*) FROM maya_rp.ships WHERE session_id=$1 AND status='active'",
+            SID,
+        )
+        or 0
+    )
     print(f"\n  FLEET: {ships_active} active ships")
-    fuel_burn = await Database.fetchval("SELECT COALESCE(SUM(hull_current/speed),0) FROM maya_rp.ships WHERE session_id=$1 AND status='active'", SID) or 1000
+    fuel_burn = (
+        await Database.fetchval(
+            "SELECT COALESCE(SUM(hull_current/speed),0) FROM maya_rp.ships WHERE session_id=$1 AND status='active'",
+            SID,
+        )
+        or 1000
+    )
     print(f"  FUEL BURN/DAY: ~{int(fuel_burn):,}")
     print(f"  DAYS OF FUEL:  {r['fuel'] // max(1, int(fuel_burn))}")
     net = total_tax + 200000 - int(fuel_burn) * 50
-    print(f"\n  {'═'*40}")
+    print(f"\n  {'═' * 40}")
     print(f"  EST. NET FLOW: {net:+,}C/day")
     print()
     await Database.close()
 
+
 async def cmd_intel():
     await Database.init()
-    print(f"\n{'═'*60}")
+    print(f"\n{'═' * 60}")
     print(f"  INTEL DASHBOARD — Session {SID}")
-    print(f"{'═'*60}")
+    print(f"{'═' * 60}")
     missions = await Database.fetch(
-        "SELECT id, mission_type, target_faction, status, success_chance, assigned_agent "
-        "FROM maya_rp.espionage_missions WHERE session_id=$1 AND status='active' ORDER BY id", SID)
+        "SELECT em.id, em.mission_type, "
+        "       COALESCE(f.name, em.faction_id::text) AS target_faction, "
+        "       em.outcome AS status, em.success_chance, em.agent_name AS assigned_agent "
+        "FROM maya_rp.espionage_missions em "
+        "LEFT JOIN maya_rp.factions f ON f.id = em.faction_id "
+        "WHERE em.session_id=$1 AND em.resolved_at IS NULL ORDER BY em.id",
+        SID,
+    )
     print(f"\n  ACTIVE MISSIONS ({len(missions)})")
-    icons = {"recon":"\U0001f441","sabotage":"\U0001f4a3","theft":"\U0001f4cb",
-             "assassination":"\u2620","infiltration":"\U0001f977","extraction":"\U0001f681"}
+    icons = {
+        "recon": "\U0001f441",
+        "sabotage": "\U0001f4a3",
+        "theft": "\U0001f4cb",
+        "assassination": "\u2620",
+        "infiltration": "\U0001f977",
+        "extraction": "\U0001f681",
+    }
     for m in missions:
         icon = icons.get(m["mission_type"], "\u2753")
-        print(f"    {icon} [{m['id']}] {m['mission_type']} vs {m['target_faction']} ({m['success_chance']}%) — {m['assigned_agent'] or 'unassigned'}")
+        print(
+            f"    {icon} [{m['id']}] {m['mission_type']} vs {m['target_faction']} ({m['success_chance']}%) — {m['assigned_agent'] or 'unassigned'}"
+        )
     stealth = await Database.fetch(
         "SELECT su.name, sut.name as type_name, su.assigned_lane, su.status "
         "FROM maya_rp.stealth_units su "
         "JOIN maya_rp.stealth_unit_types sut ON sut.id=su.unit_type_id "
-        "WHERE su.session_id=$1 AND su.status='active'", SID)
+        "WHERE su.session_id=$1 AND su.status='active'",
+        SID,
+    )
     if stealth:
         print(f"\n  DEPLOYED STEALTH UNITS ({len(stealth)})")
         for s in stealth:
@@ -125,7 +212,9 @@ async def cmd_intel():
     pipeline = await Database.fetch(
         "SELECT p.name, p.faction, pip.intel_text, pip.converted_to_clue "
         "FROM maya_rp.prisoner_intel_pipeline pip JOIN maya_rp.prisoners p ON p.id=pip.prisoner_id "
-        "WHERE pip.session_id=$1 ORDER BY pip.id DESC LIMIT 5", SID)
+        "WHERE p.session_id=$1 ORDER BY pip.id DESC LIMIT 5",
+        SID,
+    )
     if pipeline:
         print(f"\n  PRISONER INTEL ({len(pipeline)})")
         for p in pipeline:
@@ -134,74 +223,114 @@ async def cmd_intel():
     print()
     await Database.close()
 
+
 async def cmd_dashboard():
     await Database.init()
-    s = await Database.fetchrow("SELECT name, game_day, status FROM maya_rp.sessions WHERE id=$1", SID)
+    s = await Database.fetchrow(
+        "SELECT name, game_day, status FROM maya_rp.sessions WHERE id=$1", SID
+    )
     from modules.calendar_tkg import get_game_date
+
     date = await get_game_date(SID)
     from core.pacing import PacingDirector
+
     pm = await PacingDirector.get_mode(SID)
-    r = await Database.fetchrow("SELECT credits, alloys, fuel FROM maya_rp.resources WHERE session_id=$1", SID)
-    morale = await Database.fetchval("SELECT COALESCE(AVG(morale),50) FROM maya_rp.crew_roster WHERE session_id=$1", SID) or 50
-    bonds = await Database.fetch("SELECT c.name,c.bond FROM maya_rp.characters c JOIN maya_rp.romance_arcs ra ON ra.character_id=c.id WHERE c.session_id=$1 AND c.bond>0 ORDER BY c.bond DESC LIMIT 5", SID)
+    r = await Database.fetchrow(
+        "SELECT credits, alloys, fuel FROM maya_rp.resources WHERE session_id=$1", SID
+    )
+    morale = (
+        await Database.fetchval(
+            "SELECT COALESCE(AVG(morale),50) FROM maya_rp.crew_roster WHERE session_id=$1",
+            SID,
+        )
+        or 50
+    )
+    bonds = await Database.fetch(
+        "SELECT c.name,c.bond FROM maya_rp.characters c JOIN maya_rp.romance_arcs ra ON ra.character_id=c.id WHERE c.session_id=$1 AND c.bond>0 ORDER BY c.bond DESC LIMIT 5",
+        SID,
+    )
     from modules.objectives import get_active as get_obj
+
     obj = await get_obj(SID)
     from core.player_profile import get_profile
+
     prof = await get_profile(SID)
     from core.scene_stack import get_stack_summary
+
     stack = await get_stack_summary(SID)
-    fleet = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.ships WHERE session_id=$1 AND status='active'", SID)
+    fleet = await Database.fetchval(
+        "SELECT COUNT(*) FROM maya_rp.ships WHERE session_id=$1 AND status='active'",
+        SID,
+    )
 
     def bar(val, mx=1_000_000, w=20):
         filled = min(w, max(0, int(val / mx * w)))
         return "\u2588" * filled + "\u2591" * (w - filled)
 
-    print(f"\n  \u2554{'='*50}\u2557")
-    print(f"  \u2551  TKG RP  —  {date.get('formatted','?'):<30} \u2551")
-    print(f"  \u2551  Mode: {pm['mode'].upper():<10} Tension: {bar(pm['tension'],10,10)} {pm['tension']}/10 \u2551")
-    print(f"  \u255a{'='*50}\u255d")
+    print(f"\n  \u2554{'=' * 50}\u2557")
+    print(f"  \u2551  TKG RP  —  {date.get('formatted', '?'):<30} \u2551")
+    print(
+        f"  \u2551  Mode: {pm['mode'].upper():<10} Tension: {bar(pm['tension'], 10, 10)} {pm['tension']}/10 \u2551"
+    )
+    print(f"  \u255a{'=' * 50}\u255d")
     print(f"\n  CREDITS  {bar(r['credits']):20} {r['credits']:>10,}")
     print(f"  ALLOYS   {bar(r['alloys']):20} {r['alloys']:>10,}")
-    print(f"  FUEL     {bar(r['fuel']):20} {r['fuel']:>10,}  {'\u26a0 LOW' if r['fuel'] < 300_000 else ''}")
-    print(f"  MORALE   {bar(morale,100,20)} {morale:>5}%  {'\u26a0 LOW' if morale < 30 else ''}")
+    warn_fuel = "\u26a0 LOW" if r["fuel"] < 300_000 else ""
+    print(f"  FUEL     {bar(r['fuel']):20} {r['fuel']:>10,}  {warn_fuel}")
+    warn_morale = "\u26a0 LOW" if morale < 30 else ""
+    print(f"  MORALE   {bar(morale, 100, 20)} {morale:>5}%  {warn_morale}")
     print(f"\n  BONDS")
     for b in bonds:
         bv = min(10, max(0, b["bond"] // 10))
-        print(f"  {b['name']:<12} {'\u2665'*bv + '\u2661'*(10-bv)}")
+        print(f"  {b['name']:<12} {'\u2665' * bv + '\u2661' * (10 - bv)}")
     print(f"\n  FLEET  {fleet} active ships")
     print(f"  STYLE  {prof['style'].upper()}")
-    c = [o for o in obj.get("critical",[])]
-    u = [o for o in obj.get("urgent",[])]
-    if c: print(f"\n  \U0001f534 CRITICAL: {c[0]['detail'][:50]}")
-    if u: print(f"\n  \U0001f7e1 URGENT: {u[0]['detail'][:50]}")
-    a = len(obj.get("active",[]))
-    b = len(obj.get("background",[]))
+    c = [o for o in obj.get("critical", [])]
+    u = [o for o in obj.get("urgent", [])]
+    if c:
+        print(f"\n  \U0001f534 CRITICAL: {c[0]['detail'][:50]}")
+    if u:
+        print(f"\n  \U0001f7e1 URGENT: {u[0]['detail'][:50]}")
+    a = len(obj.get("active", []))
+    b = len(obj.get("background", []))
     print(f"  {a} active, {b} background objectives")
-    if stack: print(f"\n  \u23f8 Suspended scenes: {len(stack)}")
+    if stack:
+        print(f"\n  \u23f8 Suspended scenes: {len(stack)}")
     print()
     await Database.close()
+
 
 async def cmd_query(sql: str):
     await Database.init()
     try:
         rows = await Database.fetch(sql)
         import json
+
         print(json.dumps([dict(r) for r in rows], indent=2, default=str))
     except Exception as e:
         print(f"Query error: {e}")
     await Database.close()
 
+
 async def cmd_run_single(module_name: str):
     from scripts.orchestrator import run_single
+
     await run_single(SID, module_name)
+
 
 async def cmd_romance():
     """romance arcs | romance roll <initiator> <target> <position> [location]"""
     await Database.init()
-    from modules.romance import get_romance_arcs, execute_rolling_scene, _get_character_id
+    from modules.romance import (
+        get_romance_arcs,
+        execute_rolling_scene,
+        _get_character_id,
+    )
 
     if len(sys.argv) < 3:
-        print("Usage: cli.py romance {arcs|roll <initiator> <target> <position> [location]}")
+        print(
+            "Usage: cli.py romance {arcs|roll <initiator> <target> <position> [location]}"
+        )
         return
 
     sub = sys.argv[2]
@@ -210,14 +339,20 @@ async def cmd_romance():
         if not arcs:
             print("No romance arcs.")
             return
-        print(f"\n{'Character':<26} {'Bond':<5} {'Stage':<12} {'Intimacy':<9} {'Sat':<5} {'Pursuit'}")
+        print(
+            f"\n{'Character':<26} {'Bond':<5} {'Stage':<12} {'Intimacy':<9} {'Sat':<5} {'Pursuit'}"
+        )
         print("-" * 76)
         for a in arcs:
-            print(f"{a['character_name']:<26} {a['bond'] or 0:<5} {a['arc_stage']:<12} "
-                  f"{a['intimacy_level'] or 0:<9} {a['saturation_pct'] or 0:<5} {a['pursuit_stage']}")
+            print(
+                f"{a['character_name']:<26} {a['bond'] or 0:<5} {a['arc_stage']:<12} "
+                f"{a['intimacy_level'] or 0:<9} {a['saturation_pct'] or 0:<5} {a['pursuit_stage']}"
+            )
     elif sub == "roll":
         if len(sys.argv) < 6:
-            print("Usage: cli.py romance roll <initiator> <target> <position> [location]")
+            print(
+                "Usage: cli.py romance roll <initiator> <target> <position> [location]"
+            )
             return
         init_name, tgt_name, position = sys.argv[3], sys.argv[4], sys.argv[5]
         location = sys.argv[6] if len(sys.argv) > 6 else "heaven_pool"
@@ -230,53 +365,90 @@ async def cmd_romance():
         if not r.get("success"):
             print(r.get("error", "error"))
             return
-        print(f"\n🎲 {r['initiator']} → {r['target']} — {r['position']} @ {r['location']}")
-        print(f"   Roll {r['roll']} + {r['modifier']} = {r['final_score']} vs {r['threshold']}  →  {'✅ PASS' if r['passed'] else '❌ FAIL'}")
+        print(
+            f"\n🎲 {r['initiator']} → {r['target']} — {r['position']} @ {r['location']}"
+        )
+        print(
+            f"   Roll {r['roll']} + {r['modifier']} = {r['final_score']} vs {r['threshold']}  →  {'✅ PASS' if r['passed'] else '❌ FAIL'}"
+        )
         print(f"   Tier: {r['tier']} (bond {r['required_bond']}+)")
         print(f"   Hook: {r['narrative_hook']}")
         sp = r["sensory_packet"]
         print(f"   Env: {sp['environment']['lighting']}")
-        print(f"   Senses: {sp['sensory']['sight']} · {sp['sensory']['sound']} · {sp['sensory']['touch']}")
+        print(
+            f"   Senses: {sp['sensory']['sight']} · {sp['sensory']['sound']} · {sp['sensory']['touch']}"
+        )
         print(f"   Beat: {sp['emotional_beat']}")
     else:
         print("Unknown romance subcommand: arcs|roll")
+
 
 async def cmd_assembly():
     """assembly list | assembly add <name> <tier> <hull> <power> <sub_class> | assembly assemble <name> <wreck_ids> [skill]"""
     await Database.init()
     from modules.wreck_assembly import cmd as wa_cmd
+
     sub = sys.argv[2] if len(sys.argv) > 2 else ""
     if sub == "list":
         r = await wa_cmd(SID, "list", {})
         print(f"\nWrecks available: {len(r.get('wrecks', []))}")
         for w in r.get("wrecks", []):
-            print(f"  #{w['id']} {w['name']} — T{w['tier']} hull {w['hull']:,} power {w['power_rating']:,} ({w['sub_class']})")
+            print(
+                f"  #{w['id']} {w['name']} — T{w['tier']} hull {w['hull']:,} power {w['power_rating']:,} ({w['sub_class']})"
+            )
     elif sub == "add" and len(sys.argv) >= 7:
-        r = await wa_cmd(SID, "add", {"name": sys.argv[3], "tier": int(sys.argv[4]), "hull": int(sys.argv[5]),
-                                      "power": int(sys.argv[6]), "sub_class": sys.argv[7] if len(sys.argv) > 7 else "Wreck"})
+        r = await wa_cmd(
+            SID,
+            "add",
+            {
+                "name": sys.argv[3],
+                "tier": int(sys.argv[4]),
+                "hull": int(sys.argv[5]),
+                "power": int(sys.argv[6]),
+                "sub_class": sys.argv[7] if len(sys.argv) > 7 else "Wreck",
+            },
+        )
         print(f"ADDED: {r}")
     elif sub == "assemble" and len(sys.argv) >= 5:
         ids = [int(x) for x in sys.argv[4].split(",")]
         skill = int(sys.argv[5]) if len(sys.argv) > 5 else 5
-        r = await wa_cmd(SID, "assemble", {"name": sys.argv[3], "wreck_ids": ids, "skill": skill})
+        r = await wa_cmd(
+            SID, "assemble", {"name": sys.argv[3], "wreck_ids": ids, "skill": skill}
+        )
         print(f"ASSEMBLE: {r}")
     else:
-        print("Usage: cli.py assembly {list|add <name> <tier> <hull> <power> <sub_class>|assemble <name> <wreck_ids> [skill]}")
+        print(
+            "Usage: cli.py assembly {list|add <name> <tier> <hull> <power> <sub_class>|assemble <name> <wreck_ids> [skill]}"
+        )
+
 
 async def cmd_duel():
     """duel challenge <ship_id> <opp_name> <tier> <hull> <power> [stakes_type] [stakes_value] | duel resolve <id> | duel list"""
     await Database.init()
     from modules.duel import cmd as duel_cmd
+
     sub = sys.argv[2] if len(sys.argv) > 2 else ""
     if sub == "challenge" and len(sys.argv) >= 7:
-        r = await duel_cmd(SID, "challenge", {
-            "player_ship_id": int(sys.argv[3]),
-            "opponent": {"name": sys.argv[4], "tier": int(sys.argv[5]), "hull": int(sys.argv[6]),
-                         "power": int(sys.argv[7])},
-            "stakes": {"type": sys.argv[8] if len(sys.argv) > 8 else "favor",
-                       "value": int(sys.argv[9]) if len(sys.argv) > 9 and sys.argv[8] == "credits" else 0},
-            "venue": "Open Space",
-        })
+        r = await duel_cmd(
+            SID,
+            "challenge",
+            {
+                "player_ship_id": int(sys.argv[3]),
+                "opponent": {
+                    "name": sys.argv[4],
+                    "tier": int(sys.argv[5]),
+                    "hull": int(sys.argv[6]),
+                    "power": int(sys.argv[7]),
+                },
+                "stakes": {
+                    "type": sys.argv[8] if len(sys.argv) > 8 else "favor",
+                    "value": int(sys.argv[9])
+                    if len(sys.argv) > 9 and sys.argv[8] == "credits"
+                    else 0,
+                },
+                "venue": "Open Space",
+            },
+        )
         print(f"CHALLENGE: {r}")
     elif sub == "resolve" and len(sys.argv) >= 4:
         r = await duel_cmd(SID, "resolve", {"duel_id": int(sys.argv[3])})
@@ -284,59 +456,250 @@ async def cmd_duel():
     elif sub == "list":
         r = await duel_cmd(SID, "list", {})
         for d in r.get("duels", []):
-            print(f"  #{d['id']} {d['opponent_name']} — {d['stakes_type']} — {d['status']} {d.get('result') or ''}")
+            print(
+                f"  #{d['id']} {d['opponent_name']} — {d['stakes_type']} — {d['status']} {d.get('result') or ''}"
+            )
     else:
-        print("Usage: cli.py duel {challenge <ship_id> <opp_name> <tier> <hull> <power> [stakes_type] [value]|resolve <id>|list}")
+        print(
+            "Usage: cli.py duel {challenge <ship_id> <opp_name> <tier> <hull> <power> [stakes_type] [value]|resolve <id>|list}"
+        )
+
 
 async def cmd_roll():
-    """Generic dice: 'roll 100 +50 vs 90' | 'roll 3d6' | 'roll d20'"""
+    """Generic dice: 'roll 100 +50 vs 90' | 'roll 3d6' | 'roll d20'
+
+    Roll Theater (2026-08-14):
+      roll <expr> --with <blessing>     # forge_luck|navigator_reroll|oracle_peek|brace|whisper
+      roll blessings                    # list queen blessing tokens
+      roll pool open <name>             # open a betting pool for the next vs-roll
+      roll hall                         # legendary rolls gallery
+      roll telegram <1-6> <domain>      # map a Telegram dice result to d100
+    Rolls persist to roll_history; crits/fumbles memorialize; partial/fumble
+    rolls plant consequence ripples.
+    """
     expr = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
     if not expr:
         print("Usage: cli.py roll <expr> — e.g. '100 +50 vs 90' or '3d6'")
         return
+    await Database.init()
+    from modules import roll_theater as rt
+
+    # theater subcommands
+    if expr.startswith("blessings"):
+        rows = await rt.list_blessings(SID)
+        print("👑 Queen blessings (one per session, refresh 30 days):")
+        for r in rows:
+            ch = r["charges"] or 0
+            print(
+                f"  {r['blessing']:<18} {r['character_name']:<28} {r['effect']}"
+                f" {'· ' + str(ch) + ' charge' + ('s' if ch != 1 else '') if ch else '· spent'}"
+            )
+        return
+    if expr.startswith("pool open "):
+        name = expr[len("pool open ") :].strip() or "The King's Roll"
+        res = await rt.open_pool(SID, name, 70)
+        print(f"🎰 Pool open: {res['name']} — {res['odds']}")
+        print(f"   {res['bettors']} bettors · {res['credits_in_pool']}C in the pool")
+        return
+    if expr.startswith("hall"):
+        rows = await Database.fetch(
+            "SELECT roll_name, roll_value, domain, game_day, story FROM maya_rp.roll_hall "
+            "WHERE session_id=$1 ORDER BY id DESC LIMIT 10",
+            SID,
+        )
+        if not rows:
+            print("🏛 The hall is empty. Roll a 100 or a 1 and earn a name.")
+            return
+        print("🏛 Hall of Legendary Rolls:")
+        for r in rows:
+            icon = "💥" if r["roll_value"] >= 96 else "💀"
+            print(
+                f"  {icon} {r['roll_name']} — {r['roll_value']} ({r['domain']}, day {r['game_day']})"
+            )
+            print(f"     {r['story'][:110]}")
+        return
+    if expr.startswith("telegram "):
+        parts = expr.split()
+        if len(parts) < 2:
+            print("Usage: roll telegram <1-6> <domain>")
+            return
+        val = int(parts[1])
+        domain = parts[2] if len(parts) > 2 else "social"
+        total = rt.parse_telegram_dice(val)
+        tier = rt.tier_of(total, 70)
+        print(
+            f"📲 Telegram dice {val} → d100: {total} [{rt.TIER_ICONS[tier]} {tier.upper()}]"
+        )
+        print(f"   {rt.flavor(domain, tier, total)}")
+        await Database.execute(
+            "INSERT INTO maya_rp.roll_history "
+            "(session_id, roll_code, source_table, source_id, dice_used, raw_roll, "
+            " final_score, dc, outcome, created_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())",
+            SID,
+            "telegram_dice",
+            "telegram",
+            val,
+            f"tg:{val}",
+            total,
+            total,
+            70,
+            tier,
+        )
+        return
+
     import re, random
+
+    outcome = None
+    total = None
+    dc = 0
+    domain = "social"
+    # parse --with blessing
+    blessing = None
+    m_with = re.search(r"\s+--with\s+(\S+)", expr)
+    if m_with:
+        blessing = m_with.group(1).lower()
+        expr = expr[: m_with.start()].strip()
     m = re.match(r"^(\d*)d(\d+)([+-]\d+)?$", expr.replace(" ", ""))
     if m:
-        n = int(m.group(1) or 1); die = int(m.group(2)); mod = int(m.group(3) or 0)
+        n = int(m.group(1) or 1)
+        die = int(m.group(2))
+        mod = int(m.group(3) or 0)
         rolls = [random.randint(1, die) for _ in range(n)]
         total = sum(rolls) + mod
+        outcome = "raw"
         print(f"🎲 {expr}: [{', '.join(map(str, rolls))}] + {mod} = {total}")
-        return
-    m = re.match(r"^(\d+)\s*([+-])\s*(\d+)\s+vs\s+(\d+)$", expr, re.I)
-    if m:
-        base, sign, mod, thr = int(m.group(1)), m.group(2), int(m.group(3)), int(m.group(4))
+    else:
+        m = re.match(r"^(\d+)\s*([+-])\s*(\d+)\s+vs\s+(\d+)$", expr, re.I)
+        if not m:
+            print(f"Unparsed: {expr} — try '100 +50 vs 90' or '3d6'")
+            return
+        base, sign, mod, thr = (
+            int(m.group(1)),
+            m.group(2),
+            int(m.group(3)),
+            int(m.group(4)),
+        )
         total = base + (mod if sign == "+" else -mod)
-        print(f"🎲 Roll {base} {sign} {mod} = {total} vs {thr} → {'✅ PASS' if total >= thr else '❌ FAIL'}")
-        return
-    print(f"Unparsed: {expr} — try '100 +50 vs 90' or '3d6'")
+        dc = thr
+        # ── Roll Theater resolution ──
+        tier = rt.tier_of(total, dc)
+        # blessings that alter the roll
+        if blessing == "forge_luck" and await rt.consume_blessing(SID, blessing):
+            total += 10
+            tier = rt.tier_of(total, dc)
+            print(f"⚒️ Callista's Forge-luck: +10 → {total}")
+        elif blessing == "navigator_reroll" and await rt.consume_blessing(
+            SID, blessing
+        ):
+            alt = base + (mod if sign == "+" else -mod) + random.randint(-10, 10)
+            if alt > total:
+                total, tier = alt, rt.tier_of(alt, dc)
+                print(f"🧭 Vera's Reroll: kept the better — {total}")
+            else:
+                print(f"🧭 Vera's Reroll: kept the original — {total}")
+        elif blessing == "oracle_peek" and await rt.consume_blessing(SID, blessing):
+            alt = base + (mod if sign == "+" else -mod) + random.randint(-20, 20)
+            if alt > total:
+                total, tier = alt, rt.tier_of(alt, dc)
+            print(f"🔮 Aeliana's Peek: the Oracle saw both futures — you took {total}")
+        elif (
+            blessing == "brace"
+            and await rt.consume_blessing(SID, blessing)
+            and tier == "fumble"
+        ):
+            total = max(total, dc - 19)
+            tier = rt.tier_of(total, dc)
+            print(f"🛡️ Rika's Brace: the fumble was caught — {total}")
+        elif blessing == "whisper" and await rt.consume_blessing(SID, blessing):
+            print(
+                f"🤫 Kira's Whisper: the roll is hidden. Only you know: {total} ({tier.upper()})"
+            )
+            outcome = tier
+        else:
+            if blessing:
+                print(f"⚠ blessing '{blessing}' unavailable (spent?) — rolling bare")
+            print(
+                f"🎲 Roll {base} {sign} {mod} = {total} vs {dc} → {rt.TIER_ICONS[tier]} {tier.upper()}"
+            )
+        if not (blessing == "whisper" and outcome):
+            outcome = tier
+        print(f"   {rt.flavor(domain, tier, total)}")
+        # consequences ripples on partial/fumble
+        if tier in ("partial", "fumble"):
+            await rt.plant_ripple(SID, domain, tier, dc)
+        # pools resolve on any vs-roll
+        king_won = tier in ("success", "crit")
+        pres = await rt.resolve_pool(SID, king_won)
+        if pres.get("resolved"):
+            print(
+                f"🎰 Pools closed: {pres['winner'].upper()} won — {pres['paid']}C paid, {pres['house_keeps']}C house"
+            )
+        # memorialize 100s and 1s
+        if total >= 96 or total <= 5:
+            name = await rt.memorialize(SID, domain, total, total, dc)
+            print(f"🏛 {name} — memorialized.")
+    try:
+        await Database.execute(
+            "INSERT INTO maya_rp.roll_history "
+            "(session_id, roll_code, source_table, source_id, dice_used, raw_roll, "
+            " final_score, dc, outcome, created_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())",
+            SID,
+            "cli_roll",
+            "cli_roll",
+            0,
+            expr,
+            total,
+            total,
+            dc,
+            outcome,
+        )
+    except Exception as e:
+        print(f"⚠ roll not logged: {e}")
+
 
 async def cmd_templates():
     """templates [category] | templates embed — list or embed stream templates."""
     await Database.init()
     if len(sys.argv) > 2 and sys.argv[2] == "embed":
         from core.memory import _embed
+
         rows = await Database.fetch(
-            "SELECT id, trigger_tag, readable_hint FROM maya_rp.stream_templates WHERE trigger_tag_embed IS NULL")
+            "SELECT id, trigger_tag, readable_hint FROM maya_rp.stream_templates WHERE trigger_tag_embed IS NULL"
+        )
         if not rows:
             print("All templates already embedded.")
             return
         for r in rows:
-            readable = r["readable_hint"] or r["trigger_tag"].replace("[", "").replace("]", "").replace("_", " ").lower()
+            readable = (
+                r["readable_hint"]
+                or r["trigger_tag"]
+                .replace("[", "")
+                .replace("]", "")
+                .replace("_", " ")
+                .lower()
+            )
             vec = await _embed(readable)
             vstr = "[" + ",".join(map(str, vec)) + "]"
             await Database.execute(
                 "UPDATE maya_rp.stream_templates SET trigger_tag_embed=$1::vector WHERE id=$2",
-                vstr, r["id"])
+                vstr,
+                r["id"],
+            )
             print(f"Embedded: {r['trigger_tag']}")
         print(f"Done — {len(rows)} templates embedded.")
         return
     if len(sys.argv) > 2:
         rows = await Database.fetch(
             "SELECT trigger_tag, category FROM maya_rp.stream_templates "
-            "WHERE category=$1 ORDER BY trigger_tag", sys.argv[2])
+            "WHERE category=$1 ORDER BY trigger_tag",
+            sys.argv[2],
+        )
     else:
         rows = await Database.fetch(
-            "SELECT trigger_tag, category FROM maya_rp.stream_templates ORDER BY category, trigger_tag")
+            "SELECT trigger_tag, category FROM maya_rp.stream_templates ORDER BY category, trigger_tag"
+        )
     if not rows:
         print("No templates.")
         return
@@ -344,6 +707,7 @@ async def cmd_templates():
     print("-" * 42)
     for r in rows:
         print(f"{r['trigger_tag']:<28} {r['category']}")
+
 
 async def cmd_stream():
     """stream — demo: run a mock LLM stream through the StreamInterceptor."""
@@ -371,10 +735,13 @@ async def cmd_stream():
         print(chunk, end="", flush=True)
     print("\n--- Stream Complete ---")
     st = interceptor.stats
-    print(f"[interceptor stats] lines={st['lines_processed']} exact={st['exact_hits']} "
-          f"semantic_attempts={st['semantic_attempts']} semantic_hits={st['semantic_hits']} "
-          f"skipped={st['semantic_skipped']} breaker={st['breaker_engaged']} "
-          f"semantic_ms={st['semantic_total_ms']:.0f}")
+    print(
+        f"[interceptor stats] lines={st['lines_processed']} exact={st['exact_hits']} "
+        f"semantic_attempts={st['semantic_attempts']} semantic_hits={st['semantic_hits']} "
+        f"skipped={st['semantic_skipped']} breaker={st['breaker_engaged']} "
+        f"semantic_ms={st['semantic_total_ms']:.0f}"
+    )
+
 
 async def cmd_memories():
     """memories consolidate [character_id] — sleep-cycle memory consolidation."""
@@ -385,80 +752,776 @@ async def cmd_memories():
         return
     cid = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else None
     from modules.memories import consolidate_memories
+
     r = await consolidate_memories(SID, character_id=cid)
     if "error" in r:
         print(f"Error: {r['error']}")
         return
-    print(f"Consolidation (day {r['game_day']}): {r['consolidated']} summaries from {r['archived']} archived memories "
-          f"across {r['characters']} characters (age>{r['age_days']}d, min {r['min_count']}).")
+    print(
+        f"Consolidation (day {r['game_day']}): {r['consolidated']} summaries from {r['archived']} archived memories "
+        f"across {r['characters']} characters (age>{r['age_days']}d, min {r['min_count']})."
+    )
+
 
 async def cmd_intimacy():
     """intimacy gen <position> [target_desc] | intimacy text <prompt> — local abliterated generation."""
     await Database.init()
     if len(sys.argv) < 4:
-        print("Usage: cli.py intimacy {gen <position> [target_desc...] | text <prompt...>}")
+        print(
+            "Usage: cli.py intimacy {gen <position> [target_desc...] | text <prompt...>}"
+        )
         return
     from modules.local_gen import generate, generate_intimacy_template, upsert_template
+
     sub = sys.argv[2]
     if sub == "text":
         print(await generate(" ".join(sys.argv[3:])))
     elif sub == "gen":
         position = sys.argv[3].lower().replace(" ", "_")
         target_desc = " ".join(sys.argv[4:]) if len(sys.argv) > 4 else ""
-        print(f"Generating [SENSE: {position.upper()}] locally... (8B on 1060, ~1 t/s — be patient)")
+        print(
+            f"Generating [SENSE: {position.upper()}] locally... (8B on 1060, ~1 t/s — be patient)"
+        )
         text = await generate_intimacy_template(position, target_desc=target_desc)
         print(f"\n--- GENERATED ---\n{text}\n------------------")
         hint = f"sensual intimacy {position} position"
-        await upsert_template(f"[SENSE: {position.upper()}]", text,
-                              category="intimacy", readable_hint=hint)
-        print(f"✅ Template [SENSE: {position.upper()}] upserted — interceptor will serve it.")
+        await upsert_template(
+            f"[SENSE: {position.upper()}]",
+            text,
+            category="intimacy",
+            readable_hint=hint,
+        )
+        print(
+            f"✅ Template [SENSE: {position.upper()}] upserted — interceptor will serve it."
+        )
     else:
         print("Unknown intimacy subcommand: gen|text")
+
+
+async def cmd_intent():
+    """intent "<json>" — Intent-Driven Architecture entry point.
+
+    Parse LLM-produced strict JSON intent → CPU validate → CPU resolve → Result Event.
+    LLM never touches state; CPU is the only source of truth.
+
+    Usage:
+      cli.py intent '{"action_type":"attack","target":"Iron Concord","item_used":"Legion Vanguard","dialogue":"For the throne!"}'
+      cli.py intent '{"action_type":"use_item","item_used":"TKG Heaven","creative_intent":"attempt to open Gate 7"}'
+      cli.py intent '{"action_type":"talk","dialogue":"Open the gates!"}'
+    """
+    await Database.init()
+    if len(sys.argv) < 3:
+        print(
+            "Usage: cli.py intent '<json>'\n"
+            "  Parse player intent -> CPU validate -> CPU resolve -> Result Event"
+        )
+        await Database.close()
+        return
+
+    from core.intent import parse_to_intent, resolve_intent_dispatch, PlayerIntent
+
+    raw = " ".join(sys.argv[2:])
+    try:
+        intent = parse_to_intent(raw)
+    except Exception as e:
+        print(f"INTENT REJECTED (schema violation): {e}")
+        print(
+            "LLM must retry with valid PlayerIntent — CPU does not accept malformed input."
+        )
+        await Database.close()
+        return
+
+    print(f"INTENT  : {intent.model_dump_json(indent=2)}")
+    result = await resolve_intent_dispatch(SID, intent)
+    print(f"\nRESULT EVENT:")
+    for k, v in result.items():
+        print(f"  {k}: {v}")
+    await Database.close()
+
 
 async def cmd_roll100():
     """roll100 [days] [--dry-run] — roll N game days with transparent overrides."""
     await Database.init()
     import subprocess
+
     subprocess.run([sys.executable, "scripts/roll100.py"] + sys.argv[2:])
+
+
+async def cmd_voyage():
+    """voyage {status|register|arrive|wormhole|slingshot|whitehole} — voyage transit ledger.
+
+    voyage status                                   → list all voyages
+    voyage register <name> <origin> <dest> --ly N   → book a voyage (real math: 710 ly/day)
+    voyage register ... --tag T --ships N
+    voyage register ... hidden-thread opts (when crossing z-planes via a thread):
+        --act sneak|run|guard|bribe   → how the run is conducted (default sneak)
+        --guide NAME                  → guide present (no guide = +20% danger)
+        --prep N --equip N --know N   → persediaan/peralatan/pengetahuan 0-3 (each -5% danger)
+        --heat N                      → cargo_heat 0-3 (+5% danger, +8% margin)
+        --cargo N                     → cargo_value credits (profit on clean run)
+    voyage register ... exotic transit (2026-08-15 theory build):
+        --wormhole NAME               → A↔B pair, ~90% travel cut; decaying hole may collapse
+        --slingshot NAME              → black-hole Oberth boost ×0.6 + time dilation; horizon risk
+        --void --fleet "NAME"         → VOID CROSSING (inter-nebular, no gate): needs a Void
+                                        Drive in the fleet; fast (12h/u) but risk 20% (cut by
+                                        Nebular Ward); z-planes must differ
+    voyage shipmods                   → list void module catalog
+    voyage shipmods install <ship_id> <module>  → fit a module (checks tier + slots)
+    voyage wormholes                  → list wormholes (stability/status)
+    voyage slingshots                 → list black holes (hazard/dilation)
+    voyage whiteholes                 → list white-hole exits (mystery feed)
+    voyage decay                      → run wormhole decay tick now
+    voyage arrive                     → run arrival check now
+    """
+    await Database.init()
+    from modules.voyage import (register, advance, status as voyage_status,
+                                wormhole_jump, wormhole_status, wormhole_decay,
+                                black_hole_slingshot, white_hole_events)
+    from modules.ship_modules import (install_module, list_modules,
+                                      list_void_modules, fleet_void_capable,
+                                      void_crossing_cost)
+
+    sub = sys.argv[2] if len(sys.argv) > 2 else "status"
+    if sub == "status":
+        rows = await voyage_status()
+        if not rows:
+            print("No voyages.")
+            return
+        print(f"\n{'Name':<40} {'Route':<28} {'Days':>6} {'Dep':>5} {'Arr':>5}  Status")
+        print("-" * 118)
+        for r in rows:
+            route = f"{r['origin'] or '?'}→{r['destination'] or '?'}"
+            extra = ""
+            if r.get("transit_kind") in ("wormhole", "slingshot", "void"):
+                extra = f" · {r['transit_kind']}:{r.get('transit_name')}"
+                if r.get("dilation_days"):
+                    extra += f" (+{r['dilation_days']}d dilate)"
+                if r.get("collapse_roll"):
+                    extra += f" (collapse {r['collapse_roll']})"
+            elif r.get("via_hidden"):
+                extra = f" · {r.get('act') or 'sneak'} danger {r.get('danger_pct')}%"
+                if r.get("loss_ships"):
+                    extra += f" · -{r['loss_ships']} ships"
+                if r.get("reward_credits"):
+                    extra += f" · +{r['reward_credits']:,}C"
+            else:
+                lane = r.get("lane_type") or "standard"
+                extra = f" · {lane} lane"
+                if r.get("toll_paid"):
+                    extra += f" · toll {r['toll_paid']:,}C"
+                if r.get("loss_ships"):
+                    extra += f" · -{r['loss_ships']} ships (pirates)"
+            print(
+                f"{r['voyage_name']:<40} {route:<28} {float(r['travel_days']):>6.1f} "
+                f"{r['depart_day'] or 0:>5} {r['arrive_day'] or 0:>5}  {r['status']}{extra}"
+            )
+    elif sub == "register":
+        if len(sys.argv) < 6:
+            print(
+                "Usage: voyage register <name> <origin> <dest> [--ly N | --units N | --tag T | --ships N]"
+                "\n       + hidden-thread: --act sneak|run|guard|bribe --guide N --prep N --equip N --know N --heat N --cargo N"
+                "\n       + exotic: --wormhole NAME | --slingshot NAME"
+            )
+            return
+        name, origin, dest = sys.argv[3], sys.argv[4], sys.argv[5]
+        ly = units = None
+        tag = ships = None
+        act, guide = "sneak", None
+        prep = equip = know = heat = cargo = 0
+        wormhole = slingshot = fleet_name = None
+        void = False
+        i = 6
+        while i < len(sys.argv):
+            if sys.argv[i] == "--ly" and i + 1 < len(sys.argv):
+                ly = float(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == "--units" and i + 1 < len(sys.argv):
+                units = float(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == "--tag" and i + 1 < len(sys.argv):
+                tag = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == "--ships" and i + 1 < len(sys.argv):
+                ships = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == "--act" and i + 1 < len(sys.argv):
+                act = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == "--guide" and i + 1 < len(sys.argv):
+                guide = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == "--prep" and i + 1 < len(sys.argv):
+                prep = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == "--equip" and i + 1 < len(sys.argv):
+                equip = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == "--know" and i + 1 < len(sys.argv):
+                know = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == "--heat" and i + 1 < len(sys.argv):
+                heat = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == "--cargo" and i + 1 < len(sys.argv):
+                cargo = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == "--wormhole" and i + 1 < len(sys.argv):
+                wormhole = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == "--slingshot" and i + 1 < len(sys.argv):
+                slingshot = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == "--fleet" and i + 1 < len(sys.argv):
+                fleet_name = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == "--void":
+                void = True
+                i += 1
+            else:
+                i += 1
+        try:
+            v = await register(
+                name,
+                origin,
+                destination=dest,
+                distance_ly=ly,
+                distance_units=units,
+                fleet_tag=tag,
+                ship_count=ships or 0,
+                act=act,
+                guide=guide,
+                prep_level=prep,
+                equip_level=equip,
+                knowledge_level=know,
+                cargo_heat=heat,
+                cargo_value=cargo,
+                wormhole=wormhole,
+                slingshot=slingshot,
+                fleet=fleet_name,
+                void=void,
+            )
+            print("REGISTERED:", v)
+        except ValueError as e:
+            print(f"❌ {e}")
+    elif sub == "shipmods":
+        if len(sys.argv) > 3 and sys.argv[3] == "install":
+            ship_id = int(sys.argv[4])
+            mod_name = sys.argv[5]
+            try:
+                r = await install_module(ship_id, mod_name)
+                print(f"✅ {r['module']} fitted on {r['ship']} (slot {r['slot']})")
+                fitted = await list_modules(ship_id)
+                for m in fitted:
+                    print(f"   [{m['slot_index']}] {m['name']} ({m['category']}, "
+                          f"{m['effect_type']}={m['effect_value']})")
+            except ValueError as e:
+                print(f"❌ {e}")
+        else:
+            rows = await list_void_modules()
+            print("🌀 VOID modules (cross the void between nebulas):")
+            for r in rows:
+                print(f"   {r['name']:<22} {r['effect_type']}={r['effect_value']}  "
+                      f"grade {r['grade']} · tier {r['tier_min']}-{r['tier_max']} · "
+                      f"{r['cost_alloys']:,}A {r['cost_credits']:,}C")
+    elif sub == "fleetcheck":
+        fname = sys.argv[3] if len(sys.argv) > 3 else "SEF-3 Silent Maw"
+        cap = await fleet_void_capable(fname)
+        print(f"Fleet {fname!r}: {cap['ships']} ships · "
+              f"{'VOID CAPABLE' if cap['capable'] else 'NO VOID DRIVE'} "
+              f"({cap['drive_ships']} drive ships: {', '.join(cap['drive_names']) or '—'})")
+    elif sub == "wormholes":
+        rows = await wormhole_status()
+        if not rows:
+            print("No wormholes.")
+            return
+        print("🌀 Wormholes:")
+        for r in rows:
+            print(f"   {r['name']:<20} {r['entry_name']}↔{r['exit_name']}  "
+                  f"status={r['status']}  stability={r['stability']:.2f}  "
+                  f"travel={float(r['travel_multiplier'] or 0.1)*100:.0f}% of normal")
+    elif sub == "slingshots":
+        rows = await Database.fetch(
+            "SELECT b.name, b.hazard_level, b.slingshot_multiplier, b.time_dilation_ratio, s.name AS sector "
+            "FROM maya_rp.black_holes b JOIN maya_rp.sectors s ON s.id=b.sector_id "
+            "WHERE b.session_id=$1 ORDER BY b.id", SID)
+        if not rows:
+            print("No black holes.")
+            return
+        print("⚫ Black holes:")
+        for r in rows:
+            print(f"   {r['name']:<16} @{r['sector']}  hazard={r['hazard_level']:.2f}  "
+                  f"mult={r['slingshot_multiplier']:.2f}  dilation={r['time_dilation_ratio']:.1f}×")
+    elif sub == "whiteholes":
+        rows = await white_hole_events()
+        print("⚪ White holes (exit-only):")
+        for r in rows:
+            print(f"   {r['name']:<16} sector={r['sector']}  status={r['status']}  "
+                  f"mystery={r['mystery_pct']:.0f}%  linked_bh={r['linked_bh']}")
+    elif sub == "decay":
+        r = await wormhole_decay()
+        print(f"Wormhole decay: {len(r['decayed'])} decaying, {len(r['collapsed'])} collapsed")
+    elif sub == "arrive":
+        r = await advance()
+        print(f"Arrivals now: {r.get('arrivals', 0)}"
+              + (f" · {r.get('interdictions', 0)} interdicted" if r.get('interdictions') else "")
+              + (f" · {r.get('clean_runs', 0)} clean" if r.get('clean_runs') else "")
+              + (f" · {r.get('collapses', 0)} wormhole collapses" if r.get('collapses') else "")
+              + (f" · {r.get('slingshot_fails', 0)} slingshot fails" if r.get('slingshot_fails') else "")
+              + (f" · +{r.get('profit_credits', 0):,}C" if r.get('profit_credits') else ""))
+        for n in r.get("arrived", []):
+            print(f"   ✅ {n}")
+    else:
+        print("Unknown voyage subcommand:", sub)
+    await Database.close()
+
 
 async def cmd_schema():
     """schema [schema_name] [outfile] — export PG schema to markdown (default wiki/rp-dev/schema.md)."""
     import subprocess
+
     subprocess.run([sys.executable, "scripts/export_schema.py"] + sys.argv[2:])
+
 
 async def cmd_sync_pack():
     """sync-pack [--dry-run] — refresh wiki/rp-dev canon copies + regenerate one-file."""
     import subprocess
+
     subprocess.run([sys.executable, "scripts/sync_pack.py"] + sys.argv[2:])
+
+
+async def cmd_check_object():
+    """check <coordinate|name> — resolve what OBJECT is at a coordinate.
+
+    Coordinate → territory (planet) + planets (detail) + infrastructure + factions.
+    Answers the question: "apa kat koordinat 20-6?" — planet, station, gas giant, etc.
+    """
+    await Database.init()
+    q = " ".join(sys.argv[2:]).strip()
+    if not q:
+        print(
+            "Usage: cli.py check <coordinate|name>  (e.g. 'check 20-6', 'check TKG Mastika')"
+        )
+        await Database.close()
+        return
+
+    print(f"\n🔭 OBJECT CHECK — '{q}'\n")
+
+    # Normalise: exact coordinate match preferred (X-Y), else name substring
+    import re as _re
+
+    exact = _re.fullmatch(r"\s*(\d+)\s*[-xX,]\s*(\d+)\s*", q)
+    if exact:
+        norm = f"{int(exact.group(1))}-{int(exact.group(2))}"
+        terr = await Database.fetch(
+            """SELECT id, system_name, development_level, population, status, governor_name
+               FROM maya_rp.territory
+               WHERE session_id=$1 AND system_name = $2
+               ORDER BY system_name""",
+            Config.SESSION_ID,
+            norm,
+        )
+        # also planets whose system_name is this coordinate
+        pl_at = await Database.fetch(
+            """SELECT id, name, system_name, planet_type, diameter_km, gravity_g, atmosphere,
+                      water_pct, habitability, status, territory_id
+               FROM maya_rp.planets
+               WHERE session_id=$1 AND system_name = $2
+               ORDER BY id""",
+            Config.SESSION_ID,
+            norm,
+        )
+        label = norm
+    else:
+        terr = await Database.fetch(
+            """SELECT id, system_name, development_level, population, status, governor_name
+               FROM maya_rp.territory
+               WHERE session_id=$1 AND system_name ILIKE $2
+               ORDER BY system_name""",
+            Config.SESSION_ID,
+            f"%{q}%",
+        )
+        pl_at = await Database.fetch(
+            """SELECT id, name, system_name, planet_type, diameter_km, gravity_g, atmosphere,
+                      water_pct, habitability, status, territory_id
+               FROM maya_rp.planets
+               WHERE session_id=$1 AND (name ILIKE $2 OR system_name ILIKE $2)
+               ORDER BY id""",
+            Config.SESSION_ID,
+            f"%{q}%",
+        )
+        label = q
+
+    if not terr and not pl_at:
+        print(f"  ❌ Tiada objek pada rujukan '{label}'.")
+    for t in terr:
+        pop = (t["population"] or 0) / 1e6
+        print(f"  🪐 TERRITORY/PLANET: {t['system_name']} (id {t['id']})")
+        print(
+            f"     Dev: {t['development_level']} · Pop: {pop:,.1f}M · Status: {t['status']} · Gov: {t['governor_name'] or '—'}"
+        )
+    for p in pl_at:
+        print(
+            f"  🌍 PLANET DETAIL: {p['name']} (system {p['system_name']}, terr {p['territory_id'] or '?'})"
+        )
+        print(
+            f"     Type: {p['planet_type'] or '?'} · Ø {p['diameter_km'] or 0:,}km · g {p['gravity_g'] or 0} · "
+            f"Water {p['water_pct'] or 0}% · Hab {p['habitability'] or 0} · Status: {p['status']}"
+        )
+
+    # Territory ids for infra/factions: territories found + territories of planets found
+    tids = [t["id"] for t in terr]
+    tids += [
+        p["territory_id"]
+        for p in pl_at
+        if p["territory_id"] and p["territory_id"] not in tids
+    ]
+
+    # Species composition for planets found (who actually lives there)
+    pl_ids = [p["id"] for p in pl_at]
+    if pl_ids:
+        sp = await Database.fetch(
+            """SELECT pp.planet_id, pp.species_name, pp.count, pp.pct, pp.dominant
+               FROM maya_rp.planet_population pp
+               WHERE pp.session_id=$1 AND pp.planet_id = ANY($2::int[])
+               ORDER BY pp.planet_id, pp.count DESC""",
+            Config.SESSION_ID,
+            pl_ids,
+        )
+        if sp:
+            print("  👥 SPECIES COMPOSITION:")
+            cur_pl = None
+            for x in sp:
+                if x["planet_id"] != cur_pl:
+                    cur_pl = x["planet_id"]
+                    pname = next(
+                        (p["name"] for p in pl_at if p["id"] == cur_pl), str(cur_pl)
+                    )
+                    print(f"    {pname}:")
+                mark = " ★" if x["dominant"] else ""
+                print(
+                    f"      {x['species_name']:<14} {x['count']:>12,}  ({x['pct']}%){mark}"
+                )
+        else:
+            print("  👥 Tiada species data (population 0 atau belum seed).")
+
+    # 3. Infrastructure at those territories
+    if tids:
+        infra = await Database.fetch(
+            """SELECT i.name, t.name AS type_name, i.territory_id, i.status, i.level
+               FROM maya_rp.infrastructure_instances i
+               LEFT JOIN maya_rp.infrastructure_types t ON t.id = i.infrastructure_type_id
+               WHERE i.session_id=$1 AND i.territory_id = ANY($2::int[])
+               ORDER BY i.territory_id""",
+            Config.SESSION_ID,
+            tids,
+        )
+        if infra:
+            for it in infra:
+                print(
+                    f"  🏭 INFRA: {it['name']} ({it['type_name']}) · L{it['level']} · {it['status']} · terr {it['territory_id']}"
+                )
+        else:
+            print("  🏗️ Tiada infrastruktur di territory ini.")
+
+    # 4. Factions based at those coordinates
+    if tids:
+        fac = await Database.fetch(
+            """SELECT name, status, pirate_fleet_power FROM maya_rp.factions
+               WHERE session_id=$1 AND pirate_base_system_id = ANY($2::int[])""",
+            Config.SESSION_ID,
+            tids,
+        )
+        if fac:
+            for f in fac:
+                print(
+                    f"  🏴‍☠️ FAKSYEN: {f['name']} · {f['status']} · fleet {f['pirate_fleet_power'] or 0}"
+                )
+
+    await Database.close()
+
+
+async def cmd_sentiment():
+    """sentiment [coord|name] — population sentiment/bias per system.
+
+    sentiment                → top/bottom sentiment galaxy-wide
+    sentiment <coord|name>   → sentiment rows for that system
+    sentiment --faction X    → filter by faction (default Setia Empire)
+    sentiment --shift <coord> <faction> <delta> <reason>  → manual narrative shift
+    """
+    await Database.init()
+    from modules.population_sentiment import status as s_status, shift as s_shift
+
+    argv = sys.argv[2:]
+    if argv and argv[0] == "--shift":
+        if len(argv) < 5:
+            print("Usage: sentiment --shift <coord> <faction> <delta> <reason>")
+            await Database.close()
+            return
+        coord, faction, delta, reason = (
+            argv[1],
+            argv[2],
+            int(argv[3]),
+            " ".join(argv[4:]),
+        )
+        terr = await Database.fetchrow(
+            "SELECT id FROM maya_rp.territory WHERE session_id=$1 AND (system_name=$2 OR system_name ILIKE $3::text) LIMIT 1",
+            Config.SESSION_ID,
+            coord,
+            f"%{coord}%",
+        )
+        if not terr:
+            print(f"❌ Tiada sistem '{coord}'")
+            await Database.close()
+            return
+        r = await s_shift(Config.SESSION_ID, terr["id"], faction, delta, reason)
+        print("SHIFT:", r)
+        await Database.close()
+        return
+
+    fac_filter = None
+    if argv and argv[0] == "--faction":
+        fac_filter = argv[1]
+        argv = argv[2:]
+    q = argv[0] if argv else None
+
+    if q:
+        terr = await Database.fetchrow(
+            "SELECT id, system_name FROM maya_rp.territory WHERE session_id=$1 AND (system_name=$2::text OR system_name ILIKE $3::text) LIMIT 1",
+            Config.SESSION_ID,
+            q,
+            f"%{q}%",
+        )
+        if not terr:
+            print(f"❌ Tiada sistem '{q}' — cuba koordinat atau nama")
+            await Database.close()
+            return
+        rows = await s_status(
+            Config.SESSION_ID, territory_id=terr["id"], faction_name=fac_filter
+        )
+        print(f"\n📊 SENTIMENT — {terr['system_name']} ({len(rows)} faction rows)\n")
+        for x in rows:
+            print(
+                f"  {x['faction_name']:<28} sent {x['sentiment']:>4}  app {x['approval']:>3}  fear {x['fear']:>3}  trust {x['trust']:>3}  bias {x['bias']:>3}"
+            )
+        if rows:
+            print(f"\n  last: {rows[0]['last_shift_reason']}")
+    else:
+        rows = await s_status(Config.SESSION_ID, faction_name=fac_filter)
+        top = sorted(rows, key=lambda x: -x["sentiment"])[:8]
+        bot = sorted(rows, key=lambda x: x["sentiment"])[:8]
+        print(f"\n🌍 SENTIMENT GALAXY-WIDE ({len(rows)} rows)\n")
+        print("  ✅ PALING HAPPY:")
+        for x in top:
+            print(
+                f"    {x['system_name']:<18} {x['faction_name']:<28} sent {x['sentiment']:>4}"
+            )
+        print("\n  ⚠️ PALING TIDAK HAPPY:")
+        for x in bot:
+            print(
+                f"    {x['system_name']:<18} {x['faction_name']:<28} sent {x['sentiment']:>4}"
+            )
+    await Database.close()
+
+
+async def cmd_king():
+    """king present|away — set King presence (ministries prompt vs autonomous)."""
+    await Database.init()
+    from modules.ministry_ai import set_king, set_dark, king_status, dark_status
+
+    sub = sys.argv[2] if len(sys.argv) > 2 else "status"
+    if sub == "present":
+        await set_king(Config.SESSION_ID, True)
+        print("👑 King PRESENT — ministries prompt via adjutant")
+    elif sub == "away":
+        await set_king(Config.SESSION_ID, False)
+        print("🌙 King AWAY — ministries decide autonomously")
+    elif sub == "dark":
+        await set_dark(Config.SESSION_ID, True)
+        print(
+            "🌑 DARK MODE ON — King unreachable; ministries run via co-ministers (deputies), prompt only critical/Mastika"
+        )
+    elif sub == "light":
+        await set_dark(Config.SESSION_ID, False)
+        print("☀️ DARK MODE OFF — King present")
+    else:
+        pres = await king_status()
+        dark = await dark_status()
+        state = (
+            "🌑 DARK MODE (King unreachable)"
+            if dark
+            else ("👑 PRESENT" if pres else "🌙 AWAY")
+        )
+        print(f"King state: {state}")
+    await Database.close()
+
+
+async def cmd_adjutant():
+    """adjutant pending | resolve <id> accept|reject — ministry prompt queue."""
+    await Database.init()
+    from modules.ministry_ai import pending as p_list, resolve as p_resolve
+
+    sub = sys.argv[2] if len(sys.argv) > 2 else "pending"
+    if sub == "pending":
+        rows = await p_list()
+        if not rows:
+            print("No pending prompts.")
+        else:
+            print(
+                f"\n📋 ADJUTANT PROMPTS — {len(rows)} pending (via Maya/Hanum/Sara/Maria)\n"
+            )
+            for r in rows:
+                flag = {"critical": "🔴", "high": "🟠", "normal": "🟡"}.get(
+                    r["urgency"], "🟡"
+                )
+                print(
+                    f"  {flag} #{r['id']} [{r['urgency']}] {r['ministry']} ({r['holder']})"
+                )
+                print(f"      {r['action']} → {r['target']}")
+                print(f"      {r['impact']}")
+                print(f"      via {r['routed_via']} · {r['created_at']}")
+    elif sub == "resolve":
+        if len(sys.argv) < 5:
+            print("Usage: adjutant resolve <id> accept|reject")
+            await Database.close()
+            return
+        decision = (
+            "accepted"
+            if sys.argv[4] == "accept"
+            else "rejected"
+            if sys.argv[4] == "reject"
+            else sys.argv[4]
+        )
+        r = await p_resolve(Config.SESSION_ID, int(sys.argv[3]), decision)
+        print("RESOLVED:", r)
+    else:
+        print("Unknown adjutant subcommand:", sub)
+    await Database.close()
+
+
+async def cmd_decisions():
+    """cli.py decisions list|add — unified decision stream + manual record."""
+    from core.decision import decisions, add_cli
+    sub = sys.argv[2] if len(sys.argv) > 2 else "list"
+    await Database.init()
+    if sub == "list":
+        kwargs = {}
+        for i in range(3, len(sys.argv) - 1, 2):
+            key = sys.argv[i].lstrip("-")
+            val = sys.argv[i + 1]
+            if key in ("day", "limit"):
+                kwargs[key] = int(val)
+            else:
+                kwargs[key] = val
+        rows = await decisions(Config.SESSION_ID, **kwargs)
+        for r in rows:
+            print(
+                f"[{r['kind']} #{r['decision_id']}] "
+                f"D{r['game_day'] or '?'} · {r['actor']} · {r['decision_type']} · "
+                f"{r['title'][:60]} · {r['status']}"
+            )
+        print(f"--- {len(rows)} decisions")
+    elif sub == "add":
+        r = await add_cli(sys.argv[3:])
+        print("DECISION RECORDED:", r)
+    else:
+        print("Usage: cli.py decisions list [--day N] [--kind decree] [--limit N] | decisions add --title ...")
+    await Database.close()
+
+
+async def cmd_lineage():
+    """cli.py lineage <decision_id|fact> [fact_value] — walk causal chain."""
+    from core.decision import chain, by_fact
+    if len(sys.argv) < 3:
+        print("Usage: cli.py lineage <decision_id> | lineage <fact_key> [fact_value]")
+        return
+    await Database.init()
+    target = sys.argv[2]
+    try:
+        did = int(target)
+        hops = await chain(Config.SESSION_ID, did)
+        print(f"LINEAGE #{did} — {len(hops)} hops")
+        for h in reversed(hops):
+            ev = f" · events {h['event_ids']}" if h.get("event_ids") else ""
+            print(
+                f"  [D{h['game_day'] or '?'}] {h['actor']} · {h['decision_type']} · "
+                f"{h['title'][:70]} · {h['status']}{ev}"
+            )
+    except ValueError:
+        fact = target
+        val = sys.argv[3] if len(sys.argv) > 3 else None
+        rows = await by_fact(Config.SESSION_ID, fact, val)
+        print(f"FACT '{fact}' — {len(rows)} touching decisions")
+        for r in rows:
+            print(
+                f"  [D{r['game_day'] or '?'}] #{r['id']} {r['actor']} · {r['decision_type']} · "
+                f"{r['title'][:70]}"
+            )
+    await Database.close()
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python3 scripts/cli.py {status|tick|save|export|config|health|modules|run|query} [args]")
+        print(
+            "Usage: python3 scripts/cli.py {status|tick|save|export|config|health|modules|run|query} [args]"
+        )
         sys.exit(1)
     cmd = sys.argv[1]
-    if cmd == "config": cmd_config()
-    elif cmd == "modules": cmd_modules()
-    elif cmd == "health": asyncio.run(cmd_health())
-    elif cmd == "status": asyncio.run(cmd_status())
-    elif cmd == "tick": asyncio.run(cmd_tick())
-    elif cmd == "save": asyncio.run(cmd_save(sys.argv[2] if len(sys.argv) > 2 else ""))
-    elif cmd == "export": asyncio.run(cmd_export())
+    if cmd == "config":
+        cmd_config()
+    elif cmd == "modules":
+        cmd_modules()
+    elif cmd == "health":
+        asyncio.run(cmd_health())
+    elif cmd == "status":
+        asyncio.run(cmd_status())
+    elif cmd == "tick":
+        asyncio.run(cmd_tick())
+    elif cmd == "save":
+        asyncio.run(cmd_save(sys.argv[2] if len(sys.argv) > 2 else ""))
+    elif cmd == "load":
+        asyncio.run(cmd_load())
+    elif cmd == "export":
+        asyncio.run(cmd_export())
     elif cmd == "run":
-        if len(sys.argv) < 3: print("Usage: cli.py run <module_name>"); sys.exit(1)
+        if len(sys.argv) < 3:
+            print("Usage: cli.py run <module_name>")
+            sys.exit(1)
         asyncio.run(cmd_run_single(sys.argv[2]))
-    elif cmd == "briefing": asyncio.run(cmd_briefing())
-    elif cmd == "flow" or cmd == "economy": asyncio.run(cmd_economy_flow())
-    elif cmd == "intel": asyncio.run(cmd_intel())
-    elif cmd == "dash" or cmd == "dashboard": asyncio.run(cmd_dashboard())
+    elif cmd == "briefing":
+        asyncio.run(cmd_briefing())
+    elif cmd == "flow" or cmd == "economy":
+        asyncio.run(cmd_economy_flow())
+    elif cmd == "intel":
+        asyncio.run(cmd_intel())
+    elif cmd == "dash" or cmd == "dashboard":
+        asyncio.run(cmd_dashboard())
     elif cmd == "query":
-        if len(sys.argv) < 3: print("Usage: cli.py query <sql>"); sys.exit(1)
+        if len(sys.argv) < 3:
+            print("Usage: cli.py query <sql>")
+            sys.exit(1)
         asyncio.run(cmd_query(" ".join(sys.argv[2:])))
     elif cmd == "romance":
         asyncio.run(cmd_romance())
-    elif cmd == "assembly": asyncio.run(cmd_assembly())
-    elif cmd == "duel": asyncio.run(cmd_duel())
+    elif cmd == "assembly":
+        asyncio.run(cmd_assembly())
+    elif cmd == "duel":
+        asyncio.run(cmd_duel())
     elif cmd == "roll":
         asyncio.run(cmd_roll())
+    elif cmd == "voyage" or cmd == "voyages":
+        asyncio.run(cmd_voyage())
+    elif cmd == "check" or cmd == "object" or cmd == "coord":
+        asyncio.run(cmd_check_object())
+    elif cmd == "sentiment" or cmd == "opinion":
+        asyncio.run(cmd_sentiment())
+    elif cmd == "king":
+        asyncio.run(cmd_king())
+    elif cmd == "adjutant":
+        asyncio.run(cmd_adjutant())
+    elif cmd == "decisions":
+        asyncio.run(cmd_decisions())
+    elif cmd == "lineage":
+        asyncio.run(cmd_lineage())
     elif cmd == "templates":
         asyncio.run(cmd_templates())
     elif cmd == "stream":
@@ -467,6 +1530,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_memories())
     elif cmd == "intimacy":
         asyncio.run(cmd_intimacy())
+    elif cmd == "intent":
+        asyncio.run(cmd_intent())
     elif cmd == "roll100":
         asyncio.run(cmd_roll100())
     elif cmd == "schema":
@@ -474,4 +1539,6 @@ if __name__ == "__main__":
     elif cmd == "sync-pack":
         asyncio.run(cmd_sync_pack())
     else:
-        print(f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack")
+        print(
+            f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"
+        )

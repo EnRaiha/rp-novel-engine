@@ -54,11 +54,29 @@ async def generate_red_herring(session_id: int, investigation_id: int) -> dict:
     return {"clue_id": clue_id, "text": text}
 
 async def run_tick(session_id: int = None) -> dict:
+    """Investigation aging (added 2026-08-14): active investigations older
+    than 20 game-days with no deductions log a 'trail aging' entry — the GM
+    sees cold cases instead of them silently persisting."""
     if session_id is None: session_id = Config.SESSION_ID
     try:
-        active = await Database.fetch("SELECT id, title FROM maya_rp.investigations WHERE session_id=$1 AND status='active'", session_id)
-        info("mystery", f"Tick: {len(active)} active")
-        return {"active": len(active)}
+        active = await Database.fetch(
+            "SELECT id, title, deductions_made, created_at FROM maya_rp.investigations "
+            "WHERE session_id=$1 AND status='active'", session_id)
+        decayed = 0
+        for inv in active:
+            if not inv.get("created_at"):
+                continue
+            age = (await Database.fetchval(
+                "SELECT EXTRACT(EPOCH FROM NOW()-$1::timestamptz)/86400", inv["created_at"]))
+            if age >= 20 and (inv.get("deductions_made") or 0) == 0:
+                await Database.execute(
+                    "INSERT INTO maya_rp.investigation_log (session_id, investigation_id, action, result) "
+                    "VALUES ($1,$2,'aging','trail_growing_cold')",
+                    session_id, inv["id"])
+                decayed += 1
+                info("mystery", f"Decay: investigation {inv['id']} ({inv['title']}) going cold")
+        info("mystery", f"Tick: {len(active)} active, {decayed} aging")
+        return {"active": len(active), "decayed": decayed}
     except Exception as e:
         info("mystery", f"Error: {e}")
         return {"error": str(e)}

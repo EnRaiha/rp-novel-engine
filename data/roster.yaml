@@ -1,0 +1,101 @@
+# Roster — curated character reference for char:query.
+# DB (maya_rp.characters) is always truth; this file is the convenience layer.
+# char:query <group> resolves every entry live and flags stale names.
+# aliases:  nickname / role-keyword → canonical character name
+aliases:
+  the forge: Arianna al-Dabaran (The Forge)
+  forge: Arianna al-Dabaran (The Forge)
+  forger: Arianna al-Dabaran (The Forge)
+  anchor: Maya al-Dabaran (Anchor)
+  maya anchor: Maya al-Dabaran (Anchor)
+  matriarch: Maya al-Dabaran (Anchor)
+  oracle: Aeliana
+  the oracle: Aeliana
+  kitty: Kira Blackwood (Spymaster)
+  spymaster: Kira Blackwood (Spymaster)
+  general of the north: Nadia Voss (General of the North)
+  north general: Nadia Voss (General of the North)
+  dsn: Nadia Voss (Deep Space Navigator)
+  deep space navigator: Nadia Voss (Deep Space Navigator)
+  shipwright: Maya Khatri (Chief Shipwright)
+  first navigator: Vera
+  last keeper: Vera
+  golden queen: Callista
+  frost maiden: Eira Snow
+  the anima: Elara Vanna
+  bank governor: Cassandra Vale
+  chief doctor: Doktor Amara Osei
+  warden: Warden Keeper
+  first queen: Professor Lyra Chen
+  professor: Professor Lyra Chen
+  ana: Anima Prime
+
+# groups: frequently-queried rosters (char:query queens / ministers / ...)
+groups:
+  queens: # house wives — 👑 roster (char_locations, 2026-08-14)
+    - Arianna al-Dabaran (The Forge)
+    - Callista
+    - Celestine Voss
+    - Dr Sierra Vance
+    - Dr Zara El-Amin (Zara.E)
+    - Elara Vanna
+    - Hanum Voss
+    - Kira Blackwood (Spymaster)
+    - Kiri
+    - Layla Frost
+    - Leftenan Sara Valdez
+    - Malam
+    - Maria
+    - Maya al-Dabaran (Anchor)
+    - Maya Khatri (Chief Shipwright)
+    - Nadia Voss (Deep Space Navigator)
+    - Nadia Voss (General of the North)
+    - Professor Lyra Chen
+    - Rhea
+    - Rika Voss
+    - Rook Thorn (Queen)
+    - Sera al-Dabaran (Priestess)
+    - Vera
+    - Zara AD (Dual Body Lead)
+    - Aeliana
+  ministers: # cabinet / administration
+    - Cassandra Vale
+    - Dara Vance
+    - Lars Raine
+    - Seraphina Korr (Echo)
+    - Azlan Perak
+    - Aina Merpati (Merchant)
+    - Kira Flux (HAVEN Minister)
+    - Kira Cross (Intel)
+  command: # military leadership
+    - Nadia Voss (General of the North)
+    - Rika Voss
+    - Leftenan Sara Valdez
+    - Commander Hana Voss
+    - Commodore Ashcroft
+    - Doktor Amara Osei
+    - Dr. Safiya Rahman
+  royal_children:
+    - Princess Elanor al-Dabaran
+    - Princess Nilam al-Dabaran
+    - Princess Cahaya al-Dabaran
+    - Princess Senja al-Dabaran
+    - Princess Embun al-Dabaran
+    - Princess Sarah al-Dabaran
+    - Princess Inara al-Dabaran
+    - Princess Sofea al-Dabaran
+    - Prince Danish al-Dabaran
+    - Prince Irfan al-Dabaran
+    - Prince Fajar al-Dabaran
+    - Prince Ardhan al-Dabaran
+    - Prince Ahmad al-Dabaran
+  immortals:
+    - Callista
+    - Vera
+    - Aeliana
+    - Arianna al-Dabaran (The Forge)
+  perdana_night: # who slept at Perdana 2026-08-14 (session canon)
+    - Callista
+    - Vera
+    - Elara Vanna
+    - Aeliana

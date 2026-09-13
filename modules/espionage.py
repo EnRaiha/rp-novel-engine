@@ -46,5 +46,23 @@ async def list_espionage_log(session_id: int | None = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 async def run_tick(session_id: int = None) -> dict:
+    """Mission phase progression (added 2026-08-14): unresolved missions age
+    and resolve with delay — planted rumors fade, scouts go dark."""
     if session_id is None: session_id = Config.SESSION_ID
-    return {"status": "espionage_ready"}
+    try:
+        stale = await Database.fetch(
+            "SELECT id, mission_type, agent_name FROM maya_rp.espionage_missions "
+            "WHERE session_id=$1 AND resolved_at IS NULL AND launched_at < NOW() - INTERVAL '10 days'",
+            session_id)
+        resolved = 0
+        for m in stale:
+            outcome = "went_dark" if m["mission_type"] in ("scout_fleet", "plant_rumor") else "compromised"
+            await Database.execute(
+                "UPDATE maya_rp.espionage_missions SET outcome=$1, resolved_at=NOW() WHERE id=$2",
+                outcome, m["id"])
+            resolved += 1
+        info("espionage", f"Tick: {resolved} stale missions resolved")
+        return {"resolved_stale": resolved}
+    except Exception as e:
+        info("espionage", f"Error: {e}")
+        return {"error": str(e)}

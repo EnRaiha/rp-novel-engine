@@ -56,3 +56,26 @@ async def run_tick(session_id: int = None) -> dict:
     except Exception as e:
         info("tactics", f"Error: {e}")
         return {"error": str(e)}
+
+
+# ─── Formation & terrain helpers (battle campaign tick, 2026-08-14) ─────
+
+_FORMATIONS = {"wedge": 1.15, "wall": 1.10, "pincer": 1.05, "screen": 0.95, "line": 1.0}
+_TERRAINS = [
+    {"name": "open space", "player_mod": 0.0},
+    {"name": "asteroid field", "player_mod": 0.05},
+    {"name": "nebula interference", "player_mod": -0.05},
+    {"name": "gravity well", "player_mod": -0.03},
+    {"name": "debris chokepoint", "player_mod": 0.08},
+]
+
+
+def formation_bonus(formation: str) -> float:
+    """Multiplier for fleet power by formation. Unknown → 1.0."""
+    return _FORMATIONS.get(str(formation).lower(), 1.0)
+
+
+def roll_terrain() -> dict:
+    """Random battlefield terrain with a player modifier."""
+    import random
+    return dict(random.choice(_TERRAINS))

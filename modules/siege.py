@@ -2,6 +2,7 @@
 """Siege — Ported from Rust siege.rs."""
 from __future__ import annotations
 import random
+import json
 from core.db import Database
 from core.config import Config
 from core.log import info
@@ -52,7 +53,23 @@ async def list_sieges(session_id: int | None = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 async def run_tick(session_id: int = None) -> dict:
+    """Auto-advance all active sieges (attrition loop, added 2026-08-14)."""
     if session_id is None: session_id = Config.SESSION_ID
-    sieges = await list_sieges(session_id)
-    info("siege", f"Tick: {len(sieges)} sieges")
-    return {"sieges": len(sieges)}
+    rows = await Database.fetch(
+        "SELECT id FROM maya_rp.sieges WHERE session_id=$1 AND status='active'", session_id)
+    advanced = 0
+    for r in rows:
+        try:
+            res = await advance_siege(r["id"], session_id)
+            if res.get("status") != "active":
+                await Database.execute(
+                    "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
+                    "VALUES ($1, NOW(), 'siege', $2, $3, $4, 6)",
+                    session_id, f"Siege {res.get('status')}: {res.get('system')}",
+                    f"Siege of {res.get('system')} {res.get('status')}: {res.get('description')}",
+                    json.dumps(["siege", res.get("system", ""), res.get("status", "")]))
+            advanced += 1
+        except Exception as e:
+            info("siege", f"advance error: {e}")
+    info("siege", f"Tick: {advanced} sieges advanced")
+    return {"sieges_advanced": advanced}

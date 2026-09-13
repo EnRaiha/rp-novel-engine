@@ -47,7 +47,9 @@ async def execute_time_skip(
     if days < 1:
         return {"days_skipped": 0, "error": "Days must be >= 1", "montage_prompt": ""}
     if days > 365:
-        return {"days_skipped": 0, "error": "Max 365 days per skip", "montage_prompt": ""}
+        # Hard cap per single skip. Use narration_sync / chunked rolls for long skips,
+        # OR set ALLOW_LONG_SKIP = 1080+ for structural corrections (children comp).
+        raise ValueError(f"Max 365 days per skip (got {days}) — split into chunks")
 
     results = {
         "days_skipped": days,
@@ -96,9 +98,9 @@ async def execute_time_skip(
 
     await Database.execute(
         """UPDATE maya_rp.resources
-           SET credits = GREATEST(0, $1),
-               fuel = LEAST(5000000, fuel + $2),
-               alloys = LEAST(3000000, alloys + $3)
+           SET credits = GREATEST(0::bigint, $1),
+               fuel = LEAST(5000000::bigint, fuel + $2),
+               alloys = LEAST(3000000::bigint, alloys + $3)
            WHERE session_id = $4""",
         final_credits, fuel_add, alloy_add, session_id,
     )

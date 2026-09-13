@@ -1,7 +1,7 @@
 # RP Engine — Complete Port to Python
 
 **Scope:** 72 Rust modules (archive/rp-engine-rust/) + 10 JS skill modules (archive/rp-engine-js-skills/) → single Python engine.
-**Current:** 14 Python modules exist. 41 Rust + 10 JS + integration layer remain.
+**Current:** 86 Python modules exist (was 14 at plan time). ~24 flat scripts (in ~/scripts/) + 10 JS skills remain outside; engine-bridge.py still dispatches them. Retire bridge once they fold in.
 **Target:** One engine, one config, one schema.
 
 ---

@@ -54,5 +54,21 @@ async def generate_details(location: str = "bridge", session_id: int = None) -> 
     random.shuffle(details)
     return details[:4]
 
+WEATHER = ["clear skies", "ion storm", "meteor shower", "solar wind", "nebula drift", "comet tail", "quiet dark"]
+WEATHER_MOD = {"clear skies": 0.0, "ion storm": -0.05, "meteor shower": -0.02,
+               "solar wind": 0.03, "nebula drift": -0.03, "comet tail": 0.05,
+               "quiet dark": 0.0}
+
+def current_weather(session_id: int = None, game_day: int = None) -> dict:
+    """Deterministic weather per game day — voyage difficulty modifier hook."""
+    if game_day is None:
+        game_day = 1
+    idx = game_day % len(WEATHER)
+    name = WEATHER[idx]
+    return {"weather": name, "voyage_mod": WEATHER_MOD[name], "game_day": game_day}
+
 async def run_tick(session_id: int = None) -> dict:
-    return {"status": "on_demand"}
+    if session_id is None: session_id = Config.SESSION_ID
+    gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 0
+    w = current_weather(session_id, gd)
+    return {"status": "on_demand", **w}

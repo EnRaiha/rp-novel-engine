@@ -75,6 +75,18 @@ async def apply_holiday(date: dict, session_id: int):
         f"Holiday: {h['name']}",
         f"The fleet observes {h['name']}. {h.get('desc','')}",
         json.dumps(["calendar", "holiday", h["type"]]))
+    # economy/morale hook (2026-08-14): festivals boost crew morale; the
+    # Crown covers festival costs — somber days slow spending instead.
+    bonus = h.get("bonus", 0)
+    if bonus != 0:
+        await Database.execute(
+            "UPDATE maya_rp.crew_roster SET morale=LEAST(100, morale+$1) WHERE session_id=$2",
+            bonus, session_id)
+        spend = max(0, bonus) * 2000
+        if spend:
+            await Database.execute(
+                "UPDATE maya_rp.resources SET credits=GREATEST(0, credits-$1) WHERE session_id=$2",
+                spend, session_id)
 
 async def get_upcoming(session_id: int, lookahead: int = 30) -> list[dict]:
     """Holidays in the next N game days."""

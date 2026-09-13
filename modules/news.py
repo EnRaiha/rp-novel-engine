@@ -145,6 +145,27 @@ async def generate(session_id: int | None = None) -> list[dict]:
         tick = await Database.fetchval("SELECT COALESCE(MAX(tick_number),0)+1 FROM maya_rp.news_articles WHERE session_id=$1", session_id) or 1
         await Database.execute("INSERT INTO maya_rp.news_articles (session_id, tick_number, headline, category, read, game_day) VALUES ($1,$2,$3,$4,false,$5)", session_id, tick, headline, category, gd)
         articles.append({"headline": headline, "category": category, "game_day": gd})
+    # sentiment hook (2026-08-14): each headline shifts a random system's
+    # sentiment/approval a notch — the news actually moves public opinion.
+    try:
+        if random.random() < 0.5:
+            terr = await Database.fetchrow(
+                "SELECT id FROM maya_rp.territory WHERE session_id=$1 AND "
+                "controlling_faction='Setia Empire' ORDER BY RANDOM() LIMIT 1", session_id)
+            if terr:
+                delta = 2 if category in ("celebration", "trade", "science") else -1
+                await Database.execute(
+                    "INSERT INTO maya_rp.population_sentiment "
+                    "(session_id, territory_id, faction_name, sentiment, approval, fear, trust, "
+                    "bias, last_shift, last_shift_reason) "
+                    "VALUES ($1,$2,'Setia Empire',$3,$4,0,0,0,0,$5) "
+                    "ON CONFLICT (session_id, territory_id) DO UPDATE SET "
+                    "sentiment=GREATEST(-100,LEAST(100,population_sentiment.sentiment+$3)), "
+                    "approval=GREATEST(-100,LEAST(100,population_sentiment.approval+$4)), "
+                    "last_shift=0, last_shift_reason=$5, updated_at=NOW()",
+                    session_id, terr["id"], delta, delta, f"news: {category}")
+    except Exception:
+        pass
     return articles
 
 

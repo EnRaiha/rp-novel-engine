@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
-"""Database — asyncpg pool with reconnection, transaction support, driven by Config."""
+"""Database — asyncpg pool with reconnection, transaction support, driven by Config.
+
+QA fix 2026-08-14 (BUG-4): dead-pool reconnection. If PostgreSQL restarts,
+asyncpg connections die but the pool object stays non-None, so every query
+raised ConnectionDoesNotExistError until process restart. `_run()` now catches
+dead-pool errors, closes the stale pool, re-inits once, and retries the query.
+No health-check-per-query (that was removed in the Jul-31 perf pass); the
+reconnect path only executes on actual errors.
+"""
+
 from __future__ import annotations
 import asyncpg
 from contextlib import asynccontextmanager
 from core.config import Config
 from core.log import info
+
+# Errors that indicate a dead/lost pool (PG restart, network blip).
+_RECONNECT_ERRORS = (
+    asyncpg.exceptions.ConnectionDoesNotExistError,
+    asyncpg.exceptions.InterfaceError,
+    asyncpg.exceptions.PostgresConnectionError,
+)
 
 
 class Database:
@@ -26,7 +42,10 @@ class Database:
     @classmethod
     async def close(cls) -> None:
         if cls.pool:
-            await cls.pool.close()
+            try:
+                await cls.pool.close()
+            except Exception:
+                pass
             cls.pool = None
 
     @classmethod
@@ -39,35 +58,47 @@ class Database:
         return pool
 
     @classmethod
+    async def _run(cls, fn, *args):
+        """Run fn(conn, *args) with ONE reconnect retry on dead-pool errors."""
+        try:
+            pool = await cls._ensure_pool()
+            async with pool.acquire() as conn:
+                return await fn(conn, *args)
+        except _RECONNECT_ERRORS as e:
+            info("db", f"Pool connection lost ({type(e).__name__}) — reconnecting once")
+            await cls.close()
+            pool = await cls.init()
+            async with pool.acquire() as conn:
+                return await fn(conn, *args)
+
+    @classmethod
     async def fetchrow(cls, query: str, *args) -> asyncpg.Record | None:
-        pool = await cls._ensure_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetchrow(query, *args)
+        return await cls._run(lambda conn: conn.fetchrow(query, *args))
 
     @classmethod
     async def fetch(cls, query: str, *args) -> list[asyncpg.Record]:
-        pool = await cls._ensure_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetch(query, *args)
+        return await cls._run(lambda conn: conn.fetch(query, *args))
 
     @classmethod
     async def execute(cls, query: str, *args) -> str:
-        pool = await cls._ensure_pool()
-        async with pool.acquire() as conn:
-            return await conn.execute(query, *args)
+        return await cls._run(lambda conn: conn.execute(query, *args))
 
     @classmethod
     async def fetchval(cls, query: str, *args):
         """Fetch a single value from the first column using native asyncpg fetchval."""
-        pool = await cls._ensure_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetchval(query, *args)
+        return await cls._run(lambda conn: conn.fetchval(query, *args))
 
     @classmethod
     @asynccontextmanager
     async def transaction(cls):
-        """Transaction context manager — auto-rollback on exception."""
-        pool = await cls._ensure_pool()
+        """Transaction context manager — auto-rollback on exception.
+        Reconnects once if the pool is dead at acquire time."""
+        try:
+            pool = await cls._ensure_pool()
+        except _RECONNECT_ERRORS:
+            info("db", "Pool lost at transaction start — reconnecting once")
+            await cls.close()
+            pool = await cls.init()
         async with pool.acquire() as conn:
             tx = conn.transaction()
             await tx.start()
@@ -80,7 +111,7 @@ class Database:
 
     @classmethod
     async def status(cls) -> dict:
-        """Quick health check — table count + session row."""
+        """Quick health check — connection + table count + session row."""
         pool = await cls._ensure_pool()
         async with pool.acquire() as conn:
             tables = await conn.fetchval(
@@ -88,11 +119,11 @@ class Database:
                 "WHERE table_schema='maya_rp' AND table_type='BASE TABLE'"
             )
             session = await conn.fetchrow(
-                "SELECT id, name, status FROM maya_rp.sessions WHERE id=$1",
+                "SELECT id, name, status, game_day FROM maya_rp.sessions WHERE id=$1",
                 Config.SESSION_ID,
             )
-        return {
-            "connected": True,
-            "tables": tables,
-            "session": dict(session) if session else None,
-        }
+            return {
+                "connected": True,
+                "tables": tables,
+                "session": dict(session) if session else None,
+            }

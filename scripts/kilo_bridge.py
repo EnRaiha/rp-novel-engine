@@ -3,12 +3,15 @@
 Kilo Bridge — Strict JSON interface between Kilo commands and the RP Engine.
 Kilo calls this. This calls the engine. Clean JSON comes out. No SQL, no stack traces, no DSN.
 """
+
 import asyncio, sys, json, os
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from core.config import Config
 from core.db import Database
 from core.log import info
 from core.memory import embed_text
+
 
 async def handle(action: str, params: dict = None) -> dict:
     params = params or {}
@@ -18,43 +21,188 @@ async def handle(action: str, params: dict = None) -> dict:
     try:
         if action == "briefing":
             from core.master_briefing import generate
+
             result["data"] = await generate(sid)
             result["status"] = "ok"
 
         elif action == "bonds":
-            rows = await Database.fetch("SELECT name,bond,role FROM maya_rp.characters WHERE session_id=$1 AND bond>0 ORDER BY bond DESC LIMIT 10", sid)
+            rows = await Database.fetch(
+                "SELECT name,bond,role FROM maya_rp.characters WHERE session_id=$1 AND bond>0 ORDER BY bond DESC LIMIT 10",
+                sid,
+            )
             result["data"] = [dict(r) for r in rows]
             result["status"] = "ok"
 
         elif action == "fleet":
-            rows = await Database.fetch("SELECT name,tier,status,hull_current,hull FROM maya_rp.ships WHERE session_id=$1 AND status='active' ORDER BY tier DESC LIMIT 5", sid)
+            rows = await Database.fetch(
+                "SELECT name,tier,status,hull_current,hull FROM maya_rp.ships WHERE session_id=$1 AND status='active' ORDER BY tier DESC LIMIT 5",
+                sid,
+            )
             result["data"] = [dict(r) for r in rows]
             result["status"] = "ok"
 
         elif action == "treasury":
-            r = await Database.fetchrow("SELECT credits,alloys,fuel FROM maya_rp.resources WHERE session_id=$1", sid)
+            r = await Database.fetchrow(
+                "SELECT credits,alloys,fuel FROM maya_rp.resources WHERE session_id=$1",
+                sid,
+            )
             result["data"] = dict(r) if r else {}
             result["status"] = "ok"
 
+        elif action == "market":
+            rows = await Database.fetch(
+                "SELECT name, category, base_price, current_price, volatility, supply, demand "
+                "FROM maya_rp.commodities WHERE session_id=$1 ORDER BY name",
+                sid,
+            )
+            history = await Database.fetch(
+                "SELECT c.name, ph.price, ph.tick_number FROM maya_rp.price_history ph "
+                "JOIN maya_rp.commodities c ON c.id=ph.commodity_id "
+                "WHERE ph.session_id=$1 ORDER BY ph.id DESC LIMIT 13",
+                sid,
+            )
+            result["data"] = {
+                "commodities": [dict(r) for r in rows],
+                "latest_ticks": [dict(r) for r in history],
+            }
+            result["status"] = "ok"
+
+        elif action == "loc":
+            q = params.get("query", "")
+            if q:
+                import asyncio as _a
+                from scripts.char_query import resolve_loc
+
+                result["data"] = await resolve_loc(q)
+            else:
+                result["data"] = {"error": "Provide a query."}
+            result["status"] = "ok"
+
+        elif action == "char_query":
+            q = params.get("query", "")
+            if q:
+                from scripts.char_query import (
+                    resolve_char,
+                    _load_roster,
+                    _load_characters,
+                )
+
+                roster = _load_roster()
+                chars = await _load_characters()
+                g = q.lower().strip()
+                if g in roster["groups"]:
+                    from scripts.char_query import resolve_group
+
+                    result["data"] = await resolve_group(g, roster, chars)
+                else:
+                    result["data"] = resolve_char(q, chars, roster["aliases"])
+            else:
+                result["data"] = {"error": "Provide a query."}
+            result["status"] = "ok"
+
+        elif action == "novel_recall":
+            q = params.get("query", "")
+            if q:
+                from rp_novel_recall import recall_pure as _nr
+
+                result["data"] = await _nr(
+                    q, params.get("book"), int(params.get("limit", 3))
+                )
+            else:
+                result["data"] = {"error": "Provide a query."}
+            result["status"] = "ok"
+
+        elif action == "lore_pack":
+            """One-call lore bundle for prose generation: wiki lore + novel
+            recall + character card + scene context. The agent (Kilo/Hermes)
+            feeds this to DeepSeek before writing, so prose can't contradict
+            canon. Added 2026-08-15 (integration gap #1 fix — wiring, not port)."""
+            query = params.get("query", "")
+            if not query:
+                result["data"] = {"error": "Provide a query."}
+                result["status"] = "ok"
+                return result
+
+            bundle: dict = {"query": query}
+
+            # 1. Wiki lore (semantic, timeline-aware) — reuse get_lore logic
+            try:
+                lore_params = {"query": query}
+                if params.get("category"):
+                    lore_params["category"] = params["category"]
+                if params.get("speaker"):
+                    lore_params["speaker"] = params["speaker"]
+                # inline the get_lore branch by calling handle recursively
+                lore = await handle("get_lore", lore_params)
+                bundle["lore"] = lore.get("data")
+            except Exception as e:
+                bundle["lore"] = {"error": str(e)}
+
+            # 2. Novel recall (semantic chunks from the books)
+            try:
+                from rp_novel_recall import recall_pure as _nr
+
+                bundle["novel"] = await _nr(
+                    query, params.get("book"), int(params.get("recall_limit", 3))
+                )
+            except Exception as e:
+                bundle["novel"] = {"error": str(e)}
+
+            # 3. Character card (if a name is given)
+            name = params.get("name", "")
+            if name:
+                try:
+                    card_params = {"name": name}
+                    card = await handle("get_character_card", card_params)
+                    bundle["character"] = card.get("data")
+                except Exception as e:
+                    bundle["character"] = {"error": str(e)}
+
+            # 4. Scene context
+            try:
+                from modules.locations import get_scene_context
+
+                bundle["scene"] = await get_scene_context(sid)
+            except Exception as e:
+                bundle["scene"] = {"error": str(e)}
+
+            result["data"] = bundle
+            result["status"] = "ok"
+
         elif action == "prisoners":
-            rows = await Database.fetch("SELECT name,faction,status,resistance,intel_value FROM maya_rp.prisoners WHERE session_id=$1 AND status='captured'", sid)
+            rows = await Database.fetch(
+                "SELECT name,faction,status,resistance,intel_value FROM maya_rp.prisoners WHERE session_id=$1 AND status='captured'",
+                sid,
+            )
             result["data"] = [dict(r) for r in rows]
             result["status"] = "ok"
 
         elif action == "scene":
             from modules.locations import get_scene_context
+
             result["data"] = await get_scene_context(sid)
             result["status"] = "ok"
 
         elif action == "character":
             name = params.get("name", "")
             if name:
-                row = await Database.fetchrow("SELECT name,bond,role,voice_profile,status FROM maya_rp.characters WHERE session_id=$1 AND LOWER(name)=LOWER($2) ORDER BY COALESCE(bond,0) DESC LIMIT 1", sid, name)
+                row = await Database.fetchrow(
+                    "SELECT name,bond,role,voice_profile,status FROM maya_rp.characters WHERE session_id=$1 AND LOWER(name)=LOWER($2) ORDER BY COALESCE(bond,0) DESC LIMIT 1",
+                    sid,
+                    name,
+                )
                 if not row:
-                    row = await Database.fetchrow("SELECT name,bond,role,voice_profile,status FROM maya_rp.characters WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) ORDER BY COALESCE(bond,0) DESC LIMIT 1", sid, f"%{name}%")
+                    row = await Database.fetchrow(
+                        "SELECT name,bond,role,voice_profile,status FROM maya_rp.characters WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) ORDER BY COALESCE(bond,0) DESC LIMIT 1",
+                        sid,
+                        f"%{name}%",
+                    )
                 result["data"] = dict(row) if row else {"error": "not found"}
             else:
-                rows = await Database.fetch("SELECT name,bond,role FROM maya_rp.characters WHERE session_id=$1 AND status='active' ORDER BY bond DESC LIMIT 15", sid)
+                rows = await Database.fetch(
+                    "SELECT name,bond,role FROM maya_rp.characters WHERE session_id=$1 AND status='active' ORDER BY bond DESC LIMIT 15",
+                    sid,
+                )
                 result["data"] = [dict(r) for r in rows]
             result["status"] = "ok"
 
@@ -65,7 +213,11 @@ async def handle(action: str, params: dict = None) -> dict:
                 result["data"] = "Provide a character name or id."
                 return result
 
-            from modules.character_profile import get_character_card, get_character_card_by_name
+            from modules.character_profile import (
+                get_character_card,
+                get_character_card_by_name,
+            )
+
             if name_or_id.isdigit():
                 result["data"] = await get_character_card(int(name_or_id), sid)
             else:
@@ -84,7 +236,8 @@ async def handle(action: str, params: dict = None) -> dict:
             row = await Database.fetchrow(
                 "SELECT id, name, faction, resistance, intel_value, status, cell_security, escape_risk_pct, conversion_path "
                 "FROM maya_rp.prisoners WHERE id=$1 AND session_id=$2",
-                int(prisoner_id), sid,
+                int(prisoner_id),
+                sid,
             )
             if not row:
                 result["data"] = {"error": "Prisoner not found"}
@@ -120,6 +273,7 @@ async def handle(action: str, params: dict = None) -> dict:
         elif action == "check":
             text = params.get("text", "")
             from core.guard import check
+
             issues = await check(text, sid)
             result["data"] = issues
             result["status"] = "ok"
@@ -128,6 +282,7 @@ async def handle(action: str, params: dict = None) -> dict:
             char_id = params.get("character_id", 0)
             topic = params.get("topic", "")
             from modules.conversation_log import check as dup_check
+
             dup = await dup_check(char_id, topic, sid)
             result["data"] = dup
             result["status"] = "ok"
@@ -135,27 +290,45 @@ async def handle(action: str, params: dict = None) -> dict:
         elif action == "memory":
             query = params.get("query", "")
             from core.memory import recall
+
             matches = await recall(query, 5, sid)
             result["data"] = matches
             result["status"] = "ok"
 
         elif action == "objectives":
             from modules.objectives import objectives_to_prompt
+
             result["data"] = await objectives_to_prompt(sid)
             result["status"] = "ok"
 
         elif action == "save":
-            label = params.get("label", f"Kilo Auto-save Day {await Database.fetchval('SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1', sid)}")
+            label = params.get(
+                "label",
+                f"Kilo Auto-save Day {await Database.fetchval('SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1', sid)}",
+            )
             from core.state import StateManager
+
             fp = await StateManager.save_checkpoint(sid, label)
             result["data"] = {"path": str(fp)} if fp else {}
             result["status"] = "ok"
 
         elif action == "status":
-            s = await Database.fetchrow("SELECT name,status,game_day FROM maya_rp.sessions WHERE id=$1", sid)
-            r = await Database.fetchrow("SELECT credits,alloys,fuel FROM maya_rp.resources WHERE session_id=$1", sid)
-            sh = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.ships WHERE session_id=$1 AND status='active'", sid)
-            result["data"] = {"session": dict(s) if s else {}, "resources": dict(r) if r else {}, "active_ships": sh or 0}
+            s = await Database.fetchrow(
+                "SELECT name,status,game_day FROM maya_rp.sessions WHERE id=$1", sid
+            )
+            r = await Database.fetchrow(
+                "SELECT credits,alloys,fuel FROM maya_rp.resources WHERE session_id=$1",
+                sid,
+            )
+            sh = await Database.fetchval(
+                "SELECT COUNT(*) FROM maya_rp.ships WHERE session_id=$1 AND status='active'",
+                sid,
+            )
+            result["data"] = {
+                "session": dict(s) if s else {},
+                "resources": dict(r) if r else {},
+                "active_ships": sh or 0,
+            }
             result["status"] = "ok"
 
         # ═══════════════════════════════════════════════════════════
@@ -167,17 +340,61 @@ async def handle(action: str, params: dict = None) -> dict:
             days = params.get("days", 30)
             focus = params.get("focus", "balanced")
             from modules.chrono_engine import execute_time_skip
+
             result["data"] = await execute_time_skip(days, focus, sid)
             result["status"] = "ok"
 
         elif action == "collapse_status":
             """Check if any collapse conditions have been triggered."""
             from modules.collapse import check_for_collapse
+
             c = await check_for_collapse(sid)
             if c:
                 result["data"] = c
             else:
                 result["data"] = {"status": "stable"}
+            result["status"] = "ok"
+
+        # ═══════════════════════════════════════════════════════════
+        # DECISION PROVENANCE ACTIONS (Semantica plan, Fasa 1+2)
+        # ═══════════════════════════════════════════════════════════
+        elif action == "lineage":
+            """Walk a decision's causal chain, or find decisions touching a fact.
+            params: {decision_id: int} | {fact: str, value?: any}
+            """
+            from core.provenance import why_cli
+            from core.decision import chain, by_fact
+
+            did = params.get("decision_id")
+            if did is not None:
+                hops = await chain(sid, int(did))
+                result["data"] = {"decision_id": int(did), "hops": hops,
+                                  "hop_count": len(hops)}
+            else:
+                fact = params.get("fact", "")
+                value = params.get("value")
+                if fact:
+                    text = await why_cli(fact, sid)
+                    rows = await by_fact(sid, fact.lower().strip(), value)
+                    result["data"] = {"fact": fact, "summary": text,
+                                      "decisions": rows}
+                else:
+                    result["data"] = {"error": "need decision_id or fact"}
+            result["status"] = "ok"
+        elif action == "decisions":
+            """Unified decision stream (decrees + plan items).
+            params: {day?: int, kind?: str, status?: str, limit?: int}
+            """
+            from core.decision import decisions
+
+            rows = await decisions(
+                sid,
+                day=params.get("day"),
+                kind=params.get("kind"),
+                status=params.get("status"),
+                limit=params.get("limit", 20),
+            )
+            result["data"] = {"count": len(rows), "list": rows}
             result["status"] = "ok"
 
         # ═══════════════════════════════════════════════════════════
@@ -200,8 +417,12 @@ async def handle(action: str, params: dict = None) -> dict:
 
             # Lore branching: get current game_day so we only show
             # procedural lore <= this point in time
-            current_day = await Database.fetchval(
-                "SELECT game_day FROM maya_rp.sessions WHERE id=$1", sid) or 9999
+            current_day = (
+                await Database.fetchval(
+                    "SELECT game_day FROM maya_rp.sessions WHERE id=$1", sid
+                )
+                or 9999
+            )
 
             # Build a WHERE clause that respects lore branching:
             #   - Hand-authored articles (is_procedural=false) always visible
@@ -218,7 +439,9 @@ async def handle(action: str, params: dict = None) -> dict:
                 try:
                     speaker_faction = await Database.fetchval(
                         "SELECT faction FROM maya_rp.characters WHERE LOWER(name)=LOWER($1) AND session_id=$2",
-                        speaker, sid)
+                        speaker,
+                        sid,
+                    )
                 except Exception:
                     pass
 
@@ -228,42 +451,65 @@ async def handle(action: str, params: dict = None) -> dict:
                        FROM maya_rp.wiki_articles
                        WHERE session_id=$2 AND category=$4 AND {timeline_filter}
                        ORDER BY embedding <=> $1::vector(768) LIMIT 3""",
-                    vstr, sid, current_day, category)
+                    vstr,
+                    sid,
+                    current_day,
+                    category,
+                )
             elif speaker_faction:
                 rows = await Database.fetch(
                     f"""SELECT title, category, content, 1 - (embedding <=> $1::vector(768)) AS sim
                        FROM maya_rp.wiki_articles
                        WHERE session_id=$2 AND (tags @> ARRAY[$4] OR category='history') AND {timeline_filter}
                        ORDER BY embedding <=> $1::vector(768) LIMIT 3""",
-                    vstr, sid, current_day, speaker_faction)
+                    vstr,
+                    sid,
+                    current_day,
+                    speaker_faction,
+                )
                 if not rows or all(r["sim"] is None or r["sim"] < 0.50 for r in rows):
                     rows = await Database.fetch(
                         f"""SELECT title, category, content, 1 - (embedding <=> $1::vector(768)) AS sim
                            FROM maya_rp.wiki_articles
                            WHERE session_id=$2 AND {timeline_filter}
                            ORDER BY embedding <=> $1::vector(768) LIMIT 3""",
-                        vstr, sid, current_day)
+                        vstr,
+                        sid,
+                        current_day,
+                    )
             else:
                 rows = await Database.fetch(
                     f"""SELECT title, category, content, 1 - (embedding <=> $1::vector(768)) AS sim
                        FROM maya_rp.wiki_articles
                        WHERE session_id=$2 AND {timeline_filter}
                        ORDER BY embedding <=> $1::vector(768) LIMIT 3""",
-                    vstr, sid, current_day)
+                    vstr,
+                    sid,
+                    current_day,
+                )
 
             data = []
             from core.context_sentinel import scan_text
+
             for r in rows:
                 sim = r["sim"]
                 if sim is not None and sim >= threshold:
-                    safe = scan_text(r["content"], source=f"pg:wiki_articles#{r['title']}")
-                    data.append({
-                        "title": r["title"],
-                        "category": r["category"],
-                        "content": safe.sanitized,
-                        "similarity": round(sim, 3),
-                    })
-            result["data"] = data if data else "No specific lore found. Use general knowledge or ask the player."
+                    safe = scan_text(
+                        r["content"], source=f"pg:wiki_articles#{r['title']}"
+                    )
+                    data.append(
+                        {
+                            "title": r["title"],
+                            "category": r["category"],
+                            "content": safe.sanitized,
+                            "similarity": round(sim, 3),
+                        }
+                    )
+            result["data"] = (
+                data
+                if data
+                else "No specific lore found. Use general knowledge or ask the player."
+            )
             result["status"] = "ok"
 
         elif action == "write_lore":
@@ -284,8 +530,12 @@ async def handle(action: str, params: dict = None) -> dict:
                 vstr = "[" + ",".join(map(str, vec)) + "]"
 
                 # Get current game_day for lore branching
-                game_day = await Database.fetchval(
-                    "SELECT game_day FROM maya_rp.sessions WHERE id=$1", sid) or 0
+                game_day = (
+                    await Database.fetchval(
+                        "SELECT game_day FROM maya_rp.sessions WHERE id=$1", sid
+                    )
+                    or 0
+                )
 
                 await Database.execute(
                     """INSERT INTO maya_rp.wiki_articles
@@ -297,7 +547,14 @@ async def handle(action: str, params: dict = None) -> dict:
                        DO UPDATE SET content = EXCLUDED.content, tags = EXCLUDED.tags,
                                      relevance_end_day = EXCLUDED.relevance_end_day,
                                      recorded_at_game_day = EXCLUDED.recorded_at_game_day""",
-                    sid, title, category, content, tags, vstr, expire_day, game_day,
+                    sid,
+                    title,
+                    category,
+                    content,
+                    tags,
+                    vstr,
+                    expire_day,
+                    game_day,
                 )
                 result["data"] = f"Lore recorded: {title} (game_day {game_day})"
                 result["status"] = "ok"
@@ -308,7 +565,10 @@ async def handle(action: str, params: dict = None) -> dict:
             """Check if a proposed action violates hard-coded universe physics rules."""
             action_text = params.get("action", "")
             if not action_text:
-                result["data"] = {"violates_physics": False, "reason": "No action provided."}
+                result["data"] = {
+                    "violates_physics": False,
+                    "reason": "No action provided.",
+                }
                 return result
 
             vec = await embed_text(action_text)
@@ -319,7 +579,9 @@ async def handle(action: str, params: dict = None) -> dict:
                    FROM maya_rp.wiki_articles
                    WHERE session_id=$2 AND category='rules'
                    ORDER BY embedding <=> $1::vector(768) LIMIT 1""",
-                vstr, sid)
+                vstr,
+                sid,
+            )
 
             if rows and rows[0]["sim"] is not None and rows[0]["sim"] > 0.68:
                 result["data"] = {
@@ -337,14 +599,19 @@ async def handle(action: str, params: dict = None) -> dict:
             """Fetch system lore from wiki, or flag for generation if not found."""
             system_name = params.get("system_name", "")
             if not system_name:
-                result["data"] = {"status": "ERROR", "reason": "No system_name provided."}
+                result["data"] = {
+                    "status": "ERROR",
+                    "reason": "No system_name provided.",
+                }
                 return result
 
             existing = await Database.fetchrow(
                 """SELECT title, content, category FROM maya_rp.wiki_articles
                    WHERE session_id=$1 AND LOWER(title)=LOWER($2) AND category='location'
                    LIMIT 1""",
-                sid, system_name)
+                sid,
+                system_name,
+            )
 
             if existing:
                 result["data"] = {
@@ -358,9 +625,15 @@ async def handle(action: str, params: dict = None) -> dict:
                     """SELECT title, content FROM maya_rp.wiki_articles
                        WHERE session_id=$1 AND LOWER(title) LIKE LOWER($2) AND category='location'
                        ORDER BY LENGTH(title) ASC LIMIT 1""",
-                    sid, f"%{system_name}%")
+                    sid,
+                    f"%{system_name}%",
+                )
                 if partial:
-                    result["data"] = {"status": "FOUND_PARTIAL", "title": partial["title"], "content": partial["content"]}
+                    result["data"] = {
+                        "status": "FOUND_PARTIAL",
+                        "title": partial["title"],
+                        "content": partial["content"],
+                    }
                 else:
                     # CREATE a placeholder so future fetches find it (previously
                     # the "create" half of get_or_create never existed).
@@ -371,9 +644,14 @@ async def handle(action: str, params: dict = None) -> dict:
                            VALUES ($1, $2, 'location', $3, '[]'::jsonb, 'game_history', true,
                                    (SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1))
                            ON CONFLICT DO NOTHING""",
-                        sid, system_name,
-                        f"System lore placeholder for {system_name}. Awaiting survey data.")
-                    result["data"] = {"status": "CREATED_PLACEHOLDER", "system": system_name}
+                        sid,
+                        system_name,
+                        f"System lore placeholder for {system_name}. Awaiting survey data.",
+                    )
+                    result["data"] = {
+                        "status": "CREATED_PLACEHOLDER",
+                        "system": system_name,
+                    }
             result["status"] = "ok"
 
         elif action == "get_ambient_lore":
@@ -384,10 +662,14 @@ async def handle(action: str, params: dict = None) -> dict:
                 """SELECT title, content FROM maya_rp.wiki_articles
                    WHERE session_id=$1 AND category=$2
                    ORDER BY RANDOM() LIMIT 1""",
-                sid, category)
+                sid,
+                category,
+            )
 
             if row:
-                snippet = row["content"][:250] + ("..." if len(row["content"]) > 250 else "")
+                snippet = row["content"][:250] + (
+                    "..." if len(row["content"]) > 250 else ""
+                )
                 result["data"] = {
                     "title": row["title"],
                     "snippet": snippet,
@@ -399,10 +681,17 @@ async def handle(action: str, params: dict = None) -> dict:
                     """SELECT title, content, category FROM maya_rp.wiki_articles
                        WHERE session_id=$1
                        ORDER BY RANDOM() LIMIT 1""",
-                    sid)
+                    sid,
+                )
                 if row:
-                    snippet = row["content"][:250] + ("..." if len(row["content"]) > 250 else "")
-                    result["data"] = {"title": row["title"], "snippet": snippet, "category": row["category"]}
+                    snippet = row["content"][:250] + (
+                        "..." if len(row["content"]) > 250 else ""
+                    )
+                    result["data"] = {
+                        "title": row["title"],
+                        "snippet": snippet,
+                        "category": row["category"],
+                    }
                 else:
                     result["data"] = None
             result["status"] = "ok"
@@ -416,11 +705,16 @@ async def handle(action: str, params: dict = None) -> dict:
 
             if domain == "combat":
                 from modules.battle import resolve_intent
+
                 outcome = await resolve_intent(sid, intent_action, target, fleet_name)
                 # Forced-tag pipeline: engine resolves the math, LLM writes around the tag.
                 if isinstance(outcome, dict):
-                    wt = str(outcome.get("weapon_type") or outcome.get("weapon")
-                             or outcome.get("hit_type") or "RAILGUN_KINETIC").upper()
+                    wt = str(
+                        outcome.get("weapon_type")
+                        or outcome.get("weapon")
+                        or outcome.get("hit_type")
+                        or "RAILGUN_KINETIC"
+                    ).upper()
                     tag = f"[HIT: {wt}]"
                     outcome["forced_tag"] = tag
                     outcome["gm_instruction"] = (
@@ -432,23 +726,35 @@ async def handle(action: str, params: dict = None) -> dict:
                 result["status"] = "ok"
             elif domain == "economy":
                 from modules.economy import resolve_intent
-                outcome = await resolve_intent(sid, intent_action, target, params.get("amount", 0))
+
+                outcome = await resolve_intent(
+                    sid, intent_action, target, params.get("amount", 0)
+                )
                 result["data"] = outcome
                 result["status"] = "ok"
             elif domain == "diplomacy":
                 from modules.diplomacy import resolve_intent
+
                 outcome = await resolve_intent(sid, intent_action, target)
                 result["data"] = outcome
                 result["status"] = "ok"
             elif domain == "character":
                 from modules.characters import resolve_intent
-                outcome = await resolve_intent(sid, intent_action, target, params.get("character_id", 0))
+
+                outcome = await resolve_intent(
+                    sid, intent_action, target, params.get("character_id", 0)
+                )
                 result["data"] = outcome
                 result["status"] = "ok"
             else:
                 result["data"] = {
                     "error": f"Unknown domain: {domain}",
-                    "available_domains": ["combat", "economy", "diplomacy", "character"],
+                    "available_domains": [
+                        "combat",
+                        "economy",
+                        "diplomacy",
+                        "character",
+                    ],
                 }
 
         elif action == "manage_corp":
@@ -464,7 +770,8 @@ async def handle(action: str, params: dict = None) -> dict:
                     result["data"] = "Company name required."
                 else:
                     result["data"] = await corporations.charter_company(
-                        name, industry, ceo_id, sid)
+                        name, industry, ceo_id, sid
+                    )
 
             elif sub_action == "directive":
                 corp_id = params.get("corp_id", 0)
@@ -475,17 +782,22 @@ async def handle(action: str, params: dict = None) -> dict:
                     result["data"] = "Corp ID required."
                 else:
                     result["data"] = await corporations.issue_directive(
-                        corp_id, contract_type, target, duration, sid)
+                        corp_id, contract_type, target, duration, sid
+                    )
 
             elif sub_action == "list":
                 rows = await Database.fetch(
                     "SELECT id, name, industry, tier, treasury, efficiency, standing, "
                     "ceo_character_id, status FROM maya_rp.corporations "
-                    "WHERE session_id=$1 ORDER BY treasury DESC", sid)
+                    "WHERE session_id=$1 ORDER BY treasury DESC",
+                    sid,
+                )
                 result["data"] = [dict(r) for r in rows]
 
             else:
-                result["data"] = "Invalid sub_action. Use 'charter', 'directive' or 'list'."
+                result["data"] = (
+                    "Invalid sub_action. Use 'charter', 'directive' or 'list'."
+                )
             result["status"] = "ok"
 
         elif action == "den_ops":
@@ -496,7 +808,9 @@ async def handle(action: str, params: dict = None) -> dict:
             if sub_action == "bases":
                 rows = await Database.fetch(
                     "SELECT id, name, system_id, hidden, defenses, treasury, status "
-                    "FROM maya_rp.pirate_bases ORDER BY treasury DESC")
+                    "FROM maya_rp.pirate_bases WHERE session_id=$1 ORDER BY treasury DESC",
+                    sid,
+                )
                 result["data"] = [dict(r) for r in rows]
 
             elif sub_action == "raid":
@@ -511,14 +825,19 @@ async def handle(action: str, params: dict = None) -> dict:
                 rows = await Database.fetch(
                     "SELECT pb.pirate_faction_id, f.name, pb.bounty_amount, "
                     "f.status, pb.claimed_by FROM maya_rp.pirate_bounties pb "
-                    "JOIN maya_rp.factions f ON f.id=pb.pirate_faction_id")
+                    "JOIN maya_rp.factions f ON f.id=pb.pirate_faction_id "
+                    "WHERE pb.session_id=$1",
+                    sid,
+                )
                 result["data"] = [dict(r) for r in rows]
 
             elif sub_action == "claim":
                 result["data"] = await pirates.claim_bounty(sid, 6)
 
             else:
-                result["data"] = "Invalid sub_action. Use 'bases', 'raid', 'bounty' or 'claim'."
+                result["data"] = (
+                    "Invalid sub_action. Use 'bases', 'raid', 'bounty' or 'claim'."
+                )
             result["status"] = "ok"
 
         else:
@@ -526,20 +845,33 @@ async def handle(action: str, params: dict = None) -> dict:
 
     except Exception as e:
         import traceback
-        info("kilo_bridge", f"Action '{action}' FAILED: {traceback.format_exc(limit=4)}")
+
+        info(
+            "kilo_bridge", f"Action '{action}' FAILED: {traceback.format_exc(limit=4)}"
+        )
         result["data"] = str(e)
     finally:
         await Database.close()
     return result
 
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print(        json.dumps({"status": "error", "data": "No action. Try: briefing, status, scene, bonds, fleet, treasury, prisoners, character, check, check_duplicate, memory, objectives, save, get_lore, write_lore, check_physics, get_or_create_system_lore, get_ambient_lore, time_skip, collapse_status, action_intent, get_character_card, get_interrogation_context, manage_corp"}))
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "data": "No action. Try: briefing, status, scene, bonds, fleet, treasury, prisoners, character, check, check_duplicate, memory, objectives, save, get_lore, write_lore, check_physics, get_or_create_system_lore, get_ambient_lore, time_skip, collapse_status, action_intent, get_character_card, get_interrogation_context, manage_corp",
+                }
+            )
+        )
         sys.exit(1)
     action = sys.argv[1]
     params = {}
     if len(sys.argv) > 2:
-        try: params = json.loads(sys.argv[2])
-        except json.JSONDecodeError: pass
+        try:
+            params = json.loads(sys.argv[2])
+        except json.JSONDecodeError:
+            pass
     result = asyncio.run(handle(action, params))
-    print(json.dumps(result))
+    print(json.dumps(result, default=str))

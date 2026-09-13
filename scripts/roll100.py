@@ -8,11 +8,16 @@ Flags:
   --no-builds        skip build-queue completion
   --no-collapse      skip collapse check
   --no-sarang        skip Sarang carrier insertion
+  --no-preg          skip pregnancy progression (births OFF — default ON)
   --rates A,B,C      override daily credits, alloys, fuel (e.g. --rates 12000000,700000,110000)
 
 Build logic (flexible, game-day based): each in_build row accumulates progress equal to the
 number of game days rolled. A build completes when accumulated progress >= build_time_days.
 Progress is tracked in maya_rp.roll_state (build_progress JSONB map: build_id -> days done).
+
+Pregnancy logic: after game_day advances, every tracked pregnancy is progressed against the
+new day — trimesters advance, due_soon flags set, and any pregnancy past due_game_day fires
+a birth. This keeps babies on the SAME clock as ships, so narration skips reconcile BOTH.
 
 Sarang carriers: spawned only from completed Sarang build-queue rows (not hardcoded).
 """
@@ -38,6 +43,7 @@ def parse_flags(argv: list[str]) -> dict:
         "no_builds": "--no-builds" in argv,
         "no_collapse": "--no-collapse" in argv,
         "no_sarang": "--no-sarang" in argv,
+        "no_preg": "--no-preg" in argv,
     }
     days = 100
     for a in argv:
@@ -83,6 +89,10 @@ async def main() -> None:
 
     # 1. World simulation — economy focus (research, morale, geopolitics)
     r = await execute_time_skip(days, focus="economy", session_id=SID)
+    if "error" in r:
+        print(f"❌ CHRONO ERROR: {r['error']} — aborting roll (day unchanged)")
+        await Database.close()
+        return
     print(f"SIM EVENTS: {len(r.get('events', []))}  SIM ECONOMY: {r.get('economy')}")
 
     # 2. Transparent resource override
@@ -165,6 +175,38 @@ async def main() -> None:
             print(f"SARANG CARRIERS: {spawned} spawned from completed builds")
         else:
             print(f"SARANG CARRIERS: none ({existing} already present or builds not complete)")
+
+    # 4b. Pregnancy progression — babies on the SAME clock as ships.
+    #    Narration skips must reconcile pregnancies too (no more silent siap for wombs).
+    if flags["no_preg"]:
+        print("PREGNANCY: skipped (--no-preg)")
+    else:
+        from modules.pregnancy import advance as pregnancy_advance
+        preg = await pregnancy_advance(SID)
+        births = preg.get("births", [])
+        checked = preg.get("checked", 0)
+        updated = preg.get("updated", 0)
+        print(f"PREGNANCY: checked {checked} · updated {updated} · births {len(births)}")
+        for b in births:
+            print(f"   👶 BIRTH: {b.get('mother')} → {b.get('name')} ({b.get('gender')}), day {b.get('game_day')}")
+
+    # 4c. Voyage transit — fleets land on schedule during skips (same clock as ships/babies)
+    from modules.voyage import advance as voyage_advance
+    voy = await voyage_advance(SID)
+    if voy.get("arrivals", 0) > 0:
+        print(f"VOYAGES: {voy['arrivals']} arrived — {', '.join(voy['arrived'])}")
+    else:
+        print("VOYAGES: none due")
+
+    # 4d. Population sentiment — refresh across the skip (people feel time pass)
+    from modules.population_sentiment import run_tick as sentiment_tick
+    sent = await sentiment_tick(SID)
+    print(f"SENTIMENT: {sent.get('updated', 0)} rows refreshed · news bias {sent.get('news_bias_applied', 0)}")
+
+    # 4e. Ministry AI — ministries act/prompt depending on King presence
+    from modules.ministry_ai import run_tick as ministry_tick
+    mini = await ministry_tick(SID)
+    print(f"MINISTRY: king_present={mini.get('king_present')} · autonomous {mini.get('taken_autonomous')} · prompts {mini.get('prompted')}")
 
     # 5. Collapse check (optional)
     if flags["no_collapse"]:

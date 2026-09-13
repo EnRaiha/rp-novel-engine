@@ -12,9 +12,14 @@ BURN_RATES = {"per_active_ship": 10, "base_consumption": 50, "food_per_pop": 0.0
 async def calculate_daily_burn(session_id: int) -> dict:
     ships = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.ships WHERE session_id=$1 AND status IN ('active','patrol','deployed')", session_id) or 0
     pop = await Database.fetchval("SELECT population FROM maya_rp.resources WHERE session_id=$1", session_id) or 0
+    # crew salaries: every crewed hull draws wages (2026-08-14)
+    crew = await Database.fetchval(
+        "SELECT COALESCE(SUM(crew_current),0) FROM maya_rp.ships WHERE session_id=$1", session_id) or 0
     fuel_burn = (ships or 2) * BURN_RATES["per_active_ship"] + BURN_RATES["base_consumption"]
     food_burn = max(1, round(pop * BURN_RATES["food_per_pop"] * 24))
-    return {"fuel": fuel_burn, "food": food_burn, "alloy": 0, "credits": 100, "active_ships": ships}
+    salary_burn = int(crew * 2)  # 2C per crewman per game-day
+    return {"fuel": fuel_burn, "food": food_burn, "alloy": 0,
+            "credits": 100 + salary_burn, "active_ships": ships, "crew": crew}
 
 async def apply_burn(session_id: int) -> dict:
     burn = await calculate_daily_burn(session_id)

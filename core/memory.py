@@ -7,8 +7,13 @@ from core.db import Database
 from core.config import Config
 from core.log import info
 
+from core.embed import RP_EMBED_MODEL
+
 EMBED_URL = "http://localhost:11434/api/embeddings"
-EMBED_MODEL = "nomic-embed-text"
+EMBED_MODEL = RP_EMBED_MODEL
+
+import asyncio
+_OLLAMA_LOCK = asyncio.Lock()  # one Ollama job at a time on the 1060 (2026-08-14)
 
 async def _embed(text: str, keep_alive: str = "30m") -> list[float]:
     """Generate embedding via local Ollama on GTX 1060. ~50ms per call when hot.
@@ -16,10 +21,11 @@ async def _embed(text: str, keep_alive: str = "30m") -> list[float]:
     keep_alive 30m: keeps nomic-embed-text resident so the interceptor's
     semantic tier never pays cold-load latency (contends with 8B generator).
     """
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(EMBED_URL, json={
-            "model": EMBED_MODEL, "prompt": text, "keep_alive": keep_alive})
-        return resp.json()["embedding"]
+    async with _OLLAMA_LOCK:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(EMBED_URL, json={
+                "model": EMBED_MODEL, "prompt": text, "keep_alive": keep_alive})
+            return resp.json()["embedding"]
 
 # Public alias — used by wiki_ingest.py, kilo_bridge.py, and any external script
 embed_text = _embed

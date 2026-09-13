@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
 """
-Local Generation — offline prose generation via local Ollama models.
+Local Generation — prose generation via DeepSeek (sole-DS, 2026-08-15).
 
 Primary use: pre-generate stream templates (intimacy expansions, environment,
 combat) that the StreamInterceptor serves at runtime with zero latency and
 zero cost. The main loop LLM never has to write explicit prose — it just
 emits tags, and this module writes the stored templates offline.
 
-Models:
-  - huihui_ai/qwen3-abliterated:8b  (primary — 5.0GB, fits GTX 1060 6GB)
-  - fredrezones55/Qwen3.5-Uncensored-HauhauCS-Aggressive:4b (fast fallback)
+Transport: DeepSeek API (core/deepseek_client.py). Formerly Ollama qwen
+(huihui_ai/qwen3-abliterated:8b) — migrated 2026-08-15 under Izzat's
+sole-DeepSeek decision. Ollama remains ONLY for embeddings (core/embed.py).
 """
+
 from __future__ import annotations
 import re
 from typing import Any
 
-import httpx
-
 from core.db import Database
 from core.log import info
+from core import deepseek_client as ds
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-PRIMARY_MODEL = "huihui_ai/qwen3-abliterated:8b"
-FAST_MODEL = "fredrezones55/Qwen3.5-Uncensored-HauhauCS-Aggressive:4b"
+PRIMARY_MODEL = ds.DEFAULT_MODEL
+FAST_MODEL = ds.DEFAULT_MODEL
 
 
 def _strip_think(text: str) -> str:
@@ -36,22 +35,27 @@ async def generate(
     prompt: str,
     model: str = PRIMARY_MODEL,
     max_tokens: int = 350,
-    timeout: float = 300.0,
+    timeout: float = 120.0,
     temperature: float = 0.8,
 ) -> str:
-    """Generate text via local Ollama. Returns stripped response."""
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(OLLAMA_URL, json={
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "think": False,
-            "options": {"num_predict": max_tokens, "temperature": temperature},
-            "keep_alive": "10m",
-        })
-        resp.raise_for_status()
-        data = resp.json()
-        return _strip_think(data.get("response", ""))
+    """Generate text via DeepSeek (sole provider). Returns stripped response."""
+    text = await ds.generate(
+        prompt,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout=timeout,
+    )
+    text = _strip_think(text)
+    try:
+        from modules.guardrails import check_generation
+
+        gate = check_generation(text)
+        if not gate.get("allowed"):
+            return "[generation blocked: " + gate.get("reason", "guardrail") + "]"
+    except Exception:
+        pass
+    return text
 
 
 async def generate_intimacy_template(
@@ -86,6 +90,7 @@ async def upsert_template(
     """Upsert a stream template + regenerate its semantic embedding."""
     if readable_hint:
         from core.memory import _embed
+
         vec = await _embed(readable_hint)
         vstr = "[" + ",".join(map(str, vec)) + "]"
     else:
@@ -101,8 +106,13 @@ async def upsert_template(
         "readable_hint = EXCLUDED.readable_hint, "
         "required_context = EXCLUDED.required_context, "
         "trigger_tag_embed = EXCLUDED.trigger_tag_embed",
-        trigger_tag, expanded_text, category, readable_hint,
-        __import__("json").dumps(required_context or []), vstr)
+        trigger_tag,
+        expanded_text,
+        category,
+        readable_hint,
+        __import__("json").dumps(required_context or []),
+        vstr,
+    )
 
     info("local_gen", f"Upserted template: {trigger_tag}")
     return {"trigger_tag": trigger_tag, "category": category}

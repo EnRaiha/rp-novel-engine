@@ -1,60 +1,37 @@
-"""Character Manager — presence, control, relationships, arcs, unified view."""
-from typing import Dict, List, Optional
+"""Character module — tick + action-intent parser.
+
+QA cleanup 2026-08-14: removed the CharacterManager class (dead API with
+zero call sites; kilo_bridge queries characters directly). Presence/control
+changes go through the database directly.
+"""
 from core.db import Database
-from core.events import EventBus
 from core.config import Config
 
-class CharacterManager:
-    @classmethod
-    async def get(cls, table: str, cid: int) -> Optional[Dict]:
-        return await Database.fetchrow(f"SELECT * FROM {table} WHERE id=$1", cid)
-
-    @classmethod
-    async def all_present(cls, scene: str = None) -> List[Dict]:
-        q = "SELECT * FROM characters_unified WHERE presence='available'"
-        p = []
-        if scene: q += " AND scene_location=$1"; p.append(scene)
-        return await Database.fetch(q, *p)
-
-    @classmethod
-    async def set_presence(cls, table: str, cid: int, presence: str, reason: str = "system"):
-        old = await cls.get(table, cid)
-        if not old or old.get("presence") == presence: return
-        await Database.execute(f"UPDATE {table} SET presence=$1 WHERE id=$2", presence, cid)
-        await Database.execute(
-            "INSERT INTO character_presence_log (character_table,character_id,previous_presence,new_presence,changed_by,reason) VALUES ($1,$2,$3,$4,$5,$6)",
-            table, cid, old.get("presence","?"), presence, "system", reason)
-        await EventBus.emit("presence_changed", {"table": table, "id": cid, "to": presence})
-
-    @classmethod
-    async def set_control(cls, table: str, cid: int, control: str):
-        await Database.execute(f"UPDATE {table} SET controlled_by=$1 WHERE id=$2", control, cid)
-        await EventBus.emit("control_changed", {"table": table, "id": cid, "to": control})
-
-    @classmethod
-    async def set_relationship(cls, ta: str, ia: int, tb: str, ib: int, rtype: str, strength: int):
-        await Database.execute(
-            "INSERT INTO character_relationships (character_a_table,character_a_id,character_b_table,character_b_id,relationship_type,strength) "
-            "VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO UPDATE SET relationship_type=$5,strength=$6,updated_at=NOW()",
-            ta, ia, tb, ib, rtype, strength)
-        await EventBus.emit("relationship_set", {"a": f"{ta}/{ia}", "b": f"{tb}/{ib}", "type": rtype})
-
-    @classmethod
-    async def move_to_scene(cls, table: str, cid: int, scene: str):
-        await Database.execute(f"UPDATE {table} SET scene_location=$1, presence='available' WHERE id=$2", scene, cid)
-        await EventBus.emit("character_moved", {"table": table, "id": cid, "scene": scene})
-
-    @classmethod
-    async def start_arc(cls, table: str, cid: int, name: str, desc: str):
-        await Database.execute(
-            "INSERT INTO character_arcs (character_table,character_id,arc_name,arc_description,status,started_at) VALUES ($1,$2,$3,$4,'active',NOW())",
-            table, cid, name, desc)
-
 async def run_tick(session_id: int = None):
+    """Character arc aging (added 2026-08-14): arcs inactive for 20+ days
+    are marked stale and surfaced as events so the GM can retire or resume."""
     from core.log import info
+    import json
     if session_id is None: session_id = Config.SESSION_ID
-    info("characters", "Tick: no active arcs")
-    return {"character_arcs": 0}
+    try:
+        stale = await Database.fetch(
+            "SELECT id, character_table, character_id, arc_name FROM maya_rp.character_arcs "
+            "WHERE status='active' AND started_at < NOW() - INTERVAL '20 days'")
+        if stale:
+            for a in stale:
+                await Database.execute(
+                    "UPDATE maya_rp.character_arcs SET status='stale' WHERE id=$1", a["id"])
+            await Database.execute(
+                "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
+                "VALUES ($1, NOW(), 'character_arc', $2, $3, $4, 2)",
+                session_id, "Character arcs went stale",
+                f"{len(stale)} character arcs untouched for 20+ days — resume or retire",
+                json.dumps(["character", "arcs"]))
+        info("characters", f"Tick: arcs={len(stale)} stale")
+        return {"character_arcs": 0, "stale_arcs": len(stale)}
+    except Exception as e:
+        info("characters", f"Error: {e}")
+        return {"error": str(e)}
 
 
 # ─── Action Parser: resolve_intent ───────────────────────────────────────

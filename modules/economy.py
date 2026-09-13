@@ -17,8 +17,11 @@ BRACKETS = (
     (None, 0.008),
 )
 
-def _territory_tax(pop, rate, dev_mult, crisis_pen):
-    """Marginal bracket tax — returns credits/day for one territory."""
+def _territory_tax(pop, rate, dev_mult, crisis_pen, market_mult: float = 1.0):
+    """Marginal bracket tax — returns credits/day for one territory.
+
+    market_mult (2026-08-14): commodity price index feedback — hot markets
+    inflate trade-linked tax receipts, cold ones deflate them."""
     rev = 0.0
     remaining = pop
     prev = 0
@@ -31,16 +34,46 @@ def _territory_tax(pop, rate, dev_mult, crisis_pen):
             taxed = min(remaining, limit - prev)
         # Development bonus applies to the productive core population only.
         dev = dev_mult if mult == 1.0 else 1.0
-        rev += taxed * rate * mult * dev * crisis_pen
+        rev += taxed * rate * mult * dev * crisis_pen * market_mult
         remaining -= taxed
         prev = limit if limit is not None else prev
     return rev
+
+GATE_TOLL_RATE = 25000            # fair toll per crossing — third parties pay
+GATE_TOLL_VOLUME_PER_CROSSING = 40  # units of trade volume = one crossing
+
+
+async def gate_toll_income(session_id: int = 3) -> int:
+    """Foreign-faction gate tolls → Setia treasury (2026-08-15 Izzat canon).
+
+    Setia uses its own gates FREE. Third parties pay the fair toll; income is
+    grounded in active trade deals between Setia and non-Setia factions,
+    scaled by volume (one crossing per GATE_TOLL_VOLUME_PER_CROSSING units).
+    """
+    try:
+        volume = await Database.fetchval(
+            """SELECT COALESCE(SUM(ftd.quantity), 0)
+               FROM maya_rp.faction_trade_deals ftd
+               JOIN maya_rp.factions fa ON fa.id = ftd.faction_a_id
+               JOIN maya_rp.factions fb ON fb.id = ftd.faction_b_id
+               WHERE ftd.active
+                 AND ((fa.name ILIKE '%Setia%') <> (fb.name ILIKE '%Setia%'))""")
+    except Exception:
+        volume = 0
+    return (int(volume or 0) // GATE_TOLL_VOLUME_PER_CROSSING) * GATE_TOLL_RATE
+
 
 async def run_tick(session_id: int = 3):
     row = await Database.fetchrow("SELECT last_tick_at FROM resources WHERE session_id=$1", session_id)
     if not row or not row.get("last_tick_at"):
         return
     gd = calc_game_days(row["last_tick_at"])
+    try:
+        from modules.market import get_market_index
+        _mk = get_market_index(session_id)
+        market_mult = 0.9 + 0.2 * min(await _mk, 1.5)
+    except Exception:
+        market_mult = 1.0
     if gd < 0.01:
         return
 
@@ -73,7 +106,7 @@ async def run_tick(session_id: int = 3):
         crisis = t["crisis_level"] or 0
         crisis_pen = max(0.2, 1 - crisis * 0.05)
         dev_mult = 1 + (dev - 1) * 0.1
-        daily = _territory_tax(pop, rate, dev_mult, crisis_pen)
+        daily = _territory_tax(pop, rate, dev_mult, crisis_pen, market_mult)
         rev = int(daily * gd)
         total_rev += rev
 
@@ -92,7 +125,14 @@ async def run_tick(session_id: int = 3):
             natural_growth = 0
 
         # 3. DEATH / ATTRITION — taxes above 20%, crisis, overpopulation.
-        tax_death_rate = max(0.0, rate - 0.20) * 2.0 * gd
+        try:
+            from modules.ideology import tax_tolerance
+            tol = tax_tolerance((await Database.fetchrow(
+                "SELECT ideology FROM maya_rp.ideology_state WHERE session_id=$1",
+                session_id) or {}).get("ideology", "benevolent_democracy"))
+        except Exception:
+            tol = 0.20
+        tax_death_rate = max(0.0, rate - tol) * 2.0 * gd
         crisis_death_rate = (crisis * 0.01) * gd
         overpop_death_rate = (max(0.0, pop - carrying_cap) / carrying_cap) * 0.005 * gd
         attrition_rate = tax_death_rate + crisis_death_rate + overpop_death_rate
@@ -163,12 +203,23 @@ async def run_tick(session_id: int = 3):
     inc_a = int(150_000 * gd)
     inc_f = int(120_000 * gd)
     inc_c = int(200_000 * gd) + total_rev
+
+    # ── GATE TOLL INCOME (2026-08-15 Izzat canon) ──
+    # Setia uses its own gates FREE (infrastructure). THIRD PARTIES pay the
+    # fair toll (25,000C per crossing). Income = foreign factions' traffic
+    # through the gates — grounded in active trade deals with non-Setia
+    # factions, scaled by traffic volume.
+    toll_income = await gate_toll_income(session_id)
+    if toll_income:
+        inc_c += toll_income
+
     await Database.execute(
         "UPDATE resources SET alloys=alloys+$1, fuel=fuel+$2, credits=credits+$3, last_tick_at=$4 WHERE session_id=$5",
         inc_a, inc_f, inc_c, datetime.now(timezone.utc), session_id)
 
     print(f"  Economy: +{total_rev:,}C tax | +{inc_a:,}A / +{inc_f:,}F / +{inc_c:,}C "
-          f"| pop {total_empire_pop:,} (loss {global_pop_loss:,}, refugees {refugee_pool:,})")
+          f"| pop {total_empire_pop:,} (loss {global_pop_loss:,}, refugees {refugee_pool:,})"
+          + (f" | gate toll +{toll_income:,}C" if toll_income else ""))
 
 
 # ─── Action Parser: resolve_intent ───────────────────────────────────────

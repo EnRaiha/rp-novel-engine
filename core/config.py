@@ -57,8 +57,9 @@ class Config:
         "prison": True, "romance": True, "social": True,
         "mystery": True, "council": True, "celestial": True,
         "fleet_economy": True, "tactics": True, "events": True,
+        "market": True,
         # Existing game systems (7)
-        "pirates": True, "slave_system": True,
+        "pirates": True, "slave_system": True, "pregnancy": True,
         "megastructures_ports": True, "infrastructure": True,
         "space_wonders": True, "space_horror": True, "battle": True,
         # Ship operations (5)
@@ -75,7 +76,7 @@ class Config:
         "adventures": True, "narrator": True, "news": True,
         "quest": True, "epilogue": True, "image_gen": True,
         # Integration & safety (4)
-        "agnes": True, "guardrails": True, "faction_ai": True,
+        "agnes": False, "guardrails": True, "faction_ai": True,
         "event_catalog": True, "collapse": True,
         # Characters
         "characters": True,
@@ -91,6 +92,8 @@ class Config:
         # Frontiers
         "logistics": True, "geopolitics": True, "crew_career": True, "ideology": True,
         "corporations": True,
+        # Transit — real voyage time accounting
+        "voyage": True, "population_sentiment": True, "ministry_ai": True,
     }
 
     # ─── Tick Control ───────────────────────────────────────────

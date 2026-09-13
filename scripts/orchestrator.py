@@ -9,7 +9,7 @@ from core.config import Config
 from core.events import EventBus
 from core.log import info, error
 
-from modules import economy, narrative, diplomacy, research, victory
+from modules import economy, narrative, diplomacy, research, victory, market
 from modules import pirates, slave_system, space_wonders
 from modules import megastructures_ports, infrastructure, space_horror, battle
 from modules import prison, romance, social, council
@@ -19,15 +19,18 @@ from modules import ship_generation, ship_building, fleet, refit
 from modules import espionage, darkops, stealth, defense, siege, disasters, weapon_design
 from modules import tech_tree, manufacturing, exoscience, academy, university, alchemy
 from modules import archaeology, artifacts, adventures, narrator, news, quest, epilogue
-from modules import image_gen, agnes, guardrails, faction_ai, event_catalog
+from modules import image_gen, guardrails, faction_ai, event_catalog
 from modules import characters, locations, calendar_tkg, memories, war, narrative_seeds
 from modules import objectives as objectives_mod, environment as environment_mod
 from modules import npc_autonomy, secrets as secrets_mod, themes as themes_mod
-from modules import meanwhile, conversation_log, physical_state, chekhov, world_react
+from modules import conversation_log, physical_state, chekhov, world_react
 from modules import logistics, geopolitics, crew_career, ideology
 from modules import auto_queue, corporations
 from modules import collapse as collapse_mod
 from modules import wreck_assembly, duel, crew_system
+from modules import voyage as voyage_mod
+from modules import population_sentiment as population_sentiment_mod
+from modules import ministry_ai as ministry_ai_mod
 from core import consequences as consequences_mod
 from core.pacing import PacingDirector
 
@@ -97,6 +100,7 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
         # Phase 1: Economy & Resources
         await tick_header("Phase 1/24: Economy")
         if await tick("economy", economy, session_id): modules_ok += 1
+        if await tick("market", market, session_id): modules_ok += 1
         else: modules_failed += 1
         # Crew production (novel: crew bottleneck)
         if await tick("crew_system", crew_system, session_id): modules_ok += 1
@@ -117,6 +121,13 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
         if await tick("romance", romance, session_id): modules_ok += 1
         else: modules_failed += 1
         if await tick("pregnancy", pregnancy_mod, session_id): modules_ok += 1
+        else: modules_failed += 1
+        # Voyages — fleets arrive on schedule (transit days booked)
+        if await tick("voyage", voyage_mod, session_id): modules_ok += 1
+        # Population sentiment — how the people feel (resource-driven, faction-independent)
+        if await tick("population_sentiment", population_sentiment_mod, session_id): modules_ok += 1
+        # Ministry AI — ministries do their jobs; prompt King via adjutant when present
+        if await tick("ministry_ai", ministry_ai_mod, session_id): modules_ok += 1
         else: modules_failed += 1
 
         # Phase 5: Council
@@ -230,8 +241,6 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
 
         # Phase 18: Integration & Safety
         await tick_header("Phase 18/24: Integration & Safety")
-        if await tick("agnes", agnes, session_id): modules_ok += 1
-        else: modules_failed += 1
         if await tick("guardrails", guardrails, session_id): modules_ok += 1
         else: modules_failed += 1
 
@@ -260,7 +269,7 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
         else: modules_failed += 1
 
         # Phase 25: Calendar & Consequences
-        await tick_header("Phase 25/28: Calendar & Consequences")
+        await tick_header("Phase 25/32: Calendar & Consequences")
         if await tick("calendar", calendar_tkg, session_id): modules_ok += 1
         else: modules_failed += 1
         if await tick("consequences", consequences_mod, session_id): modules_ok += 1
@@ -269,19 +278,19 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
         else: modules_failed += 1
 
         # Phase 26: War & Memories
-        await tick_header("Phase 26/28: War & Memories")
+        await tick_header("Phase 26/32: War & Memories")
         if await tick("war", war, session_id): modules_ok += 1
         else: modules_failed += 1
         if await tick("memories", memories, session_id): modules_ok += 1
         else: modules_failed += 1
 
         # Phase 27: Locations
-        await tick_header("Phase 27/28: Locations & Scenes")
+        await tick_header("Phase 27/32: Locations & Scenes")
         if await tick("locations", locations, session_id): modules_ok += 1
         else: modules_failed += 1
 
         # Phase 29: Geopolitics & Logistics
-        await tick_header("Phase 29/31: Geopolitics & Logistics")
+        await tick_header("Phase 28/32: Geopolitics & Logistics")
         if await tick("geopolitics", geopolitics, session_id): modules_ok += 1
         else: modules_failed += 1
         if await tick("logistics", logistics, session_id): modules_ok += 1
@@ -292,7 +301,7 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
         else: modules_failed += 1
 
         # Phase 30: Living Universe — GM Brain + off-screen life
-        await tick_header("Phase 30/31: Living Universe")
+        await tick_header("Phase 29/32: Living Universe")
         if await tick("pacing", PacingDirector, session_id): modules_ok += 1
         else: modules_failed += 1
         if await tick("objectives", objectives_mod, session_id): modules_ok += 1
@@ -313,17 +322,17 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
         else: modules_failed += 1
 
         # Phase 31: Endgame Watch — collapse triggers (now live via pop sync)
-        await tick_header("Phase 31/31: Endgame Watch")
+        await tick_header("Phase 30/32: Endgame Watch")
         if await tick("collapse", collapse_mod, session_id): modules_ok += 1
         else: modules_failed += 1
 
         # Phase 30: Ideology
-        await tick_header("Phase 30/31: Ideology & Progress")
+        await tick_header("Phase 31/32: Ideology & Progress")
         if await tick("ideology", ideology, session_id): modules_ok += 1
         else: modules_failed += 1
 
         # Phase 31: Ship Operations
-        await tick_header("Phase 31/31: Ship Operations")
+        await tick_header("Phase 32/32: Ship Operations")
         if await tick("ship_generation", ship_generation, session_id): modules_ok += 1
         else: modules_failed += 1
         if await tick("ship_building", ship_building, session_id): modules_ok += 1
@@ -337,21 +346,53 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
 
         # Summary
         duration_ms = int((time.monotonic() - tick_start) * 1000)
+        # ── Phase 32/32: Housekeeping (added 2026-08-14) ──
+        # events retention: archive rows older than 180 days when the table
+        # grows past 5K rows, so "recent events" queries stay fast.
+        try:
+            old = await Database.fetchval(
+                "SELECT COUNT(*) FROM maya_rp.events WHERE happened_at < NOW() - INTERVAL '180 days'")
+            total_ev = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.events")
+            if old and total_ev and total_ev > 5000:
+                archived = await Database.execute(
+                    "INSERT INTO maya_rp.events_archive SELECT * FROM maya_rp.events "
+                    "WHERE happened_at < NOW() - INTERVAL '180 days'")
+                await Database.execute(
+                    "DELETE FROM maya_rp.events WHERE happened_at < NOW() - INTERVAL '180 days'")
+                info("orchestrator", f"Housekeeping: archived {old} old events")
+        except Exception as e:
+            error("orchestrator", f"Housekeeping failed: {e}")
         try:
             await Database.execute(
                 "INSERT INTO tick_summaries (session_id, started_at, completed_at, modules_run, modules_failed, duration_ms) "
                 "VALUES ($1, NOW(), NOW(), $2, $3, $4)",
                 session_id, modules_ok, modules_failed, duration_ms)
-        except Exception:
-            pass
+        except Exception as e:
+            error("orchestrator", f"tick_summaries insert failed: {e}")
 
         print(f"{'='*60}")
         print(f"  Tick complete: {modules_ok} OK, {modules_failed} failed ({duration_ms}ms)")
         print(f"{'='*60}\n")
+
+        # Auto-savegame after tick (game-engine style .sav + rotation)
+        try:
+            from core.savegame import export_sav
+            sav_path = await export_sav(session_id)
+            print(f"  💾 Auto-save: {sav_path}")
+            # rotation: keep last 12 .sav files
+            import glob, os
+            savs = sorted(glob.glob(os.path.join(os.path.dirname(sav_path), f"save_{session_id}_day*.sav")))
+            for old in savs[:-12]:
+                try: os.remove(old)
+                except Exception: pass
+        except Exception as e:
+            print(f"  ⚠ Auto-save failed: {e}")
+
         await Database.close()
 
 MODULE_MAP = {
-    "economy": economy, "prison": prison, "social": social, "romance": romance,
+    "economy": economy, "market": market, "prison": prison, "social": social, "romance": romance,
+    "pregnancy": pregnancy_mod,
     "council": council, "research": research, "diplomacy": diplomacy,
     "narrative": narrative, "pirates": pirates, "slave_system": slave_system,
     "victory": victory, "space_wonders": space_wonders,
@@ -367,7 +408,7 @@ MODULE_MAP = {
     "faction_ai": faction_ai, "event_catalog": event_catalog,
     "narrator": narrator, "news": news, "quest": quest,
     "epilogue": epilogue, "image_gen": image_gen,
-    "adventures": adventures, "agnes": agnes, "guardrails": guardrails,
+    "adventures": adventures, "guardrails": guardrails,
     "ship_generation": ship_generation, "ship_building": ship_building,
     "fleet": fleet, "refit": refit, "weapon_design": weapon_design,
     "calendar": calendar_tkg, "consequences": consequences_mod,
@@ -375,12 +416,13 @@ MODULE_MAP = {
     "locations": locations,
     "pacing": PacingDirector, "objectives": objectives_mod, "environment": environment_mod,
     "npc_autonomy": npc_autonomy, "secrets": secrets_mod, "themes": themes_mod,
-    "meanwhile": meanwhile, "conversation_log": conversation_log,
+    "conversation_log": conversation_log,
     "physical_state": physical_state, "chekhov": chekhov, "world_react": world_react,
     "logistics": logistics, "geopolitics": geopolitics,
     "crew_career": crew_career, "ideology": ideology,
     "corporations": corporations, "collapse": collapse_mod,
     "wreck_assembly": wreck_assembly, "duel": duel, "crew_system": crew_system,
+    "voyage": voyage_mod, "population_sentiment": population_sentiment_mod, "ministry_ai": ministry_ai_mod,
 }
 
 async def run_single(session_id: int, module_name: str):

@@ -203,11 +203,113 @@ class BattleEngine:
                            enemy=BattleFleet("ai"), terrain={}, phase=row.get("phase",1))
 
 async def run_tick(session_id: int = None):
-    """Battle module tick — currently no active battles to process."""
-    from core.log import info
+    """Autonomous campaign engagement tick (added 2026-08-14).
+
+    Previously a stub ("no active battles"). Now: wars in hot phases
+    (clash/attrition/turning_point) generate engagements with
+    formation/terrain bonuses, casualties flow to wars + combat_results,
+    and named commanders can take injuries (character_injuries).
+    Conservative: cold phases (escalation/mobilization) never fight here —
+    war.advance() owns phase progression.
+    """
+    from core.log import info, error
     if session_id is None: session_id = Config.SESSION_ID
-    info("battle", "Tick: no active battles")
-    return {"active_battles": 0}
+    try:
+        from modules.tactics import formation_bonus, roll_terrain
+        import random as _r
+        wars = await Database.fetch(
+            "SELECT id, opponent_faction, phase FROM maya_rp.wars "
+            "WHERE session_id=$1 AND status='active'", session_id)
+        hot = {"clash": 0.35, "attrition": 0.50, "turning_point": 0.40}
+        engagements = 0
+        for w in wars:
+            chance = hot.get(w["phase"], 0)
+            if not chance or _r.random() > chance:
+                continue
+            player_power = await Database.fetchval(
+                "SELECT COALESCE(SUM(power_rating),0) FROM maya_rp.ships "
+                "WHERE session_id=$1 AND status IN ('active','standby_alert')", session_id) or 0
+            enemy_power = await Database.fetchval(
+                "SELECT COALESCE(SUM(power_rating),0) FROM maya_rp.faction_ships "
+                "WHERE faction_name=$1 AND status='active'", w["opponent_faction"]) or 0
+            if player_power < 1000 or enemy_power < 1000:
+                continue  # don't burn paper fleets
+            formation = _r.choice(["wedge", "wall", "screen", "pincer"])
+            terrain = roll_terrain()   # sync helper — NOT a coroutine
+            p_mult = formation_bonus(formation) + terrain.get("player_mod", 0)
+            ratio = (player_power * max(0.5, p_mult)) / max(1, enemy_power)
+            # loss caps protect the smaller side
+            small_side = min(player_power, enemy_power)
+            p_loss = max(0, _r.randint(0, int(small_side * 0.02)))
+            e_loss = max(0, _r.randint(0, int(small_side * 0.025)))
+            if ratio >= 1.2:
+                e_loss = int(e_loss * 1.6)
+            elif ratio <= 0.8:
+                p_loss = int(p_loss * 1.6)
+            await Database.execute(
+                "INSERT INTO maya_rp.combat_results "
+                "(session_id, difficulty, encounter_size, player_power, enemy_power, "
+                "ships_lost, ships_damaged, enemy_ships_destroyed, enemy_ships_routed, crew_casualties) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                session_id, "hard", _encounter_size(small_side), player_power, enemy_power,
+                json.dumps({"hulls": p_loss}), json.dumps({"hulls": max(0, _r.randint(0, int(p_loss * 0.5)))}),
+                e_loss, max(0, e_loss // 2), _r.randint(0, 200))
+            await Database.execute(
+                "UPDATE maya_rp.wars SET attacker_casualties=attacker_casualties+$1, "
+                "defender_casualties=defender_casualties+$2 WHERE id=$3",
+                p_loss, e_loss, w["id"])
+            # injury hook: named commander risk
+            if _r.random() < 0.05:
+                await _maybe_injure_commander(session_id)
+            await Database.execute(
+                "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
+                "VALUES ($1, NOW(), 'battle', $2, $3, $4, 6)",
+                session_id, f"Engagement: {w['opponent_faction']}",
+                f"{formation}/{terrain['name']} — ratio {ratio:.2f}; losses {p_loss}/{e_loss}",
+                json.dumps(["war", w["opponent_faction"], "battle"]))
+            engagements += 1
+        info("battle", f"Tick: {engagements} engagements resolved")
+        return {"engagements": engagements}
+    except Exception as e:
+        error("battle", f"Tick error: {e}")
+        return {"error": str(e)}
+
+
+def _encounter_size(power: int) -> str:
+    """Map a fleet-power total to the combat_results.encounter_size enum."""
+    if power >= 10_000_000:
+        return "armada"
+    if power >= 1_000_000:
+        return "fleet_action"
+    if power >= 100_000:
+        return "battle"
+    if power >= 10_000:
+        return "engagement"
+    return "skirmish"
+
+
+async def _maybe_injure_commander(session_id: int):
+    """5% hook → injure a random named commander (spouse first)."""
+    import random as _r
+    import json as _j
+    gd = await Database.fetchval(
+        "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 0
+    char = await Database.fetchrow(
+        "SELECT id, name FROM maya_rp.characters WHERE session_id=$1 AND "
+        "status IN ('active','married') ORDER BY (is_spouse DESC), random() LIMIT 1",
+        session_id)
+    if not char:
+        return
+    body = _r.choice(["left arm", "right leg", "ribs", "shoulder", "side"])
+    sev = _r.choice(["minor", "minor", "serious"])
+    heal_days = 5 if sev == "minor" else 20
+    await Database.execute(
+        "INSERT INTO maya_rp.character_injuries "
+        "(session_id, character_id, description, severity, body_part, cause, "
+        "received_game_day, heal_by_game_day, became_scar, status) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,false,'active')",
+        session_id, char["id"], f"{sev} wound to {body}",
+        sev, body, "campaign engagement", gd, gd + heal_days)
 
 
 # ─── Action Parser: resolve_intent ───────────────────────────────────────

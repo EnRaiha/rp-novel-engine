@@ -37,6 +37,14 @@ async def _recalculate(session_id: int) -> dict:
     cfg = IDEOS[winner]
     return {"ideology":winner,"scores":scores,**cfg}
 
+TAX_TOLERANCE = {"military_dictatorship": 0.25, "pirate_confederacy": 0.20,
+                 "technocratic_utopia": 0.15, "religious_fundamentalism": 0.30,
+                 "benevolent_democracy": 0.12}
+
+def tax_tolerance(ideology: str) -> float:
+    """Max tax rate before population attrition kicks in."""
+    return TAX_TOLERANCE.get(ideology, 0.20)
+
 async def get_prompt(session_id: int = None) -> str:
     ideo = await get(session_id)
     lines=[f"[SOCIETY: {ideo['ideology'].replace('_',' ').title()}]",f"Values: {', '.join(ideo['values'])}",f"Tone: {ideo['tone']}",f"Recruits: {ideo['recruits']}"]

@@ -8,15 +8,53 @@ from core.utils import calc_game_days
 # ── WAR MACHINE ──
 
 async def run_tick(session_id: int = 3):
-    """Main pirate tick — spawn, move, attack, alert, hoard income."""
+    """Main pirate tick — spawn, move, attack, alert, hoard income, den regen."""
     try:
         await _spawn(session_id)
         await _attack(session_id)
         await _alerts(session_id)
         await _hoard_tick(session_id)
         await _den_feeding(session_id)
+        await _den_regen(session_id)
     except Exception as e:
         print(f"  Pirates: {e}")
+
+
+async def _den_regen(session_id: int):
+    """Den regeneration (2026-08-14): dens with a LIVING Pirate Queen or King
+    rebuild their fleet each tick up to fleet_cap. Both leaders dead → regen
+    stops — kill the crown, kill the swarm."""
+    from core.log import info
+    bases = await Database.fetch(
+        "SELECT id, faction_id, regen_per_tick, fleet_cap, name FROM maya_rp.pirate_bases "
+        "WHERE status='active' AND COALESCE(regen_per_tick,0) > 0")
+    regen = 0
+    for b in bases:
+        try:
+            leader = await Database.fetchval(
+                "SELECT COUNT(*) FROM maya_rp.characters WHERE faction_id=$1 AND status='active' "
+                "AND (role ILIKE '%pirate queen%' OR role ILIKE '%pirate king%')",
+                b["faction_id"])
+            if not leader:
+                continue
+            fname = await Database.fetchval(
+                "SELECT name FROM maya_rp.factions WHERE id=$1", b["faction_id"])
+            current = await Database.fetchval(
+                "SELECT COUNT(*) FROM maya_rp.faction_ships WHERE faction_name=$1", fname) or 0
+            cap = b["fleet_cap"] or 300
+            add = min(int(b["regen_per_tick"] or 0), max(0, cap - current))
+            for i in range(add):
+                await Database.execute(
+                    "INSERT INTO maya_rp.faction_ships "
+                    "(session_id, faction_name, ship_name, class_name, tier, power_rating, status) "
+                    "VALUES ($1,$2,$3,'Raider',5,$4,'active')",
+                    session_id, fname, f"{b['name'][:14]} #{current + i + 1}",
+                    120000 + random.randint(0, 60000))
+            regen += add
+        except Exception as e:
+            info("pirates", f"den regen error {b['name']}: {e}")
+    if regen:
+        info("pirates", f"Den regen: {regen} T5 ships rebuilt")
 
 # HARTA KARUN: the Den's treasure floor. No upper limit — the longer a
 # hoard lives, the fatter it gets. Every faction strong enough can feed.
@@ -138,14 +176,38 @@ async def _attack(session_id: int):
     # Defense capped at 5000+50 — canon-scale worlds (hundreds of millions)
     # can't become raid-proof; the Den can still strike, just never the capital.
     defense = min(int(t["population"] / 1000), 5000) + 50
-    success = random.random() < pf["pirate_fleet_power"] / (pf["pirate_fleet_power"] + defense)
+    # ── ML decision hook (2026-08-14): pirate group → doctrine → raid policy
+    group = "free"
+    policy = "check_first"
+    try:
+        from core.decision_models import (detect_pirate_group, predict_pirate_policy,
+                                          predict_pirate_survival, log_decision)
+        group = await detect_pirate_group(pf["id"], session_id)
+        cond = "boarding" if t["population"] < 100000 else "den_resists"
+        policy = predict_pirate_policy(group, "ai_policy", "STANDARD UNIFORMITY",
+                                       cond, "check_first")["class"]
+        await log_decision(pf["id"], "pirate_policy",
+                           {"src": "ai_policy", "policy": "STANDARD UNIFORMITY",
+                            "cond": cond, "act": "check_first"},
+                           policy, None, group, session_id)
+    except Exception:
+        pass
+    # doctrine modifiers: aggression trades loot for risk
+    _AGGRO = {"bullet": 1.0, "clear_all": 1.0, "bullet_or_ransom": 0.9,
+              "check_first": 0.97, "confirm_first": 0.95, "debt_bound": 0.9,
+              "convert": 0.9, "level": 0.85}
+    aggro = _AGGRO.get(policy, 0.95)
+    success = random.random() < aggro * pf["pirate_fleet_power"] / (pf["pirate_fleet_power"] + defense)
     loot = await _generate_loot("raiding", 0)
     loot_c = loot.get("credits", random.randint(25000, 100000)) if success else 0
+    # sponsored wolf packs take a cut for their patron; hired crews run clean
+    if success and group in ("sponsor", "hired"):
+        loot_c = int(loot_c * (1.05 if group == "sponsor" else 0.9))
     await Database.execute(
         "INSERT INTO pirate_raids (pirate_faction_id, target_territory_id, raid_type, loot_credits, outcome, description) "
         "VALUES ($1,$2,'colony',$3,$4,$5)",
         pf["id"], t["id"], loot_c, "success" if success else "failure",
-        f"Raid on {t['system_name']}: {'+' if success else '-'}{loot_c}C")
+        f"Raid on {t['system_name']} [{group}:{policy}]: {'+' if success else '-'}{loot_c}C")
     if success:
         await Database.execute("UPDATE resources SET credits=credits-$1 WHERE session_id=$2", loot_c, session_id)
         # HARTA KARUN: 40% goes to Den faction treasury, 60% into their
@@ -167,6 +229,21 @@ async def _attack(session_id: int):
     else:
         loss = int(pf["pirate_fleet_power"] * 0.1)
         await Database.execute("UPDATE factions SET pirate_fleet_power=GREATEST(0,pirate_fleet_power-$1) WHERE id=$2", loss, pf["id"])
+        # ML survival hook: on intercepted raid, predict the crew's fate
+        try:
+            from core.decision_models import predict_pirate_survival, log_decision
+            live = 0.5 if (pf["pirate_fleet_power"] or 0) > defense else 0.25
+            fate = predict_pirate_survival(group, 0, live, "queen_offers_alliance")
+            await log_decision(pf["id"], "pirate_survival",
+                               {"virgin": 0, "live_chance": live,
+                                "action": "queen_offers_alliance"},
+                               fate["class"], fate.get("probs"), group, session_id)
+            await Database.execute(
+                "INSERT INTO maya_rp.pirate_raids (pirate_faction_id, target_territory_id, raid_type, loot_credits, outcome, description) "
+                "VALUES ($1,$2,'intercept',0,'fate', $3)",
+                pf["id"], t["id"], f"Intercepted raid crew fate [{group}]: {fate['class']} ({fate['source']})")
+        except Exception:
+            pass
 
 async def _alerts(session_id: int):
     total = await Database.fetchrow("SELECT COALESCE(SUM(pirate_fleet_power),0) AS t FROM factions WHERE is_pirate=true")

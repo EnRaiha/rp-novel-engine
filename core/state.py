@@ -22,6 +22,24 @@ class StateManager:
             "SELECT happened_at, category, title, content, importance FROM story_log WHERE session_id=$1 ORDER BY happened_at DESC LIMIT 15", session_id)
         state["hooks"] = await Database.fetch(
             "SELECT hook_type, description, status FROM narrative_hooks WHERE session_id=$1 AND status!='resolved'", session_id)
+        # ── ML importance gating (2026-08-14): blend recency with the
+        # trained event-importance model — top 15 by score, not raw recency.
+        try:
+            from core.decision_models import predict_event_importance
+            rows = await Database.fetch(
+                "SELECT happened_at, category, title, content, importance, event_type "
+                "FROM story_log WHERE session_id=$1 ORDER BY happened_at DESC LIMIT 40",
+                session_id)
+            if rows:
+                scored = []
+                for r in rows:
+                    ev = {"event_type": r.get("event_type") or r.get("category") or "",
+                          "tags": [], "happened_at": r["happened_at"]}
+                    scored.append((predict_event_importance(ev), dict(r)))
+                scored.sort(key=lambda x: -x[0])
+                state["story"] = [s[1] for s in scored[:15]]
+        except Exception:
+            pass  # ML off/degraded → recency list above stays authoritative
         return state
 
     @classmethod

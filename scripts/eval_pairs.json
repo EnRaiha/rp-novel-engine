@@ -1,0 +1,52 @@
+[
+  {
+    "question": "Who is the Golden Queen and how was she created?",
+    "book": "08",
+    "keywords": ["Callista", "Forge", "Golden Queen"]
+  },
+  {
+    "question": "Why does the Oracle weep?",
+    "book": "08",
+    "keywords": ["Aeliana", "Oracle", "wept"]
+  },
+  {
+    "question": "What happened in the betting pools chapter?",
+    "book": "08",
+    "keywords": ["betting", "pool", "personalities"]
+  },
+  {
+    "question": "Who chose the King at the temple of the forgotten world?",
+    "book": "08",
+    "keywords": ["Aeliana", "chose", "Oracle"]
+  },
+  {
+    "question": "Who is the Maker and what does she forge?",
+    "book": "08",
+    "keywords": ["Maker", "Forge", "Arianna"]
+  },
+  {
+    "question": "What is the Host's Grace?",
+    "book": "08",
+    "keywords": ["Host", "Grace"]
+  },
+  {
+    "question": "Who are the six SEFs and why did they arrive?",
+    "book": "05",
+    "keywords": ["SEF", "arrive", "six"]
+  },
+  {
+    "question": "What happened in the Silent Maw's charge?",
+    "book": "05",
+    "keywords": ["Silent Maw", "charge"]
+  },
+  {
+    "question": "What are the Seven Gates?",
+    "book": "08",
+    "keywords": ["Seven Gates", "Gate"]
+  },
+  {
+    "question": "What happened at the wedding in the pools?",
+    "book": "08",
+    "keywords": ["wedding", "Chapter Six"]
+  }
+]

@@ -48,4 +48,34 @@ async def run_tick(session_id: int = None) -> dict:
                     "ON CONFLICT DO NOTHING",
                     session_id, fa["name"], target, int(power * random.uniform(0.6, 1.0)), eta)
                 events += 1
+    # Escalation engine (2026-08-14): hot relations without an active war
+    # occasionally tip into open conflict (border war rows, conservative).
+    hot = await Database.fetch(
+        "SELECT faction_a, faction_b, military_tension FROM maya_rp.faction_relations "
+        "WHERE session_id=$1 AND military_tension >= 0.8", session_id)
+    for r in hot:
+        existing = await Database.fetchval(
+            "SELECT COUNT(*) FROM maya_rp.wars WHERE session_id=$1 AND status='active' "
+            "AND (opponent_faction=(SELECT name FROM maya_rp.factions WHERE id=$2) "
+            "OR opponent_faction=(SELECT name FROM maya_rp.factions WHERE id=$3))",
+            session_id, r["faction_a"], r["faction_b"])
+        if not existing and random.random() < 0.02:
+            fa = await Database.fetchrow("SELECT name FROM maya_rp.factions WHERE id=$1", r["faction_a"])
+            fb = await Database.fetchrow("SELECT name FROM maya_rp.factions WHERE id=$1", r["faction_b"])
+            if fa and fb:
+                game_day = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id)
+                await Database.execute(
+                    "INSERT INTO maya_rp.wars (session_id, opponent_faction, casus_belli, war_goal, phase, status, started_at_game_day) "
+                    "VALUES ($1,$2,$3,$4,'escalation','active',$5)",
+                    session_id, fb["name"],
+                    f"border tension with {fa['name']}",
+                    f"contain {fa['name']} border pressure",
+                    game_day)
+                await Database.execute(
+                    "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
+                    "VALUES ($1, NOW(), 'war', $2, $3, $4, 4)",
+                    session_id, f"Border war: {fa['name']} vs {fb['name']}",
+                    f"Military tension between {fa['name']} and {fb['name']} has boiled over.",
+                    '["geopolitics","war"]')
+                events += 1
     return {"events_generated":events}

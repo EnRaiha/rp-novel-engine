@@ -23,14 +23,31 @@ from typing import Any, Sequence
 
 from core.config import Config
 from core.db import Database
+from core import campaign
 from core.ooc import suspicion_band
 
+ARCS_ROOT = Path(
+    os.environ.get("TKG_ARCS_ROOT", str(Path.home() / "Bumi-Hijau" / "adventures" / "tkg" / "arcs"))
+)
+STAGE_TO_ACT = {"lockdown": 1, "selective": 2, "confrontation": 3}
 STORY_PATH = Path(
     os.environ.get("TKG_STORY_PATH", str(Path.home() / "Bumi-Hijau" / "adventures" / "tkg" / "story.md"))
 )
 # Event types that are engine chatter, not story beats.
 NOISE_EVENT_TYPES = ("policy",)
 MIN_EVENT_IMPORTANCE = 3
+
+
+def act_line(stage: str | None) -> str:
+    """The current act's title line, from `arcs/act-<n>.md`."""
+    number = STAGE_TO_ACT.get(stage or "")
+    path = ARCS_ROOT / f"act-{number}.md" if number else None
+    if path is None or not path.is_file():
+        return ""
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("#"):
+            return f"- Act {number}: {line.lstrip('# ').strip()}"
+    return ""
 
 
 def story_brief() -> str:
@@ -127,6 +144,11 @@ def render_blocks(blocks: dict[str, Any]) -> str:
     """The per-turn context text; empty sections drop out entirely."""
     lines: list[str] = []
 
+    act = blocks.get("act")
+    if act:
+        lines.append("[ACT]")
+        lines.append(act)
+
     events = blocks.get("recent_events") or []
     if events:
         lines.append("[RECENT EVENTS]")
@@ -155,6 +177,12 @@ def render_blocks(blocks: dict[str, Any]) -> str:
             progress = goal.get("progress_pct")
             progress_text = f", {progress}%" if progress is not None else ""
             lines.append(f"- {goal['title']} (priority {goal.get('priority') or '-'}{progress_text})")
+
+    lore = blocks.get("lore") or []
+    if lore:
+        lines.append("[LORE]")
+        for entry in lore[:4]:
+            lines.append(f"- {entry['title']}: {str(entry['content'])[:320]}")
 
     system = blocks.get("system") or []
     if system:
@@ -188,11 +216,29 @@ async def build_context(
     @returns the story brief, the blocks, and the rendered text.
     """
     sid = int(session_id if session_id is not None else Config.SESSION_ID)
-    blocks = {
+    from core import ooc
+
+    stage = (await ooc.state(sid))["arc_stage"]
+    story = story_brief()
+    blocks: dict[str, Any] = {
+        "act": act_line(stage),
         "recent_events": await recent_events(sid, events),
         "companions": await companions_of_note(sid),
         "goals": await current_goals(sid),
         "system": await ooc_status_lines(sid, traits),
         "scene": await scene_state(sid),
     }
-    return {"session_id": sid, "story": story_brief(), "blocks": blocks, "text": render_blocks(blocks)}
+    # Lore triggers on this turn's own scene text (act, chronicle, goals), and
+    # near-ending hints ride the [SYSTEM] block so the edge stays visible.
+    probe = "\n".join(
+        [
+            blocks["act"] or "",
+            " ".join(str(event.get("title") or "") for event in blocks["recent_events"]),
+            " ".join(str(goal.get("title") or "") for goal in blocks["goals"]),
+        ]
+    )
+    entries = await campaign.lore_entries(sid, stage)
+    blocks["lore"] = campaign.lore_for(probe, entries)
+    values = await campaign.stats(sid)
+    blocks["system"] = list(blocks["system"]) + campaign.near_endings(await campaign.endings(sid), values)
+    return {"session_id": sid, "story": story, "blocks": blocks, "text": render_blocks(blocks)}

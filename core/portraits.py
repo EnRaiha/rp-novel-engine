@@ -16,6 +16,7 @@ Layout on disk (one folder per character):
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -63,6 +64,24 @@ OCCASIONS: dict[str, tuple[str, tuple[str, ...]]] = {
 
 STYLE_SUFFIX = "cinematic lighting, detailed face, sci-fi, 512x512, upper body portrait"
 NEGATIVE_PROMPT = "lowres, blurry, watermark, text, extra limbs, deformed, bad anatomy"
+
+
+def parse_traits(value: Any) -> list[str]:
+    """Traits as stored: a JSON list, JSON text, or a Postgres array string."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if str(item).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed if str(item).strip()]
+    return [part.strip().strip('"') for part in text.strip("{}").split(",") if part.strip()]
 
 
 def slugify(name: str) -> str:
@@ -128,7 +147,7 @@ async def find_character(session_id: int, name: str) -> dict[str, Any] | None:
     for pattern in (name, f"{name}%", f"%{name}%"):
         row = await Database.fetchrow(
             "SELECT id, name, role, archetype, character_type, appearance, description,"
-            " current_outfit, traits FROM maya_rp.characters"
+            " current_outfit, traits, bond, romance_stage, is_spouse FROM maya_rp.characters"
             " WHERE session_id=$1 AND name ILIKE $2 ORDER BY importance DESC NULLS LAST, id LIMIT 1",
             sid,
             pattern,
@@ -240,6 +259,86 @@ def ensure_dirs(name: str) -> dict[str, Path]:
     (root / "refs").mkdir(parents=True, exist_ok=True)
     (root / "emotions").mkdir(parents=True, exist_ok=True)
     return {"root": root, "refs": root / "refs", "emotions": root / "emotions"}
+
+
+INSPECT_READS = {
+    "neutral": "composed; the face gives nothing away",
+    "flustered": "a faint blush, gaze averted a heartbeat too long",
+    "happy": "the eyes brighten before the mouth does",
+    "sad": "the shoulders drop; the answer is slower than the question",
+    "angry": "the jaw sets; the breath goes quiet",
+    "surprised": "a half-breath held, lips parted",
+    "determined": "steady hands, level voice, weight forward",
+    "hurt": "favouring one side; the voice thin at the edges",
+    "tired": "heavy-lidded; a beat behind the conversation",
+    "tender": "softened attention the words do not admit",
+    "intimate": "closer than duty allows; the pause is deliberate",
+    "mourning": "restrained grief; the eyes do not leave the middle distance",
+    "battle": "focused, weapon ready, breathing measured",
+}
+
+
+async def inspect_line(session_id: int | None = None, name: str = "") -> dict[str, Any]:
+    """A micro-expression hint for the narrator (M30 `/inspect`).
+
+    Reads the character's sheet and current emotion so the model can describe
+    body language instead of inventing it — a prompt aid, never a rule.
+
+    @param session_id - session key.
+    @param name - character name.
+    @returns the hint, or `found: False` when the character is unknown.
+    """
+    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    character = await find_character(sid, name)
+    if character is None:
+        return {"found": False, "character": None}
+    hit = await lookup(sid, name, "portrait")
+    emotion = hit["emotion"] if hit else "neutral"
+    traits = parse_traits(character.get("traits"))
+    appearance = (character.get("appearance") or character.get("description") or "")[:180]
+    hint = (
+        f"{character['name']} — {character.get('role') or '—'}; bond {character.get('bond') or 0}"
+        + (f", stage {character['romance_stage']}" if character.get("romance_stage") else "")
+        + f". Read: {INSPECT_READS.get(emotion, INSPECT_READS['neutral'])}."
+        + (f" Traits: {', '.join(str(t) for t in traits)}." if traits else "")
+        + (f" Appearance: {appearance}" if appearance else "")
+    )
+    return {"found": True, "character": {"id": character["id"], "name": character["name"]}, "emotion": emotion, "hint": hint}
+
+
+def scaffold_fields(name: str, *, role: str = "", lore: str = "") -> dict[str, Path]:
+    """Write the four per-character fields (M24) when missing.
+
+    Same split as a persona: operational register in `voice.md`, backstory in
+    `lore.md`, the entrance beat in `intro.md`, player-only notes in
+    `play-guide.md`. Human-written text is never overwritten.
+    """
+    root = character_dir(name)
+    templates = {
+        "voice": (
+            f"# {name} — Voice\n\n## Register rules\n\n"
+            f"- (how they speak: clipped? warm? archaic? what they never say)\n\n"
+            f"## Few-shot exchanges\n\n**Player:** …\n\n**{name}:** …\n\n"
+            "## Boundary\n\n- player pushes past their guard => the answer deflects, never confesses\n"
+        ),
+        "lore": f"# {name} — Lore\n\n{lore or '- (past events, loyalties, grudges — no instructions)'}\n",
+        "intro": (
+            f"# {name} — Intro\n\n"
+            f"- Entrance beat: where they are and what they are mid-way through when the scene opens\n"
+            f"- Sensory anchor and one unresolved tension\n"
+        ),
+        "play-guide": (
+            f"# {name} — Play guide (player only, never sent to the model)\n\n"
+            "- Hooks:\n- Expectations (pace, coldness is intentional):\n- Content notes:\n"
+        ),
+    }
+    written: dict[str, Path] = {}
+    for field, text in templates.items():
+        path = root / f"{field}.md"
+        if not path.exists():
+            path.write_text(text, encoding="utf-8")
+        written[field] = path
+    return written
 
 
 def occasions_report() -> list[dict[str, Any]]:

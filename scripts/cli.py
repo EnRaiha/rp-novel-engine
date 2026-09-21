@@ -1476,6 +1476,11 @@ async def cmd_ooc():
       cli.py ooc status [--session N]
       cli.py ooc audit "<text>" [--layer=dialogue|somatic|tool] [--trait=aloof,mentor]
                                 [--evidence] [--turn=REF]
+      cli.py ooc persona [--slug=…]                    # voice/lore/intro/play-guide summary
+      cli.py ooc portrait <name> [occasion]            # preset image lookup or queue
+      cli.py ooc spend <kind> [target]                 # RPP sinks: skip_beat · calm_observer · reveal_intel
+      cli.py ooc effects                               # active penalty as concrete modifiers
+      cli.py ooc know [list|learn <fact>] [--observer=N]
       cli.py ooc rules  [--trait=…] [--stage=…]
       cli.py ooc beats  [--all] [--from-text="<prose>"]  # scripted beats; --from-text fires the prose path
       cli.py ooc milestone done <name> [--text=…] [--evidence]
@@ -1488,7 +1493,7 @@ async def cmd_ooc():
       cli.py ooc events [N]
       cli.py ooc prune [DAYS]
     """
-    from core import ooc
+    from core import campaign, ooc
 
     flags = [a for a in sys.argv[2:] if a.startswith("--")]
     args = [a for a in sys.argv[2:] if not a.startswith("--")]
@@ -1558,6 +1563,93 @@ async def cmd_ooc():
         print(f"effective ruleset — session {session} · traits {','.join(traits)} · {len(rules)} rules")
         for rule in rules:
             print(f"  {rule.id:24s} {rule.kind:17s} layer={rule.layer:8s} trait={rule.trait or '(campaign)':9s} +{rule.delta}  {rule.pattern[:48]}")
+    elif sub == "endings":
+        rows = await campaign.endings(session)
+        print(f"endings — session {session} · {len(rows)} registered")
+        for entry in rows:
+            mark = "✔" if entry["met"] else "·"
+            triggered = f"  triggered {entry['triggered_at']}" if entry.get("triggered_at") else ""
+            print(f"  {mark} {entry['name']:28s} {entry['kind']:7s} {entry['condition']}{triggered}")
+
+    elif sub == "lore":
+        entries = await campaign.lore_entries(session)
+        print(f"lorebook — session {session} · {len(entries)} entries")
+        for entry in entries:
+            print(f"  · {entry['title']:28s} keywords: {', '.join(entry['keywords'])}")
+
+    elif sub == "note":
+        note = " ".join(args[1:]) or flag("text") or ""
+        row = await campaign.add_directive(session, note)
+        print(f"director note #{row['id']} recorded (never audited as prose)")
+
+    elif sub == "snapshot":
+        action = args[1] if len(args) > 1 else "save"
+        path = flag("path") or f"/home/maya/.dsh/ooc/snapshots/session-{session}.json"
+        if action == "save":
+            data = await campaign.snapshot(session)
+            target = campaign.save_snapshot(data, path)
+            print(f"snapshot saved → {target} (milestones {len(data['milestones'])}, "
+                  f"exemptions {len(data['exemptions'])}, suspicion {len(data['suspicion'])})")
+        elif action == "load":
+            data = campaign.load_snapshot(path)
+            print(json.dumps(await campaign.restore_snapshot(data), default=str))
+        else:
+            print("Usage: cli.py ooc snapshot save|load [--path=…]")
+
+    elif sub == "spend":
+        kind = args[1] if len(args) > 1 else ""
+        target = args[2] if len(args) > 2 else flag("target")
+        try:
+            row = await campaign.spend(session, kind, target)
+            print(f"spent {row['price']} rpp on {row['sink']} — {row['detail']} (balance was {row['spent_from']})")
+        except ValueError as error:
+            print(f"refused: {error}")
+
+    elif sub == "effects":
+        fx = await campaign.debuff_effects(session)
+        print(f"debuff: {fx['debuff'] or 'none'} · battle {fx['battle_penalty']:+d} · "
+              f"romance {'blocked' if fx['romance_blocked'] else 'open'} · morale {fx['crew_morale']:+d} — {fx['note']}")
+
+    elif sub == "know":
+        from core import campaign as _campaign
+
+        action = args[1] if len(args) > 1 else "list"
+        observer = int(flag("observer", "0") or 0) or await ooc.observer_id(session)
+        if action == "learn":
+            fact = " ".join(args[2:]) or flag("fact") or ""
+            row = await _campaign.learn(session, observer, fact, flag("source") or "")
+            print(f"observer {row['character_id']} knows: {row['fact_key']}")
+        else:
+            rows = await _campaign.knowledge_of(session, observer)
+            print(f"knowledge — observer {observer} · {len(rows)} facts")
+            for row in rows[:20]:
+                print(f"  · {row['fact_key']}")
+
+    elif sub == "persona":
+        from core import persona
+
+        slug = flag("slug") or persona.DEFAULT_SLUG
+        data = persona.load(slug)
+        print(f"persona {data['slug']} · block {len(data['block'])} chars · "
+              f"boundary cases {len(data['boundary_cases'])} · play guide {data['has_play_guide']}")
+        for case in data["boundary_cases"]:
+            print(f"  - {case}")
+
+    elif sub == "portrait":
+        from core import portraits
+
+        name = args[1] if len(args) > 1 else ""
+        occasion = args[2] if len(args) > 2 else "portrait"
+        if not name:
+            print("Usage: cli.py ooc portrait <name> [occasion]")
+        else:
+            hit = await portraits.lookup(session, name, occasion)
+            if hit:
+                print(f"{hit['character']['name']} [{occasion}] → {hit['asset']['image_path']}")
+            else:
+                queued = await portraits.queue(session, name, occasion)
+                print(f"queued {queued['character']['name']} [{occasion}] — run: python3 scripts/portrait_render.py --session {session}")
+
     elif sub == "beats" and flag("from-text"):
         # §6.3 — the same prose path `audit()` uses, callable on demand.
         completed = await ooc.beats_from_prose(
@@ -1578,6 +1670,33 @@ async def cmd_ooc():
                       f" stage={beat['stage']:13s} rpp={beat['rpp_reward']}"
                       + ("  required" if beat["required"] else "")
                       + ("  OVERDUE" if beat["overdue"] else ""))
+        elif action == "add":
+            name = args[2] if len(args) > 2 else flag("name")
+            if not name:
+                print("Usage: cli.py ooc milestone add <name> [--trait=…] [--stage=…] [--rpp=N] [--latch=…] [--pattern=re:…]")
+            else:
+                stage = flag("stage", "lockdown")
+                trait = flag("trait") or None
+                latch = flag("latch") or None
+                rpp = int(flag("rpp", "5"))
+                pattern = flag("pattern")
+                await Database.execute(
+                    "INSERT INTO maya_rp.ooc_milestones (session_id, name, trait, stage, rpp_reward, latch_ruleset)"
+                    " VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (session_id, name) DO UPDATE SET"
+                    " trait=EXCLUDED.trait, stage=EXCLUDED.stage, rpp_reward=EXCLUDED.rpp_reward,"
+                    " latch_ruleset=EXCLUDED.latch_ruleset",
+                    session, name, trait, stage, rpp, latch,
+                )
+                if pattern:
+                    await Database.execute(
+                        "INSERT INTO maya_rp.ooc_rules"
+                        " (id, scope, session_id, trait, kind, layer, pattern, is_regex, delta)"
+                        " VALUES ($1,'session',$2,$3,'scripted_beat','both',$4,true,1)"
+                        " ON CONFLICT (id) DO UPDATE SET trait=EXCLUDED.trait, pattern=EXCLUDED.pattern",
+                        f"beat:{name}", session, trait, pattern,
+                    )
+                print(f"beat {name} authored (stage {stage}, rpp {rpp}" + (f", rule {pattern}" if pattern else "") + ")")
+
         elif action == "done":
             if len(args) < 3:
                 print("Usage: cli.py ooc milestone done <name> [--text=…] [--evidence]")

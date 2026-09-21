@@ -28,9 +28,7 @@ LEGACY_SHEETS = Path.home() / "Bumi-Hijau" / "adventures" / "tkg" / "character-s
 
 def render_sheet(row: dict) -> str:
     """One sheet page: frontmatter the renderer reads, then the human sections."""
-    traits = row.get("traits") or []
-    if isinstance(traits, str):
-        traits = [part.strip() for part in traits.strip("{}").split(",") if part.strip()]
+    traits = portraits.parse_traits(row.get("traits"))
     front = {
         "id": row["id"],
         "name": row["name"],
@@ -89,6 +87,8 @@ async def main() -> int:
     parser.add_argument("--session", type=int, default=Config.SESSION_ID)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--fields", action="store_true",
+                        help="also scaffold voice/lore/intro/play-guide per character (M24)")
     args = parser.parse_args()
 
     await Database.init()
@@ -108,6 +108,9 @@ async def main() -> int:
     for row in rows:
         row = dict(row)
         portraits.ensure_dirs(row["name"])
+        if args.fields:
+            lore_line = (row.get("description") or row.get("appearance") or "").strip()
+            portraits.scaffold_fields(row["name"], role=row.get("role") or "", lore=lore_line[:400])
         target = portraits.character_dir(row["name"]) / "sheet.md"
         # A legacy sheet may be named for the short form ("Maya", "Rika Voss")
         # while the database carries the full title ("Maya al-Dabaran (Anchor)").

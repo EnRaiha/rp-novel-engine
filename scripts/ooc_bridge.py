@@ -62,7 +62,7 @@ from core import ooc  # noqa: E402
 from core.config import Config  # noqa: E402
 from core.db import Database  # noqa: E402
 
-CALLS = ("state", "turn", "canon", "portrait", "context")
+CALLS = ("state", "turn", "canon", "portrait", "context", "persona", "inspect", "direct")
 
 
 def _adopt_state_file(request: dict) -> None:
@@ -112,21 +112,37 @@ def _write_context_mirror(session_id: int, request: dict) -> None:
 
         # No event queries here: the mirror only needs the story brief and the
         # blocks the plugin injects, not a fresh chronicle scan on every write.
+        from core import persona
+
         story = context_layer.story_brief()
         os.makedirs(os.path.dirname(story_path), exist_ok=True)
         with open(story_path, "w", encoding="utf-8") as handle:
             handle.write(story)
-        _append_context_pending(session_id, context_path)
+        persona_path = os.path.join(
+            os.path.dirname(story_path),
+            os.path.basename(story_path).replace("-story.md", "-persona.md"),
+        )
+        audits = _CONTEXT_AUDITS.get(session_id, 0)
+        with open(persona_path, "w", encoding="utf-8") as handle:
+            handle.write(persona.build_block(persona.DEFAULT_SLUG, audits=audits))
+        try:
+            audits = int(_CONTEXT_AUDITS.get(session_id, 0))
+        except Exception:
+            audits = 0
+        _append_context_pending(session_id, context_path, audits)
     except Exception:
         return
 
 
 _CONTEXT_PENDING: list[tuple[int, str]] = []
+# Last known audit count per session, so the persona mirror can pace the intro.
+_CONTEXT_AUDITS: dict[int, int] = {}
 
 
-def _append_context_pending(session_id: int, context_path: str) -> None:
+def _append_context_pending(session_id: int, context_path: str, audits: int = 0) -> None:
     """Queue the memory-block refresh for after the reply is written."""
     _CONTEXT_PENDING.append((session_id, context_path))
+    _CONTEXT_AUDITS[session_id] = audits
 
 
 async def _flush_context_mirror() -> None:
@@ -186,6 +202,24 @@ async def handle(request: dict) -> dict:
             ],
         }
 
+    if call == "inspect":
+        from core import portraits
+
+        name = str(request.get("character") or "").strip()
+        if not name:
+            return {"ok": False, "error": "inspect needs a character"}
+        return {"ok": True, "call": call, "session_id": sid, **(await portraits.inspect_line(sid, name))}
+
+    if call == "direct":
+        from core import campaign
+
+        note = str(request.get("note") or "")
+        try:
+            row = await campaign.add_directive(sid, note)
+        except ValueError as error:
+            return {"ok": False, "error": str(error)}
+        return {"ok": True, "call": call, "session_id": sid, "directive_id": row["id"]}
+
     if call == "context":
         from core import context as context_layer
 
@@ -194,13 +228,34 @@ async def handle(request: dict) -> dict:
             events=int(request.get("events") or 6),
             traits=tuple(request.get("traits") or ("general",)),
         )
+        from core import persona
+
+        slug = str(request.get("persona") or persona.DEFAULT_SLUG)
+        audits = (await ooc.state(sid))["audits"]
         return {
             "ok": True,
             "call": call,
             "session_id": sid,
+            "slug": slug,
             "story": data["story"],
+            "persona": persona.build_block(slug, audits=audits),
             "blocks": data["blocks"],
             "text": data["text"],
+        }
+
+    if call == "persona":
+        from core import persona
+
+        slug = str(request.get("persona") or persona.DEFAULT_SLUG)
+        audits = (await ooc.state(sid))["audits"]
+        return {
+            "ok": True,
+            "call": call,
+            "session_id": sid,
+            "slug": slug,
+            "block": persona.build_block(slug, audits=audits),
+            "boundary_cases": persona.boundary_cases(slug),
+            "has_play_guide": bool(persona.read_field(slug, "play-guide")),
         }
 
     if call == "portrait":

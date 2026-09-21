@@ -264,7 +264,32 @@ Seeded content:
   play-guide) — voice+intro reach the model, lore routes through the lorebook,
   the play guide never leaves the table.
 
-4.11 PORTRAITS — preset images per character and occasion (fasa 5)
+4.11 CAMPAIGN LAYER (fasa 6 B3-B4, migration 112/113)
+  core/campaign.py owns the bookkeeping around the audit:
+    - Lorebook  `ooc_lorebook`   keyword-triggered entries; `[LORE]` rides the
+      context only when a keyword appears (M29/M21). Seeds: System Overseer,
+      Malicious Compliance, Companions of the Crown.
+    - Endings   `ooc_endings`    a stat condition (`deviation >= 100`,
+      `suspicion_max >= 85`, `roleplay_points >= 500`), kind, and prose;
+      `near_endings` puts close conditions in `[SYSTEM]` (M28).
+    - Director  `ooc_directives` out-of-character notes, never audited (M30).
+    - Sinks     `spend()`        skip_beat 25 · calm_observer 15 · reveal_intel 10;
+      unknown sinks refuse, an unaffordable spend refuses (M7).
+    - Effects   `debuff_effects()` the penalty as concrete modifiers
+      (battle_penalty, romance_blocked, crew_morale) so modules stop parsing the
+      ladder themselves (M6, mapping only — module wiring is follow-up).
+    - Knowledge `character_knowledge` (migration 113) what a character has
+      witnessed; the audit rule that enforces blindness is follow-up (M4).
+    - Snapshots `snapshot()/save/load/restore` — state + milestones + exemptions
+      + suspicion, so a later act can start directly (M31).
+  Stage-scoped rules (M27): `ooc_rules.min_stage` / `max_stage` gate a rule to an
+  arc window; effective_rules filters by stage rank (lockdown < selective <
+  confrontation) — the F1 fix generalised.
+  Characters: dead companions no longer count as O1 evidence (M10); suspicion
+  moves for every character present in the scene (M8); `character_rules()` reads
+  rules whose trait matches an NPC's own traits (M9).
+
+4.12 PORTRAITS — preset images per character and occasion (fasa 5)
   One folder per character:
     <TKG_CHARACTERS_ROOT>/<slug>/{sheet.md, refs/, emotions/<emotion>.png}
   Default root: ~/Bumi-Hijau/adventures/tkg/characters (override with
@@ -464,6 +489,21 @@ Fasa 3 (2026-09-21)
   a persona trait, so every seeded beat rule was silently dropped and
   prose-proven beats could never resolve. Muting now uses the MILESTONE's stage.
   Regression test: test_seeded_shape_beat_rule_resolves_in_its_stage.
+
+Fasa 6 (2026-09-21, B2-B4: personas, campaign layer, tools)
+  - Persona wiring: bridge `persona` + `context` return the block; plugin section
+    `ooc:persona-voice`; intro paced by audit count (INTRO_MAX_AUDITS).
+  - Acts: adventures/tkg/arcs/act-{1,2,3}.md + `[ACT]` block from the stage.
+  - Tools: `inspect` (body-language hint) and `ooc_note` (director note).
+  - CLI: endings · lore · note · snapshot save|load · spend · effects · know ·
+    persona · portrait · milestone add.
+  - Scripts: export_character_cards (V2 JSON, 275 written) ·
+    ruleset_regression (pure replay) · generate_roster (player page) ·
+    character field scaffolds (M24, 60 main characters).
+  - Ops: systemd user units tkg-map (3460) + tkg-web (3080), both enabled.
+  - tests: engine 77 · plugin 47 · tsc clean.
+  - Deferred, named: M18 (embed map/portraits inside the play UI — client plugin),
+    M4 audit rule, M6 module wiring.
 
 Fasa 6 (2026-09-21, B1: context pass)
   - core/context.py + bridge `context` call + mirror files + plugin injection

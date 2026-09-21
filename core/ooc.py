@@ -166,6 +166,9 @@ class OocRule:
     layer: str = LAYER_BOTH
     trait: str | None = None
     is_regex: bool = False
+    # Arc window (M27): a rule may open at a stage and close after another.
+    min_stage: str | None = None
+    max_stage: str | None = None
 
 
 @dataclass(frozen=True)
@@ -324,6 +327,8 @@ def _row_to_rule(row: Any) -> OocRule:
         layer=row["layer"],
         trait=row["trait"],
         is_regex=bool(row["is_regex"]),
+        min_stage=row["min_stage"] if "min_stage" in row.keys() else None,
+        max_stage=row["max_stage"] if "max_stage" in row.keys() else None,
     )
 
 
@@ -384,7 +389,7 @@ async def effective_rules(
         | {row["latch_ruleset"] for row in latched}
     )
     rows = await Database.fetch(
-        "SELECT id, kind, pattern, delta, layer, trait, is_regex FROM maya_rp.ooc_effective_rules($1, $2)",
+        "SELECT id, kind, pattern, delta, layer, trait, is_regex, min_stage, max_stage FROM maya_rp.ooc_effective_rules($1, $2)",
         sid,
         wanted,
     )
@@ -403,7 +408,10 @@ async def effective_rules(
     for row in rows:
         if row["kind"] == "scripted_beat" and row["id"] not in beat_ids:
             continue  # a beat authored for another stage is inert here
-        rules.append(_row_to_rule(row))
+        rule = _row_to_rule(row)
+        if not stage_allows(rule, stage):
+            continue  # M27: the rule's arc window does not include this stage
+        rules.append(rule)
     return rules
 
 
@@ -534,8 +542,7 @@ async def audit(
             turn_ref,
         )
         if micro:
-            observer = await observer_id(sid)
-            if observer is not None:
+            for observer in await observer_ids(sid):
                 await Database.execute(
                     "INSERT INTO maya_rp.ooc_suspicion"
                     " (session_id, observer_id, suspicion, last_reason, last_event_id, updated_at)"
@@ -618,6 +625,7 @@ async def companion_ids(session_id: int | None = None) -> list[int]:
     sid = int(session_id if session_id is not None else Config.SESSION_ID)
     rows = await Database.fetch(
         "SELECT id FROM maya_rp.characters WHERE session_id=$1"
+        " AND status IS DISTINCT FROM 'dead'"
         " AND (romance_flag IS TRUE OR is_spouse IS TRUE OR COALESCE(bond, 0) > 0)"
         " ORDER BY id",
         sid,
@@ -1015,6 +1023,49 @@ async def suspicion(session_id: int | None = None) -> list[dict[str, Any]]:
         sid,
     )
     return [dict(row) for row in rows]
+
+
+STAGE_RANK = {"lockdown": 0, "selective": 1, "confrontation": 2}
+
+
+def stage_allows(rule: OocRule, stage: str) -> bool:
+    """Whether a rule's arc window includes the current stage (M27)."""
+    rank = STAGE_RANK.get(stage)
+    if rank is None:
+        return True
+    low = STAGE_RANK.get(rule.min_stage or "")
+    high = STAGE_RANK.get(rule.max_stage or "")
+    if rule.min_stage and low is None:
+        return True
+    if rule.max_stage and high is None:
+        return True
+    if rule.min_stage and rank < low:
+        return False
+    if rule.max_stage and rank > high:
+        return False
+    return True
+
+
+async def observer_ids(session_id: int | None = None) -> list[int]:
+    """Every observer a suspicion step should move (M8).
+
+    Characters present in the scene notice first; with nobody marked present the
+    closest NPC stands in, which is the pre-M8 behaviour.
+
+    @param session_id - session key.
+    @returns character ids, scene-present first.
+    """
+    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    present = await Database.fetch(
+        "SELECT id FROM maya_rp.characters"
+        " WHERE session_id=$1 AND presence='present' AND status IS DISTINCT FROM 'dead'"
+        " ORDER BY COALESCE(bond, 0) DESC, id LIMIT 5",
+        sid,
+    )
+    if present:
+        return [int(row["id"]) for row in present]
+    closest = await observer_id(sid)
+    return [] if closest is None else [int(closest)]
 
 
 async def bump_suspicion(

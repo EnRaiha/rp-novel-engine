@@ -29,6 +29,10 @@ PERSONA_ROOT = Path(
 )
 
 FIELDS = ("voice", "lore", "intro", "play-guide")
+# The persona the campaign plays as, when the caller names none.
+DEFAULT_SLUG = os.environ.get("TKG_PERSONA", "the-king")
+# The opening beat is worth its tokens only while the session is still opening.
+INTRO_MAX_AUDITS = 3
 # The two fields that may reach the model: rules + examples, and the opening
 # beat. `lore` is injected only through the lorebook (keyword-triggered) and
 # `play-guide` never leaves the table.
@@ -66,15 +70,15 @@ def ensure_dirs(slug: str) -> dict[str, Path]:
     return {"root": root, "assets": root / "assets"}
 
 
-def build_block(slug: str) -> str:
+def build_block(slug: str, *, audits: int | None = None) -> str:
     """The persona block the harness injects, or an empty string when absent.
 
-    Voice first (rules and examples), then the opening beat. Lore and the play
-    guide are deliberately excluded: lore belongs to the keyword lorebook, and
-    the play guide is player-only.
+    Voice first (rules and examples), then the opening beat — but only while the
+    session is still opening (`audits <= INTRO_MAX_AUDITS`): after that the beat
+    has done its work and would only spend tokens.
     """
     voice = read_field(slug, "voice")
-    intro = read_field(slug, "intro")
+    intro = read_field(slug, "intro") if audits is None or audits <= INTRO_MAX_AUDITS else ""
     parts: list[str] = []
     if voice:
         parts.append(voice)

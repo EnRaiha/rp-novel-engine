@@ -167,6 +167,9 @@ _SCRATCH_CLEANUP = (
     "DELETE FROM maya_rp.ooc_suspicion WHERE session_id=$1",
     "DELETE FROM maya_rp.events WHERE session_id=$1",
     "DELETE FROM maya_rp.objectives WHERE session_id=$1",
+    "DELETE FROM maya_rp.ooc_directives WHERE session_id=$1",
+    "DELETE FROM maya_rp.ooc_endings WHERE session_id=$1",
+    "DELETE FROM maya_rp.ooc_lorebook WHERE session_id=$1",
     "DELETE FROM maya_rp.ooc_rules WHERE session_id=$1",
     "DELETE FROM maya_rp.characters WHERE session_id=$1 AND name='Scratch Observer'",
     "DELETE FROM maya_rp.ooc_system_state WHERE session_id=$1",
@@ -783,6 +786,143 @@ class TestContextBlocks:
         titles = [event["title"] for event in events]
         assert "POLICY NOISE" not in titles, "engine chatter stays out of the chronicle block"
         assert "quiet event" not in titles, "below the importance floor"
+
+
+class TestCampaignLayer:
+    """Fasa 6 B3 — stage windows, lorebook, endings, snapshots, observers."""
+
+    async def test_stage_window_filters_rules(self, scratch_session):
+        from core import ooc
+
+        await Database.execute(
+            "INSERT INTO maya_rp.ooc_rules (id, scope, session_id, kind, layer, pattern, delta, min_stage)"
+            " VALUES ('scratch-late-rule','session',$1,'modern_phrasing','dialogue','re:(indeed)',3,'selective')"
+            " ON CONFLICT (id) DO UPDATE SET min_stage='selective'",
+            SCRATCH_SESSION,
+        )
+        lockdown = {rule.id for rule in await ooc.effective_rules(SCRATCH_SESSION, ("general",), "lockdown")}
+        selective = {rule.id for rule in await ooc.effective_rules(SCRATCH_SESSION, ("general",), "selective")}
+        assert "scratch-late-rule" not in lockdown, "the rule opens only at selective"
+        assert "scratch-late-rule" in selective
+
+    async def test_dead_companions_are_not_evidence(self, scratch_session):
+        from core import ooc
+
+        assert scratch_session["observer"] in await ooc.companion_ids(SCRATCH_SESSION)
+        await Database.execute(
+            "UPDATE maya_rp.characters SET status='dead' WHERE id=$1", scratch_session["observer"]
+        )
+        assert scratch_session["observer"] not in await ooc.companion_ids(SCRATCH_SESSION)
+        await Database.execute(
+            "UPDATE maya_rp.characters SET status='active' WHERE id=$1", scratch_session["observer"]
+        )
+
+    async def test_present_observers_are_returned(self, scratch_session):
+        from core import ooc
+
+        await Database.execute(
+            "UPDATE maya_rp.characters SET presence='present' WHERE id=$1", scratch_session["observer"]
+        )
+        observers = await ooc.observer_ids(SCRATCH_SESSION)
+        assert scratch_session["observer"] in observers
+        await Database.execute(
+            "UPDATE maya_rp.characters SET presence=NULL WHERE id=$1", scratch_session["observer"]
+        )
+        assert await ooc.observer_ids(SCRATCH_SESSION) == [await ooc.observer_id(SCRATCH_SESSION)]
+
+    async def test_lorebook_matches_keywords(self, scratch_session):
+        from core import campaign
+
+        await Database.execute(
+            "INSERT INTO maya_rp.ooc_lorebook (session_id, keywords, title, content)"
+            " VALUES ($1, ARRAY['lantern','wreck'], 'The Lantern', 'A beacon that answers only the crown.')",
+            SCRATCH_SESSION,
+        )
+        entries = await campaign.lore_entries(SCRATCH_SESSION)
+        assert campaign.lore_for("the lantern answers", entries), "keyword present -> entry triggers"
+        assert not campaign.lore_for("nothing relevant here", entries)
+        block = campaign.render_lore(campaign.lore_for("the lantern answers", entries))
+        assert "[LORE]" in block and "The Lantern" in block
+
+    async def test_ending_conditions_and_near_hints(self):
+        from core import campaign
+
+        values = {"deviation": 82, "roleplay_points": 10, "suspicion_max": 30}
+        assert campaign.condition_met({"stat": "deviation", "op": ">=", "value": 80}, values)
+        assert not campaign.condition_met({"stat": "deviation", "op": ">=", "value": 100}, values)
+        near = campaign.near_endings(
+            [{"name": "Reclamation", "condition": {"stat": "deviation", "op": ">=", "value": 100}, "met": False}],
+            values,
+        )
+        assert near and "Reclamation" in near[0]
+
+    async def test_snapshot_round_trip(self, scratch_session, tmp_path):
+        from core import campaign
+
+        await Database.execute(
+            "UPDATE maya_rp.ooc_system_state SET deviation=12, roleplay_points=7 WHERE session_id=$1",
+            SCRATCH_SESSION,
+        )
+        data = await campaign.snapshot(SCRATCH_SESSION)
+        assert data["state"]["deviation"] == 12
+        path = campaign.save_snapshot(data, tmp_path / "snap.json")
+        loaded = campaign.load_snapshot(path)
+        result = await campaign.restore_snapshot(loaded)
+        assert result["ok"] is True
+
+    async def test_spend_sinks_move_state(self, scratch_session):
+        from core import campaign
+
+        await Database.execute(
+            "UPDATE maya_rp.ooc_system_state SET roleplay_points=40 WHERE session_id=$1", SCRATCH_SESSION
+        )
+        await _author_scratch_beat("scratch-skip-me")
+        row = await campaign.spend(SCRATCH_SESSION, "skip_beat", "scratch-skip-me")
+        assert row["price"] == campaign.SPEND_PRICES["skip_beat"]
+        balance = await Database.fetchval(
+            "SELECT roleplay_points FROM maya_rp.ooc_system_state WHERE session_id=$1", SCRATCH_SESSION
+        )
+        assert balance == 40 - row["price"], "the price is actually deducted"
+        with pytest.raises(ValueError):
+            await campaign.spend(SCRATCH_SESSION, "teleport", None)
+
+    async def test_debuff_effects_map(self, scratch_session):
+        from core import campaign
+
+        fx = await campaign.debuff_effects(SCRATCH_SESSION)
+        assert fx["debuff"] is None and fx["battle_penalty"] == 0
+        await Database.execute(
+            "UPDATE maya_rp.ooc_system_state SET debuff='Meridian Lock' WHERE session_id=$1", SCRATCH_SESSION
+        )
+        fx = await campaign.debuff_effects(SCRATCH_SESSION)
+        assert fx["romance_blocked"] is True and fx["battle_penalty"] == 3
+
+    async def test_knowledge_ledger(self, scratch_session):
+        from core import campaign
+
+        await campaign.learn(SCRATCH_SESSION, scratch_session["observer"], "the queen lives", "scene")
+        facts = await campaign.knowledge_of(SCRATCH_SESSION, scratch_session["observer"])
+        assert [fact["fact_key"] for fact in facts] == ["the queen lives"]
+
+    async def test_character_rules_by_trait(self, scratch_session):
+        from core import campaign
+
+        await Database.execute(
+            "UPDATE maya_rp.characters SET traits=$2::jsonb WHERE id=$1",
+            scratch_session["observer"],
+            json.dumps(["aloof", "loyal"]),
+        )
+        found = await campaign.character_rules(SCRATCH_SESSION, "Scratch Observer")
+        assert "aloof" in found["traits"]
+        assert all(row["kind"] for row in found["rules"])
+
+    async def test_director_note_is_recorded(self, scratch_session):
+        from core import campaign
+
+        row = await campaign.add_directive(SCRATCH_SESSION, "keep the pace slow")
+        assert row["id"]
+        notes = await campaign.directives(SCRATCH_SESSION)
+        assert notes and notes[0]["note"] == "keep the pace slow"
 
 
 class TestStageGates:

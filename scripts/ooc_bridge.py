@@ -62,7 +62,7 @@ from core import ooc  # noqa: E402
 from core.config import Config  # noqa: E402
 from core.db import Database  # noqa: E402
 
-CALLS = ("state", "turn", "canon", "portrait")
+CALLS = ("state", "turn", "canon", "portrait", "context")
 
 
 def _adopt_state_file(request: dict) -> None:
@@ -75,6 +75,74 @@ def _adopt_state_file(request: dict) -> None:
     path = request.get("state_file")
     if isinstance(path, str) and path.strip():
         os.environ["OOC_STATE_FILE"] = path.strip()
+    _write_context_mirror(_session(request), request)
+
+
+def _context_files(request: dict) -> tuple[str, str] | None:
+    """Mirror paths for the story brief and the memory blocks.
+
+    The harness plugin reads files synchronously: an async seam call races the
+    first prompt build, so the engine writes these two files on every call and
+    the plugin starts warm. `context_file` names the memory file; the story file
+    sits beside it.
+    """
+    explicit = request.get("context_file")
+    state_path = request.get("state_file") or os.environ.get("OOC_STATE_FILE")
+    base = explicit or state_path
+    if not isinstance(base, str) or not base.strip():
+        return None
+    path = os.path.abspath(base.strip())
+    root, _, name = path.rpartition(os.sep)
+    stem = name.rsplit(".", 1)[0] or "tkg-state"
+    story = os.path.join(root, f"{stem}-story.md")
+    if explicit:
+        return story, path
+    context = os.path.join(root, f"{stem}-context.txt")
+    return story, context
+
+
+def _write_context_mirror(session_id: int, request: dict) -> None:
+    """Best-effort: never fail a call because the mirror could not be written."""
+    files = _context_files(request)
+    if files is None:
+        return
+    story_path, context_path = files
+    try:
+        from core import context as context_layer
+
+        # No event queries here: the mirror only needs the story brief and the
+        # blocks the plugin injects, not a fresh chronicle scan on every write.
+        story = context_layer.story_brief()
+        os.makedirs(os.path.dirname(story_path), exist_ok=True)
+        with open(story_path, "w", encoding="utf-8") as handle:
+            handle.write(story)
+        _append_context_pending(session_id, context_path)
+    except Exception:
+        return
+
+
+_CONTEXT_PENDING: list[tuple[int, str]] = []
+
+
+def _append_context_pending(session_id: int, context_path: str) -> None:
+    """Queue the memory-block refresh for after the reply is written."""
+    _CONTEXT_PENDING.append((session_id, context_path))
+
+
+async def _flush_context_mirror() -> None:
+    """Write the memory blocks once per call, after the caller already has its answer."""
+    if not _CONTEXT_PENDING:
+        return
+    from core import context as context_layer
+
+    session_id, path = _CONTEXT_PENDING[-1]
+    try:
+        data = await context_layer.build_context(session_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(data["text"])
+    except Exception:
+        return
 
 
 def _session(request: dict) -> int:
@@ -116,6 +184,23 @@ async def handle(request: dict) -> dict:
                  "rpp_reward": beat["rpp_reward"], "completed": beat["completed_at"] is not None}
                 for beat in await ooc.milestones(sid, traits=tuple(request.get("traits") or ("general",)))
             ],
+        }
+
+    if call == "context":
+        from core import context as context_layer
+
+        data = await context_layer.build_context(
+            sid,
+            events=int(request.get("events") or 6),
+            traits=tuple(request.get("traits") or ("general",)),
+        )
+        return {
+            "ok": True,
+            "call": call,
+            "session_id": sid,
+            "story": data["story"],
+            "blocks": data["blocks"],
+            "text": data["text"],
         }
 
     if call == "portrait":
@@ -217,6 +302,7 @@ async def main() -> int:
     else:
         code = 0 if reply.get("ok") else 1
     finally:
+        await _flush_context_mirror()
         await Database.close()
     json.dump(reply, sys.stdout, default=str)
     sys.stdout.write("\n")

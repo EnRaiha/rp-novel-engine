@@ -165,6 +165,8 @@ _SCRATCH_CLEANUP = (
     "DELETE FROM maya_rp.ooc_exemptions WHERE session_id=$1",
     "DELETE FROM maya_rp.ooc_milestones WHERE session_id=$1",
     "DELETE FROM maya_rp.ooc_suspicion WHERE session_id=$1",
+    "DELETE FROM maya_rp.events WHERE session_id=$1",
+    "DELETE FROM maya_rp.objectives WHERE session_id=$1",
     "DELETE FROM maya_rp.ooc_rules WHERE session_id=$1",
     "DELETE FROM maya_rp.characters WHERE session_id=$1 AND name='Scratch Observer'",
     "DELETE FROM maya_rp.ooc_system_state WHERE session_id=$1",
@@ -730,6 +732,57 @@ class TestPersona:
         voice.write_text("HAND-WRITTEN", encoding="utf-8")
         persona.scaffold("nethara", display_name="Nethara")
         assert voice.read_text(encoding="utf-8") == "HAND-WRITTEN"
+
+
+class TestContextBlocks:
+    """Fasa 6 — M1/M3/M25: the blocks injected before the player's turn."""
+
+    async def test_blocks_render_from_live_data(self, scratch_session, tmp_path, monkeypatch):
+        from core import context
+
+        story = tmp_path / "story.md"
+        story.write_text("# Brief\n\n[CORE PREMISE & WORLD]\nTest world.", encoding="utf-8")
+        monkeypatch.setattr(context, "STORY_PATH", story)
+        await Database.execute(
+            "INSERT INTO maya_rp.events (session_id, event_type, title, importance)"
+            " VALUES ($1,'player_action','A queen lives',5)",
+            SCRATCH_SESSION,
+        )
+        await Database.execute(
+            "INSERT INTO maya_rp.objectives (session_id, title, objective_type, status, priority)"
+            " VALUES ($1,'Secure the corridor','test','active',1)",
+            SCRATCH_SESSION,
+        )
+
+        data = await context.build_context(SCRATCH_SESSION)
+        text = data["text"]
+
+        assert "Test world." in data["story"]
+        assert "[RECENT EVENTS]" in text and "A queen lives" in text
+        assert "[RELATIONSHIPS]" in text and "Scratch Observer" in text
+        assert "[CURRENT GOAL]" in text and "Secure the corridor" in text
+        assert "[SCENE]" in text
+
+    async def test_system_block_carries_due_beats(self, scratch_session):
+        from core import context
+
+        await _author_scratch_beat("scratch-context-beat")
+        data = await context.build_context(SCRATCH_SESSION, traits=("aloof",))
+        assert "[SYSTEM]" in data["text"]
+        assert "scratch-context-beat" in data["text"], "the turn sees which beats are due"
+
+    async def test_noise_events_are_filtered(self, scratch_session, monkeypatch):
+        from core import context
+
+        await Database.execute(
+            "INSERT INTO maya_rp.events (session_id, event_type, title, importance)"
+            " VALUES ($1,'policy','POLICY NOISE',9), ($1,'player_action','quiet event',1)",
+            SCRATCH_SESSION,
+        )
+        events = await context.recent_events(SCRATCH_SESSION)
+        titles = [event["title"] for event in events]
+        assert "POLICY NOISE" not in titles, "engine chatter stays out of the chronicle block"
+        assert "quiet event" not in titles, "below the importance floor"
 
 
 class TestStageGates:

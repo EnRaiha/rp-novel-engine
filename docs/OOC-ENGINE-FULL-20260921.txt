@@ -248,7 +248,23 @@ Seeded content:
   readiness(session) -> per-stage gate report (beats needed/available, rpp,
   exemptions) for the CLI `ooc readiness`.
 
-4.10 PORTRAITS — preset images per character and occasion (fasa 5)
+4.10 CONTEXT & PERSONA (fasa 6)
+  core/context.py builds the turn's memory blocks from live PG:
+    [RECENT EVENTS]  maya_rp.events, importance >= 3, 'policy' noise filtered
+    [RELATIONSHIPS]  companions of note: bond, romance stage, suspicion band
+    [CURRENT GOAL]   active objectives by priority
+    [SYSTEM]         due beats, the loudest observer, live exemptions
+    [SCENE]          game day, location, campaign name
+  The campaign story brief lives in adventures/tkg/story.md (premise, narration
+  rules, overseer mechanics, arc gates) and is injected as a prompt section.
+  Mirror files keep the harness warm: the bridge writes `<state>-story.md` and
+  `<state>-context.txt` beside the state file on every call, the plugin reads
+  them at load, and the seam refresh (bridge call `context`) updates them after
+  each audited turn. Persona fields live in core/persona.py (voice, lore, intro,
+  play-guide) — voice+intro reach the model, lore routes through the lorebook,
+  the play guide never leaves the table.
+
+4.11 PORTRAITS — preset images per character and occasion (fasa 5)
   One folder per character:
     <TKG_CHARACTERS_ROOT>/<slug>/{sheet.md, refs/, emotions/<emotion>.png}
   Default root: ~/Bumi-Hijau/adventures/tkg/characters (override with
@@ -448,6 +464,14 @@ Fasa 3 (2026-09-21)
   a persona trait, so every seeded beat rule was silently dropped and
   prose-proven beats could never resolve. Muting now uses the MILESTONE's stage.
   Regression test: test_seeded_shape_beat_rule_resolves_in_its_stage.
+
+Fasa 6 (2026-09-21, B1: context pass)
+  - core/context.py + bridge `context` call + mirror files + plugin injection
+    (story section `ooc:story`, memory context `ooc:memory`).
+  - adventures/tkg/story.md story brief; adventures/tkg/personas/the-king scaffold.
+  - core/persona.py (voice/lore/intro/play-guide + boundary cases).
+  - tests: engine 66 · plugin 45. Live proof: a scratch turn answered the arc
+    stages and "malicious compliance" from its context alone.
 
 Fasa 5 (2026-09-21, potret watak)
   - core/portraits.py + migration 111 (character_assets) + scripts/

@@ -684,6 +684,54 @@ class TestPortraits:
             await portraits.queue(SCRATCH_SESSION, "Nobody Here", "portrait")
 
 
+class TestPersona:
+    """Fasa 6 — the four persona fields, and what the model may see."""
+
+    def _write(self, root, slug, field, text):
+        from core import persona
+
+        persona.ensure_dirs(slug)
+        (persona.persona_dir(slug) / f"{field}.md").write_text(text, encoding="utf-8")
+
+    def test_block_injects_voice_and_intro_only(self, tmp_path, monkeypatch):
+        from core import persona
+
+        monkeypatch.setattr(persona, "PERSONA_ROOT", tmp_path)
+        self._write(tmp_path, "king", "voice", "# King — Voice\n\n## Register rules\n- clipped\n")
+        self._write(tmp_path, "king", "intro", "Open mid-decision.")
+        self._write(tmp_path, "king", "lore", "SECRET-BACKSTORY")
+        self._write(tmp_path, "king", "play-guide", "SECRET-PLAY-GUIDE")
+
+        block = persona.build_block("king")
+
+        assert "clipped" in block and "Open mid-decision." in block
+        assert "SECRET-BACKSTORY" not in block, "lore is routed through the lorebook, not the persona block"
+        assert "SECRET-PLAY-GUIDE" not in block, "the play guide never reaches the model"
+
+    def test_boundary_cases_are_parsed(self, tmp_path, monkeypatch):
+        from core import persona
+
+        monkeypatch.setattr(persona, "PERSONA_ROOT", tmp_path)
+        self._write(
+            tmp_path,
+            "king",
+            "voice",
+            "# Voice\n\n## Boundary\n\n- player offers warmth => answer stays clipped\n- modern slang => refused\n\n## Other\n- ignored\n",
+        )
+        cases = persona.boundary_cases("king")
+        assert cases == ["player offers warmth => answer stays clipped", "modern slang => refused"]
+
+    def test_scaffold_never_overwrites(self, tmp_path, monkeypatch):
+        from core import persona
+
+        monkeypatch.setattr(persona, "PERSONA_ROOT", tmp_path)
+        persona.scaffold("nethara", display_name="Nethara")
+        voice = persona.field_path("nethara", "voice")
+        voice.write_text("HAND-WRITTEN", encoding="utf-8")
+        persona.scaffold("nethara", display_name="Nethara")
+        assert voice.read_text(encoding="utf-8") == "HAND-WRITTEN"
+
+
 class TestStageGates:
     """D7 — the arc stage opens on gates, it is not a toggle."""
 

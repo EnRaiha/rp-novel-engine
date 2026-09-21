@@ -62,7 +62,7 @@ from core import ooc  # noqa: E402
 from core.config import Config  # noqa: E402
 from core.db import Database  # noqa: E402
 
-CALLS = ("state", "turn", "canon")
+CALLS = ("state", "turn", "canon", "portrait")
 
 
 def _adopt_state_file(request: dict) -> None:
@@ -116,6 +116,48 @@ async def handle(request: dict) -> dict:
                  "rpp_reward": beat["rpp_reward"], "completed": beat["completed_at"] is not None}
                 for beat in await ooc.milestones(sid, traits=tuple(request.get("traits") or ("general",)))
             ],
+        }
+
+    if call == "portrait":
+        from core import portraits
+
+        name = request.get("character")
+        if not isinstance(name, str) or not name.strip():
+            return {"ok": True, "call": call, "taxonomy": portraits.occasions_report(),
+                    "hint": "pass character=<name> (and occasion=<key>) to fetch or queue one portrait"}
+        occasion = str(request.get("occasion") or "portrait")
+        hit = await portraits.lookup(sid, name.strip(), occasion)
+        if hit:
+            return {
+                "ok": True,
+                "call": call,
+                "found": True,
+                "character": {
+                    "id": hit["character"]["id"],
+                    "name": hit["character"]["name"],
+                    "slug": portraits.slugify(hit["character"]["name"]),
+                },
+                "occasion": occasion,
+                "emotion": hit["emotion"],
+                "image_path": hit["asset"]["image_path"],
+            }
+        queued = None
+        if request.get("queue", True) is not False:
+            queued = await portraits.queue(sid, name.strip(), occasion)
+        return {
+            "ok": True,
+            "call": call,
+            "found": False,
+            "queued": queued is not None,
+            "character": None if queued is None else {
+                "id": queued["character"]["id"],
+                "name": queued["character"]["name"],
+                "slug": portraits.slugify(queued["character"]["name"]),
+            },
+            "occasion": occasion,
+            "emotion": None if queued is None else queued["emotion"],
+            "prompt": None if queued is None else queued["prompt"],
+            "hint": None if queued is None else f"python3 scripts/portrait_render.py --session {sid}",
         }
 
     _adopt_state_file(request)

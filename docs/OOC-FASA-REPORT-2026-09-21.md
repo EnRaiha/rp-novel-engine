@@ -11,12 +11,23 @@ code claims resolve to `## FILE:` blocks in the sibling parts.
 | F1 fix | `effective_rules()` muted beat rules by `(trait or stage) != stage`; `ooc_rules` has no stage column, so **every seeded beat rule was dropped** and prose beats could never resolve. Muting now uses the milestone's stage. Regression: `test_seeded_shape_beat_rule_resolves_in_its_stage`. |
 | Fasa 4 | enforcement §10a (pre-execute deny, recorded once, WeakSet stops double billing) · prose audit (`session/event` → `assistant/message`) · bridge loads `~/.env` (`OC_PG_*` only) when the spawning process carries none · `@deepseek-ai/dsh-session` dependency · plugin tests 34 → 40 |
 
+## 1b. Fasa 5 — potret watak (hari yang sama)
+
+| Perkara | Isi |
+|---|---|
+| Sheets | 275 folder `adventures/tkg/characters/<slug>/` + `sheet.md` (3 legasi disalin verbatim) |
+| Aset | `maya_rp.character_assets` (migration 111) — unik (character, kind, occasion); `pending` = queue render |
+| Taksonomi | 13 emosi × 11 occasion dengan pencetus engine (`core/portraits.py`) |
+| Renderer | `scripts/portrait_render.py` → ComfyUI; ujian: Maya `flustered.png` 512² dalam 58s |
+| Tool | bridge `portrait` + plugin tool `portrait`; smoke e2e menerima imej sebenar dalam turn |
+| ComfyUI | Dipulihkan: `workflows/default-512.json`, path mati `/home/ju/...` dibetulkan, auto-start servis |
+
 ## 2. Gates (all green)
 
 ```
-pytest tests/test_ooc.py                    -> 57 passed
-python3 -m pytest tests/ -q                 -> 227 passed
-npx vitest run packages/experimental/ooc-engine -> 40 passed
+pytest tests/test_ooc.py                    -> 60 passed
+python3 -m pytest tests/ -q                 -> 230 passed
+npx vitest run packages/experimental/ooc-engine -> 43 passed
 npx tsc -b packages/experimental/ooc-engine/tsconfig.json -> clean
 bash ~/scripts/ooc-preflight.sh             -> OK, exit 0
 canon session 3: dev=0 audits=0 rpp=0 · rules=18 · milestones=4 · events=0

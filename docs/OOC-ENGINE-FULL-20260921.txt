@@ -248,6 +248,37 @@ Seeded content:
   readiness(session) -> per-stage gate report (beats needed/available, rpp,
   exemptions) for the CLI `ooc readiness`.
 
+4.10 PORTRAITS — preset images per character and occasion (fasa 5)
+  One folder per character:
+    <TKG_CHARACTERS_ROOT>/<slug>/{sheet.md, refs/, emotions/<emotion>.png}
+  Default root: ~/Bumi-Hijau/adventures/tkg/characters (override with
+  TKG_CHARACTERS_ROOT).
+  - modules/core: `core/portraits.py` — EMOTIONS (13 fragments) and OCCASIONS
+    (11 keys with their engine triggers), slugify, build_prompt (sheet + DB
+    fields + emotion fragment), find_character (exact -> prefix -> contains),
+    lookup (ready asset whose file exists), queue (idempotent per
+    character+occasion; status='pending' is the render queue), pending,
+    mark_ready / mark_failed, ensure_dirs, occasions_report.
+  - table: `maya_rp.character_assets` (migration 111) — unique
+    (character_id, kind, occasion); status pending|ready|failed.
+  - renderer: `scripts/portrait_render.py --session 3 [--limit N] [--dry-run]`
+    renders pending rows through ComfyUI via ~/scripts/maya-generate, writes
+    emotions/<emotion>.png, and records model/seed/size.
+  - sheets: `scripts/generate_character_sheets.py --session 3 [--force]`
+    writes sheet.md per character from the database; a legacy hand-written sheet
+    in adventures/tkg/character-sheets/<slug>.md is copied verbatim (short-name
+    aliases match: "maya" -> "maya-al-dabaran-anchor").
+  - seam: bridge call `portrait` -> {found, character, occasion, emotion,
+    image_path} or {found:false, queued, prompt, hint}.
+  - harness: the plugin's `portrait` tool (engine mode) returns the image as an
+    attachment when the calling route declares image input, else the file path.
+
+  Render host (2026-09-21): ComfyUI 0.20.1 on the local GTX 1060 6GB
+  (torch 2.6.0+cu124, sm_60 cubin on sm_61). 512x512 SD1.5, dpmpp_2m/karras,
+  14 steps -> ~1 min cold, faster warm. No LCM sampler in 0.20.1; the workflow
+  is workflows/default-512.json and `maya-generate` starts the service when the
+  idle checker has stopped it.
+
 --------------------------------------------------------------------------------
 5. ENGINE API (core/ooc.py)
 --------------------------------------------------------------------------------
@@ -417,6 +448,17 @@ Fasa 3 (2026-09-21)
   a persona trait, so every seeded beat rule was silently dropped and
   prose-proven beats could never resolve. Muting now uses the MILESTONE's stage.
   Regression test: test_seeded_shape_beat_rule_resolves_in_its_stage.
+
+Fasa 5 (2026-09-21, potret watak)
+  - core/portraits.py + migration 111 (character_assets) + scripts/
+    {generate_character_sheets,portrait_render}.py.
+  - 275 character folders with sheet.md; 3 legacy sheets copied verbatim.
+  - bridge `portrait` call; plugin `portrait` tool (attaches the image when the
+    route declares image input, else names the path); tests 40 -> 43.
+  - ComfyUI repaired: workflow file created (workflows/default-512.json),
+    WORKFLOW_PATH fixed (was a dead /home/ju path), service auto-start added;
+    first portrait rendered (512x512, 14 steps, ~1 min) and served through the
+    tool in a live e2e turn.
 
 Fasa 4 (2026-09-21, "habiskan baki")
   - enforcement §10a built: tools/pre-execute deny above enforce.minDelta,

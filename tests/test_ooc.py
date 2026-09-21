@@ -641,6 +641,49 @@ class TestLatchAndOverdue:
         assert listed["scratch-on-time"]["overdue"] is False
 
 
+class TestPortraits:
+    """Fasa 5 — the portrait pipeline: sheet -> prompt -> asset -> lookup."""
+
+    def test_slug_and_prompt(self):
+        from core import portraits
+
+        assert portraits.slugify("Maya al-Dabaran (Anchor)") == "maya-al-dabaran-anchor"
+        assert portraits.slugify("") == "unknown"
+        prompt = portraits.build_prompt(
+            {"name": "Maya", "role": "Adjutant", "appearance": "amber eyes, dark hair"},
+            "flustered",
+            sheet="# Maya\n\n## Profile\n\n- **Designation**: Adjutant-01",
+        )
+        assert "Maya" in prompt and "faint blush" in prompt
+        assert "#" not in prompt, "sheet markdown is flattened for the renderer"
+
+    async def test_queue_then_lookup(self, scratch_session, tmp_path):
+        from core import portraits
+
+        queued = await portraits.queue(SCRATCH_SESSION, "Scratch Observer", "romance")
+        assert queued["emotion"] == "flustered"
+        row = await Database.fetchrow(
+            "SELECT status FROM maya_rp.character_assets WHERE id=$1", queued["asset_id"]
+        )
+        assert row["status"] == "pending"
+        # A pending asset is not an answer.
+        assert await portraits.lookup(SCRATCH_SESSION, "Scratch Observer", "romance") is None
+
+        image = tmp_path / "flustered.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        await portraits.mark_ready(queued["asset_id"], str(image), model="test", seed=None, width=8, height=8)
+        hit = await portraits.lookup(SCRATCH_SESSION, "Scratch Observer", "romance")
+        assert hit is not None
+        assert hit["asset"]["image_path"] == str(image)
+        assert hit["emotion"] == "flustered"
+
+    async def test_unknown_character_raises(self, scratch_session):
+        from core import portraits
+
+        with pytest.raises(ValueError):
+            await portraits.queue(SCRATCH_SESSION, "Nobody Here", "portrait")
+
+
 class TestStageGates:
     """D7 — the arc stage opens on gates, it is not a toggle."""
 

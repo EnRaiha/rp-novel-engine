@@ -84,6 +84,21 @@ class Database:
         return await cls._run(lambda conn: conn.execute(query, *args))
 
     @classmethod
+    async def fetch_readonly(cls, query: str, *args):
+        """Run a SELECT inside a real READ ONLY transaction.
+
+        The CLI/bridge query path is advertised as read-only; a start-anchored
+        regex is not an enforcement (multi-statement and SELECT … INTO slip
+        through). PostgreSQL rejects writes itself here:
+        `cannot execute INSERT in a read-only transaction`.
+        """
+        async def _fn(conn):
+            async with conn.transaction(readonly=True):
+                return await conn.fetch(query, *args)
+
+        return await cls._run(_fn)
+
+    @classmethod
     async def fetchval(cls, query: str, *args):
         """Fetch a single value from the first column using native asyncpg fetchval."""
         return await cls._run(lambda conn: conn.fetchval(query, *args))

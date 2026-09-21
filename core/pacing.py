@@ -31,7 +31,10 @@ OPENING_BEATS = {
 
 CHECK_QUERIES = {
     # narrative_hooks has hook_type/status — no 'severity' column (audit 31 Jul).
-    "crisis": ["SELECT COUNT(*) FROM maya_rp.narrative_hooks WHERE session_id=$1 AND status='pending'"],
+    # Open hooks are 'active' (readers: briefing/objectives/dramatic_structure/
+    # narrative all filter status='active'); 'pending' was the column default and
+    # matched nothing else, so counting it pinned the mode to crisis forever.
+    "crisis": ["SELECT COUNT(*) FROM maya_rp.narrative_hooks WHERE session_id=$1 AND status='active'"],
     "combat": ["SELECT COUNT(*) FROM maya_rp.sieges WHERE session_id=$1 AND status='active'"],
     # cabinet_meetings has no status — convened without minutes = in progress.
     "political": ["SELECT COUNT(*) FROM maya_rp.cabinet_meetings WHERE session_id=$1 AND convened_at IS NOT NULL AND minutes IS NULL"],

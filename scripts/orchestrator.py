@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Async tick orchestrator — runs all modules in dependency order with concurrency guard."""
-import asyncio, sys, os, time
+import asyncio, json, sys, os, time
 from datetime import datetime, timezone
 sys.path.insert(0, str(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -363,10 +363,23 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
         except Exception as e:
             error("orchestrator", f"Housekeeping failed: {e}")
         try:
+            # tick_summaries has no started_at/completed_at/modules_run/
+            # modules_failed/duration_ms columns (live: id, session_id,
+            # tick_number, categories jsonb, events_json jsonb,
+            # formatted_bulletin, ai_prose, alerts_count, resource_snapshot,
+            # summary_for_telegram, generated_at) — the old INSERT failed on
+            # every tick and was swallowed, so this table stayed empty forever.
+            tick_no = await Database.fetchval(
+                "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 0
             await Database.execute(
-                "INSERT INTO tick_summaries (session_id, started_at, completed_at, modules_run, modules_failed, duration_ms) "
-                "VALUES ($1, NOW(), NOW(), $2, $3, $4)",
-                session_id, modules_ok, modules_failed, duration_ms)
+                "INSERT INTO tick_summaries "
+                "(session_id, tick_number, categories, alerts_count, generated_at) "
+                "VALUES ($1, $2, $3::jsonb, $4, NOW())",
+                session_id, tick_no,
+                json.dumps({"modules_ok": modules_ok,
+                            "modules_failed": modules_failed,
+                            "duration_ms": duration_ms}),
+                modules_failed)
         except Exception as e:
             error("orchestrator", f"tick_summaries insert failed: {e}")
 

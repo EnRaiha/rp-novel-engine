@@ -47,8 +47,8 @@ FACT_REGISTRY: dict[str, dict] = {
         "sql": "SELECT game_day AS value FROM maya_rp.sessions WHERE id=$1",
     },
     "mode": {
-        "table": "pacing_state", "column": "mode",
-        "sql": "SELECT mode AS value FROM maya_rp.pacing_state WHERE session_id=$1 ORDER BY changed_at DESC LIMIT 1",
+        "table": "narrative_pacing", "column": "mode",
+        "sql": "SELECT mode AS value FROM maya_rp.narrative_pacing WHERE session_id=$1",
     },
 }
 

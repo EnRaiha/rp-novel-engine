@@ -176,10 +176,29 @@ DEFAULT_FLAVOR = {
     "partial": ["A half-victory — the kind that keeps its receipt."],
 }
 
+# Tiers that no domain table covers (success/fail) used to render as an empty
+# string, so the CLI printed blank lines for most rolls.
+GENERIC_FLAVOR = {
+    "success": [
+        "The attempt lands clean. Nothing wasted, nothing spent.",
+        "It works. The room moves on, satisfied.",
+        "A good outcome, banked without ceremony.",
+    ],
+    "fail": [
+        "The attempt falls short. The cost is paid anyway.",
+        "Not this time. The ledger notes the miss.",
+        "It slips through the fingers, quietly.",
+    ],
+    "raw": ["The dice simply report what they are."],
+}
+
 
 def flavor(domain: str, tier: str, total: int) -> str:
     table = (
-        FLAVOR.get(domain, DEFAULT_FLAVOR).get(tier) or DEFAULT_FLAVOR.get(tier) or [""]
+        FLAVOR.get(domain, DEFAULT_FLAVOR).get(tier)
+        or DEFAULT_FLAVOR.get(tier)
+        or GENERIC_FLAVOR.get(tier)
+        or ["The moment holds."]
     )
     return table[total % len(table)]
 

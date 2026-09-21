@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """FLEET EXPANSION WORKFLOW — automated executor.
 
@@ -17,7 +18,7 @@ Usage:
 Standard: 1 legion = 100 ships ±20% (80-120). Cost/crew models in legion_build_program.
 """
 import asyncio, sys, argparse
-sys.path.insert(0, str(__file__ + "/../../"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.config import Config
 from core.db import Database
 

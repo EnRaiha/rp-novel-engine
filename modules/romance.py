@@ -537,10 +537,14 @@ async def get_bond_ranking(session_id: int | None = None) -> list[dict]:
     """Get all characters sorted by bond. Ported from RomanceState.getBondRanking()."""
     if session_id is None:
         session_id = Config.SESSION_ID
+    # arc_stage / intimacy_level live on romance_arcs, not on characters.
     rows = await Database.fetch(
-        "SELECT id, name, bond, arc_stage, intimacy_level, role, archetype "
-        "FROM maya_rp.characters WHERE session_id = $1 AND bond > 0 "
-        "ORDER BY bond DESC",
+        "SELECT c.id, c.name, c.bond, a.arc_stage, COALESCE(a.intimacy_level, 0) AS intimacy_level, "
+        "c.role, c.archetype "
+        "FROM maya_rp.characters c "
+        "LEFT JOIN maya_rp.romance_arcs a ON a.character_id = c.id AND a.session_id = c.session_id "
+        "WHERE c.session_id = $1 AND c.bond > 0 "
+        "ORDER BY c.bond DESC",
         session_id,
     )
     return [dict(r) for r in rows]
@@ -655,7 +659,10 @@ async def check_jealousy(session_id: int | None = None) -> list[dict]:
                     "rival_id = COALESCE($1, rival_id), last_trigger = NOW() WHERE id = $2",
                     rival_id, existing["id"],
                 )
-            else:
+            elif rival_id is not None:
+                # jealousy_states.rival_id is NOT NULL. A rival with no character
+                # row (the generic "another") cannot be recorded — inserting NULL
+                # raised NotNullViolation and killed the whole romance tick.
                 await Database.execute(
                     "INSERT INTO maya_rp.jealousy_states "
                     "(session_id, character_id, rival_id, jealousy_level, last_trigger) "
@@ -663,6 +670,10 @@ async def check_jealousy(session_id: int | None = None) -> list[dict]:
                     session_id, a["character_id"], rival_id,
                     2 if jealousy["intensity"] == "strong" else 1,
                 )
+            else:
+                info("romance",
+                     f"jealousy state skipped for {a['character_name']}: "
+                     f"rival '{rival_name}' has no character row")
 
             # Log as intimacy event
             await Database.execute(

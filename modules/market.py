@@ -60,14 +60,17 @@ def next_price(base: float, current: float, volatility: float,
     return max(base * PRICE_MIN_MULT, min(base * PRICE_MAX_MULT, current + drift))
 
 
-async def _seed(session_id: int) -> None:
+async def _seed(session_id: int, tick: int = 0) -> None:
+    # commodities.last_tick_at is an INTEGER (game day), not a timestamp —
+    # writing NOW() here raised DatatypeMismatchError on every tick, which is
+    # why price_history stayed at 0 rows.
     for name, cat, base, vol, supply, demand in SEED_COMMODITIES:
         await Database.execute(
             "INSERT INTO maya_rp.commodities (session_id, name, category, base_price, "
             "current_price, volatility, supply, demand, last_tick_at) "
-            "VALUES ($1,$2,$3,$4,$4,$5,$6,$7,NOW()) "
+            "VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8) "
             "ON CONFLICT (session_id, name) DO NOTHING",
-            session_id, name, cat, base, vol, supply, demand)
+            session_id, name, cat, base, vol, supply, demand, tick)
 
 
 async def run_tick(session_id: int | None = None) -> dict:
@@ -80,9 +83,8 @@ async def run_tick(session_id: int | None = None) -> dict:
     gd = calc_game_days(row["last_tick_at"])
     if gd < 0.01:
         return {"skipped": "no game day elapsed"}
-    await _seed(session_id)
-    tick = await Database.fetchval(
-        "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 0
+    await _seed(session_id, tick := (await Database.fetchval(
+        "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 0))
     commodities = await Database.fetch(
         "SELECT id, name, base_price, current_price, volatility, supply, demand "
         "FROM maya_rp.commodities WHERE session_id=$1", session_id)
@@ -95,7 +97,7 @@ async def run_tick(session_id: int | None = None) -> dict:
         d = int(c["demand"] * (1 + gd * 0.006))
         await Database.execute(
             "UPDATE maya_rp.commodities SET current_price=$1, supply=$2, demand=$3, "
-            "last_tick_at=NOW() WHERE id=$4", round(new_price, 2), s, d, c["id"])
+            "last_tick_at=$5 WHERE id=$4", round(new_price, 2), s, d, c["id"], tick)
         await Database.execute(
             "INSERT INTO maya_rp.price_history (commodity_id, tick_number, price, volume) "
             "VALUES ($1,$2,$3,$4)",

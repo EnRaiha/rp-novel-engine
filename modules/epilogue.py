@@ -10,7 +10,11 @@ async def generate(session_id: int | None = None) -> dict:
     chars = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.characters WHERE session_id=$1", session_id) or 0
     ships = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.ships WHERE session_id=$1", session_id) or 0
     events = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.events WHERE session_id=$1", session_id) or 0
-    victories = await Database.fetch("SELECT victory_type, progress FROM maya_rp.victory_tracking WHERE session_id=$1", session_id)
+    # victory_tracking is faction-scoped (faction_id) — there is no session_id,
+    # so reach the session through factions.
+    victories = await Database.fetch(
+        "SELECT vt.victory_type, vt.progress FROM maya_rp.victory_tracking vt "
+        "JOIN maya_rp.factions f ON f.id = vt.faction_id WHERE f.session_id = $1", session_id)
     v_data = {r["victory_type"]: r["progress"] for r in victories} if victories else {}
     return {
         "characters": chars, "ships": ships, "events": events,

@@ -27,7 +27,8 @@ async def seed_sites(session_id: int, count: int = 8) -> list[dict]:
 
 async def excavate(site_id: int, session_id: int | None = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
-    site = await Database.fetchrow("SELECT id, name, site_type, difficulty, artifact_yield, progress, excavation_progress, status FROM maya_rp.dig_sites WHERE id=$1 AND session_id=$2", site_id, session_id)
+    # dig_sites has excavation_progress/max_progress — there is no `progress`.
+    site = await Database.fetchrow("SELECT id, name, site_type, difficulty, artifact_yield, excavation_progress, status FROM maya_rp.dig_sites WHERE id=$1 AND session_id=$2", site_id, session_id)
     if not site: return {"error": "Site not found"}
     if site["status"] == "depleted": return {"error": "Site depleted"}
     gain = random.randint(10, 25) + (10 - site["difficulty"]) * 2
@@ -36,7 +37,12 @@ async def excavate(site_id: int, session_id: int | None = None) -> dict:
     if done:
         await Database.execute("UPDATE maya_rp.dig_sites SET status='depleted', excavation_progress=100 WHERE id=$1", site_id)
         for _ in range(site["artifact_yield"]):
-            await Database.execute("INSERT INTO maya_rp.artifacts (session_id, name, source) VALUES ($1,$2,'archaeology')", session_id, f"{site['name']}_artifact")
+            # artifacts carries no `source` column; the origin goes in the
+            # description and the registered type value is 'relic'.
+            await Database.execute(
+                "INSERT INTO maya_rp.artifacts (session_id, name, type, description) "
+                "VALUES ($1,$2,'relic',$3)",
+                session_id, f"{site['name']}_artifact", f"Excavated from {site['name']}")
         return {"completed": True, "artifacts": site["artifact_yield"]}
     else:
         await Database.execute("UPDATE maya_rp.dig_sites SET excavation_progress=$1 WHERE id=$2", new_progress, site_id)

@@ -56,7 +56,14 @@ async def generate_anomaly(location: str, session_id: int | None = None) -> dict
     name = f"{random.choice(ANOMALY_PREFIXES)} {random.choice(ANOMALY_SUFFIXES)}"
     atype = random.choice(ANOMALY_TYPES)
     threshold = random.randint(30, 100)
+    # anomalies_catalog keys its site by sector_id (there is no `location`
+    # column): resolve the location name to a sector and keep the raw text in
+    # the description so nothing is lost when the name is not a sector.
+    sector_id = await Database.fetchval(
+        "SELECT id FROM maya_rp.sectors WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) LIMIT 1",
+        session_id, f"%{location}%")
     aid = await Database.fetchval(
-        "INSERT INTO maya_rp.anomalies_catalog (session_id, name, anomaly_type, location, data_threshold, studied) VALUES ($1,$2,$3,$4,$5,false) RETURNING id",
-        session_id, name, atype, location, threshold)
-    return {"anomaly_id": aid, "name": name, "type": atype, "location": location}
+        "INSERT INTO maya_rp.anomalies_catalog (session_id, name, anomaly_type, sector_id, data_threshold, studied, description) "
+        "VALUES ($1,$2,$3,$4,$5,false,$6) RETURNING id",
+        session_id, name, atype, sector_id, threshold, f"Location: {location}")
+    return {"anomaly_id": aid, "name": name, "type": atype, "location": location, "sector_id": sector_id}

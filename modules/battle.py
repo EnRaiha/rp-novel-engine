@@ -1,10 +1,18 @@
-"""Battle Engine — terrain, tactics, formations, phases, commanders, aftermath."""
+"""Battle Engine — terrain, tactics, formations, phases, commanders, aftermath.
+
+Schema contract (migration 105): combat_results keeps the live battle row
+(status/outcome/ended_at/player_formation/ship_states); battle_log_entries,
+battle_phases and battle_aftermath hang off combat_results.id. `ships` carries
+no combat_rating/evasion column — power_rating is the rated combat value and
+evasion/multipliers come from ship_roles.base_stats.
+"""
 import random, json, asyncio
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from core.db import Database
 from core.events import EventBus
+from core.log import info
 from core.utils import calc_game_days
 from core.config import Config
 
@@ -26,6 +34,7 @@ class BattleState:
     terrain: Dict; phase: int = 1; turn: int = 0
     player_tactic: str = "Direct Assault"; enemy_tactic: str = "Direct Assault"
     log: list = field(default_factory=list)
+    session_id: int = 0
 
 class BattleEngine:
     @classmethod
@@ -33,14 +42,22 @@ class BattleEngine:
                    enemy_faction: str, terrain_id: int = None) -> BattleState:
         """Initialize a new battle."""
         pf = await cls._make_fleet(player_ships, "Setia Empire")
-        ef = await cls._make_fleet([], enemy_faction)
-        terrain = await Database.fetchrow("SELECT * FROM battle_terrain WHERE id=$1" if terrain_id
-            else "SELECT * FROM battle_terrain ORDER BY random() LIMIT 1", terrain_id or 1) or {}
+        ef = await cls._make_enemy_fleet(enemy_faction)
+        # One argument list per query: passing terrain_id into the "random()"
+        # variant raised InterfaceError (server expects 0 arguments) every time
+        # init() was called without an explicit terrain.
+        if terrain_id:
+            terrain = await Database.fetchrow("SELECT * FROM battle_terrain WHERE id=$1", terrain_id) or {}
+        else:
+            terrain = await Database.fetchrow("SELECT * FROM battle_terrain ORDER BY random() LIMIT 1") or {}
+        terrain = dict(terrain)
         bid = await Database.fetchrow(
             "INSERT INTO combat_results (session_id, player_power, enemy_power, status) "
             "VALUES ($1,$2,$3,'active') RETURNING id",
             session_id, sum(s.combat_rating for s in pf.ships), sum(s.combat_rating for s in ef.ships))
-        state = BattleState(battle_id=bid["id"], player=pf, enemy=ef, terrain=terrain)
+        state = BattleState(battle_id=bid["id"], player=pf, enemy=ef, terrain=terrain,
+                            session_id=session_id)
+        await cls._save(state, None)
         await EventBus.emit("battle_started", {"battle_id": state.battle_id})
         return state
 
@@ -52,6 +69,8 @@ class BattleEngine:
         pp = sum(s.combat_rating for s in state.player.ships) * pm
         ep = sum(s.combat_rating for s in state.enemy.ships) * em
         te = state.terrain.get("effects", {}) or {}
+        if isinstance(te, str):   # asyncpg hands jsonb back as text
+            te = json.loads(te)
         if "damage_bonus" in te: pp *= 1 + te["damage_bonus"]; ep *= 1 + te["damage_bonus"]
         ratio = pp / max(1, ep); wins = random.random() < ratio / (1 + ratio)
         dd = int((pp + ep) / 10 * random.uniform(0.7, 1.3))
@@ -68,16 +87,42 @@ class BattleEngine:
 
     @classmethod
     async def _make_fleet(cls, ship_ids: List[int], faction: str) -> BattleFleet:
-        ships = []
-        for row in await Database.fetch(
-            "SELECT s.*, sr.base_stats FROM ships s LEFT JOIN ship_roles sr ON sr.name=s.role WHERE s.id = ANY($1)", ship_ids) if ship_ids else []:
-            bs = (row.get("base_stats") or {}); r = row["combat_rating"]
-            ships.append(BattleShip(id=row["id"], name=row["name"], ship_type=row.get("ship_type",""),
-                hull=int(row.get("hull",100)*bs.get("hull_mult",1)),
-                shield=int(row.get("hull_current",50)*bs.get("shield_mult",1)),
-                speed=int(row.get("speed",10)*bs.get("speed_mult",1)),
-                evasion=float(row.get("evasion",0.1)), combat_rating=float(r)))
-        return BattleFleet(faction=faction, ships=ships)
+        if not ship_ids:
+            return BattleFleet(faction=faction)
+        rows = await Database.fetch(
+            "SELECT s.*, sr.base_stats FROM ships s "
+            "LEFT JOIN ship_roles sr ON LOWER(sr.name)=LOWER(s.role) "
+            "WHERE s.id = ANY($1::int[])", ship_ids)
+        return BattleFleet(faction=faction, ships=[cls._to_ship(r) for r in rows])
+
+    @classmethod
+    async def _make_enemy_fleet(cls, faction: str, limit: int = 60) -> BattleFleet:
+        """Enemy order of battle comes from `faction_ships` — `ships` only holds
+        Setia hulls, so an enemy built from it was always an empty fleet."""
+        rows = await Database.fetch(
+            "SELECT id, ship_name, ship_type, hull, speed, power_rating FROM maya_rp.faction_ships "
+            "WHERE faction_name=$1 AND status='active' ORDER BY power_rating DESC LIMIT $2",
+            faction, limit)
+        if not rows:
+            info("battle", f"Faction '{faction}' has no active hulls — empty order of battle")
+        return BattleFleet(faction=faction, ships=[cls._to_ship(r) for r in rows])
+
+    @staticmethod
+    def _to_ship(row) -> BattleShip:
+        """Map a `ships`/`faction_ships` row onto BattleShip."""
+        bs = row.get("base_stats") or {}
+        if isinstance(bs, str):
+            bs = json.loads(bs)
+        hull = int(row.get("hull") or 100)
+        return BattleShip(
+            id=row["id"], name=row.get("name") or row.get("ship_name") or "",
+            ship_type=row.get("ship_type") or "",
+            hull=int(hull * bs.get("hull_mult", 1)),
+            shield=int((row.get("hull_current") or hull) * bs.get("shield_mult", 1)),
+            speed=int((row.get("speed") or 10) * bs.get("speed_mult", 1)),
+            evasion=float(bs.get("evasion", 0.1)),
+            combat_rating=float(row.get("power_rating") or 0),
+            role=row.get("role") or row.get("ship_type") or "line")
 
     @classmethod
     async def _tactic_mult(cls, tactic: str) -> float:
@@ -109,21 +154,24 @@ class BattleEngine:
         pa, ea = bool(state.player.ships), bool(state.enemy.ships)
         outcome = "player_victory" if pa and not ea else "player_defeat" if not pa and ea else "stalemate"
         await Database.execute(
-            "UPDATE combat_results SET outcome=$1, ended_at=NOW(), status='completed' WHERE id=$2",
-            outcome, state.battle_id)
+            "UPDATE combat_results SET outcome=$1, ended_at=NOW(), status='completed', "
+            "player_power=$2, enemy_power=$3 WHERE id=$4",
+            outcome, sum(s.combat_rating for s in state.player.ships),
+            sum(s.combat_rating for s in state.enemy.ships), state.battle_id)
         loot = random.randint(1000, 50000) if outcome == "player_victory" else 0
         rep = 10 if outcome == "player_victory" else -10
         await Database.execute("INSERT INTO battle_aftermath (battle_id, loot_credits, reputation_change, narrative) VALUES ($1,$2,$3,$4)",
             state.battle_id, loot, rep, f"Battle resolved: {outcome}")
         # Novel adaptation — Ship Legacy (bab 7, 35): kapal veteran dapat battle_honors + legacy_score
         if outcome == "player_victory" and state.player.ships:
+            ship_ids = [s.id for s in state.player.ships]
             await Database.execute(
                 "UPDATE maya_rp.ships SET battle_honors=battle_honors+1, veteran_kills=veteran_kills+1, "
                 "legacy_score=legacy_score+GREATEST(1, LEAST(10, power_rating/50000)) "
                 "WHERE session_id=$1 AND id = ANY($2::int[])",
-                state.session_id, state.player.ships)
+                state.session_id, ship_ids)
             # NOVEL ULTIMATE #5 — Rank naik + procedural scars untuk near-death survivor
-            for ship_id in state.player.ships:
+            for ship_id in ship_ids:
                 row = await Database.fetchrow(
                     "SELECT name, veteran_kills, hull, hull_current, scars_jsonb, ship_rank FROM maya_rp.ships WHERE id=$1",
                     ship_id)
@@ -160,8 +208,13 @@ class BattleEngine:
 
     @classmethod
     async def set_formation(cls, battle_id: int, formation: str):
-        r = await Database.fetchrow("SELECT bonus FROM fleet_formations WHERE name=$1", formation)
-        if r: await Database.execute("UPDATE combat_results SET player_formation=$1 WHERE id=$2", formation, battle_id)
+        # fleet_formations is capitalised ('Wedge', 'Defensive Circle'); the
+        # campaign tick hands out lowercase names, so match case-insensitively
+        # and persist the catalogue's own spelling.
+        r = await Database.fetchrow(
+            "SELECT name FROM maya_rp.fleet_formations WHERE LOWER(name)=LOWER($1)", formation)
+        if r:
+            await Database.execute("UPDATE combat_results SET player_formation=$1 WHERE id=$2", r["name"], battle_id)
 
     @classmethod
     async def attempt_retreat(cls, battle_id: int) -> Dict:
@@ -173,7 +226,9 @@ class BattleEngine:
         success = random.random() < chance
         dmg = int(random.randint(0, 20) * (1 - chance))
         await Database.execute(
-            "UPDATE combat_results SET retreat_attempted=true, retreat_successful=$1, pursuit_damage=$2, status='completed' WHERE id=$3",
+            "UPDATE combat_results SET retreat_attempted=true, retreat_successful=$1, "
+            "pursuit_damage=$2, status='completed', ended_at=NOW(), "
+            "outcome=COALESCE(outcome,'player_retreat') WHERE id=$3",
             success, dmg if success else 0, battle_id)
         await EventBus.emit("battle_retreated", {"battle_id": battle_id, "success": success})
         return {"success": success, "damage": dmg if not success else 0}
@@ -184,7 +239,14 @@ class BattleEngine:
         return f"{pn}: {'Player presses attack.' if wins else 'Enemy counterattacks.'} Using {state.player_tactic}."
 
     @classmethod
-    async def _save(cls, state: BattleState, entry: Dict):
+    async def _save(cls, state: BattleState, entry: Optional[Dict]):
+        # Live hull/shield snapshot so a mid-battle reload (retreat, resume) can
+        # rebuild the fleets instead of fighting with empty ones.
+        await Database.execute(
+            "UPDATE combat_results SET ship_states=$1 WHERE id=$2",
+            json.dumps(cls._snapshot(state)), state.battle_id)
+        if entry is None:
+            return
         await Database.execute(
             "INSERT INTO battle_log_entries (battle_id, turn_number, actor, action, result, damage) VALUES ($1,$2,$3,$4,$5,$6)",
             state.battle_id, entry["turn"], "player" if entry["won"] else "enemy",
@@ -195,12 +257,35 @@ class BattleEngine:
                 state.battle_id, state.phase, PHASE_NAMES[state.phase-1], entry["tactic"],
                 entry["enemy_tactic"], entry["damage_dealt"], entry["damage_taken"])
 
+    @staticmethod
+    def _snapshot(state: BattleState) -> Dict:
+        def ser(f: BattleFleet) -> Dict:
+            return {"faction": f.faction, "formation": f.formation, "ships": [
+                {"id": s.id, "name": s.name, "ship_type": s.ship_type, "hull": s.hull,
+                 "shield": s.shield, "speed": s.speed, "evasion": s.evasion,
+                 "combat_rating": s.combat_rating, "role": s.role} for s in f.ships]}
+        return {"player": ser(state.player), "enemy": ser(state.enemy),
+                "phase": state.phase, "turn": state.turn,
+                "player_tactic": state.player_tactic, "enemy_tactic": state.enemy_tactic}
+
     @classmethod
     async def _load_state(cls, battle_id: int) -> Optional[BattleState]:
         row = await Database.fetchrow("SELECT * FROM combat_results WHERE id=$1", battle_id)
         if not row: return None
-        return BattleState(battle_id=battle_id, player=BattleFleet("player"),
-                           enemy=BattleFleet("ai"), terrain={}, phase=row.get("phase",1))
+        snap = row.get("ship_states") or {}
+        if isinstance(snap, str): snap = json.loads(snap)
+
+        def fleet(key: str, default_faction: str) -> BattleFleet:
+            d = snap.get(key) or {}
+            f = BattleFleet(faction=d.get("faction") or default_faction,
+                            ships=[BattleShip(**s) for s in (d.get("ships") or [])])
+            f.formation = d.get("formation") or "Line"
+            return f
+
+        return BattleState(battle_id=battle_id, player=fleet("player", "player"),
+                           enemy=fleet("enemy", "ai"), terrain={},
+                           phase=snap.get("phase", 1), turn=snap.get("turn", 0),
+                           session_id=row["session_id"])
 
 async def run_tick(session_id: int = None):
     """Autonomous campaign engagement tick (added 2026-08-14).
@@ -296,7 +381,7 @@ async def _maybe_injure_commander(session_id: int):
         "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 0
     char = await Database.fetchrow(
         "SELECT id, name FROM maya_rp.characters WHERE session_id=$1 AND "
-        "status IN ('active','married') ORDER BY (is_spouse DESC), random() LIMIT 1",
+        "status IN ('active','married') ORDER BY is_spouse DESC, random() LIMIT 1",
         session_id)
     if not char:
         return

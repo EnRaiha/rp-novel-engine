@@ -361,14 +361,32 @@ async def compute_travel(
         return {"travel_hours": travel_hours, "travel_days": travel_hours / 24.0,
                 "distance_ly": None, "distance_units": dist, "mode": "coord"}
 
-    # Fallback: try sector_connections for a direct link
+    # Fallback: try sector_connections for a direct link.
+    # from_sector_id/to_sector_id are INTEGER sector ids — the old code bound
+    # '%Name%' against their ::text form, which could never match (dead path).
     if origin and destination:
-        row = await Database.fetchrow(
-            """SELECT distance, travel_time_hours FROM maya_rp.sector_connections
-               WHERE session_id=$1
-                 AND (from_sector_id::text ILIKE $2 OR to_sector_id::text ILIKE $2)
-               ORDER BY id LIMIT 1""",
-            session_id, f"%{origin.split('-')[0] if isinstance(origin, str) else origin}%")
+        async def _sector_id(name: str):
+            return await Database.fetchval(
+                "SELECT id FROM maya_rp.sectors WHERE session_id=$1 AND name ILIKE $2 "
+                "ORDER BY id LIMIT 1",
+                session_id, f"%{str(name).split('-')[0]}%")
+
+        o_id, d_id = await _sector_id(origin), await _sector_id(destination)
+        row = None
+        if o_id and d_id:
+            row = await Database.fetchrow(
+                """SELECT distance, travel_time_hours FROM maya_rp.sector_connections
+                   WHERE session_id=$1
+                     AND ((from_sector_id=$2 AND to_sector_id=$3)
+                       OR (from_sector_id=$3 AND to_sector_id=$2))
+                   ORDER BY id LIMIT 1""",
+                session_id, o_id, d_id)
+        if row is None and (o_id or d_id):
+            row = await Database.fetchrow(
+                """SELECT distance, travel_time_hours FROM maya_rp.sector_connections
+                   WHERE session_id=$1 AND (from_sector_id=$2 OR to_sector_id=$2)
+                   ORDER BY id LIMIT 1""",
+                session_id, o_id or d_id)
         if row and row["travel_time_hours"]:
             return {"travel_hours": row["travel_time_hours"],
                     "travel_days": row["travel_time_hours"] / 24.0,

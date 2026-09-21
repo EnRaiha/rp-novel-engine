@@ -35,19 +35,22 @@ async def check(text: str, session_id: int = None) -> list[dict]:
         if f.get("is_dead") and any(v in lower for v in ["says","shouts","grabs","steps","turns","looks"]):
             issues.append({"type":"dead_char_active","detail":f"{f['name']} is dead but appears active","fix":"Remove from scene or reference as memory"})
         w = (f.get("weapon") or "").lower()
-        if w and "blade" in w and ("pistol" in lower or "gun" in lower):
-            np = lower.find(n)
-            wp = lower.find("pistol")
-            gp = lower.find("gun")
-            if 0 < abs(np - min([x for x in (wp,gp) if x>0], default=np)) < 80:
-                issues.append({"type":"wrong_weapon","detail":f"{f['name']} uses {f['weapon']} but text mentions gun/pistol","fix":f"Replace with {f['weapon']}"})
+        if w and "blade" in w:
+            # Word-boundary match: a substring test flagged "gun" inside "begun".
+            mw = re.search(r"\b(?:pistol|gun|firearm|rifle)s?\b", lower)
+            if mw:
+                np = lower.find(n)
+                wp = mw.start()
+                if np >= 0 and 0 < abs(np - wp) < 80:
+                    issues.append({"type":"wrong_weapon","detail":f"{f['name']} uses {f['weapon']} but text mentions gun/pistol","fix":f"Replace with {f['weapon']}"})
         b = f.get("bond") or 0
         if b < 3 and any(t in lower for t in ["lover","beloved","my love","darling"]):
             issues.append({"type":"wrong_bond","detail":f"{f['name']} bond {b} but called 'lover'","fix":"Use neutral address"})
 
     res = await Database.fetchrow("SELECT credits FROM maya_rp.resources WHERE session_id=$1", session_id)
     if res:
-        for m in re.finditer(r"purchas[ed]?\s+.*?([\d,]+)\s*credit", lower):
+        # "purchas[ed]?" never matched "purchased" — use an explicit alternation.
+        for m in re.finditer(r"purchas(?:e|ed|ing)?\s+.*?([\d,]+)\s*credit", lower):
             a = int(m.group(1).replace(",",""))
             if a > (res["credits"] or 0):
                 issues.append({"type":"insufficient_credits","detail":f"Spent {a:,}C but only {res['credits']:,}C available","fix":f"Reduce to \u2264{res['credits']:,}"})

@@ -20,7 +20,7 @@ from typing import Any
 
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info
 
 # ─── Constants ───────────────────────────────────────────────────
 
@@ -479,7 +479,7 @@ async def execute_conversion(
     chance = cfg["base_chance"]
     # Apply low_rank modifier if applicable
     row = await Database.fetchrow(
-        "SELECT name, faction, rank, ship_id FROM maya_rp.prisoners WHERE id = $1",
+        "SELECT name, faction, rank, cell_ship_id AS ship_id FROM maya_rp.prisoners WHERE id = $1",
         prisoner_id
     )
     if row:
@@ -556,20 +556,27 @@ async def feed_intel_to_investigation(
         prisoner_id, investigation_id, intel_text,
     )
 
-    # Try to insert clue
+    # Live `clues` columns are (id, session_id, source, source_type, text,
+    # connects_to_clue, revealed, revealed_by_character, location_id,
+    # session_found, investigation_id, created_at) — there is no
+    # title/description. The missing columns used to be swallowed here, so this
+    # pipeline was silently dead; the case link now rides on the registered
+    # clues.investigation_id (migration 105) as well as the pipeline row.
     clue_id = None
     try:
         clue_id = await Database.fetchval(
-            "INSERT INTO maya_rp.clues (session_id, source, source_type, title, description, investigation_id, revealed) "
-            "VALUES ($1, 'prisoner_intel', 'interrogation', $2, $2, $3, true) RETURNING id",
-            session_id, intel_text, investigation_id,
+            "INSERT INTO maya_rp.clues "
+            "(session_id, source, source_type, text, revealed, session_found, investigation_id) "
+            "VALUES ($1, 'prisoner_intel', 'interrogation', $2, true, $3, $4) "
+            "RETURNING id",
+            session_id, intel_text, session_id, investigation_id,
         )
         await Database.execute(
             "UPDATE maya_rp.prisoner_intel_pipeline SET converted_to_clue = true, clue_id = $1 WHERE id = $2",
             clue_id, pl_id,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        error("prison", f"clue insert failed: {e}")
 
     return {"pipeline_id": pl_id, "clue_id": clue_id}
 

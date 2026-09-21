@@ -11,8 +11,9 @@ seed_planets.py — Reseed planets across all systems (Day 1383, Izzat spec).
 Only Mastika is hand-crafted; the rest are generated.
 """
 from __future__ import annotations
+import os
 import asyncio, hashlib, random, sys
-sys.path.insert(0, str(__file__ + "/../../"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.config import Config
 from core.db import Database

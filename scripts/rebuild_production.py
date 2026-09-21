@@ -9,8 +9,9 @@ Fixes the stale display (was showing template pops 1.2M) with the new model:
   - Species-adjusted: none (tax is pop-based, already correct)
 """
 from __future__ import annotations
+import os
 import asyncio, sys
-sys.path.insert(0, str(__file__ + "/../../"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.config import Config
 from core.db import Database
 from modules.economy import _territory_tax

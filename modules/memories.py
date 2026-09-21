@@ -185,14 +185,18 @@ async def consolidate_memories(session_id: int = None, character_id: int | None 
             if len(mems) < min_count:
                 continue
             summary = await _summarize([m["content"] for m in mems])
-            await Database.execute(
-                "INSERT INTO maya_rp.character_memories "
-                "(session_id, character_id, memory_type, content, created_at_game_day, emotional_weight) "
-                "VALUES ($1, $2, 'consolidated', $3, $4, 8)",
-                session_id, cid, summary, game_day)
-            await Database.execute(
-                "DELETE FROM maya_rp.character_memories WHERE id = ANY($1::int[])",
-                [m["id"] for m in mems])
+            # The gist REPLACES the originals (the old docstring said "archive",
+            # the code deleted). Wrap insert+delete in one transaction so a
+            # crash can't leave a duplicated summary or orphaned originals.
+            async with Database.transaction() as conn:
+                await conn.execute(
+                    "INSERT INTO maya_rp.character_memories "
+                    "(session_id, character_id, memory_type, content, created_at_game_day, emotional_weight) "
+                    "VALUES ($1, $2, 'consolidated', $3, $4, 8)",
+                    session_id, cid, summary, game_day)
+                await conn.execute(
+                    "DELETE FROM maya_rp.character_memories WHERE id = ANY($1::int[])",
+                    [m["id"] for m in mems])
             consolidated += 1
             archived += len(mems)
             info("memories", f"Consolidated {len(mems)} memories -> char {cid} (day {game_day})")

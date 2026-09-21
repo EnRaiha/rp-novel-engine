@@ -55,15 +55,42 @@ async def handle(action: str, params: dict = None) -> dict:
                 "FROM maya_rp.commodities WHERE session_id=$1 ORDER BY name",
                 sid,
             )
+            # price_history has NO session_id column (id, commodity_id,
+            # tick_number, price, volume) — scope through commodities.
             history = await Database.fetch(
                 "SELECT c.name, ph.price, ph.tick_number FROM maya_rp.price_history ph "
                 "JOIN maya_rp.commodities c ON c.id=ph.commodity_id "
-                "WHERE ph.session_id=$1 ORDER BY ph.id DESC LIMIT 13",
+                "WHERE c.session_id=$1 ORDER BY ph.id DESC LIMIT 13",
                 sid,
             )
             result["data"] = {
                 "commodities": [dict(r) for r in rows],
                 "latest_ticks": [dict(r) for r in history],
+            }
+            result["status"] = "ok"
+
+        elif action == "pirates":
+            """Harta Karun overview (read-only): pirate bases + open bounties.
+            Same queries as den_ops bases/bounty, exposed as a top-level action
+            because tools.py + schemas.py already advertised 'pirates' while the
+            bridge had no branch for it (callers got 'Unknown action')."""
+            bases = await Database.fetch(
+                "SELECT pb.id, pb.name, pb.system_id, pb.hidden, pb.defenses, "
+                "pb.treasury, pb.status FROM maya_rp.pirate_bases pb "
+                "JOIN maya_rp.factions f ON f.id=pb.faction_id "
+                "WHERE f.session_id=$1 ORDER BY pb.treasury DESC",
+                sid,
+            )
+            bounties = await Database.fetch(
+                "SELECT pb.pirate_faction_id, f.name, pb.bounty_amount, "
+                "f.status, pb.claimed_by FROM maya_rp.pirate_bounties pb "
+                "JOIN maya_rp.factions f ON f.id=pb.pirate_faction_id "
+                "WHERE f.session_id=$1",
+                sid,
+            )
+            result["data"] = {
+                "bases": [dict(r) for r in bases],
+                "bounties": [dict(r) for r in bounties],
             }
             result["status"] = "ok"
 
@@ -806,9 +833,12 @@ async def handle(action: str, params: dict = None) -> dict:
             from modules import pirates
 
             if sub_action == "bases":
+                # pirate_bases has no session_id — scope through its faction.
                 rows = await Database.fetch(
-                    "SELECT id, name, system_id, hidden, defenses, treasury, status "
-                    "FROM maya_rp.pirate_bases WHERE session_id=$1 ORDER BY treasury DESC",
+                    "SELECT pb.id, pb.name, pb.system_id, pb.hidden, pb.defenses, "
+                    "pb.treasury, pb.status FROM maya_rp.pirate_bases pb "
+                    "JOIN maya_rp.factions f ON f.id=pb.faction_id "
+                    "WHERE f.session_id=$1 ORDER BY pb.treasury DESC",
                     sid,
                 )
                 result["data"] = [dict(r) for r in rows]
@@ -822,11 +852,12 @@ async def handle(action: str, params: dict = None) -> dict:
                     result["data"] = await pirates.raid_pirate_base(sid, base_id, power)
 
             elif sub_action == "bounty":
+                # pirate_bounties has no session_id either — scope via factions.
                 rows = await Database.fetch(
                     "SELECT pb.pirate_faction_id, f.name, pb.bounty_amount, "
                     "f.status, pb.claimed_by FROM maya_rp.pirate_bounties pb "
                     "JOIN maya_rp.factions f ON f.id=pb.pirate_faction_id "
-                    "WHERE pb.session_id=$1",
+                    "WHERE f.session_id=$1",
                     sid,
                 )
                 result["data"] = [dict(r) for r in rows]

@@ -1,0 +1,447 @@
+================================================================================
+DSH OOC ENGINE — FULL DOCUMENTATION
+Persona-deviation overseer for DeepSeek Harness roleplay
+================================================================================
+Version   : 2026-09-21 (fasa 3 complete)
+Repo      : /home/maya/Bumi-Hijau/rp-engine-py
+Remote    : https://lotus.tail73711d.ts.net/maya/maya-vault.git (Forgejo, private)
+Seam      : scripts/ooc_bridge.py  (JSON in / JSON out, fail-loud)
+Companion : docs in wiki/rp-dev/ (reference, design, rpg-ooc module page)
+
+--------------------------------------------------------------------------------
+0. ONE-MINUTE SUMMARY
+--------------------------------------------------------------------------------
+The OOC engine turns "love may not be spoken" into bookkeeping the model cannot
+drift away from. It audits the Host's prose and tool arguments for persona
+deviation, keeps a deviation score per session, pays roleplay points for
+compliant loopholes, gates the arc by stage, tracks observer suspicion, and
+completes scripted beats from prose. Audit is regex + SQL: zero tokens.
+
+Two planes, one writer:
+  - Engine  (Python, core/ooc.py)       authoritative state, ledger, economy
+  - Harness (TypeScript plugin)         prompt slot + tool-argument audit
+
+Current live numbers (2026-09-21):
+  canon session 3 : deviation 0, audits 0, rpp 0  (untouched, seam off)
+  rules 18 · milestones(session 3) 4 · audit events(session 3) 0
+  tests: pytest 57 · full suite 227 · vitest 34 · tsc clean
+
+--------------------------------------------------------------------------------
+1. DESIGN INTENT — WHAT PROBLEM IT SOLVES
+--------------------------------------------------------------------------------
+A constrained protagonist fails in two ways a prompt alone cannot prevent:
+
+  1. Register drift  — the model says "I'm sorry" or "weird" when the persona
+     must not speak warmth, apology, or modern filler.
+  2. Arc drift       — the model rushes or skips story beats the campaign wants
+     at a specific stage.
+
+Prompts are advisory; the model can drift away from them mid-session. The engine
+converts the constraint into state the engine owns: every audited number the
+model saw is reconstructable from the session log (provenance), and cost is
+narrative (deviation, debuff, suspicion), never a crash.
+
+Principles:
+  - Single writer: only the engine writes ooc_* rows. Modules read.
+  - Recorded, never enacted: a slip stays playable; the System is felt as
+    consequence, not announced.
+  - Deterministic: regex + SQL only. No LLM calls, no embeddings, no tokens.
+  - Fail loud: a broken bridge never writes a second state (mirror + exit 1).
+  - Evidence rule (O1): roleplay-point payment needs an action record — a
+    companion id in the turn's tool arguments — not narration alone.
+
+--------------------------------------------------------------------------------
+2. ARCHITECTURE — TWO PLANES AND THE SEAM
+--------------------------------------------------------------------------------
+2.1 ENGINE PLANE (authoritative)
+  core/ooc.py (1,268 lines) owns:
+    - the persona ruleset cascade (campaign + session rows, trait-scoped)
+    - the deviation ledger (ooc_audit_events)
+    - scripted beats / milestones, RPP economy, exemptions
+    - observer suspicion
+    - the state mirror JSON the harness reads (single-writer contract)
+    - arc stage gates and auto-advance
+
+  Modules (social, council, ...) never write ooc_* rows. They read:
+    - modules/social.py   : probe beat when a suspicious observer is in scene
+    - modules/council.py  : narrative "notice" line on high suspicion
+
+2.2 HARNESS PLANE (stateless caller)
+  packages/experimental/ooc-engine (in ~/projects/deepseek-harness):
+    src/index.ts  (429)  plugin: prompt sections, hooks, tools, config schema
+    src/audit.ts  (301)  in-process regex audit (self-contained mode)
+    src/state.ts  (215)  JSON state document (self-contained mode)
+    src/bridge.ts (215)  engine seam client (engine mode)
+    tests/        (452)  vitest: 34 tests
+
+  With engine.enabled the plugin keeps no authoritative state: every audit is a
+  bridge call and the engine's answer is the truth. Without the engine the
+  plugin still works alone (in-process audit + its own JSON state file).
+
+2.3 SEAM PROTOCOL
+  Command:
+    echo '{"call":"turn","session_id":3,"text":"...","traits":["aloof"],
+           "preview":false,"state_file":"/path/tkg-state.json"}' \
+      | python3 scripts/ooc_bridge.py
+
+  Calls:
+    state  -> current state row + effective rule count
+    turn   -> audit prose (layer=dialogue), returns findings, deviation,
+              debuff, award, suspicion, milestones, beats_completed
+    canon  -> read-only snapshot for the prompt context
+
+  Answer (shape): { ok, call, source:"engine", ...payload }
+  Failure: { ok:false, error } + exit 1. The plugin logs and keeps its local
+  snapshot; it never persists a second authoritative state.
+
+  Rules:
+    - preview:true  -> never writes (deviation, beats, suspicion all skipped)
+    - layer=tool    -> audit of tool arguments; beats never fire from it
+    - state_file    -> the mirror the harness plugin reads; always pass it for
+                       the game profiles so the mirror lands where the plugin
+                       looks (sharp edge #1)
+
+2.4 MIRROR
+  Every engine write refreshes <state_file>: one JSON array of
+  { sessionId, deviation, roleplayPoints, audits, findings, debuff, stage,
+    updatedAt }. The mirror always equals PG after a write — verified in tests
+  (test_mirror_carries_state_into_the_harness_file,
+   test_mirror_keeps_other_sessions) and in the live E2E.
+
+--------------------------------------------------------------------------------
+3. DATA MODEL (schema maya_rp, migrations 108/109/110)
+--------------------------------------------------------------------------------
+Migration files (apply by hand as owner maya; never via scripts/migrate.py):
+  migrations/108-ooc-engine-20260919.sql        six tables
+  migrations/109-ooc-effective-rules.sql        resolver function
+  migrations/110-ooc-rule-tool-layer.sql        layer accepts 'tool'
+
+ooc_system_state
+  session_id int PK · arc_stage text · deviation int · roleplay_points int
+  audits int · findings int · debuff text · updated_at timestamptz
+
+ooc_rules
+  id text PK · scope ('campaign'|'session') · session_id int NULL (campaign)
+  trait text NULL · kind ('somatic_lock'|'forbidden_lexicon'|'modern_phrasing'
+  |'scripted_beat') · layer ('somatic'|'dialogue'|'both'|'tool')
+  pattern text · is_regex bool · delta int · enabled bool · created_at
+
+ooc_audit_events  (the ledger; never stores raw prose)
+  id bigint · session_id · rule_id · layer · disposition
+  ('flagged'|'no_match'|'exempt'|...) · skip_reason · match_sha256 (12 hex)
+  match_len · delta · deviation_after · suspicion_delta · turn_ref · created_at
+
+ooc_milestones  (scripted beats)
+  id bigint · session_id · name · trait · stage · required bool
+  rpp_reward int · latch_ruleset text · completed_at · expires_at
+
+ooc_exemptions  (RPP sink; silence one rule on one action key)
+  id · session_id · rule_id · action_key · condition (e.g. scene:medical)
+  cost_rpp · permanent bool · expires_at · purchased_at
+
+ooc_suspicion  (observer meter; a mortal notices, the System never does)
+  session_id · observer_id (FK characters) · suspicion int · last_reason
+  last_event_id · updated_at            PK (session_id, observer_id)
+
+Resolver:
+  ooc_effective_rules(p_session_id int, p_traits text[]) RETURNS rule rows
+  Campaign rows (session_id IS NULL) + that session's rows, filtered by trait,
+  enabled only. Python side then:
+    - unions latched rulesets from completed milestones (§6.2)
+    - mutes scripted_beat rules whose milestone is in another arc stage (F1 fix)
+
+Seeded content:
+  14 campaign rules  (general/modern, aloof, mentor, tyrant register)
+   4 campaign beat rules  beat:<name>  (one per seeded milestone)
+   -> total 18 rules. 4 milestones per session at stage lockdown, 5 rpp each.
+
+--------------------------------------------------------------------------------
+4. MECHANICS
+--------------------------------------------------------------------------------
+4.1 LAYER SPLIT  (pure; no I/O)
+  split_layers(text) -> { somatic, dialogue }
+    - quoted speech -> dialogue only
+    - narration      -> somatic + dialogue
+    - apostrophes inside words (don't, it's) never open a quote
+  somatic rules (tears, trembling) never see quoted speech; register rules
+  (forbidden_lexicon, modern_phrasing) see 'both' — a slip in unquoted
+  narration must still cost.
+  compile_rule caches per rule id and rejects nested quantifiers
+  (MAX_PATTERN_CHARS = 400, ReDoS bound).
+
+4.2 AUDIT (async)
+  audit(text, session_id, layer='dialogue', traits=..., preview=False,
+        turn_ref=None)
+    1. resolve stage + effective rules (beats stripped from penalties)
+    2. §6.3 prose turns: beats_from_prose() may complete beats (not in preview,
+       not for layer='tool')
+    3. audit_text against live exemptions (D5)
+    4. fold result: deviation = clamp(deviation + delta - decay, 0, 100)
+    5. observer suspicion micro-step (D6)
+    6. ledger row (sha256 of match, length, disposition) + mirror
+  Findings carry rule id, match text (for the notice), delta, layer.
+
+4.3 DEVIATION LADDER + STAGES   (provisional; Q2/Q5 open with Izzat)
+  stage          warning  critical  execution  decay/turn
+  lockdown          25       50         75          0
+  selective         40       75        100          2
+  confrontation     50       80        100          5
+  Stage gates (§7):
+    lockdown       — always available
+    selective      — needs 1 completed beat AND 5 rpp
+    confrontation  — needs 2 completed beats, 10 rpp, 1 exemption
+
+4.4 DEBUFF LADDER (narrative; recorded, never enacted by the plugin)
+  warning   -> Neural Tremor
+  critical  -> Meridian Lock
+  execution -> System Reclamation
+  debuff_for(deviation, stage) is pure; the string lands in state.debuff and is
+  shown in the prompt context.
+
+4.5 RPP ECONOMY (O1)
+  - Loophole: a compliant line whose score >= 40 earns +1 rpp per audit.
+  - Payment rule O1: rpp beyond the audit award requires action evidence — a
+    companion id present in the turn's tool arguments. Narration alone never
+    pays (tested).
+  - Exemptions (D5): buy silence for one rule on one action_key; conditions
+    (scene:medical), TTL or permanent; audited calls become disposition
+    'exempt' with skip_reason.
+  - Beats pay their rpp_reward when completed (see 4.8).
+
+4.6 OBSERVER SUSPICION (D6, §6.1)
+  One row per observer (a mortal character). The System itself never notices.
+  - a hidden micro-slip (delta <= 4) that the next turn does not repeat: +5
+    (reason micro_consistency:<rule>)
+  - a clean turn: -1 (relaxation)
+  - bands: unaware < 25 <= watchful < 60 <= probing < 90 <= certain
+  Consumers (read-only, one-way):
+    - suspicion_band(value) -> band name (pure)
+    - suspicion_reading(session_id) -> top observer + band + count
+    - modules/social.py  : inserts an observer_probe beat when the watcher is
+      in the scene (watchful+)
+    - modules/council.py : returns a narrative notice for the band
+  Contract: modules never write ooc_*; the row is byte-identical before/after
+  a module call (asserted in tests).
+
+4.7 SCRIPTED BEATS / MILESTONES
+  A beat = ooc_milestones row (trait, stage, required, rpp_reward,
+  latch_ruleset, expires_at) + optional paired rule id 'beat:<name>'.
+  - Prose-proven: complete_milestone(session, name, text=...) matches the
+    paired rule against dialogue + somatic surfaces.
+  - Evidence: a beat with no paired rule needs evidence=True + evidence_actions
+    (a companion id). This keeps O1 intact: prose alone cannot claim it.
+  - required + expires_at: overdue_milestones() reports unmet required beats
+    past their window. Reported (CLI), never billed as deviation.
+  - latch_ruleset (§6.2): when a beat fires, that ruleset is unioned into the
+    session's effective traits. Derived from the completed milestone (single
+    source of truth; no state column, no rule row mutated per session).
+  - beats_from_prose(session, text, traits, turn_ref) (§6.3): completes every
+    due beat this prose proves. audit() calls it for prose turns, so the
+    narrator's prose fires beats with no manual CLI call. Preview and tool
+    turns write nothing.
+
+4.8 ARC STAGE AUTO-ADVANCE
+  advance(session, auto=False): stage gates checked against completed beats,
+  rpp, exemptions. `ooc advance --auto` advances only when gates pass.
+
+4.9 READINESS
+  readiness(session) -> per-stage gate report (beats needed/available, rpp,
+  exemptions) for the CLI `ooc readiness`.
+
+--------------------------------------------------------------------------------
+5. ENGINE API (core/ooc.py)
+--------------------------------------------------------------------------------
+Pure (no I/O):
+  split_layers(text) -> {somatic, dialogue}
+  compile_rule(rule) -> compiled matcher (cached, ReDoS-bounded)
+  audit_text(text, rules, layer, exemptions) -> findings
+  count_token(text) / loophole_score(text) / rpp_award(...)
+  debuff_for(deviation, stage) / suspicion_band(value)
+  condition_met(condition, ...) / state_file_path() / _iso(value)
+  STAGE_THRESHOLDS / STAGE_GATES / BEAT_RULE_PREFIX / MAX_PATTERN_CHARS
+Async (PostgreSQL + mirror):
+  state(session_id)                     ensure + read ooc_system_state
+  effective_rules(session_id, traits, stage=None)   cascade + latch + beat mute
+  audit(text, session_id, layer, traits, preview, turn_ref)
+  set_stage(session_id, stage)
+  companion_ids(...) / observer_id(session_id) / evidence_from_actions(...)
+  milestones(session_id, traits, stage=None, due_only)  + overdue flag per row
+  overdue_milestones(session_id, traits, stage=None)
+  complete_milestone(session_id, name, text, traits, evidence, evidence_actions,
+                     turn_ref)
+  beats_from_prose(session_id, text, traits, turn_ref)
+  exemptions(session_id) / live_exemptions(...) / buy_exemption(...)
+  suspicion(session_id, observer=None) / bump_suspicion(...) /
+  suspicion_reading(session_id)
+  stage_readiness(session_id) / advance_stage(session_id, auto=...)
+  mirror_state_file(session_id)
+  CLI-level helpers (`ooc events`, `ooc prune`) query the ledger directly.
+
+--------------------------------------------------------------------------------
+6. CLI REFERENCE  (python3 scripts/cli.py ooc ...)
+--------------------------------------------------------------------------------
+  status [--session N]                 deviation, rpp, debuff, overdue beats
+  audit "<text>" [--layer=…] [--trait=…] [--evidence] [--turn=REF]
+                                       audit + prose-fired beats print ★
+  rules [--trait=…] [--stage=…]        effective ruleset for the moment
+  beats [--all] [--from-text="<prose>"]
+                                       due beats; --from-text fires prose path
+  milestone done <name> [--text=…] [--evidence]
+  exemption list | buy <rule_id> <action_key> [--cost=N] [--condition=…]
+  suspicion [--observer=N] [--bump] [--delta=5] [--reason=…]
+  readiness                            arc-stage gates
+  advance [--auto]
+  stage <lockdown|selective|confrontation>
+  mirror                               push state into the harness JSON
+  events [N] · prune [DAYS]
+
+  Always export OOC_STATE_FILE when working on a scratch session, so the mirror
+  does not overwrite a game profile's file.
+
+--------------------------------------------------------------------------------
+7. HARNESS PLUGIN (packages/experimental/ooc-engine)
+--------------------------------------------------------------------------------
+Config fields (schema defaults):
+  sessionId 0 · statePath '' (-> <harness home>/ooc-state.json)
+  personaName '' · personaArchetype ''
+  rules (14 defaults) · warningThreshold 40 · criticalThreshold 75
+  executionThreshold 100 · loopholeMin 40 · rppPerLoophole 25
+  banner true · traits ['general']
+  engine { enabled false, command 'python3', script '', cwd '',
+           timeoutMs 3000 }
+
+Surfaces:
+  - prompt section  [SYSTEM: PERSONA LOCK]  rules the Host is bound by
+  - prompt context  [SYSTEM STATE]          live deviation/penalty/rpp/audits
+  - hook tools/post-execute                 audits prose arguments of a call,
+                                            attaches [SYSTEM NOTICE] on leak
+  - tools ooc_status / ooc_audit            inspection; engine owns audit for
+                                            real turns
+  - engine seam                             when enabled, bridge calls replace
+                                            local state (single writer)
+
+Validation: unknown rule kind / layer / non-positive delta / duplicate id /
+non-increasing threshold ladder all throw at load (fail loud, not silent
+mis-audit).
+
+Build & test:
+  npx tsc -b packages/experimental/ooc-engine/tsconfig.json
+  npx vitest run packages/experimental/ooc-engine
+
+--------------------------------------------------------------------------------
+8. OPERATIONS
+--------------------------------------------------------------------------------
+Profiles (JSON patch over the harness config):
+  ~/.dsh/profiles/ooc-e2e/cordis.patch.yml      seam ON, session 999 scratch
+  ~/.dsh/profiles/headless/cordis.patch.yml     canon game, seam OFF
+  ~/.dsh/profiles/headless/cordis.patch.yml.engine-pending
+                                                ready variant: seam ON for
+                                                session 3 (awaiting enable)
+Smoke:
+  cd ~/projects/deepseek-harness && node apps/cli/lib/bin.js \
+     --profile ooc-e2e "<prompt>"
+Preflight (wraps every check in the handoff contract):
+  bash ~/scripts/ooc-preflight.sh
+Sharp edges:
+  1. state_file must point at the file the plugin reads, else the mirror lands
+     on the default TKG path and the game sees stale numbers.
+  2. Preview never writes — use it for inspection only.
+  3. The plugin audits tool arguments, not assistant prose; prose beats fire in
+     the engine plane (CLI / bridge turn) by design (§6.3).
+  4. Scratch DB tests use session 999; the pytest fixture (_SCRATCH_CLEANUP)
+     wipes its rows before and after each test.
+  5. Applying migrations: by hand as owner maya. Never scripts/migrate.py.
+Repo/remote: the engine lives in the vault repo, now on the private Forgejo
+  https://lotus.tail73711d.ts.net/maya/maya-vault.git (Tailscale serve, HTTPS).
+
+--------------------------------------------------------------------------------
+9. TESTING & EVIDENCE (2026-09-21)
+--------------------------------------------------------------------------------
+Engine:  python3 -m pytest tests/test_ooc.py -q      -> 57 passed
+Full:    python3 -m pytest tests/ -q                 -> 227 passed
+Plugin:  npx vitest run packages/experimental/ooc-engine -> 34 passed
+Types:   npx tsc -b packages/experimental/ooc-engine/tsconfig.json -> clean
+Preflight: bash ~/scripts/ooc-preflight.sh -> OK, exit 0
+  (bridge fails loud, session 3 canon untouched, rules 18, milestones 4)
+
+Fasa 3 tests (+12):
+  suspicion consumers: social probe + no-probe + council tick + bands (4)
+  beats from prose: stage-mute regression (F1), prose completion, audit turn,
+    preview no-write, tool no-write, unpaired needs evidence (6)
+  required/overdue + latch (2)
+
+Live E2E (ooc-e2e, session 999):
+  tool-argument turn  -> PG deviation 4, audits 1, event
+                         gen-modern-slip layer=tool delta=4; mirror == PG
+  engine prose path   -> "She kneels and answers nothing."
+                         ★ beat complete aloof-receive-without-answering, rpp 5
+                         completed_at 2026-09-21 19:37:35+08
+
+Consumers byte-identical test: the ooc_suspicion row is compared before/after
+the social/council call (assert before == after).
+
+--------------------------------------------------------------------------------
+10. CHANGELOG
+--------------------------------------------------------------------------------
+D1–D7 (2026-09-19/20, fasa 1–2)
+  D1 schema + resolver · D2 rule cascade · D3 ledger · D4 beats/milestones ·
+  D5 exemptions · D6 observer suspicion · D7 stage gates + mirror.
+  Seam built (bridge + plugin engine mode), E2E live dev=12 audits=2.
+
+Fasa 3 (2026-09-21)
+  §6.1 suspicion consumers: suspicion_band/suspicion_reading; social probe beat;
+       council notice.
+  §6.2 required/overdue: `overdue` flag on every beat row + overdue_milestones();
+       CLI warning; latch_ruleset read by effective_rules (derived from the
+       completed milestone).
+  §6.3 beats from prose: beats_from_prose(); audit() calls it for prose turns;
+       CLI `ooc beats --from-text`; preview/tool never write.
+  §6.4 wiki pack: rpg-ooc.md module page + index row; sync-pack clean.
+
+  F1 FIX (blocker): effective_rules muted scripted_beat rules with
+  (trait or stage) != stage. ooc_rules has no stage column; seeded beats carry
+  a persona trait, so every seeded beat rule was silently dropped and
+  prose-proven beats could never resolve. Muting now uses the MILESTONE's stage.
+  Regression test: test_seeded_shape_beat_rule_resolves_in_its_stage.
+
+--------------------------------------------------------------------------------
+11. OPEN ITEMS
+--------------------------------------------------------------------------------
+  - Q2 deviation decay (lambda) values · Q4 (O1 vs O2) · Q5 stage gates:
+    still provisional; Izzat's call.
+  - Canon seam: ~/.dsh/profiles/headless/cordis.patch.yml.engine-pending is
+    ready; enabling it starts auditing TKG session 3.
+  - enforceAtExecution (§10a): NOT built. The plugin records findings; it never
+    denies a call. A pre-execute block is a design decision + build item.
+  - Prose hook: the harness plugin audits tool arguments only. Assistant prose
+    reaches the engine today via CLI/bridge; a turn-stopping hook would make
+    prose beats live (new scope).
+  - Commit/push state of fasa 3 in the vault repo.
+
+--------------------------------------------------------------------------------
+12. FILE MAP & DOC INDEX
+--------------------------------------------------------------------------------
+Engine repo (rp-engine-py/)
+  core/ooc.py                engine (this document's subject)
+  scripts/ooc_bridge.py      seam client (155 lines)
+  scripts/cli.py             CLI incl. `ooc` block
+  scripts/seed_ooc_rules.py  campaign rules + beats seeder
+  migrations/108..110        schema + resolver + tool layer
+  tests/test_ooc.py          engine tests (57)
+Harness repo (~/projects/deepseek-harness)
+  packages/experimental/ooc-engine/src/{index,audit,state,bridge}.ts
+  packages/experimental/ooc-engine/tests/*.spec.ts (34)
+Wiki (Bumi-Hijau/wiki/rp-dev/)
+  OOC-ENGINE-REFERENCE-2026-09-20.md   reference: schema, runbook, tests
+  OOC-SYSTEM-DESIGN-2026-09-19.md      design: Q&A, D1-D7 plan
+  rpg-ooc.md                           module page (wiki pack)
+  OOC-ECOSYSTEM-REVIEW-2026-09-19.md   7-repo survey (PORT/STEAL/SKIP)
+Handoff / reports
+  ~/scripts/HANDOFF-ooc-engine-20260920.md   contract + executed status
+  /tmp/kilo/ooc-fasa3/report.md              fasa 3 report (evidence)
+  wiki/FORGEJO-VAULT-20260921.md             forge migration ops note
+  wiki/POSTMORTEM-TAILSCALE-ADDRESSING-20260921.md
+
+================================================================================
+END OF DOCUMENT
+================================================================================

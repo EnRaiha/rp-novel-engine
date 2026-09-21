@@ -32,21 +32,25 @@ async def build_ship(class_name: str, tier: int, ship_type: str, name: str, loca
         return {"error": f"Not enough resources! Need {ship['total_alloy_cost']}a/{ship['total_credit_cost']}c, "
                 f"have {res['alloys']}a/{res['credits']}c"}
 
-    # Deduct alloys + credits
-    await Database.execute(
-        "UPDATE maya_rp.resources SET alloys = alloys - $1, credits = credits - $2, updated_at = NOW() WHERE session_id = $3",
-        ship["total_alloy_cost"], ship["total_credit_cost"], session_id)
-
-    # Check materials
+    # Validate materials BEFORE spending anything: the old order deducted
+    # alloys/credits first, so a build that then failed on a missing material
+    # burned the resources and produced nothing.
     mats = TIER_MATERIALS.get(tier, TIER_MATERIALS[1])
-    for mat_name, qty_per_mass in mats:
-        qty = max(1, round(ship["mass"] * qty_per_mass))
+    needed = {mat_name: max(1, round(ship["mass"] * qty_per_mass)) for mat_name, qty_per_mass in mats}
+    for mat_name, qty in needed.items():
         avail = await Database.fetchval(
             "SELECT COALESCE(SUM(quantity - reserved), 0) FROM maya_rp.material_stockpiles "
             "WHERE session_id = $1 AND material_name = $2", session_id, mat_name) or 0
         if avail < qty:
             return {"error": f"Not enough {mat_name}! Need {qty}, have {avail}"}
 
+    # Deduct alloys + credits (resources has no updated_at column)
+    await Database.execute(
+        "UPDATE maya_rp.resources SET alloys = alloys - $1, credits = credits - $2 WHERE session_id = $3",
+        ship["total_alloy_cost"], ship["total_credit_cost"], session_id)
+
+    # Consume materials
+    for mat_name, qty in needed.items():
         stockpiles = await Database.fetch(
             "SELECT id, quantity - reserved AS available FROM maya_rp.material_stockpiles "
             "WHERE session_id = $1 AND material_name = $2 AND quantity > reserved ORDER BY quantity DESC",

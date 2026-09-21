@@ -5,7 +5,7 @@ import random
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info
 
 SKILLS = {"combat":["gunnery","tactics","melee","boarding"],"engineering":["reactor","ftl","weapons","hull"],"science":["xenobiology","astrometrics","quantum","archaeology"],"command":["leadership","logistics","morale","strategy"],"medical":["surgery","pharma","psychology","xeno"]}
 ALL_SKILLS = [s for sub in SKILLS.values() for s in sub]
@@ -32,8 +32,8 @@ async def run_tick(session_id: int = None) -> dict:
     gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)
     try:
         await Database.execute("UPDATE maya_rp.crew_roster SET level=COALESCE(level,1),rank=COALESCE(rank,'Crewman') WHERE session_id=$1 AND level IS NULL", session_id)
-    except Exception:
-        pass
+    except Exception as e:
+        error("crew_career", f"rank backfill failed: {e}")
     return {"processed":True}
 
 

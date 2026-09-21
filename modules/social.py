@@ -19,6 +19,7 @@ from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import info
+from core import ooc
 
 
 # ─── Constants ───────────────────────────────────────────────────
@@ -146,6 +147,15 @@ TENSION_NARRATIVES = {
     "mutiny":    "The bridge door locks from the inside now. Someone you trust will not meet your eyes.",
 }
 
+# ─── Observer suspicion (§6.1) — one-way read of the OOC meter ───
+# A high-suspicion observer probes instead of sharing. The engine owns the
+# value; this module only colours the scene by its band, and never writes it.
+SUSPICION_PROBE_LINES = {
+    "watchful": "I will keep my own counsel on that.",
+    "probing": "You have been different lately. What are you not telling me?",
+    "certain": "I know. Tell me the truth. Now.",
+}
+
 
 # ─── Relationship Helpers ────────────────────────────────────────
 
@@ -180,7 +190,7 @@ async def shift_bond(
             "INSERT INTO maya_rp.character_relationships "
             "(session_id, char_a_id, char_b_id, score, relationship_type, last_interaction) "
             "VALUES ($1, $2, $3, $4, 'neutral', NOW()) "
-            "ON CONFLICT (char_a_id, char_b_id) DO UPDATE SET "
+            "ON CONFLICT (session_id, char_a_id, char_b_id) DO UPDATE SET "
             "  score = GREATEST(-50, LEAST(50, maya_rp.character_relationships.score + $4)), "
             "  last_interaction = NOW() "
             "RETURNING *",
@@ -198,8 +208,8 @@ async def shift_bond(
 
         await Database.execute(
             "UPDATE maya_rp.character_relationships SET relationship_type = $1 "
-            "WHERE char_a_id = $2 AND char_b_id = $3",
-            rtype, a, b,
+            "WHERE session_id = $4 AND char_a_id = $2 AND char_b_id = $3",
+            rtype, a, b, session_id,
         )
         return {"relationship": row, "type": rtype, "bond": bond}
     except Exception as e:
@@ -500,16 +510,26 @@ async def update_morale(
     rows = await Database.fetch(
         "SELECT id, name, morale FROM maya_rp.crew_roster WHERE session_id = $1", session_id
     )
+    before_sum = after_sum = 0
     for r in rows:
-        new_morale = max(0, min(100, (r["morale"] or 50) + delta))
+        before = r["morale"] or 50
+        new_morale = max(0, min(100, before + delta))
+        before_sum += before
+        after_sum += new_morale
         await Database.execute(
             "UPDATE maya_rp.crew_roster SET morale = $1 WHERE id = $2",
             new_morale, r["id"],
         )
+    if rows:
+        # morale_history is fleet/ship graded: (ship_id, fleet_wide,
+        # morale_before, morale_after, cause). The old per-crew INSERT named
+        # columns that do not exist (character_id/morale_level/reason) — it
+        # failed on every call, and this one fleet-wide row also avoids writing
+        # 4,000+ history rows per morale event.
         await Database.execute(
-            "INSERT INTO maya_rp.morale_history (session_id, character_id, morale_level, reason) "
-            "VALUES ($1, $2, $3, $4)",
-            session_id, r["id"], new_morale, reason,
+            "INSERT INTO maya_rp.morale_history (session_id, fleet_wide, morale_before, morale_after, cause) "
+            "VALUES ($1, true, $2, $3, $4)",
+            session_id, round(before_sum / len(rows)), round(after_sum / len(rows)), reason,
         )
 
     fleet = await _get_fleet_morale(session_id)
@@ -549,6 +569,28 @@ def get_social_event_config(event_type: str) -> dict:
     return SOCIAL_EVENT_TYPES.get(event_type, SOCIAL_EVENT_TYPES["banquet"])
 
 
+def _observer_probe(reading: dict, participants: list[dict]) -> dict | None:
+    """A probe beat when the watcher is in the scene and suspicious enough (§6.1).
+
+    @param reading - `core.ooc.suspicion_reading` result.
+    @param participants - scene participants.
+    @returns the beat, or None when nobody in this scene is watching.
+    """
+    line = SUSPICION_PROBE_LINES.get(reading.get("band"))
+    name = reading.get("name")
+    if not line or not name:
+        return None
+    if not any(p.get("name") == name for p in participants):
+        return None
+    return {
+        "type": "observer_probe",
+        "speaker": name,
+        "band": reading["band"],
+        "suspicion": reading["suspicion"],
+        "line": line,
+    }
+
+
 async def generate_social_event(
     session_id: int,
     event_type: str,
@@ -581,7 +623,10 @@ async def generate_social_event(
     participants.extend(npc_participants)
 
     # Companion voice line
+    # companion_line is assigned only when a companion has a line, and c_name
+    # only exists inside the loop — the check below used to read both unbound.
     companion_line = None
+    c_name = None
     for c_name in companions:
         cl = companions if companions else []
         if c_name in ("Nethara", "Melano", "Valia"):
@@ -616,6 +661,13 @@ async def generate_social_event(
             ["Speak", "Act", "Stay silent", "Free action"]),
     })
 
+    # §6.1 — read the OOC suspicion meter (never write it): an observer in this
+    # scene who has grown suspicious shares less and probes instead.
+    reading = await ooc.suspicion_reading(session_id)
+    probe = _observer_probe(reading, participants)
+    if probe:
+        beats.insert(len(beats) - 1, probe)
+
     # Save to social_events
     await Database.execute(
         "INSERT INTO maya_rp.social_events "
@@ -631,6 +683,7 @@ async def generate_social_event(
         "participants": participants,
         "beats": beats,
         "morale_impact": BASE_MORALE_MODIFIERS.get(f"social_{event_type}", 0),
+        "suspicion": reading,
     }
 
 
@@ -687,8 +740,11 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
         mutiny = await calculate_mutiny_risk(session_id)
         fleet_morale = await _get_fleet_morale(session_id)
         morale = get_morale_status(fleet_morale)
+        # §6.1 — read-only: the OOC meter colours the tick, it is never written here.
+        reading = await ooc.suspicion_reading(session_id)
 
-        info("social", f"Tick: fleet_morale={fleet_morale} [{morale['status']}] mutiny={mutiny['risk_level']} ({mutiny['probability']}%)")
+        info("social", f"Tick: fleet_morale={fleet_morale} [{morale['status']}] mutiny={mutiny['risk_level']} ({mutiny['probability']}%)"
+                       f" observer={reading['band']} ({reading['suspicion']})")
         return {
             "fleet_morale": fleet_morale,
             "morale_status": morale["status"],
@@ -696,6 +752,7 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
             "mutiny_probability": mutiny["probability"],
             "mutiny_stage": mutiny["stage"],
             "ringleaders": len(mutiny["ringleaders"]),
+            "observer_suspicion": reading,
         }
     except Exception as e:
         info("social", f"Error: {e}")

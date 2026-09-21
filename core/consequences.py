@@ -5,7 +5,7 @@ import json
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info
 
 async def _current_tick(session_id: int) -> int:
     """Get the current session game day as tick number."""
@@ -84,20 +84,25 @@ async def _fire(effect: dict, seed: dict, session_id: int):
         )
 
     elif effect["type"] == "stat":
-        col = effect.get("target", "morale")
+        # `morale` is NOT a column of maya_rp.resources (live columns: credits,
+        # alloys, fuel, population, tech_score, influence, fear,
+        # aggregate_morale, …) — the old default raised UndefinedColumnError
+        # into a bare `except: pass`, so every stat consequence silently did
+        # nothing.
+        col = effect.get("target") or "aggregate_morale"
         # Whitelist allowed columns to prevent SQL injection via effect templates
-        _ALLOWED_COLS = {"morale", "credits", "alloys", "fuel", "population",
-                          "tech_score", "influence", "fear", "aggregate_morale"}
+        _ALLOWED_COLS = {"aggregate_morale", "credits", "alloys", "fuel", "population",
+                         "tech_score", "influence", "fear"}
         if col not in _ALLOWED_COLS:
-            col = "morale"  # safe default
+            col = "aggregate_morale"  # safe default
         delta = effect.get("delta", 0)
         try:
             await Database.execute(
                 f"UPDATE maya_rp.resources SET {col} = GREATEST(0, COALESCE({col},0) + $1) "
                 f"WHERE session_id=$2",
                 delta, session_id)
-        except Exception:
-            pass
+        except Exception as e:
+            error("consequences", f"stat consequence {col} failed: {e}")
 
     elif effect["type"] == "faction_reaction":
         faction = effect.get("faction", "")

@@ -11,9 +11,10 @@ Exits non-zero if a hard threshold fails (regression guard).
 Usage: python3 scripts/bench_interceptor.py
 """
 import asyncio
+import os
 import sys
 import time
-sys.path.insert(0, str(__file__ + "/../../"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.db import Database
 from core.stream_interceptor import StreamInterceptor

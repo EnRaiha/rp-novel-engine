@@ -115,46 +115,73 @@ async def upgrade_infrastructure(session_id: int, inst_id: int) -> dict:
 
     return {"infrastructure_id": inst_id, "new_level": new_level, "bonus": bonus}
 
-async def run_production_tick(session_id: int, game_days: float = 0.5):
-    """Tick — produce resources from active infrastructure."""
+# effect keys → `resources` column. The catalogue spells it "alloy_production"
+# while the ledger column is `alloys` (the mismatch silently dropped every alloy
+# payout). Only white-listed columns are ever interpolated into the UPDATE.
+RESOURCE_COLUMNS = ("credits", "alloys", "fuel", "dream_essence", "rare_earth",
+                    "starsteel", "void_crystal", "aetherium")
+RESOURCE_ALIAS = {"alloy": "alloys"}
+
+
+def _resource_column(effect_key: str) -> str | None:
+    res = effect_key.replace("_production", "")
+    res = RESOURCE_ALIAS.get(res, res)
+    return res if res in RESOURCE_COLUMNS else None
+
+
+async def run_production_tick(session_id: int, game_days: float = 0.5) -> dict:
+    """Tick — produce resources from active infrastructure.
+
+    Scoped to the session that owns the instance: the query used to select every
+    session's active infrastructure and credit the totals to the session_id
+    argument, so a second session's facilities paid into this one's treasury.
+    """
+    produced = {}
     for inst in await Database.fetch("""
         SELECT ii.*, it.effects, it.category
         FROM maya_rp.infrastructure_instances ii
         JOIN maya_rp.infrastructure_types it ON it.id = ii.infrastructure_type_id
-        WHERE ii.status = 'active'
-    """):
+        WHERE ii.status = 'active' AND ii.session_id = $1
+    """, session_id):
         effects = _j(inst.get("effects"))
-        bonus = inst.get("production_bonus") or 1.0
+        # numeric columns and jsonb numerics arrive as Decimal → float() before
+        # multiplying (Decimal * float raised TypeError, so the tick never
+        # produced anything: infrastructure_production was empty).
+        bonus = float(inst.get("production_bonus") or 1.0)
         production = {}
 
         for key, val in effects.items():
             if key.endswith("_production"):
-                resource = key.replace("_production", "")
-                amount = int(val * bonus * game_days)
+                col = _resource_column(key)
+                if not col:
+                    continue
+                amount = int(float(val) * bonus * game_days)
                 if amount > 0:
-                    production[resource] = amount
+                    production[col] = production.get(col, 0) + amount
 
-        if production:
-            for res, amount in production.items():
-                col = res if res in ("credits", "alloys", "fuel", "dream_essence",
-                                      "rare_earth", "starsteel", "void_crystal") else None
-                if col:
-                    await Database.execute(
-                        f"UPDATE maya_rp.resources SET {col} = {col} + $1 WHERE session_id = $2",
-                        amount, session_id
-                    )
-                    await Database.execute("""
-                        INSERT INTO maya_rp.infrastructure_production
-                            (infrastructure_id, resource_type, amount_produced, produced_at)
-                        VALUES ($1, $2, $3, NOW())
-                    """, inst["id"], res, amount)
+        for res, amount in production.items():
+            await Database.execute(
+                f"UPDATE maya_rp.resources SET {res} = {res} + $1 WHERE session_id = $2",
+                amount, session_id
+            )
+            await Database.execute("""
+                INSERT INTO maya_rp.infrastructure_production
+                    (infrastructure_id, resource_type, amount_produced, produced_at)
+                VALUES ($1, $2, $3, NOW())
+            """, inst["id"], res, amount)
+            produced[res] = produced.get(res, 0) + amount
+    return {"produced": produced}
 
 async def run_tick(session_id: int = 3):
     """Infrastructure tick — run production."""
+    from core.log import info, error
     try:
-        await run_production_tick(session_id)
+        out = await run_production_tick(session_id)
+        info("infrastructure", f"Tick: produced {out['produced'] or 'nothing'}")
+        return out
     except Exception as e:
-        print(f"  Infrastructure: {e}")
+        error("infrastructure", f"Tick error: {e}")
+        return {"error": str(e)}
 
 # ============================================================
 # Helpers

@@ -57,6 +57,96 @@ def _json_default(o):
     return str(o)
 
 
+# ─── Row encoding (type-aware) ──────────────────────────────────────────
+
+async def _column_udts(tables: list[str]) -> dict[str, dict[str, str]]:
+    """{table: {column: udt_name}} for the tables in a .sav (one query)."""
+    rows = await Database.fetch(
+        "SELECT table_name, column_name, udt_name FROM information_schema.columns "
+        "WHERE table_schema='maya_rp' AND table_name = ANY($1::text[])", tables)
+    out: dict[str, dict[str, str]] = {}
+    for r in rows:
+        out.setdefault(r["table_name"], {})[r["column_name"]] = r["udt_name"]
+    return out
+
+
+def _pg_array_literal(v: list, udt: str) -> str:
+    """Encode a Python list as a PostgreSQL ARRAY literal.
+
+    The old blanket `::jsonb` cast raised DatatypeMismatchError for every
+    ARRAY column (8 of them, e.g. cabinet_decrees.event_ids INT[],
+    planet_types_catalog.special_events TEXT[]), which is why those tables
+    could never be restored.
+    """
+    elem_type = udt[1:] + "[]" if udt.startswith("_") else "text[]"
+    parts = []
+    for x in v:
+        if x is None:
+            parts.append("NULL")
+        elif isinstance(x, bool):
+            parts.append("true" if x else "false")
+        elif isinstance(x, (int, float)):
+            parts.append(str(x))
+        else:
+            s = str(x).replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'"{s}"')
+    return f"'{{{','.join(parts)}}}'::{elem_type}"
+
+
+def _encode_value(v, udt: str) -> str:
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        if udt in ("json", "jsonb"):
+            return "'" + json.dumps(v, default=_json_default).replace("'", "''") + "'::jsonb"
+        return _pg_array_literal(v, udt)
+    if isinstance(v, str):
+        if udt in ("json", "jsonb"):
+            return "'" + v.replace("'", "''") + "'::jsonb"
+        return "'" + v.replace("'", "''") + "'"
+    # dict / anything else → jsonb
+    return "'" + json.dumps(v, default=_json_default).replace("'", "''") + "'::jsonb"
+
+
+async def _generated_columns(tables: list[str]) -> dict[str, set]:
+    """{table: {generated column}} — GENERATED ALWAYS columns cannot be
+    inserted explicitly (e.g. yard_capacity.total_capacity)."""
+    rows = await Database.fetch(
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema='maya_rp' AND is_generated = 'ALWAYS' "
+        "AND table_name = ANY($1::text[])", tables)
+    out: dict[str, set] = {}
+    for r in rows:
+        out.setdefault(r["table_name"], set()).add(r["column_name"])
+    return out
+
+
+def _insert_sql(table: str, cols: list, row: dict, types: dict, conflict: str) -> str:
+    colsql = ", ".join(f'"{c}"' for c in cols)
+    vals = ", ".join(_encode_value(row.get(c), types.get(c, "")) for c in cols)
+    return f"INSERT INTO maya_rp.{table} ({colsql}) VALUES ({vals}) {conflict}"
+
+
+def _conflict_clause(table: str, cols: list) -> str:
+    """UPSERT on the primary key so the .sav is authoritative.
+
+    ON CONFLICT DO NOTHING silently skipped any snapshot row whose id was still
+    present in the live table (rows outside the wiped session scope), so those
+    tables came back short. DO UPDATE replaces them instead.
+    """
+    if table == "sessions" or "id" in cols:
+        upd = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in cols if c != "id")
+        if not upd:
+            return "ON CONFLICT DO NOTHING"
+        target = "(id)" if "id" in cols else ""
+        return f"ON CONFLICT {target} DO UPDATE SET {upd}"
+    return "ON CONFLICT DO NOTHING"
+
+
 # ─── Pure helpers (unit-testable, no DB) ─────────────────────────────────
 
 def classify_tables(all_tables: set, has_session_id: set, vector_tables: set,
@@ -102,6 +192,32 @@ def fk_wipe_order(tables: set, fk_edges: list) -> list:
     return order
 
 
+def fk_cycle_members(tables: set, fk_edges: list) -> set:
+    """Tables Kahn cannot order because they sit in an FK cycle.
+
+    fk_wipe_order() appends these at the end (alphabetical), which is NOT a
+    valid delete order — the first DELETE then hits a parent FK. Callers must
+    break each cycle-internal edge (NULL the child column) before wiping.
+    """
+    edges = [(c, p) for c, p in fk_edges if c in tables and p in tables]
+    parents_of = defaultdict(list)
+    indegree = defaultdict(int)
+    for c, p in edges:
+        parents_of[c].append(p)
+        indegree[p] += 1
+
+    queue = deque(sorted(t for t in tables if indegree[t] == 0))
+    done = set()
+    while queue:
+        node = queue.popleft()
+        done.add(node)
+        for parent in parents_of[node]:
+            indegree[parent] -= 1
+            if indegree[parent] == 0:
+                queue.append(parent)
+    return set(tables) - done
+
+
 # ─── Schema inventory (live DB) ─────────────────────────────────────────
 
 async def _schema_inventory() -> tuple[set, set, set, list]:
@@ -123,6 +239,19 @@ async def _schema_inventory() -> tuple[set, set, set, list]:
         "JOIN pg_namespace n ON n.oid = c1.relnamespace "
         "WHERE k.contype='f' AND n.nspname='maya_rp'")]
     return all_tables, has_sid, vector_tables, fks
+
+
+async def _fk_child_columns() -> list[tuple[str, str, str]]:
+    """[(child_table, parent_table, child_column)] for every maya_rp FK."""
+    return [(r["child"], r["parent"], r["col"]) for r in await Database.fetch(
+        "SELECT c1.relname AS child, c2.relname AS parent, a.attname AS col "
+        "FROM pg_constraint k "
+        "JOIN pg_class c1 ON c1.oid = k.conrelid "
+        "JOIN pg_class c2 ON c2.oid = k.confrelid "
+        "JOIN pg_namespace n ON n.oid = c1.relnamespace "
+        "JOIN unnest(k.conkey) AS ck(attnum) ON true "
+        "JOIN pg_attribute a ON a.attrelid = c1.oid AND a.attnum = ck.attnum "
+        "WHERE k.contype='f' AND n.nspname='maya_rp'")]
 
 
 # ─── Export ─────────────────────────────────────────────────────────────
@@ -214,6 +343,7 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
     restored = 0
     row_errors = 0
     skipped_tables = 0
+    deferred: list[tuple[str, str]] = []   # (insert SQL, table) awaiting parents
 
     async with Database.transaction() as conn:
         if wipe:
@@ -221,7 +351,56 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
             session_scoped, global_tables = classify_tables(
                 all_tables, has_sid, vector_tables, EXCLUDED_TABLES)
             session_set = set(session_scoped)
-            order = fk_wipe_order(set(session_scoped) | set(global_tables), fks)
+            wipe_set = (set(session_scoped) | set(global_tables)) - {"sessions"}
+            order = fk_wipe_order(wipe_set, fks)
+            fk_cols = await _fk_child_columns()
+            # Tables left OUT of the wipe (excluded logs, vector/RAG tables) can
+            # still hold FKs into tables we are about to wipe — PostgreSQL then
+            # aborts the parent DELETE and the whole restore rolls back
+            # (e.g. sessions.primary_partner_id -> characters,
+            #  roll_history.difficulty_id -> difficulty_tiers). Detach first:
+            # NULL the referencing column, and only delete rows if it is NOT NULL.
+            for child, parent, col in fk_cols:
+                if parent not in wipe_set or child in wipe_set:
+                    continue
+                try:
+                    async with conn.transaction():  # savepoint
+                        await conn.execute(f'UPDATE maya_rp.{child} SET "{col}"=NULL')
+                except Exception:
+                    try:
+                        async with conn.transaction():  # savepoint
+                            if child in has_sid:
+                                await conn.execute(
+                                    f"DELETE FROM maya_rp.{child} WHERE session_id=$1", sid)
+                            else:
+                                await conn.execute(f"DELETE FROM maya_rp.{child}")
+                    except Exception as e:
+                        # the parent wipe below will surface any real blocker
+                        error("savegame",
+                              f"detach {child}.{col} skipped ({e})")
+            # FK cycles (10 tables in maya_rp: characters -> territory ->
+            # locations, clues -> characters, self-referencing heirs/prerequisites)
+            # cannot be topologically ordered; Kahn parks them at the end and the
+            # first DELETE then violates a parent FK. Break each cycle-internal
+            # edge by NULLing the child column first.
+            cycles = fk_cycle_members(wipe_set, fks)
+            if cycles:
+                info("savegame",
+                     f"FK cycles: {len(cycles)} tables — breaking with NULLs")
+            for child, parent, col in fk_cols:
+                if child not in cycles or parent not in cycles:
+                    continue
+                try:
+                    async with conn.transaction():  # savepoint
+                        if child in has_sid:
+                            await conn.execute(
+                                f'UPDATE maya_rp.{child} SET "{col}"=NULL '
+                                f"WHERE session_id=$1", sid)
+                        else:
+                            await conn.execute(
+                                f'UPDATE maya_rp.{child} SET "{col}"=NULL')
+                except Exception as e:
+                    error("savegame", f"cycle break {child}.{col} skipped ({e})")
             for t in order:
                 if t == "sessions":
                     continue  # preserve the session row itself
@@ -236,6 +415,8 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
                     raise  # no silent half-wipes — abort the transaction
 
         # restore in the .sav's stored (parents-first) order
+        udts = await _column_udts(list(tables))
+        gens = await _generated_columns(list(tables))
         for t, rows in tables.items():
             if not isinstance(rows, list) or not rows:
                 continue
@@ -243,31 +424,66 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
                 skipped_tables += 1
                 info("savegame", f"restore skip {t}: exported with error {rows[0]['__error__']}")
                 continue
-            cols = list(rows[0].keys())
-            colsql = ", ".join(f'"{c}"' for c in cols)
-            for row in rows:
-                vals = []
-                for c in cols:
-                    v = row.get(c)
-                    if isinstance(v, str):
-                        vals.append(f"'{v.replace(chr(39), chr(39)+chr(39))}'")
-                    elif v is None:
-                        vals.append("NULL")
-                    elif isinstance(v, bool):
-                        vals.append("true" if v else "false")
-                    elif isinstance(v, (int, float)):
-                        vals.append(str(v))
-                    else:
-                        vals.append(
-                            f"'{json.dumps(v, default=_json_default).replace(chr(39), chr(39)+chr(39))}'::jsonb")
+            cols = [c for c in rows[0].keys() if c not in gens.get(t, set())]
+            # Type-aware encoding: ARRAY columns need an ARRAY literal, jsonb
+            # columns need ::jsonb, everything else stays a scalar. The old
+            # blanket `::jsonb` broke all 8 ARRAY columns.
+            types = udts.get(t, {})
+            conflict = _conflict_clause(t, cols)
+
+            def _sql(row: dict, _t=t, _cols=cols, _types=types,
+                     _conflict=conflict) -> str:
+                return _insert_sql(_t, _cols, row, _types, _conflict)
+
+            # One savepoint per table: a single bad row must NOT abort the outer
+            # transaction (that used to abort every remaining INSERT, silently
+            # reporting ok:True with a partial restore). On failure the table is
+            # retried row-by-row under its own savepoint so the good rows land.
+            try:
+                async with conn.transaction():
+                    for row in rows:
+                        await conn.execute(_sql(row))
+                        restored += 1
+            except Exception as e:
+                error("savegame",
+                      f"restore {t}: batch failed ({e}) — retrying row-by-row")
+                for row in rows:
+                    try:
+                        async with conn.transaction():
+                            await conn.execute(_sql(row))
+                        restored += 1
+                    except Exception as e2:
+                        row_errors += 1
+                        deferred.append((_sql(row), t))
+                        if row_errors <= 10:
+                            error("savegame", f"restore row {t} failed: {e2}")
+
+        # Deferred pass: the .sav's stored order is parents-first, but FK cycles
+        # (characters ⇄ territory ⇄ locations ⇄ clues) can't be ordered at all and
+        # a child row may legitimately fail before its parent lands. Retry the
+        # leftovers until a round makes no progress.
+        for _round in range(4):
+            if not deferred:
+                break
+            still: list[tuple[str, str]] = []
+            for sql, tbl in deferred:
                 try:
-                    await conn.execute(
-                        f'INSERT INTO maya_rp.{t} ({colsql}) VALUES ({", ".join(vals)}) ON CONFLICT DO NOTHING')
+                    async with conn.transaction():  # savepoint
+                        await conn.execute(sql)
                     restored += 1
-                except Exception as e:
-                    row_errors += 1
-                    if row_errors <= 5:
-                        error("savegame", f"restore row {t} failed: {e}")
+                    row_errors -= 1
+                except Exception:
+                    still.append((sql, tbl))
+            if len(still) == len(deferred):
+                break  # no progress — remaining rows are genuinely unresolvable
+            info("savegame",
+                 f"deferred pass {_round + 1}: {len(deferred) - len(still)} rows landed, "
+                 f"{len(still)} still pending")
+            deferred = still
+        if deferred:
+            error("savegame",
+                  f"{len(deferred)} rows could not be restored (FK-unresolvable): "
+                  f"{sorted({t for _, t in deferred})[:8]}")
 
     info("savegame", f"Restored {restored} rows, {row_errors} row errors, "
                      f"{skipped_tables} skipped tables (checksum_ok={checksum_ok})")

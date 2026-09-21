@@ -15,8 +15,15 @@ async def generate_prompt(session_id: int | None = None) -> dict:
     if chars: prompt += f"{chars['name']} ({chars['role']}) "
     if ships: prompt += f"onboard T{ships['tier']} vessel in the {systems['system_name'] if systems else 'void'} system. "
     prompt += "Sci-fi cinematic lighting, detailed starship interior, epic scale."
-    await Database.execute("INSERT INTO maya_rp.image_prompts (session_id, prompt, tags) VALUES ($1,$2,'[]'::jsonb)", session_id, prompt)
-    return {"prompt": prompt}
+    # image_prompts keys on (scene_type, prompt_full) — there is no `prompt`
+    # column and no `tags` column. scene_type is enum-checked, so pick a legal
+    # value for what the prompt actually describes.
+    scene_type = "character-portrait" if chars else "planet-landscape"
+    await Database.execute(
+        "INSERT INTO maya_rp.image_prompts (session_id, scene_type, subject_name, prompt_full) "
+        "VALUES ($1,$2,$3,$4)",
+        session_id, scene_type, (chars["name"] if chars else None), prompt)
+    return {"prompt": prompt, "scene_type": scene_type}
 
 async def run_tick(session_id: int = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID

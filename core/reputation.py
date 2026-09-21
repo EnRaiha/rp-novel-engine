@@ -65,7 +65,7 @@ class Reputation:
 
     def _public(self) -> Dict:
         def _find(val, mapping):
-            for (lo, hi), label in mapping:
+            for (lo, hi), label in mapping.items():
                 if lo <= val < hi:
                     return label
             return "Unknown"

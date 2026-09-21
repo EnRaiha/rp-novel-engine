@@ -69,7 +69,13 @@ async def _trigger_revolt(sid: int, tid: int):
     sev = min(10, int(await _revolt_risk(tid) / 10) + 1)
     await Database.execute("INSERT INTO slave_revolts (session_id,territory_id,size,severity,outcome,narrative) VALUES ($1,$2,$3,$4,'ongoing',$5)", sid, tid, sz, sev, f"Revolt in {t['system_name']}: {sz} slaves risen.")
     await Database.execute("UPDATE territory SET slave_population=GREATEST(0,slave_population-$1) WHERE id=$2", sz, tid)
-    await Database.execute("UPDATE slaves SET status='rebellious' WHERE assigned_to='territory' AND assigned_id=$1 AND status='active' ORDER BY loyalty ASC LIMIT $2", tid, sz)
+    # PostgreSQL has no UPDATE … ORDER BY … LIMIT — use a subquery to pick the
+    # exact rows (this statement used to abort the whole revolt phase).
+    await Database.execute(
+        "UPDATE slaves SET status='rebellious' WHERE id IN ("
+        "  SELECT id FROM slaves WHERE session_id=$1 AND assigned_to='territory' "
+        "  AND assigned_id=$2 AND status='active' ORDER BY loyalty ASC LIMIT $3)",
+        sid, tid, sz)
     await _log(sid, "crisis", f"Slave Revolt in {t['system_name']}", f"{sz} slaves risen, severity {sev}/10", 4)
 
 async def _generate_market(sid: int, tid: int, count: int = 5, pool: str = None):
@@ -181,7 +187,10 @@ async def cmd(sid: int, action: str, params: dict) -> dict:
             sv = min(10, r["severity"] + 1)
             await Database.execute("UPDATE slave_revolts SET severity=$1 WHERE id=$2", sv, r["id"])
             esc = int(r["size"] * random.uniform(0.1, 0.3))
-            await Database.execute("UPDATE slaves SET status='escaped' WHERE status='rebellious' ORDER BY random() LIMIT $1", esc)
+            await Database.execute(
+                "UPDATE slaves SET status='escaped' WHERE id IN ("
+                "  SELECT id FROM slaves WHERE session_id=$1 AND status='rebellious' "
+                "  ORDER BY random() LIMIT $2)", sid, esc)
             await _log(sid, "crisis", f"Revolt Escalates!", f"Severity now {sv}/10, {esc} escaped", 4)
             return {"success": False, "severity": sv, "escaped": esc}
         return {"success": success, "casualties": cas}

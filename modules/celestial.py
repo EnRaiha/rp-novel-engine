@@ -47,7 +47,7 @@ async def query_systems(session_id: int, filters: dict | None = None) -> list[di
     """Query systems by filters. Ported from SystemRegistry.querySystems()."""
     if filters is None: filters = {}
     rows = await Database.fetch(
-        "SELECT name, system_name, faction_control, status, fleet_presence, "
+        "SELECT system_name, controlling_faction, status, fleet_presence, "
         "contested_by FROM maya_rp.territory WHERE session_id = $1 ORDER BY system_name",
         session_id,
     )
@@ -57,7 +57,8 @@ async def query_systems(session_id: int, filters: dict | None = None) -> list[di
     for sys in systems:
         match = True
         for key, val in filters.items():
-            sys_val = sys.get(key) or sys.get({"sector": "sector", "faction": "faction_control", "status": "status", "threat": "threat_level"}.get(key, key))
+            sys_val = sys.get(key) or sys.get({"sector": "sector", "faction": "controlling_faction",
+                                               "status": "status", "threat": "threat_level"}.get(key, key))
             if sys_val != val:
                 match = False
                 break
@@ -104,7 +105,7 @@ async def get_sector_breakdown(session_id: int) -> dict:
 async def get_planets_in_system(session_id: int, system_name: str) -> list[dict]:
     """Get planets in a system. Ported from PlanetCatalog.queryBySystem()."""
     rows = await Database.fetch(
-        "SELECT name, system_name, type, habitability_score, population, status, "
+        "SELECT name, system_name, planet_type AS type, habitability_score, population, status, "
         "diameter_km, gravity_g, water_pct, biosphere "
         "FROM maya_rp.planets WHERE session_id = $1 AND system_name = $2 ORDER BY name",
         session_id, system_name,
@@ -115,18 +116,21 @@ async def get_planets_in_system(session_id: int, system_name: str) -> list[dict]
 async def get_planet_stats(session_id: int) -> dict:
     """Get planet statistics. Ported from PlanetCatalog.getStats()."""
     rows = await Database.fetch(
-        "SELECT type, habitability_score, population, status, colonized "
+        "SELECT planet_type AS type, habitability_score, population, status "
         "FROM maya_rp.planets WHERE session_id = $1",
         session_id,
     )
     stats = {"total": len(rows), "colonized": 0, "habitable": 0,
              "terraforming_candidates": 0, "gas_giants": 0, "total_population": 0}
     for r in rows:
-        if r.get("colonized") or r["status"] == "colonized": stats["colonized"] += 1
+        if r["status"] == "colonized": stats["colonized"] += 1
         hab = r["habitability_score"] or 0
         if hab >= 50: stats["habitable"] += 1
         if r["type"] == "Gas Giant": stats["gas_giants"] += 1
-        if hab < 50 and r["type"] == "Terrestrial" and r["status"] != "colonized": stats["terraforming_candidates"] += 1
+        # `planets.planet_type` spells the catalogue's terrestrial class "Terran"
+        # (and "Gaia" for the garden class) — "Terrestrial" never appears.
+        if hab < 50 and r["type"] in ("Terrestrial", "Terran", "Gaia") and r["status"] != "colonized":
+            stats["terraforming_candidates"] += 1
         stats["total_population"] += r["population"] or 0
     return stats
 
@@ -135,7 +139,7 @@ async def get_colonies(session_id: int) -> list[dict]:
     """Get colonized planets. Ported from PlanetCatalog.getColonies()."""
     rows = await Database.fetch(
         "SELECT name, system_name, population, status, habitability_score, biosphere "
-        "FROM maya_rp.planets WHERE session_id = $1 AND (colonized = true OR status = 'colonized')",
+        "FROM maya_rp.planets WHERE session_id = $1 AND status = 'colonized'",
         session_id,
     )
     return [dict(r) for r in rows]
@@ -145,16 +149,32 @@ async def get_colonies(session_id: int) -> list[dict]:
 # ROUTE MAPPER — ported from route-mapper.js + nav-planner.js
 # ═══════════════════════════════════════════════════════════════
 
+# space_lanes stores no distance/fuel estimate: a lane IS one jump, and its
+# hazard label derives from threat_level (1-5). Both defaults match the values
+# the generated fallback below already uses.
+LANE_HAZARD = {1: "Low", 2: "Moderate", 3: "High", 4: "Extreme", 5: "Maximum"}
+LANE_FUEL_COST = 100
+
+
+def _lane_row(r) -> dict:
+    """Map a `space_lanes` row onto the route shape the nav planner consumes."""
+    lvl = r["threat_level"] or 1
+    return {"id": r["id"], "origin": r["origin"], "destination": r["destination"],
+            "lane_type": r["lane_type"], "threat_level": lvl,
+            "intel_level": r["intel_level"], "last_scouted": r["last_scouted"],
+            "hazard_level": LANE_HAZARD.get(lvl, "Low"),
+            "estimated_jumps": 1, "total_fuel_cost": LANE_FUEL_COST}
+
+
 async def get_routes(session_id: int) -> list[dict]:
     """Get fleet travel routes from DB."""
     rows = await Database.fetch(
-        "SELECT id, origin, destination, distance_ly, hazard_level, "
-        "estimated_jumps, total_fuel_cost "
+        "SELECT id, origin, destination, lane_type, threat_level, intel_level, last_scouted "
         "FROM maya_rp.space_lanes WHERE session_id = $1 ORDER BY origin",
         session_id,
     )
     if rows:
-        return [dict(r) for r in rows]
+        return [_lane_row(r) for r in rows]
     # Generate from territory connections
     systems = await Database.fetch(
         "SELECT system_name FROM maya_rp.territory WHERE session_id = $1 ORDER BY system_name",
@@ -344,18 +364,34 @@ async def get_faction_territories(session_id: int) -> dict:
     return {r["controlling_faction"]: r["count"] for r in rows}
 
 
+async def _faction_id(session_id: int, name_or_id) -> int | None:
+    """`treaties` keys factions by id (faction_a_id/faction_b_id), so a name has
+    to resolve through `factions` first."""
+    if name_or_id is None: return None
+    if isinstance(name_or_id, int): return name_or_id
+    return await Database.fetchval(
+        "SELECT id FROM maya_rp.factions WHERE session_id = $1 AND name = $2",
+        session_id, name_or_id,
+    )
+
+
 async def get_faction_relations(session_id: int, faction_a: str, faction_b: str | None = None) -> list[dict]:
-    """Get faction relations from DB."""
-    if faction_b:
+    """Get faction relations from DB. `treaties` is not session-scoped: it is a
+    universe-level table, so only faction identity is filtered here."""
+    a = await _faction_id(session_id, faction_a)
+    b = await _faction_id(session_id, faction_b)
+    if a is None or (faction_b and b is None):
+        return []
+    if b is not None:
         rows = await Database.fetch(
-            "SELECT * FROM maya_rp.treaties WHERE session_id = $1 "
-            "AND ((faction_a = $2 AND faction_b = $3) OR (faction_a = $3 AND faction_b = $2))",
-            session_id, faction_a, faction_b,
+            "SELECT * FROM maya_rp.treaties "
+            "WHERE (faction_a_id = $1 AND faction_b_id = $2) OR (faction_a_id = $2 AND faction_b_id = $1)",
+            a, b,
         )
     else:
         rows = await Database.fetch(
-            "SELECT * FROM maya_rp.treaties WHERE session_id = $1 AND (faction_a = $2 OR faction_b = $2)",
-            session_id, faction_a,
+            "SELECT * FROM maya_rp.treaties WHERE (faction_a_id = $1 OR faction_b_id = $1)",
+            a,
         )
     return [dict(r) for r in rows]
 

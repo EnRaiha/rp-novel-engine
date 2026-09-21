@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unified CLI — single entry point for everything RP."""
 
-import asyncio, os, sys
+import asyncio, json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -303,12 +303,15 @@ async def cmd_dashboard():
 async def cmd_query(sql: str):
     await Database.init()
     try:
-        rows = await Database.fetch(sql)
+        # read-only transaction — the server enforces it, not a regex
+        rows = await Database.fetch_readonly(sql)
         import json
 
         print(json.dumps([dict(r) for r in rows], indent=2, default=str))
     except Exception as e:
-        print(f"Query error: {e}")
+        print(f"Query error: {e}", file=sys.stderr)
+        await Database.close()
+        sys.exit(1)
     await Database.close()
 
 
@@ -552,6 +555,7 @@ async def cmd_roll():
 
     outcome = None
     total = None
+    raw_value = None
     dc = 0
     domain = "social"
     # parse --with blessing
@@ -567,6 +571,7 @@ async def cmd_roll():
         mod = int(m.group(3) or 0)
         rolls = [random.randint(1, die) for _ in range(n)]
         total = sum(rolls) + mod
+        raw_value = sum(rolls)
         outcome = "raw"
         print(f"🎲 {expr}: [{', '.join(map(str, rolls))}] + {mod} = {total}")
     else:
@@ -581,6 +586,7 @@ async def cmd_roll():
             int(m.group(4)),
         )
         total = base + (mod if sign == "+" else -mod)
+        raw_value = base          # the die itself, before modifiers
         dc = thr
         # ── Roll Theater resolution ──
         tier = rt.tier_of(total, dc)
@@ -643,14 +649,18 @@ async def cmd_roll():
         await Database.execute(
             "INSERT INTO maya_rp.roll_history "
             "(session_id, roll_code, source_table, source_id, dice_used, raw_roll, "
-            " final_score, dc, outcome, created_at) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())",
+            " modifier_total, final_score, dc, outcome, created_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())",
             SID,
             "cli_roll",
             "cli_roll",
             0,
             expr,
-            total,
+            # raw_roll must be the DIE, not the modified total — roll_theater's
+            # open_pool odds treat raw_roll>=96 as a crit, so logging the total
+            # (e.g. 100+50=150) inflated every crit rate.
+            raw_value if raw_value is not None else total,
+            (total - raw_value) if raw_value is not None else 0,
             total,
             dc,
             outcome,
@@ -1459,6 +1469,219 @@ async def cmd_lineage():
     await Database.close()
 
 
+async def cmd_ooc():
+    """OOC engine — System overseer.
+
+    Usage:
+      cli.py ooc status [--session N]
+      cli.py ooc audit "<text>" [--layer=dialogue|somatic|tool] [--trait=aloof,mentor]
+                                [--evidence] [--turn=REF]
+      cli.py ooc rules  [--trait=…] [--stage=…]
+      cli.py ooc beats  [--all] [--from-text="<prose>"]  # scripted beats; --from-text fires the prose path
+      cli.py ooc milestone done <name> [--text=…] [--evidence]
+      cli.py ooc exemption list|buy <rule_id> <action_key> [--cost=N] [--condition=scene:medical]
+      cli.py ooc suspicion [--observer=N] [--bump] [--delta=5] [--reason=…]
+      cli.py ooc readiness                            # arc-stage gates (§7)
+      cli.py ooc advance [--auto]
+      cli.py ooc stage <lockdown|selective|confrontation>
+      cli.py ooc mirror                               # push state into the harness JSON
+      cli.py ooc events [N]
+      cli.py ooc prune [DAYS]
+    """
+    from core import ooc
+
+    flags = [a for a in sys.argv[2:] if a.startswith("--")]
+    args = [a for a in sys.argv[2:] if not a.startswith("--")]
+
+    def flag(name: str, default: str | None = None) -> str | None:
+        for item in flags:
+            if item.startswith(f"--{name}="):
+                return item.split("=", 1)[1]
+        return default
+
+    sub = args[0] if args else "status"
+    session = int(flag("session", str(Config.SESSION_ID)) or Config.SESSION_ID)
+    traits = tuple((flag("trait", "general") or "general").split(","))
+    context = {
+        key: value
+        for key, _, value in (part.partition(":") for part in (flag("context") or "").split(","))
+        if key
+    }
+
+    if sub == "status":
+        row = await ooc.state(session)
+        stage = row["arc_stage"]
+        bounds = ooc.STAGE_THRESHOLDS[stage]
+        penalty = ooc.debuff_for(row["deviation"], stage)
+        print(f"OOC — session {session} · stage {stage} (λ decay {bounds['decay']}/turn)")
+        print(f"  deviation      {row['deviation']}/100   (warn {bounds['warning']} · crit {bounds['critical']} · exec {bounds['execution']})")
+        print(f"  roleplay pts   {row['roleplay_points']}")
+        print(f"  audits         {row['audits']}   findings {row['findings']}")
+        print(f"  debuff         {row['debuff'] or '—'}")
+        if penalty:
+            print(f"  active effect  {penalty[1]}")
+        # §6.2 — a required beat past its window is reported, never billed.
+        for beat in await ooc.overdue_milestones(session, traits=traits):
+            print(f"  ⚠ REQUIRED BEAT OVERDUE  {beat['name']} (expired {beat['expires_at']})")
+        print(f"  updated        {row['updated_at']}")
+    elif sub == "audit":
+        if len(args) < 2:
+            print('Usage: cli.py ooc audit "<text>" [--layer=…] [--trait=…] [--evidence]')
+            sys.exit(1)
+        result = await ooc.audit(
+            " ".join(args[1:]),
+            session,
+            layer=flag("layer", ooc.LAYER_DIALOGUE) or ooc.LAYER_DIALOGUE,
+            traits=traits,
+            action_evidence="--evidence" in flags,
+            context=context,
+            turn_ref=flag("turn"),
+        )
+        print(f"layer={result['layer']} rules={result['rules']} disposition={result['disposition']}"
+              + (f" ({result['skip_reason']})" if result["skip_reason"] else ""))
+        for finding in result["findings"]:
+            print(f"  ✖ [{finding['rule_id']}] {finding['kind']}/{finding['layer']} +{finding['delta']}  «{finding['match']}»")
+        print(f"  delta {result['delta']} → deviation {result['deviation']} (decay {result['decay']})"
+              f" · debuff {result['debuff'] or '—'} · loophole {result['loophole_score']} · rpp +{result['rpp_award']}")
+        for exempt in result["exempted"]:
+            print(f"  ⚪ [{exempt['rule_id']}] exempt ({exempt['action_key']})")
+        if result["suspicion_delta"]:
+            print(f"  observer suspicion {result['suspicion_delta']:+d}"
+                  + (f" — {result['suspicion_reason']}" if result["suspicion_reason"] else ""))
+        for beat in result.get("beats_completed", []):
+            print(f"  ★ beat complete {beat['name']}  rpp +{beat['rpp_reward']}"
+                  + (f"  latch={beat['latched_ruleset']}" if beat.get("latched_ruleset") else ""))
+        print(f"  audit_event #{result['audit_event_id']}")
+    elif sub == "rules":
+        stage = flag("stage")
+        rules = await ooc.effective_rules(session, traits, stage)
+        print(f"effective ruleset — session {session} · traits {','.join(traits)} · {len(rules)} rules")
+        for rule in rules:
+            print(f"  {rule.id:24s} {rule.kind:17s} layer={rule.layer:8s} trait={rule.trait or '(campaign)':9s} +{rule.delta}  {rule.pattern[:48]}")
+    elif sub == "beats" and flag("from-text"):
+        # §6.3 — the same prose path `audit()` uses, callable on demand.
+        completed = await ooc.beats_from_prose(
+            session, flag("from-text"), traits=traits, turn_ref=flag("turn"),
+        )
+        print(f"beats from prose — session {session} · {len(completed)} completed")
+        for beat in completed:
+            print(f"  ★ {beat['name']}  rpp +{beat['rpp_reward']}"
+                  + (f"  latch={beat['latched_ruleset']}" if beat.get("latched_ruleset") else ""))
+    elif sub in ("beats", "milestone"):
+        action = args[1] if len(args) > 1 else "list"
+        if action == "list":
+            due = await ooc.milestones(session, traits=traits, due_only="--all" not in flags)
+            print(f"scripted beats — session {session} · traits {','.join(traits)} · {len(due)} shown")
+            for beat in due:
+                mark = "✔" if beat["completed_at"] else ("⚠" if beat["overdue"] else "·")
+                print(f"  {mark} {beat['name']:32s} trait={beat['trait'] or '(any)':9s}"
+                      f" stage={beat['stage']:13s} rpp={beat['rpp_reward']}"
+                      + ("  required" if beat["required"] else "")
+                      + ("  OVERDUE" if beat["overdue"] else ""))
+        elif action == "done":
+            if len(args) < 3:
+                print("Usage: cli.py ooc milestone done <name> [--text=…] [--evidence]")
+                sys.exit(1)
+            result = await ooc.complete_milestone(
+                session,
+                args[2],
+                text=flag("text") or (" ".join(args[3:]) or None),
+                traits=traits,
+                evidence="--evidence" in flags,
+            )
+            print(json.dumps(result, default=str, indent=2))
+        else:
+            print("Usage: cli.py ooc milestone {list|done <name>}")
+            sys.exit(1)
+    elif sub == "exemption":
+        action = args[1] if len(args) > 1 else "list"
+        if action == "list":
+            rows = await ooc.exemptions(session)
+            print(f"exemptions — session {session} · {len(rows)} rows")
+            for row in rows:
+                print(f"  {row['rule_id']:24s} {row['action_key']:18s} cost={row['cost_rpp']:<4}"
+                      f" condition={row['condition'] or '—':24s} {'live' if row['live'] else 'expired'}")
+        elif action == "buy":
+            if len(args) < 4:
+                print("Usage: cli.py ooc exemption buy <rule_id> <action_key>"
+                      " [--cost=N] [--condition=scene:medical] [--temp --ttl=24]")
+                sys.exit(1)
+            result = await ooc.buy_exemption(
+                session,
+                args[2],
+                args[3],
+                int(flag("cost")) if flag("cost") else None,
+                condition=flag("condition"),
+                permanent="--temp" not in flags,
+                ttl_hours=int(flag("ttl")) if flag("ttl") else None,
+            )
+            print(json.dumps(result, default=str, indent=2))
+        else:
+            print("Usage: cli.py ooc exemption {list|buy <rule_id> <action_key>}")
+            sys.exit(1)
+    elif sub == "suspicion":
+        if "--bump" in flags:
+            result = await ooc.bump_suspicion(
+                session,
+                observer=int(flag("observer")) if flag("observer") else None,
+                delta=int(flag("delta", "5") or 5),
+                reason=flag("reason"),
+            )
+            print(json.dumps(result, default=str, indent=2))
+        else:
+            rows = await ooc.suspicion(session)
+            print(f"observer suspicion — session {session} · {len(rows)} observer(s)")
+            for row in rows:
+                print(f"  {row['observer_id']:<6} {(row['name'] or '?')[:22]:24s} {row['suspicion']:>3}/100"
+                      f"  {row['last_reason'] or '—'}")
+    elif sub in ("readiness", "advance"):
+        if sub == "readiness":
+            ready = await ooc.stage_readiness(session, traits)
+            print(f"stage {ready['stage']} → {ready['next'] or '(last stage)'} · ready={ready['ready']}")
+            for key, check in ready["gates"].items():
+                print(f"  {key:12s} {check['have']}/{check['required']}"
+                      f" {'✔' if check['met'] else '✖'}")
+        else:
+            result = await ooc.advance_stage(session, auto="--auto" in flags, traits=traits)
+            print(json.dumps(result, default=str, indent=2))
+    elif sub == "mirror":
+        path = await ooc.mirror_state_file(session)
+        print(f"state mirrored → {path}")
+    elif sub == "stage":
+        if len(args) < 2:
+            print(f"Usage: cli.py ooc stage <{'|'.join(ooc.STAGES)}>")
+            sys.exit(1)
+        row = await ooc.set_stage(session, args[1])
+        print(f"session {row['session_id']} → stage {row['arc_stage']} (deviation {row['deviation']})")
+    elif sub == "events":
+        limit = int(args[1]) if len(args) > 1 else 15
+        rows = await Database.fetch(
+            "SELECT id, rule_id, layer, disposition, skip_reason, match_sha256, match_len, delta,"
+            " deviation_after, created_at FROM maya_rp.ooc_audit_events"
+            " WHERE session_id=$1 ORDER BY id DESC LIMIT $2",
+            session,
+            limit,
+        )
+        print(f"last {len(rows)} audit events — session {session}")
+        for row in rows:
+            fingerprint = (row["match_sha256"] or "")[:12]
+            print(f"  #{row['id']:<6} {row['created_at']:%m-%d %H:%M} {row['disposition']:8s}"
+                  f" {row['layer']:8s} {row['rule_id'] or '—':22s} Δ{row['delta']:<3}"
+                  f" dev={row['deviation_after']:<3} sha={fingerprint or '—'}")
+    elif sub == "prune":
+        days = int(args[1]) if len(args) > 1 else 30
+        deleted = await Database.execute(
+            "DELETE FROM maya_rp.ooc_audit_events WHERE created_at < now() - ($1 || ' days')::interval",
+            days,
+        )
+        print(f"pruned audit events older than {days} days: {deleted}")
+    else:
+        print("Usage: cli.py ooc {status|audit|rules|beats|milestone|exemption|suspicion"
+              "|readiness|advance|stage|mirror|events|prune}")
+        sys.exit(1)
+    await Database.close()
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(
@@ -1502,6 +1725,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_query(" ".join(sys.argv[2:])))
     elif cmd == "romance":
         asyncio.run(cmd_romance())
+    elif cmd == "ooc":
+        asyncio.run(cmd_ooc())
     elif cmd == "assembly":
         asyncio.run(cmd_assembly())
     elif cmd == "duel":

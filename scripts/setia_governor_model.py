@@ -13,8 +13,9 @@ Per governor (territory):
   - autonomy: FALSE at Mastika (requires_king_prompt), TRUE elsewhere
 """
 from __future__ import annotations
+import os
 import asyncio, sys
-sys.path.insert(0, str(__file__ + "/../../"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.config import Config
 from core.db import Database
 

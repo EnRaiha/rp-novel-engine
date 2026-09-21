@@ -23,6 +23,7 @@ from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import info
+from core import ooc
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -490,10 +491,17 @@ async def assign_agent(session_id: int, crew_id: int, role: str) -> dict:
         return {"error": "Invalid role"}
     try:
         quality_boost = {"networker": 5, "watcher": 3, "interrogator": 2}.get(role, 0)
+        # intel_network is a per-session singleton (created on first assignment —
+        # the module used to UPDATE a `game_id` column on a table that did not
+        # exist, so every assignment failed).
         await Database.execute(
-            "UPDATE maya_rp.intel_network SET agents_assigned = coalesce(agents_assigned, '[]'::jsonb) || $1::jsonb, "
-            "quality = LEAST(100, quality + $2), last_scan = NOW() WHERE game_id = $3",
-            json.dumps([{"crew_id": crew_id, "role": role}]), quality_boost, session_id,
+            "INSERT INTO maya_rp.intel_network (session_id, agents_assigned, quality, last_scan) "
+            "VALUES ($1, $2::jsonb, LEAST(100, $3), NOW()) "
+            "ON CONFLICT (session_id) DO UPDATE SET "
+            "agents_assigned = COALESCE(maya_rp.intel_network.agents_assigned, '[]'::jsonb) || EXCLUDED.agents_assigned, "
+            "quality = LEAST(100, COALESCE(maya_rp.intel_network.quality, 0) + $3), "
+            "last_scan = NOW()",
+            session_id, json.dumps([{"crew_id": crew_id, "role": role}]), quality_boost,
         )
         return {"assigned": True, "role": role, "quality_boost": quality_boost}
     except Exception as e:
@@ -785,6 +793,26 @@ def _find_portfolio_match(action: str) -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════════
+# OBSERVER SUSPICION (§6.1) — narrative colour, one-way read
+# ═══════════════════════════════════════════════════════════════
+
+SUSPICION_NOTICES = {
+    "watchful": "A minister has started keeping a private record of the Commander's decisions.",
+    "probing": "The council chamber has gone quiet in the way that means questions are being asked.",
+    "certain": "Whispers in the cabinet: the Commander is no longer trusted to speak plainly.",
+}
+
+
+def suspicion_notice(reading: dict) -> str | None:
+    """Narrative colour when an observer's suspicion reaches a band (§6.1).
+
+    @param reading - `core.ooc.suspicion_reading` result.
+    @returns a councillor-notices line, or None when nobody is suspicious yet.
+    """
+    return SUSPICION_NOTICES.get(reading.get("band"))
+
+
+# ═══════════════════════════════════════════════════════════════
 # TICK
 # ═══════════════════════════════════════════════════════════════
 
@@ -795,8 +823,13 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
         seats = await get_cabinet_seats(session_id)
         valid = validate_cabinet(seats)
         cohesion = get_cohesion(seats)
-        info("council", f"Tick: {len(seats)} seats, cohesion={cohesion}%, valid={valid['valid']}")
-        return {"seats": len(seats), "cohesion": cohesion, "valid": valid["valid"], "missing": valid["missing"]}
+        # §6.1 — read-only: the OOC meter colours the tick, never written here.
+        reading = await ooc.suspicion_reading(session_id)
+        notice = suspicion_notice(reading)
+        info("council", f"Tick: {len(seats)} seats, cohesion={cohesion}%, valid={valid['valid']}"
+                        + (f" · {notice}" if notice else ""))
+        return {"seats": len(seats), "cohesion": cohesion, "valid": valid["valid"],
+                "missing": valid["missing"], "observer_suspicion": reading, "notice": notice}
     except Exception as e:
         info("council", f"Error: {e}")
         return {"error": str(e)}

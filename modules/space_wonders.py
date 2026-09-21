@@ -361,16 +361,21 @@ async def get_wonders_overview() -> dict:
 
 async def run_tick(session_id: int = 3):
     """Space wonders tick — spawn animals, trigger discoveries."""
+    from core.log import error
+    spawned = discovered = surveyed = 0
     try:
         gd = 0.5  # simplified game days
 
         # 1. Random animal spawns in unoccupied systems
         if random.random() < 0.05 * gd:
+            # sectors records its owner in `controlled_by`; there is no
+            # occupied_by column (the old name aborted the tick 5% of the time).
             systems = await Database.fetch(
-                "SELECT id FROM maya_rp.sectors WHERE occupied_by IS NULL ORDER BY random() LIMIT 1"
+                "SELECT id FROM maya_rp.sectors WHERE controlled_by IS NULL ORDER BY random() LIMIT 1"
             )
             if systems:
                 await encounter_animal(systems[0]["id"])
+                spawned += 1
 
         # 2. Random anomaly discoveries
         if random.random() < 0.03 * gd:
@@ -380,6 +385,7 @@ async def run_tick(session_id: int = 3):
             if systems:
                 await discover_anomaly(systems[0]["id"],
                                        random.choice(["scan_low", "scan_high", "explore"]))
+                discovered += 1
 
         # 3. Auto-survey un-surveyed planets (AI assist)
         if random.random() < 0.1 * gd:
@@ -388,9 +394,13 @@ async def run_tick(session_id: int = 3):
             )
             if un:
                 await survey_planet(un["id"])
+                surveyed += 1
 
     except Exception as e:
-        print(f"  Space Wonders: {e}")
+        # A bare print() left the orchestrator scoring a crash as success.
+        error("space_wonders", f"Tick error: {e}")
+        return {"error": str(e)}
+    return {"spawned": spawned, "anomalies": discovered, "surveyed": surveyed}
 
 
 # ============================================================

@@ -26,7 +26,9 @@ CANON_SRC = VAULT / "adventures/tkg"
 CANON_DST = VAULT / "wiki/rp-dev/canon"
 
 COPIES = [
-    (Path("/home/maya/plugins/maya-skills/skills/rp-engine/SKILL.md"), "rp-engine-skill.md"),
+    # The rp-engine skill moved from maya-skills to the Hermes skill tree; the
+    # maya-skills copy was removed, so point at the canonical file that exists.
+    (Path("/home/maya/.hermes/skills/maya/rp-engine/SKILL.md"), "rp-engine-skill.md"),
     (VAULT / "main/rp-current-session.md", "rp-current-session.md"),
     (CANON_SRC / "setting-bible.md", "setting-bible.md"),
     (CANON_SRC / "progression.md", "progression.md"),

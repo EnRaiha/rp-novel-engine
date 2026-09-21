@@ -68,13 +68,16 @@ async def advance(war_id: int, session_id: int = None) -> dict:
 
     if current_idx >= 4:
         winner = war["opponent_faction"] if ratio < 0.8 else "Player"
-        await Database.execute("UPDATE maya_rp.wars SET status='ended', phase='resolution' WHERE id=$1", war_id)
-        await Database.execute(
-            "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
-            "VALUES ($1, NOW(), 'war_end', $2, $3, $4, 10)",
-            session_id, f"War Ended: {war['opponent_faction']}",
-            f"The war with {war['opponent_faction']} has ended. {winner} emerges victorious.",
-            json.dumps(["war", "ended"]))
+        # Only fire the end-of-war side effects ONCE — this block used to
+        # re-emit the importance-10 war_end event on every tick forever.
+        if war.get("status") != "ended":
+            await Database.execute("UPDATE maya_rp.wars SET status='ended', phase='resolution' WHERE id=$1", war_id)
+            await Database.execute(
+                "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
+                "VALUES ($1, NOW(), 'war_end', $2, $3, $4, 10)",
+                session_id, f"War Ended: {war['opponent_faction']}",
+                f"The war with {war['opponent_faction']} has ended. {winner} emerges victorious.",
+                json.dumps(["war", "ended"]))
         result["ended"] = True
         result["winner"] = winner
 

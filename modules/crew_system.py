@@ -341,7 +341,7 @@ async def screen_crew(session_id: int | None, crew_id: int, clearance: int = 5) 
     if session_id is None:
         session_id = Config.SESSION_ID
     cr = await Database.fetchrow(
-        "SELECT id, name, loyalty FROM maya_rp.crew_roster WHERE id=$1 AND session_id=$2", crew_id, session_id)
+        "SELECT id, name, loyalty_flag AS loyalty FROM maya_rp.crew_roster WHERE id=$1 AND session_id=$2", crew_id, session_id)
     if not cr:
         return {"error": "Crew not found"}
     await Database.execute(

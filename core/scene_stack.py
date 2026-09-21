@@ -11,7 +11,7 @@ async def push(interrupt_type: str, context: dict, session_id: int = None):
     if session_id is None: session_id = Config.SESSION_ID
     gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)
     await Database.execute("INSERT INTO maya_rp.scene_stack (session_id,interrupt_type,context_jsonb,pushed_at_game_day,status) VALUES ($1,$2,$3,$4,'suspended')", session_id, interrupt_type, json.dumps(context), gd)
-    info("scene_stack", f"Pushed: {context.get('what_was_happening','?')[:60]}", interrupt=interrupt_type)
+    info("scene_stack", f"Pushed: {context.get('what_was_happening','?')[:60]}")
 
 async def pop(session_id: int = None) -> dict | None:
     if session_id is None: session_id = Config.SESSION_ID

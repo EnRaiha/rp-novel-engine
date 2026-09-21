@@ -72,7 +72,8 @@ async def run_tick(session_id: int = 3):
         }
         desc = descs.get(ht, "Something stirs in the deep.")
         await Database.execute(
-            "INSERT INTO narrative_hooks (session_id, hook_type, description) VALUES ($1,$2,$3)",
+            "INSERT INTO narrative_hooks (session_id, hook_type, description, status) "
+            "VALUES ($1,$2,$3,'active')",
             session_id, ht, desc)
         await _story_entry(session_id, "narrative", f"Hook: {ht.title()}", desc, 2)
 

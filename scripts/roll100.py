@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """
 Roll N game days — world sim + transparent resource override + flexible build completions.
@@ -22,7 +23,7 @@ a birth. This keeps babies on the SAME clock as ships, so narration skips reconc
 Sarang carriers: spawned only from completed Sarang build-queue rows (not hardcoded).
 """
 import asyncio, sys, json
-sys.path.insert(0, str(__file__ + "/../../"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.config import Config
 from core.db import Database
@@ -37,7 +38,35 @@ DEFAULT_ALLOYS_PER_DAY = 80_000 + 150_000 + 400_000   # chrono + economy + Jaw 4
 DEFAULT_FUEL_PER_DAY = 100_000
 
 
+_KNOWN_FLAGS = {"--dry-run", "--no-builds", "--no-collapse", "--no-sarang",
+                "--no-preg", "--rates", "-h", "--help"}
+
+USAGE = """roll100.py [DAYS] [options]
+
+  DAYS            days to roll (default 100)
+  --dry-run       preview only — NO writes (use this unless you mean it)
+  --no-builds     skip build-queue processing
+  --no-collapse   skip collapse checks
+  --no-sarang     skip Sarang AI progression
+  --no-preg       skip pregnancy tracking
+  --rates C,A,F   override credits/alloys/fuel per day
+
+Without --dry-run this ADVANCES THE GAME CLOCK and writes state.
+"""
+
+
 def parse_flags(argv: list[str]) -> dict:
+    # `--help` used to fall through to a LIVE 100-day roll (no arg validation,
+    # substring matching only) — one call cost a full restore from backup.
+    if any(a in ("-h", "--help") for a in argv):
+        print(USAGE)
+        raise SystemExit(0)
+    unknown = [a for a in argv if a.startswith("-") and a not in _KNOWN_FLAGS]
+    if unknown:
+        print("roll100: unknown option(s): " + " ".join(unknown), file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        raise SystemExit(2)
+
     flags = {
         "dry": "--dry-run" in argv,
         "no_builds": "--no-builds" in argv,
@@ -69,6 +98,9 @@ async def main() -> None:
     dry = flags["dry"]
 
     await Database.init()
+    if not dry:
+        print("⚠ LIVE ROLL — this advances the game clock and writes state. "
+              "Use --dry-run to preview.", file=sys.stderr)
     info("roll100", f"Rolling {days} days — {'DRY RUN (no writes)' if dry else 'LIVE'}")
 
     credits_pd, alloys_pd, fuel_pd = (

@@ -50,7 +50,11 @@ async def init_for_territory(session_id: int | None = None) -> int:
                    VALUES ($1,$2,$3,5,55,10,45,0,'seed: governance baseline')
                    ON CONFLICT (session_id, territory_id, faction_name) DO NOTHING""",
                 session_id, t["id"], f)
-            n += r  # type: ignore
+            # Database.execute returns a status command tag ("INSERT 0 1"),
+            # not a count — `n += r` raised TypeError and killed the seeding
+            # loop on the first territory.
+            tag = str(r).rsplit(" ", 1)[-1]
+            n += int(tag) if tag.isdigit() else 0
     return n
 
 
@@ -142,17 +146,22 @@ async def apply_news_bias(session_id: int | None = None, limit: int = 50) -> int
         except (TypeError, ValueError):
             delta = 0
         if delta:
-            await Database.execute(
+            # $2 was passed but never referenced → asyncpg could not infer its
+            # type (IndeterminateDatatypeError) and the whole bias pass died.
+            # The faction_name filter used the *bias value* as a faction name
+            # (`news_articles` has no faction column), so it matched nothing:
+            # per the module's own docstring a news item nudges the session's
+            # sentiment — the filter is gone and `applied` now counts rows.
+            status = await Database.execute(
                 """UPDATE maya_rp.population_sentiment
-                   SET sentiment = GREATEST(-100, LEAST(100, sentiment + $3)),
-                       bias = GREATEST(0, LEAST(100, bias + $4)),
-                       last_shift_reason = COALESCE(last_shift_reason, '') || '; news#' || $5,
+                   SET sentiment = GREATEST(-100, LEAST(100, sentiment + $2::int)),
+                       bias = GREATEST(0, LEAST(100, bias + $3::int)),
+                       last_shift_reason = COALESCE(last_shift_reason, '') || '; news#' || $4::text,
                        updated_at = NOW()
                    WHERE session_id=$1 AND territory_id IN
-                     (SELECT id FROM maya_rp.territory WHERE session_id=$1)
-                     AND faction_name ILIKE '%' || $6 || '%'""",
-                session_id, n["id"], delta, 2, n["id"], fb)
-            applied += 1
+                     (SELECT id FROM maya_rp.territory WHERE session_id=$1)""",
+                session_id, delta, 2, str(n["id"]))
+            applied += int(status.split()[-1]) if status.startswith("UPDATE") else 0
     return applied
 
 
@@ -160,7 +169,7 @@ async def run_tick(session_id: int | None = None) -> dict:
     """Tick hook: refresh all + apply news bias."""
     if session_id is None:
         session_id = SID
-    init_for_territory(session_id)  # ensure rows
+    await init_for_territory(session_id)  # ensure rows
     ref = await refresh(session_id)
     nb = await apply_news_bias(session_id)
     info("sentiment", f"refreshed {ref['updated']} rows, news bias {nb} articles")

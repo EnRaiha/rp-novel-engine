@@ -12,7 +12,13 @@ async def start_siege(system: str, session_id: int | None = None) -> dict:
     t = await Database.fetchrow("SELECT id, controlling_faction, status FROM maya_rp.territory WHERE session_id=$1 AND LOWER(system_name) LIKE LOWER($2) LIMIT 1", session_id, f"%{system}%")
     if not t: return {"error": f"System '{system}' not found"}
     atk = await Database.fetchval("SELECT COALESCE(SUM(tier)*1000 + SUM(hull_current/10), 0) FROM maya_rp.ships WHERE session_id=$1 AND status='active'", session_id) or 0
-    def_power = await Database.fetchval("SELECT fleet_strength FROM maya_rp.factions WHERE name=$1 AND session_id=$2", t["controlling_faction"], session_id) or 30
+    # factions has no fleet_strength column: the registered scalar for a
+    # faction's fleet is pirate_fleet_power (maintained by pirates.py /
+    # faction_ai.py). The * 800 scale below was calibrated for that magnitude,
+    # so keep the module's own default when the faction has no rating yet.
+    def_power = await Database.fetchval(
+        "SELECT NULLIF(pirate_fleet_power, 0) FROM maya_rp.factions WHERE name=$1 AND session_id=$2",
+        t["controlling_faction"], session_id) or 30
     defender = def_power * 800 + random.randint(200, 2000)
     sid = await Database.fetchval("INSERT INTO maya_rp.sieges (session_id, territory_id, target_system, target_faction, attacker_power, defender_power) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id", session_id, t["id"], system, t["controlling_faction"], atk, defender)
     info("siege", f"Siege started: {system} vs {t['controlling_faction']}")

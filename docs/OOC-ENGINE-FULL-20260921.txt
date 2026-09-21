@@ -501,6 +501,9 @@ Fasa 6 (2026-09-21, B2-B4: personas, campaign layer, tools)
   - Scripts: export_character_cards (V2 JSON, 275 written) ·
     ruleset_regression (pure replay) · generate_roster (player page) ·
     character field scaffolds (M24, 60 main characters).
+  - Local GPU text: Ollama presets stheno-2k/4k/6k/8k (L3-SthenoMaidBlackroot Q4_K_M;
+    2k 1272 tok/min, 6k 790, 4k 596, 8k 143 on the GTX 1060) and the harness profile
+    `tkg-local` routing turns through the OpenAI-compatible Ollama endpoint.
   - Ops: systemd user units tkg-map (3460) + tkg-web (3080), both enabled; the map
     webpage requires HTTP Basic auth (MAP_USER/MAP_PASS), the play page its token.
   - tests: engine 77 · plugin 47 · tsc clean.

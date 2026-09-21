@@ -501,7 +501,8 @@ Fasa 6 (2026-09-21, B2-B4: personas, campaign layer, tools)
   - Scripts: export_character_cards (V2 JSON, 275 written) ·
     ruleset_regression (pure replay) · generate_roster (player page) ·
     character field scaffolds (M24, 60 main characters).
-  - Ops: systemd user units tkg-map (3460) + tkg-web (3080), both enabled.
+  - Ops: systemd user units tkg-map (3460) + tkg-web (3080), both enabled; the map
+    webpage requires HTTP Basic auth (MAP_USER/MAP_PASS), the play page its token.
   - tests: engine 77 · plugin 47 · tsc clean.
   - Closed after all: M16 injection-order contract test · M18 game shell
     (`/play`: map left, portraits + play link right; the DSH UI refuses framing,

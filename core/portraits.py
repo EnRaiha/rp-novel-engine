@@ -296,12 +296,20 @@ async def inspect_line(session_id: int | None = None, name: str = "") -> dict[st
     emotion = hit["emotion"] if hit else "neutral"
     traits = parse_traits(character.get("traits"))
     appearance = (character.get("appearance") or character.get("description") or "")[:180]
+    registers: list[str] = []
+    try:
+        from core import campaign
+
+        registers = [row["id"] for row in (await campaign.character_rules(sid, character["name"]))["rules"]][:4]
+    except Exception:
+        registers = []
     hint = (
         f"{character['name']} — {character.get('role') or '—'}; bond {character.get('bond') or 0}"
         + (f", stage {character['romance_stage']}" if character.get("romance_stage") else "")
         + f". Read: {INSPECT_READS.get(emotion, INSPECT_READS['neutral'])}."
         + (f" Traits: {', '.join(str(t) for t in traits)}." if traits else "")
         + (f" Appearance: {appearance}" if appearance else "")
+        + (f" Registers: {', '.join(registers)}." if registers else "")
     )
     return {"found": True, "character": {"id": character["id"], "name": character["name"]}, "emotion": emotion, "hint": hint}
 

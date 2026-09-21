@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 PERSONA_ROOT = Path(
     os.environ.get("TKG_PERSONA_ROOT", str(Path.home() / "Bumi-Hijau" / "adventures" / "tkg" / "personas"))
@@ -106,6 +106,46 @@ def boundary_cases(slug: str) -> list[str]:
         if in_section and stripped and not stripped.startswith("#"):
             cases.append(stripped.lstrip("-* ").strip())
     return cases
+
+
+def boundary_expectations(slug: str) -> list[dict[str, str]]:
+    """Boundary cases as runnable assertions (M20).
+
+    A case is written `"<literal line the player writes>" => <what must happen>`;
+    the literal is what a ruleset regression feeds to the matcher, and the right
+    side names the expected rule (or `flagged`) for the check.
+    """
+    cases: list[dict[str, str]] = []
+    for raw in boundary_cases(slug):
+        text, _, expect = raw.partition("=>")
+        literal = text.strip().strip('"').strip("'").strip()
+        if not literal:
+            continue
+        cases.append({"text": literal, "expect": expect.strip() or "flagged"})
+    return cases
+
+
+def check_boundaries(cases: Sequence[dict[str, str]], rules: Sequence[Any], layer: str = "dialogue") -> list[dict[str, Any]]:
+    """Run each boundary case through the matcher (M20, pure: no writes).
+
+    @param cases - `boundary_expectations` output.
+    @param rules - compiled rules from the live ruleset.
+    @param layer - surface to audit (dialogue by default).
+    @returns one result per case: whether it flagged and whether the named rule matched.
+    """
+    from core import ooc
+
+    results: list[dict[str, Any]] = []
+    for case in cases:
+        findings = ooc.audit_text(case["text"], rules, layer)
+        matched = [finding.rule_id for finding in findings]
+        expect = case["expect"]
+        if expect in ("flagged", "flag", ""):
+            ok = bool(findings)
+        else:
+            ok = expect in matched
+        results.append({"text": case["text"], "expect": expect, "matched": matched, "ok": ok})
+    return results
 
 
 def load(slug: str) -> dict[str, Any]:

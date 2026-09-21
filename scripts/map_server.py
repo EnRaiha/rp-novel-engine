@@ -14,6 +14,10 @@ import psycopg2
 
 APP = Flask(__name__, static_folder=None)
 
+# `core` lives one level up; the unit runs this file directly, so the engine
+# package is not on sys.path by default.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 ASSETS = "/home/maya/Bumi-Hijau/wiki/rp-dev/canon/assets"
 
 # ── Auth config (env or defaults) ──
@@ -160,6 +164,91 @@ def api_map():
         return r
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+CHARACTERS = "/home/maya/Bumi-Hijau/adventures/tkg/characters"
+PLAY_UNIT = "tkg-web"
+
+
+def _play_url() -> str:
+    """The play page's current token URL, read from its unit journal.
+
+    The token rotates on every restart, so hardcoding it in the shell page would
+    rot; the journal is where the app prints it.
+    """
+    import re
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["journalctl", "--user", "-u", PLAY_UNIT, "-n", "200", "--no-pager"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return ""
+    matches = re.findall(r"http://127\.0\.0\.1:3080/\?token=[A-Za-z0-9_-]+", out)
+    # The browser reaches the play page through the tailnet serve, not the
+    # loopback bind, so the shell embeds the served authority.
+    return matches[-1].replace("http://127.0.0.1:3080", "https://lotus.tail73711d.ts.net:8443") if matches else ""
+
+
+@APP.route("/characters/<path:relpath>")
+@require_auth
+def characters(relpath):
+    return send_from_directory(CHARACTERS, relpath)
+
+
+@APP.route("/roster")
+@require_auth
+def roster_page():
+    return send_from_directory(ASSETS, "roster.html")
+
+
+@APP.route("/play")
+@require_auth
+def play_page():
+    return send_from_directory(ASSETS, "tkg-shell.html")
+
+
+@APP.route("/api/roster")
+@require_auth
+def api_roster():
+    conn = db()
+    cur = conn.cursor()
+    rows = q(cur, """
+        SELECT c.name, c.role, c.bond, COALESCE(c.romance_stage,'') AS stage,
+               COALESCE(string_agg(DISTINCT a.occasion, ','), '') AS emotions
+        FROM maya_rp.characters c
+        LEFT JOIN maya_rp.character_assets a
+               ON a.character_id = c.id AND a.status = 'ready'
+        WHERE c.session_id = 3 AND c.status IS DISTINCT FROM 'dead'
+        GROUP BY c.id, c.name, c.role, c.bond, c.romance_stage
+        ORDER BY COALESCE(c.bond,0) DESC, c.id
+    """)
+    conn.close()
+    from core import portraits  # occasion -> the emotion file that was written
+
+    data = []
+    for row in rows:
+        slug = re.sub(r"[^a-z0-9]+", "-", row["name"].lower()).strip("-")
+        emotions = []
+        for occasion in (row["emotions"] or "").split(","):
+            if not occasion:
+                continue
+            emotion = portraits.OCCASIONS.get(occasion, (occasion, ()))[0]
+            if emotion not in emotions:
+                emotions.append(emotion)
+        data.append({
+            "name": row["name"], "slug": slug, "role": row["role"] or "", "bond": row["bond"] or 0,
+            "stage": row["stage"], "emotions": emotions,
+        })
+    return jsonify(data)
+
+
+@APP.route("/api/play-url")
+@require_auth
+def api_play_url():
+    return jsonify({"url": _play_url()})
+
 
 @APP.route("/api/status")
 @require_auth

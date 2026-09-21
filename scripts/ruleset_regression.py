@@ -31,14 +31,21 @@ async def main() -> int:
     parser.add_argument("--layer", default="dialogue")
     parser.add_argument("--text", action="append", default=[])
     parser.add_argument("--file", default=None)
+    parser.add_argument("--boundaries", default=None,
+                        help="persona slug: run its voice.md boundary cases as assertions (M20)")
     args = parser.parse_args()
 
     texts = list(args.text)
     if args.file:
         texts.extend(line.strip() for line in Path(args.file).read_text(encoding="utf-8").splitlines() if line.strip())
-    if not texts:
-        print("no texts given (--text or --file)", file=sys.stderr)
-        return 2
+    boundary_results: list[dict] = []
+    if args.boundaries:
+        from core import persona
+
+        cases = persona.boundary_expectations(args.boundaries)
+        if not cases:
+            print(f"no runnable boundary cases in voice.md for {args.boundaries}", file=sys.stderr)
+            return 2
 
     await Database.init()
     traits = tuple(part.strip() for part in args.traits.split(",") if part.strip())
@@ -46,6 +53,17 @@ async def main() -> int:
     await Database.close()
 
     print(f"ruleset: {len(rules)} penalty rules · stage {args.stage or '(current)'} · layer {args.layer}")
+    if args.boundaries:
+        from core import persona
+
+        boundary_results = persona.check_boundaries(cases, rules, args.layer)
+        for result in boundary_results:
+            mark = "OK  " if result["ok"] else "FAIL"
+            print(f"{mark} {result['text'][:60]!r} expects {result['expect']!r} → {result['matched']}")
+        if not texts:
+            failed = [r for r in boundary_results if not r["ok"]]
+            print(f"boundary checks: {len(boundary_results) - len(failed)}/{len(boundary_results)} pass")
+            return 1 if failed else 0
     total = 0
     for text in texts:
         findings = ooc.audit_text(text, rules, args.layer)

@@ -27,8 +27,13 @@ DEFAULT_OUT = Path("/home/maya/Bumi-Hijau/wiki/rp-dev/canon/assets/roster.html")
 def card(row: dict, assets: dict[str, str], fields: dict[str, bool], play_guide: str) -> str:
     name = html.escape(row["name"])
     slug = portraits.slugify(row["name"])
-    rel = f"../../../../adventures/tkg/characters/{slug}"
-    emotions = " ".join(sorted(assets)) or "—"
+    rel = f"/characters/{slug}"
+    emotions_files = sorted({portraits.OCCASIONS.get(key, (key, ()))[0] for key in assets})
+    thumbs = " ".join(
+        f'<img src="/characters/{slug}/emotions/{html.escape(key)}.png" alt="{html.escape(key)}" title="{html.escape(key)}">'
+        for key in emotions_files
+    )
+    emotions = thumbs or "—"
     flags = " ".join(key for key, present in fields.items() if present) or "—"
     notes = html.escape(play_guide[:220]) if play_guide else "—"
     return f"""      <article class="card">
@@ -86,6 +91,7 @@ async def main() -> int:
  .card{{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:14px}}
  .card h3{{margin:0 0 6px;color:#c4b5fd}} .meta{{margin:2px 0;font-size:12px;color:#8b8aa8}}
  .notes{{font-size:12px;color:#6b6a8a}} .links a{{color:#7dd3fc;font-size:12px;margin-right:10px}}
+ .card img{{height:54px;border-radius:6px;margin-right:6px}}
 </style></head><body>
 <h1>TKG — Roster</h1>
 <p class="meta">{len(cards)} characters · player only · never sent to the model</p>

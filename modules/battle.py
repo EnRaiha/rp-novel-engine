@@ -406,21 +406,32 @@ async def resolve_intent(session_id: int, action: str, target: str, fleet_name: 
     Called by kilo_bridge.py action_intent domain=combat.
     """
     # Simple combat resolution: TKG forces vs target
+    from core import campaign
+
+    effects = await campaign.debuff_effects(session_id)
     player_power = await Database.fetchval(
         "SELECT COUNT(*) FROM maya_rp.ships WHERE session_id=$1 AND status='active'", session_id) or 0
-    enemy_power = random.randint(player_power // 2, player_power * 2)
+    # M6: the penalty ladder degrades command, not the hulls — effective power
+    # drops, and the narrative says why.
+    effective_power = max(1, player_power - int(effects["battle_penalty"]))
+    enemy_power = random.randint(effective_power // 2, effective_power * 2)
 
     # Basic outcome
-    if player_power >= enemy_power:
+    if effective_power >= enemy_power:
         winner = "TKG"
         ships_lost = random.randint(0, max(1, player_power // 10))
         damage_taken = random.randint(100, 500)
         narrative = f"TKG forces engaged {target}. Victory achieved with {ships_lost} ship{'s' if ships_lost != 1 else ''} lost."
     else:
         winner = target
-        ships_lost = random.randint(max(1, player_power // 5), player_power // 3)
+        loss_low = max(1, player_power // 5)
+        loss_high = max(loss_low, player_power // 3)  # a one-ship fleet still rolls
+        ships_lost = random.randint(loss_low, loss_high)
         damage_taken = random.randint(500, 2000)
         narrative = f"TKG forces engaged {target}. Defeat sustained — {ships_lost} ship{'s' if ships_lost != 1 else ''} lost. Fleet retreating."
+
+    if effects["battle_penalty"]:
+        narrative += f" [{effects['debuff']}: {effects['note']}; command penalty -{effects['battle_penalty']}]"
 
     # Reduce ship count from DB
     remaining = max(1, player_power - ships_lost)
@@ -436,4 +447,6 @@ async def resolve_intent(session_id: int, action: str, target: str, fleet_name: 
         "damage_taken": damage_taken,
         "narrative_hook": narrative,
         "player_remaining_ships": remaining,
+        "player_power_effective": effective_power,
+        "debuff_battle_penalty": int(effects["battle_penalty"]),
     }

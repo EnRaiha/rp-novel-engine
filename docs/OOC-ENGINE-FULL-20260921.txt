@@ -277,9 +277,10 @@ Seeded content:
       unknown sinks refuse, an unaffordable spend refuses (M7).
     - Effects   `debuff_effects()` the penalty as concrete modifiers
       (battle_penalty, romance_blocked, crew_morale) so modules stop parsing the
-      ladder themselves (M6, mapping only — module wiring is follow-up).
+      ladder themselves (M6; battle and romance are wired).
     - Knowledge `character_knowledge` (migration 113) what a character has
-      witnessed; the audit rule that enforces blindness is follow-up (M4).
+      witnessed; `kind='knowledge'` rules (migration 114) flag a reveal that a
+      present character cannot know (M4; ships disabled).
     - Snapshots `snapshot()/save/load/restore` — state + milestones + exemptions
       + suspicion, so a later act can start directly (M31).
   Stage-scoped rules (M27): `ooc_rules.min_stage` / `max_stage` gate a rule to an
@@ -502,8 +503,14 @@ Fasa 6 (2026-09-21, B2-B4: personas, campaign layer, tools)
     character field scaffolds (M24, 60 main characters).
   - Ops: systemd user units tkg-map (3460) + tkg-web (3080), both enabled.
   - tests: engine 77 · plugin 47 · tsc clean.
-  - Deferred, named: M18 (embed map/portraits inside the play UI — client plugin),
-    M4 audit rule, M6 module wiring.
+  - Closed after all: M16 injection-order contract test · M18 game shell
+    (`/play`: map left, portraits + play link right; the DSH UI refuses framing,
+    so it opens as its own tab) · M20 boundary cases as runnable assertions
+    (`ruleset_regression.py --boundaries the-king` → 3/3) · M4 knowledge rules
+    (`kind='knowledge'`, id `fact:<key>`, ships disabled; migration 114) ·
+    M6 debuff wired into battle (effective power -penalty) and romance (intimacy
+    blocked) · M9 `inspect` carries the character's own register rules.
+  - tests: engine 79 · plugin 48.
 
 Fasa 6 (2026-09-21, B1: context pass)
   - core/context.py + bridge `context` call + mirror files + plugin injection

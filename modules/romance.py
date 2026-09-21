@@ -562,6 +562,18 @@ async def advance_bond(
     if session_id is None:
         session_id = Config.SESSION_ID
 
+    # M6: a locked penalty blocks intimacy outright; the story says the flesh
+    # refuses, it does not silently skip the beat.
+    from core import campaign
+
+    effects = await campaign.debuff_effects(session_id)
+    if effects["romance_blocked"]:
+        return {
+            "blocked_by": effects["debuff"],
+            "note": effects["note"],
+            "bond_unchanged": True,
+        }
+
     # Get current state
     arc = await _get_romance_arc(character_id, session_id)
     char = await Database.fetchrow(

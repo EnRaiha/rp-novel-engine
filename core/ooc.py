@@ -37,6 +37,9 @@ LAYER_SOMATIC = "somatic"
 LAYER_DIALOGUE = "dialogue"
 LAYER_BOTH = "both"
 LAYER_TOOL = "tool"
+# A knowledge rule (M4): its id names the fact (`fact:<key>`), and the pattern
+# matches prose that reveals it. Present characters without that fact flag.
+KIND_KNOWLEDGE = "knowledge"
 
 # ── Bounds (R1: a regex may only ever backtrack over a bounded text) ────
 MAX_AUDIT_CHARS = 20_000
@@ -204,8 +207,17 @@ def compile_rule(rule: OocRule) -> re.Pattern[str]:
     source = rule.pattern[3:] if rule.pattern.startswith("re:") else re.escape(rule.pattern)
     if len(source) > MAX_PATTERN_CHARS:
         raise ValueError(f"pattern longer than {MAX_PATTERN_CHARS} chars: {rule.id}")
+    # The group wrapper below would make a leading inline flag a syntax error, so
+    # hoist it into the compile flags instead of rejecting the rule.
+    flags = re.IGNORECASE
+    inline = re.match(r"\(\?([aiLmsux]+)\)", source)
+    if inline:
+        flag_bits = {"i": re.IGNORECASE, "m": re.MULTILINE, "s": re.DOTALL, "x": re.VERBOSE}
+        for letter in inline.group(1):
+            flags |= flag_bits.get(letter, 0)
+        source = source[inline.end():]
     _reject_nested_quantifier(source)
-    compiled = re.compile(rf"(?<![A-Za-z0-9_])(?:{source})(?![A-Za-z0-9_])", re.IGNORECASE)
+    compiled = re.compile(rf"(?<![A-Za-z0-9_])(?:{source})(?![A-Za-z0-9_])", flags)
     _PATTERN_CACHE[key] = compiled
     return compiled
 
@@ -453,6 +465,10 @@ async def audit(
     # out of the deviation audit — `complete_milestone()` matches them instead.
     rules = [rule for rule in rules if rule.kind != "scripted_beat"]
     raw_findings = audit_text(text, rules, layer)
+    # M4: a reveal a present character cannot know is a finding of its own kind.
+    knowledge = await knowledge_findings(sid, text, rules, layer)
+    if knowledge:
+        raw_findings = list(raw_findings) + knowledge
 
     # §6.3 — a scripted beat completes on the turn the narrator writes it. This
     # is the engine plane's prose path (bridge `turn` / CLI `ooc audit`); the
@@ -1044,6 +1060,49 @@ def stage_allows(rule: OocRule, stage: str) -> bool:
     if rule.max_stage and rank > high:
         return False
     return True
+
+
+async def knowledge_findings(
+    session_id: int, text: str, rules: Sequence[OocRule], layer: str
+) -> list[OocFinding]:
+    """Findings for prose a present character cannot know (M4).
+
+    A `knowledge` rule matches a reveal; every character present in the scene
+    (or the closest observer when nobody is marked present) must hold the fact in
+    `character_knowledge` or the reveal is a knowledge leak. Delta is the rule's
+    own, so an author can record a leak without charging deviation (delta 0).
+
+    @param session_id - session key.
+    @param text - the audited text.
+    @param rules - the live ruleset (knowledge rules included).
+    @param layer - surface being audited.
+    @returns knowledge findings, one per revealed fact a watcher cannot know.
+    """
+    knowledge_rules = [rule for rule in rules if rule.kind == KIND_KNOWLEDGE]
+    if not knowledge_rules:
+        return []
+    watchers = await observer_ids(session_id)
+    if not watchers:
+        return []
+    findings: list[OocFinding] = []
+    for rule in knowledge_rules:
+        hits = audit_text(text, [rule], layer)
+        if not hits:
+            continue
+        fact = rule.id.split(":", 1)[1] if ":" in rule.id else rule.id
+        rows = await Database.fetch(
+            "SELECT DISTINCT character_id FROM maya_rp.character_knowledge"
+            " WHERE session_id=$1 AND fact_key=$2",
+            session_id,
+            fact,
+        )
+        knowers = {int(row["character_id"]) for row in rows}
+        if any(watcher not in knowers for watcher in watchers):
+            findings.append(
+                OocFinding(rule_id=rule.id, kind=KIND_KNOWLEDGE, layer=layer,
+                           match=hits[0].match, delta=rule.delta)
+            )
+    return findings
 
 
 async def observer_ids(session_id: int | None = None) -> list[int]:

@@ -168,6 +168,7 @@ _SCRATCH_CLEANUP = (
     "DELETE FROM maya_rp.events WHERE session_id=$1",
     "DELETE FROM maya_rp.objectives WHERE session_id=$1",
     "DELETE FROM maya_rp.ooc_directives WHERE session_id=$1",
+    "DELETE FROM maya_rp.ships WHERE session_id=$1",
     "DELETE FROM maya_rp.ooc_endings WHERE session_id=$1",
     "DELETE FROM maya_rp.ooc_lorebook WHERE session_id=$1",
     "DELETE FROM maya_rp.ooc_rules WHERE session_id=$1",
@@ -491,6 +492,13 @@ class TestSuspicionConsumers:
         assert ooc.suspicion_band(59) == "watchful"
         assert ooc.suspicion_band(60) == "probing"
         assert ooc.suspicion_band(90) == "certain"
+
+
+async def campaign_learn(session_id, observer, fact):
+    """Small helper so tests do not import the campaign module twice."""
+    from core import campaign
+
+    return await campaign.learn(session_id, observer, fact, "test")
 
 
 async def _author_scratch_beat(
@@ -915,6 +923,45 @@ class TestCampaignLayer:
         found = await campaign.character_rules(SCRATCH_SESSION, "Scratch Observer")
         assert "aloof" in found["traits"]
         assert all(row["kind"] for row in found["rules"])
+
+    async def test_knowledge_rule_flags_the_uninformed(self, scratch_session):
+        from core import ooc
+
+        await Database.execute(
+            "INSERT INTO maya_rp.ooc_rules (id, scope, session_id, kind, layer, pattern, is_regex, delta)"
+            " VALUES ('fact:scratch_fact','session',$1,'knowledge','both','re:the vault opened',true,1)"
+            " ON CONFLICT (id) DO UPDATE SET enabled=true",
+            SCRATCH_SESSION,
+        )
+        rules = [rule for rule in await ooc.effective_rules(SCRATCH_SESSION, ("general",)) if rule.kind == "knowledge"]
+        assert rules, "the knowledge rule resolves"
+        leaked = await ooc.knowledge_findings(SCRATCH_SESSION, "The vault opened that night.", rules, "both")
+        assert [finding.rule_id for finding in leaked] == ["fact:scratch_fact"]
+
+        await campaign_learn(SCRATCH_SESSION, scratch_session["observer"], "scratch_fact")
+        quiet = await ooc.knowledge_findings(SCRATCH_SESSION, "The vault opened that night.", rules, "both")
+        assert quiet == [], "a watcher who knows the fact stops the leak"
+
+    async def test_debuff_reaches_battle_and_romance(self, scratch_session):
+        from modules import battle, romance
+
+        await Database.execute("DELETE FROM maya_rp.ships WHERE session_id=$1", SCRATCH_SESSION)
+        for index in range(5):
+            await Database.execute(
+                "INSERT INTO maya_rp.ships (session_id, name, status) VALUES ($1,$2,'active')",
+                SCRATCH_SESSION,
+                f"Scratch Hull {index + 1}",
+            )
+        await Database.execute(
+            "UPDATE maya_rp.ooc_system_state SET debuff='Meridian Lock' WHERE session_id=$1", SCRATCH_SESSION
+        )
+        outcome = await battle.resolve_intent(SCRATCH_SESSION, "attack", "the target")
+        assert outcome["debuff_battle_penalty"] == 3
+        assert outcome["player_power_effective"] >= 1
+        assert "Meridian Lock" in outcome["narrative_hook"]
+
+        blocked = await romance.advance_bond(scratch_session["observer"], 1, SCRATCH_SESSION)
+        assert blocked.get("blocked_by") == "Meridian Lock"
 
     async def test_director_note_is_recorded(self, scratch_session):
         from core import campaign

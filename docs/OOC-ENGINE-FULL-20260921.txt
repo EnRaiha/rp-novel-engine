@@ -307,8 +307,22 @@ Config fields (schema defaults):
   rules (14 defaults) · warningThreshold 40 · criticalThreshold 75
   executionThreshold 100 · loopholeMin 40 · rppPerLoophole 25
   banner true · traits ['general']
+  enforce { enabled false, minDelta 4 }   (§10a; see below)
+  proseAudit false                         (assistant-prose audit; see below)
   engine { enabled false, command 'python3', script '', cwd '',
            timeoutMs 3000 }
+
+Opt-in features (both default OFF; opt-ins stay out of shipped defaults):
+  enforce.enabled (§10a) — before a call executes, its arguments are audited;
+    at or above `minDelta` the call is DENIED with a System reason and the
+    attempt is recorded once (post-execute also runs after a denial, so a
+    WeakSet marks the call to stop double billing). Off by default because the
+    System records leaks, it does not police them: a slip stays playable.
+    `minDelta` must be an integer >= 1 or the plugin refuses to load.
+  proseAudit — on each `assistant/message` session event the Host's own prose is
+    audited and recorded (layer dialogue, so scripted beats can fire from it).
+    Recorded, never announced: the next turn's state context carries the new
+    deviation. Off by default; the canon profile leaves it off.
 
 Surfaces:
   - prompt section  [SYSTEM: PERSONA LOCK]  rules the Host is bound by
@@ -359,7 +373,7 @@ Repo/remote: the engine lives in the vault repo, now on the private Forgejo
 --------------------------------------------------------------------------------
 Engine:  python3 -m pytest tests/test_ooc.py -q      -> 57 passed
 Full:    python3 -m pytest tests/ -q                 -> 227 passed
-Plugin:  npx vitest run packages/experimental/ooc-engine -> 34 passed
+Plugin:  npx vitest run packages/experimental/ooc-engine -> 40 passed
 Types:   npx tsc -b packages/experimental/ooc-engine/tsconfig.json -> clean
 Preflight: bash ~/scripts/ooc-preflight.sh -> OK, exit 0
   (bridge fails loud, session 3 canon untouched, rules 18, milestones 4)
@@ -404,18 +418,25 @@ Fasa 3 (2026-09-21)
   prose-proven beats could never resolve. Muting now uses the MILESTONE's stage.
   Regression test: test_seeded_shape_beat_rule_resolves_in_its_stage.
 
+Fasa 4 (2026-09-21, "habiskan baki")
+  - enforcement §10a built: tools/pre-execute deny above enforce.minDelta,
+    recorded once (denied calls also reach post-execute); default off.
+  - prose hook built: session/event 'assistant/message' -> engine audit of the
+    Host's prose (layer dialogue); default off.
+  - bridge env bootstrap: ooc_bridge.py loads ~/.env (OC_PG_* only) when the
+    spawning process carries none — no silent fallback to a local audit.
+  - plugin: @deepseek-ai/dsh-session added (peer+dev); tests 34 -> 40.
+  - canon seam: ~/.dsh/profiles/headless/cordis.patch.yml enabled for session 3.
+  - vault repo committed + pushed to Forgejo (origin, tailnet HTTPS).
+
 --------------------------------------------------------------------------------
 11. OPEN ITEMS
 --------------------------------------------------------------------------------
   - Q2 deviation decay (lambda) values · Q4 (O1 vs O2) · Q5 stage gates:
     still provisional; Izzat's call.
-  - Canon seam: ~/.dsh/profiles/headless/cordis.patch.yml.engine-pending is
-    ready; enabling it starts auditing TKG session 3.
-  - enforceAtExecution (§10a): NOT built. The plugin records findings; it never
-    denies a call. A pre-execute block is a design decision + build item.
-  - Prose hook: the harness plugin audits tool arguments only. Assistant prose
-    reaches the engine today via CLI/bridge; a turn-stopping hook would make
-    prose beats live (new scope).
+  - Canon seam: ~/.dsh/profiles/headless/cordis.patch.yml is LIVE with the seam
+    on for session 3 (backup: cordis.patch.yml.bak-preseam-20260921-1320).
+    Enabling `proseAudit` in the same profile is the next dial.
   - Commit/push state of fasa 3 in the vault repo.
 
 --------------------------------------------------------------------------------

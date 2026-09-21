@@ -28,6 +28,36 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+
+def _load_env_file() -> None:
+    """Load `~/.env` when the caller's process carries no engine PG config.
+
+    The harness spawns the bridge without the shell's exports. Without this the
+    bridge fails every call and the plugin falls back to a local, file-only
+    audit — a silent divergence from the ledger. Only `OC_PG_*` keys are read,
+    and never over an existing value: the same source the CLI uses, no second
+    source of truth.
+    """
+    if os.environ.get("OC_PG_HOST"):
+        return
+    path = os.path.join(os.path.expanduser("~"), ".env")
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, sep, value = line.partition("=")
+            if not sep:
+                continue
+            key = key.removeprefix("export ").strip()
+            if key.startswith("OC_PG_") and key not in os.environ:
+                os.environ[key] = value.strip().strip("'\"")
+
+
+_load_env_file()
+
 from core import ooc  # noqa: E402
 from core.config import Config  # noqa: E402
 from core.db import Database  # noqa: E402

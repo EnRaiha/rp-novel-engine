@@ -218,15 +218,24 @@ async def queue(session_id: int, name: str, occasion: str) -> dict[str, Any]:
     }
 
 
-async def pending(session_id: int, limit: int = 10) -> list[dict[str, Any]]:
-    """Queued renders, oldest first."""
-    rows = await Database.fetch(
-        "SELECT a.id, a.occasion, a.prompt, a.negative_prompt, c.name"
-        " FROM maya_rp.character_assets a JOIN maya_rp.characters c ON c.id = a.character_id"
-        " WHERE a.session_id=$1 AND a.status='pending' ORDER BY a.id LIMIT $2",
-        int(session_id),
-        int(limit),
-    )
+async def pending(
+    session_id: int, limit: int = 10, character: str | None = None
+) -> list[dict[str, Any]]:
+    """Queued renders, oldest first; optionally only one character's.
+
+    The filter runs in SQL, before the limit: filtering an already-limited page
+    silently drops a character whose rows sit at the end of the queue.
+    """
+    sql = ("SELECT a.id, a.occasion, a.prompt, a.negative_prompt, c.name"
+           " FROM maya_rp.character_assets a JOIN maya_rp.characters c ON c.id = a.character_id"
+           " WHERE a.session_id=$1 AND a.status='pending'")
+    params: list[Any] = [int(session_id)]
+    if character:
+        sql += " AND c.name=$3"
+        params.append(character)
+    sql += " ORDER BY a.id LIMIT $2"
+    params.insert(1, int(limit))
+    rows = await Database.fetch(sql, *params)
     return [dict(row) for row in rows]
 
 

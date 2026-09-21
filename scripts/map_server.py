@@ -170,25 +170,13 @@ PLAY_UNIT = "tkg-web"
 
 
 def _play_url() -> str:
-    """The play page's current token URL, read from its unit journal.
+    """The play page's URL.
 
-    The token rotates on every restart, so hardcoding it in the shell page would
-    rot; the journal is where the app prints it.
+    The page sits behind the fixed-password proxy (`dsh-auth.service`), so no
+    launch token appears here any more; the app's rotating token is injected
+    upstream by the proxy.
     """
-    import re
-    import subprocess
-
-    try:
-        out = subprocess.run(
-            ["journalctl", "--user", "-u", PLAY_UNIT, "-n", "200", "--no-pager"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout
-    except Exception:
-        return ""
-    matches = re.findall(r"http://127\.0\.0\.1:3080/\?token=[A-Za-z0-9_-]+", out)
-    # The browser reaches the play page through the tailnet serve, not the
-    # loopback bind, so the shell embeds the served authority.
-    return matches[-1].replace("http://127.0.0.1:3080", "https://lotus.tail73711d.ts.net:8443") if matches else ""
+    return os.environ.get("TKG_PLAY_URL", "https://lotus.tail73711d.ts.net:8443/")
 
 
 @APP.route("/characters/<path:relpath>")

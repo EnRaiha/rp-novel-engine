@@ -62,12 +62,14 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description="Render queued character assets")
     parser.add_argument("--session", type=int, default=Config.SESSION_ID)
     parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--character", default=None,
+                        help="only this character (full-spectrum waves for one person)")
     parser.add_argument("--steps", type=int, default=14)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     await Database.init()
-    queue = await portraits.pending(args.session, args.limit)
+    queue = await portraits.pending(args.session, args.limit, args.character)
     if not queue:
         print(f"queue empty for session {args.session}")
         await Database.close()

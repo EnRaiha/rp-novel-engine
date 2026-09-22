@@ -270,6 +270,13 @@ def _slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-") or "unknown"
 
 
+@APP.route("/nav.js")
+@require_auth
+def nav_script():
+    """The shared navigation rail every page includes."""
+    return send_from_directory(ASSETS, "tkg-nav.js", mimetype="application/javascript")
+
+
 @APP.route("/characters")
 @require_auth
 def characters_page():

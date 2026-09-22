@@ -54,7 +54,10 @@ def load_nulls() -> None:
         data = json.loads(STATE.read_text(encoding="utf-8"))
     except Exception:
         return
-    NULLS.update({name: list(fields) for name, fields in (data.get("nulls") or {}).items()})
+    for name, fields in (data.get("nulls") or {}).items():
+        keep = [field for field in fields if field in FIELD_OPTIONAL]
+        if keep:
+            NULLS[name] = keep
 
 BRIEF = (
     "TKG — a fleet state under House al-Dabaran three years into a contested expansion across the Vein "
@@ -177,6 +180,10 @@ async def run_character(row: dict[str, Any], face: bool, force: bool) -> str:
 
 FIELD_ORDER = ["background", "appearance", "description", "voice_profile", "dialogue_style",
                "species", "origin_system"]
+# Only these two may legitimately come back null: a face, a biography or a voice
+# is always writable from the role, archetype and traits, so a null there is the
+# model stalling, not the canon being silent, and it must not be remembered.
+FIELD_OPTIONAL = {"species", "origin_system"}
 FIELD_BRIEFS = {
     "background": ("where they came from, how they reached the crown, and what they carry now "
                    "(a loyalty, a grudge, a debt, a habit). Ground every claim in the facts. "
@@ -239,8 +246,10 @@ def fields_prompt(row: dict[str, Any], facts: str, needed: list[str]) -> tuple[s
         "### Campaign", BRIEF, "", "### Facts", facts, "",
         "### Instruction",
         f"Fill the blank dossier fields for {row['name']}. Answer with one JSON object whose keys "
-        f"are exactly: {', '.join(needed)}. Values are strings; species and origin_system may be "
-        "null when the facts do not say.",
+        f"are exactly: {', '.join(needed)}. Values are strings. Only species and origin_system may "
+        "be null, and only when the facts do not name them; never answer null for background, "
+        "appearance, description, voice_profile or dialogue_style — write those from the role, "
+        "archetype, traits and facts.",
         "Field briefs:",
     ]
     for key in needed:
@@ -286,9 +295,12 @@ def patch_sheet(row: dict[str, Any], updates: dict[str, str]) -> bool:
 
 
 async def run_fields(row: dict[str, Any], force: bool) -> str:
-    # A field the model already answered "null" for is not a blank to chase: the
-    # canon does not state it. `NULLS` remembers those answers between passes.
-    known_null = set() if force else set(NULLS.get(row["name"], []))
+    # A species or origin the model answered "null" for is not a blank to chase:
+    # the canon does not state it. `NULLS` remembers those answers between
+    # passes. Backgrounds, faces and voices are always writable, so a null there
+    # is a stall and the next pass asks again.
+    remembered = set(NULLS.get(row["name"], [])) & FIELD_OPTIONAL
+    known_null = set() if force else remembered
     needed = [field for field in FIELD_ORDER if (force or empty(row.get(field))) and field not in known_null]
     if not needed:
         return "skipped"
@@ -316,7 +328,7 @@ async def run_fields(row: dict[str, Any], force: bool) -> str:
     fields = clean_fields(data)
     filled = {key: value for key, value in fields.items() if key in needed}
     for key in needed:
-        if key not in filled:
+        if key not in filled and key in FIELD_OPTIONAL:
             NULLS.setdefault(row["name"], [])
             if key not in NULLS[row["name"]]:
                 NULLS[row["name"]].append(key)

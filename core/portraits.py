@@ -118,27 +118,54 @@ def _plain(text: str) -> str:
     return text.strip()
 
 
+def _section(sheet: str, heading: str) -> str:
+    """The prose under one `## heading`, without the outfit bookkeeping line."""
+    match = re.search(rf"(?ms)^## {re.escape(heading)}\s*\n(.*?)(?=^## |\Z)", sheet or "")
+    if not match:
+        return ""
+    body = re.split(r"\*\*Current outfit\*\*", match.group(1))[0]
+    return _plain(body)
+
+
+def _outfit(value: Any) -> str:
+    """The outfit as words: the stored JSON carries a description."""
+    if not value:
+        return ""
+    data = value
+    if not isinstance(data, dict):
+        try:
+            data = json.loads(str(value))
+        except json.JSONDecodeError:
+            return str(value).strip()[:120]
+    if isinstance(data, dict):
+        return str(data.get("desc") or data.get("name") or "").strip()[:120]
+    return ""
+
+
 def build_prompt(character: dict[str, Any], emotion: str, *, sheet: str = "") -> str:
     """The render prompt for one character and occasion.
 
-    The character's own words come first (sheet, then database fields), so the
-    face stays the same across occasions; only the emotion fragment changes.
+    The face comes first — the sheet's `## Appearance` prose, else the database
+    `appearance` field — because that is what has to stay the same across
+    occasions. Role, traits and outfit follow, then the emotion fragment.
     """
     fragment = EMOTIONS.get(emotion, EMOTIONS["neutral"])
+    face = _section(sheet, "Appearance") or " ".join(
+        str(character.get("appearance") or character.get("description") or "").split()
+    )
+    traits = parse_traits(character.get("traits"))[:6]
     identity = "; ".join(
         part
         for part in (
             character.get("name"),
+            face[:340],
             character.get("role"),
-            character.get("archetype"),
-            character.get("character_type"),
-            (character.get("appearance") or character.get("description") or "")[:280],
-            character.get("current_outfit") or "",
+            ", ".join(traits),
+            _outfit(character.get("current_outfit")),
         )
         if part
     )
-    body = _plain(sheet)[:420] if sheet else identity
-    return f"{body}; {fragment}; {STYLE_SUFFIX}" if body else f"{fragment}; {STYLE_SUFFIX}"
+    return f"{identity}; {fragment}; {STYLE_SUFFIX}" if identity else f"{fragment}; {STYLE_SUFFIX}"
 
 
 async def find_character(session_id: int, name: str) -> dict[str, Any] | None:

@@ -38,10 +38,17 @@ NOISE_EVENT_TYPES = ("policy",)
 MIN_EVENT_IMPORTANCE = 3
 
 
-def act_line(stage: str | None) -> str:
+def arcs_root_for(story: Path | None) -> Path:
+    """The arc folder that belongs to a brief: `<story dir>/arcs`, else the default."""
+    if story is not None and (story.parent / "arcs").is_dir():
+        return story.parent / "arcs"
+    return ARCS_ROOT
+
+
+def act_line(stage: str | None, arcs_root: Path | None = None) -> str:
     """The current act's title line, from `arcs/act-<n>.md`."""
     number = STAGE_TO_ACT.get(stage or "")
-    path = ARCS_ROOT / f"act-{number}.md" if number else None
+    path = (arcs_root or ARCS_ROOT) / f"act-{number}.md" if number else None
     if path is None or not path.is_file():
         return ""
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -50,11 +57,30 @@ def act_line(stage: str | None) -> str:
     return ""
 
 
-def story_brief() -> str:
-    """The campaign's structural brief, or an empty string when absent."""
-    if not STORY_PATH.is_file():
+async def _story_row(session_id: int) -> dict[str, Any] | None:
+    """The session's brief row, or None when the column/row is absent."""
+    try:
+        return await Database.fetchrow(
+            "SELECT story_path FROM maya_rp.sessions WHERE id=$1", int(session_id))
+    except Exception:
+        return None
+
+
+async def brief_path(session_id: int | None = None) -> Path:
+    """The brief a session reads: `sessions.story_path` when set, else the default."""
+    if session_id is not None:
+        row = await _story_row(int(session_id))
+        if row and row.get("story_path") and Path(row["story_path"]).is_file():
+            return Path(row["story_path"])
+    return STORY_PATH
+
+
+async def story_brief(session_id: int | None = None) -> str:
+    """The campaign's structural brief: the session's own, else the default."""
+    path = await brief_path(session_id)
+    if not path.is_file():
         return ""
-    return STORY_PATH.read_text(encoding="utf-8", errors="replace").strip()
+    return path.read_text(encoding="utf-8", errors="replace").strip()
 
 
 async def recent_events(session_id: int, limit: int = 6) -> list[dict[str, Any]]:
@@ -219,9 +245,10 @@ async def build_context(
     from core import ooc
 
     stage = (await ooc.state(sid))["arc_stage"]
-    story = story_brief()
+    brief = await brief_path(sid)
+    story = await story_brief(sid)
     blocks: dict[str, Any] = {
-        "act": act_line(stage),
+        "act": act_line(stage, arcs_root_for(brief)),
         "recent_events": await recent_events(sid, events),
         "companions": await companions_of_note(sid),
         "goals": await current_goals(sid),

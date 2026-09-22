@@ -65,7 +65,7 @@ from core.db import Database  # noqa: E402
 CALLS = ("state", "turn", "canon", "portrait", "context", "persona", "inspect", "direct")
 
 
-def _adopt_state_file(request: dict) -> None:
+async def _adopt_state_file(request: dict) -> None:
     """Mirror state to the file the caller's plugin reads (D7 phase 1).
 
     The plugin knows its own state path; the engine defaults to the TKG store, so
@@ -75,7 +75,7 @@ def _adopt_state_file(request: dict) -> None:
     path = request.get("state_file")
     if isinstance(path, str) and path.strip():
         os.environ["OOC_STATE_FILE"] = path.strip()
-    _write_context_mirror(_session(request), request)
+    await _write_context_mirror(_session(request), request)
 
 
 def _context_files(request: dict) -> tuple[str, str] | None:
@@ -101,7 +101,7 @@ def _context_files(request: dict) -> tuple[str, str] | None:
     return story, context
 
 
-def _write_context_mirror(session_id: int, request: dict) -> None:
+async def _write_context_mirror(session_id: int, request: dict) -> None:
     """Best-effort: never fail a call because the mirror could not be written."""
     files = _context_files(request)
     if files is None:
@@ -114,7 +114,7 @@ def _write_context_mirror(session_id: int, request: dict) -> None:
         # blocks the plugin injects, not a fresh chronicle scan on every write.
         from core import persona
 
-        story = context_layer.story_brief()
+        story = await context_layer.story_brief(session_id)
         os.makedirs(os.path.dirname(story_path), exist_ok=True)
         with open(story_path, "w", encoding="utf-8") as handle:
             handle.write(story)
@@ -178,7 +178,7 @@ async def handle(request: dict) -> dict:
         return {"ok": False, "error": f"unknown call {call!r}; expected one of {', '.join(CALLS)}"}
     sid = _session(request)
 
-    _adopt_state_file(request)
+    await _adopt_state_file(request)
     if call == "state":
         return {"ok": True, "call": call, "state": await ooc.state(sid)}
 
@@ -300,7 +300,7 @@ async def handle(request: dict) -> dict:
             "hint": None if queued is None else f"python3 scripts/portrait_render.py --session {sid}",
         }
 
-    _adopt_state_file(request)
+    await _adopt_state_file(request)
     text = request.get("text")
     if not isinstance(text, str) or not text:
         return {"ok": False, "error": "turn needs a non-empty text"}

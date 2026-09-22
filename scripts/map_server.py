@@ -470,18 +470,24 @@ def api_ooc_context():
 
     stage = str(state.get("arc_stage") or "lockdown")
     arc_file = {"lockdown": "act-1.md", "selective": "act-2.md", "confrontation": "act-3.md"}.get(stage)
+    # A session may carry its own brief (`sessions.story_path`), so a restarted arc
+    # reads its own story and landmarks from the panel.
+    conn = db()
+    row = qp(conn.cursor(), "SELECT story_path FROM maya_rp.sessions WHERE id=%s", (sid,), one=True)
+    conn.close()
+    story_file = Path(row["story_path"]) if row and row.get("story_path") else STORY_PATH
     arc_text = ""
     if arc_file:
-        path = STORY_PATH.parent / "arcs" / arc_file
+        path = story_file.parent / "arcs" / arc_file
         if path.is_file():
             arc_text = path.read_text(encoding="utf-8", errors="replace")
-    story = STORY_PATH.read_text(encoding="utf-8", errors="replace") if STORY_PATH.is_file() else ""
+    story = story_file.read_text(encoding="utf-8", errors="replace") if story_file.is_file() else ""
     return jsonify({
         "session_id": sid,
         "stage": stage,
         "state": {key: (str(value) if key == "updated_at" and value else value) for key, value in dict(state).items()},
         "story": story,
-        "arc": {"file": arc_file, "text": arc_text},
+        "arc": {"file": arc_file, "text": arc_text, "story_path": str(story_file)},
         "milestones": [dict(row) for row in milestones],
         "suspicion": [dict(row) for row in suspicion],
         "audits": [dict(row) for row in audits],

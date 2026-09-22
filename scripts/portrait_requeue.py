@@ -57,6 +57,8 @@ async def main() -> int:
     parser.add_argument("--occasions", default=None,
                         help="comma list of occasion keys to queue, creating rows when missing"
                              " (e.g. bun,unbun)")
+    parser.add_argument("--only", action="store_true",
+                        help="queue only the --occasions keys, leaving existing rows untouched")
     parser.add_argument("--create-portrait", action="store_true",
                         help="queue the neutral portrait for characters that have no rows")
     parser.add_argument("--dry-run", action="store_true")
@@ -84,7 +86,10 @@ async def main() -> int:
         if args.occasion:
             occasions = [occasion for occasion in occasions if occasion == args.occasion]
         extra = [key.strip() for key in (args.occasions or "").split(",") if key.strip()]
-        occasions += [key for key in extra if key not in occasions]
+        if args.only:
+            occasions = extra
+        else:
+            occasions += [key for key in extra if key not in occasions]
         if not occasions and args.create_portrait:
             occasions = ["portrait"]
         if not occasions:

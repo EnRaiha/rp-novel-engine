@@ -51,9 +51,12 @@ EMOTIONS: dict[str, str] = {
     # `tudung` are the professional-attire options.
     "bun": "hair gathered up into a neat bun, updo, no loose length",
     "unbun": "hair fully loose and down, hanging free, no tie or clip",
-    "braid": "hair in a single long braid over one shoulder",
-    "ponytail": "hair in a high ponytail, ends falling",
-    "halfup": "hair half-up in a small clasp, the rest falling loose",
+    "braid": "hair in one thick plait over the shoulder, the braid clearly visible"
+             " from the nape to the tip, no loose length",
+    "ponytail": "hair pulled back into a high ponytail, the tail clearly visible"
+                " falling behind the head, no loose length at the sides",
+    "halfup": "hair half-up: the top half gathered and pinned at the back of the head,"
+              " the rest falling loose, the division clearly visible",
     "tudung": "wearing a neat hijab headscarf that covers the hair entirely,"
               " modest professional attire, soft fabric framing the face",
 }

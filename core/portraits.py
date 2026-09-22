@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -90,19 +91,112 @@ def slugify(name: str) -> str:
     return slug or "unknown"
 
 
-def character_dir(name: str) -> Path:
-    """Folder that owns one character's sheet, refs and emotion images."""
-    return CHARACTERS_ROOT / slugify(name)
+def character_dir(name: str, cid: int | None = None) -> Path:
+    """Folder that owns one character's sheet, refs and emotion images.
+
+    Folders are named `<id>-<slug>`, so the id travels with the folder. An
+    id-free caller still resolves by suffix, which keeps the helpers usable from
+    scripts that only hold a name. The suffix test is exact, so `Nyx` never
+    resolves to `Agent Nyx`.
+    """
+    slug = slugify(name)
+    if cid is not None:
+        return CHARACTERS_ROOT / f"{int(cid)}-{slug}"
+    direct = CHARACTERS_ROOT / slug
+    if direct.is_dir():
+        return direct
+    for candidate in sorted(CHARACTERS_ROOT.glob(f"*-{slug}")):
+        parts = candidate.name.split("-", 1)
+        if len(parts) == 2 and parts[0].isdigit() and parts[1] == slug:
+            return candidate
+    return direct
 
 
-def emotion_path(name: str, emotion: str) -> Path:
+def emotion_path(name: str, emotion: str, cid: int | None = None) -> Path:
     """Where the preset image for one occasion lives on disk."""
-    return character_dir(name) / "emotions" / f"{emotion}.png"
+    return character_dir(name, cid) / "emotions" / f"{emotion}.png"
 
 
-def sheet_text(name: str) -> str:
+def versions_dir(name: str, cid: int | None = None) -> Path:
+    """The folder that keeps every render of each emotion (v1, v2, …)."""
+    return character_dir(name, cid) / "emotions" / "versions"
+
+
+def list_versions(name: str, emotion: str, cid: int | None = None) -> list[int]:
+    """The render versions on disk for one emotion, oldest first."""
+    folder = versions_dir(name, cid)
+    if not folder.is_dir():
+        return []
+    found = []
+    for path in folder.glob(f"{emotion}.v*.png"):
+        match = re.fullmatch(rf"{re.escape(emotion)}\.v(\d+)\.png", path.name)
+        if match:
+            found.append(int(match.group(1)))
+    return sorted(found)
+
+
+def version_path(name: str, emotion: str, version: int, cid: int | None = None) -> Path:
+    return versions_dir(name, cid) / f"{emotion}.v{int(version)}.png"
+
+
+def stage_version(name: str, emotion: str, cid: int | None = None) -> tuple[int, Path]:
+    """The version number and path the next render should write.
+
+    History starts from the current image: an emotion with no versions yet has
+    its live PNG copied to `v1`, so the new render becomes `v2` and the frame
+    that was on screen is never lost.
+    """
+    folder = versions_dir(name, cid)
+    folder.mkdir(parents=True, exist_ok=True)
+    existing = list_versions(name, emotion, cid)
+    live = emotion_path(name, emotion, cid)
+    if not existing and live.is_file():
+        shutil.copyfile(live, version_path(name, emotion, 1, cid))
+        existing = [1]
+    version = (max(existing) + 1) if existing else 1
+    return version, version_path(name, emotion, version, cid)
+
+
+def live_marker(name: str, emotion: str, cid: int | None = None) -> Path:
+    """Sidecar that names the version currently copied to the live image."""
+    return versions_dir(name, cid) / f"{emotion}.live"
+
+
+def set_live_version(name: str, emotion: str, version: int, cid: int | None = None) -> None:
+    marker = live_marker(name, emotion, cid)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(str(int(version)), encoding="utf-8")
+
+
+def live_version(name: str, emotion: str, cid: int | None = None) -> int | None:
+    """Which render version is live: the sidecar, else the newest on disk."""
+    marker = live_marker(name, emotion, cid)
+    if marker.is_file():
+        try:
+            value = int(marker.read_text(encoding="utf-8").strip())
+            if value in list_versions(name, emotion, cid):
+                return value
+        except (OSError, ValueError):
+            pass
+    versions = list_versions(name, emotion, cid)
+    return versions[-1] if versions else None
+
+
+def promote_version(name: str, emotion: str, version: int, cid: int | None = None) -> Path:
+    """Copy one render version onto the live emotion image the engine reads."""
+    source = version_path(name, emotion, version, cid)
+    if not source.is_file():
+        raise ValueError(f"no version {version} for {emotion}")
+    target = emotion_path(name, emotion, cid)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    set_live_version(name, emotion, version, cid)
+    return target
+
+
+def sheet_text(name: str, cid: int | None = None) -> str:
     """The character's sheet body, or an empty string when none exists."""
-    path = character_dir(name) / "sheet.md"
+    path = character_dir(name, cid) / "sheet.md"
     if not path.is_file():
         return ""
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -246,9 +340,9 @@ async def queue(session_id: int, name: str, occasion: str) -> dict[str, Any]:
 
 
 async def pending(
-    session_id: int, limit: int = 10, character: str | None = None
+    session_id: int, limit: int = 10, character: str | None = None, occasion: str | None = None
 ) -> list[dict[str, Any]]:
-    """Queued renders, oldest first; optionally only one character's.
+    """Queued renders, oldest first; optionally only one character's or occasion's.
 
     The filter runs in SQL, before the limit: filtering an already-limited page
     silently drops a character whose rows sit at the end of the queue.
@@ -256,12 +350,14 @@ async def pending(
     sql = ("SELECT a.id, a.occasion, a.prompt, a.negative_prompt, c.name"
            " FROM maya_rp.character_assets a JOIN maya_rp.characters c ON c.id = a.character_id"
            " WHERE a.session_id=$1 AND a.status='pending'")
-    params: list[Any] = [int(session_id)]
+    params: list[Any] = [int(session_id), int(limit)]
     if character:
-        sql += " AND c.name=$3"
         params.append(character)
+        sql += f" AND c.name=${len(params)}"
+    if occasion:
+        params.append(occasion)
+        sql += f" AND a.occasion=${len(params)}"
     sql += " ORDER BY a.id LIMIT $2"
-    params.insert(1, int(limit))
     rows = await Database.fetch(sql, *params)
     return [dict(row) for row in rows]
 

@@ -316,17 +316,24 @@ def api_character(cid):
         conn.close()
         return jsonify({"error": "no such character"}), 404
     name = row["name"]
-    root = CHARACTERS_ROOT / _slug(name)
+    from core import portraits
+
+    root = portraits.character_dir(name, cid)
     files = {}
     for field in CHAR_FILES:
         path = root / f"{field}.md"
         files[field] = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
-    from core import portraits
 
     assets = qp(cur, "SELECT occasion, status, image_path, model, updated_at FROM maya_rp.character_assets"
                      " WHERE character_id=%s ORDER BY occasion", (cid,))
     for asset in assets:
         asset["emotion"] = portraits.OCCASIONS.get(asset["occasion"], (asset["occasion"], ()))[0]
+    emotion_keys = sorted({a["emotion"] for a in assets})
+    versions = {
+        emotion: {"versions": portraits.list_versions(name, emotion, cid),
+                  "live": portraits.live_version(name, emotion, cid)}
+        for emotion in emotion_keys
+    }
     suspicion = qp(cur, "SELECT s.observer_id, s.suspicion, s.last_reason, s.updated_at"
                         " FROM maya_rp.ooc_suspicion s WHERE s.session_id = %s AND s.observer_id = %s",
                   (row["session_id"], cid))
@@ -338,8 +345,11 @@ def api_character(cid):
     return jsonify({
         "character": dict(row),
         "slug": _slug(name),
+        "folder": str(root),
+        "folderName": root.name,
         "files": files,
         "assets": [dict(a) for a in assets],
+        "versions": versions,
         "suspicion": [dict(s) for s in suspicion],
         "events": [dict(e) for e in events],
         "editable": list(CHAR_EDITABLE),
@@ -366,6 +376,33 @@ def api_character_update(cid):
     return jsonify({"ok": True, "id": updated["id"], "fields": list(updates)})
 
 
+@APP.route("/api/characters/<int:cid>/version", methods=["POST"])
+@require_auth
+def api_character_version(cid):
+    """Make one render version the live image the engine reads."""
+    payload = request.get_json(silent=True) or {}
+    emotion = str(payload.get("emotion") or "")
+    try:
+        version = int(payload.get("version"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "version must be an integer"}), 400
+    if not emotion:
+        return jsonify({"error": "emotion is required"}), 400
+    conn = db()
+    cur = conn.cursor()
+    row = qp(cur, "SELECT name FROM maya_rp.characters WHERE id = %s", (cid,), one=True)
+    conn.close()
+    if row is None:
+        return jsonify({"error": "no such character"}), 404
+    from core import portraits
+
+    try:
+        live = portraits.promote_version(row["name"], emotion, version, cid)
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 404
+    return jsonify({"ok": True, "emotion": emotion, "version": version, "live": str(live)})
+
+
 @APP.route("/api/characters/<int:cid>/file", methods=["POST"])
 @require_auth
 def api_character_file(cid):
@@ -382,7 +419,7 @@ def api_character_file(cid):
     conn.close()
     if row is None:
         return jsonify({"error": "no such character"}), 404
-    root = CHARACTERS_ROOT / _slug(row["name"])
+    root = portraits.character_dir(row["name"], cid)
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"{field}.md"
     if path.is_file():

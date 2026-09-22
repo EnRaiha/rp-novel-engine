@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -33,28 +34,32 @@ async def render_one(asset: dict, *, steps: int, dry_run: bool) -> bool:
     name = asset["name"]
     emotion = portraits.OCCASIONS.get(asset["occasion"], (asset["occasion"], ()))[0]
     target = portraits.emotion_path(name, emotion)
+    version, version_file = portraits.stage_version(name, emotion)
     target.parent.mkdir(parents=True, exist_ok=True)
     if dry_run:
-        print(f"DRY  {name} [{asset['occasion']}] -> {target}")
+        print(f"DRY  {name} [{asset['occasion']}] -> {version_file}")
         print(f"     prompt: {asset['prompt'][:160]}…")
         return False
     # The negative prompt lives in the ComfyUI workflow's node 7; the CLI takes
     # the positive text only.
     prompt = asset["prompt"] or ""
     result = subprocess.run(
-        [sys.executable, str(GENERATOR), prompt, "-o", str(target), "--steps", str(steps)],
+        [sys.executable, str(GENERATOR), prompt, "-o", str(version_file), "--steps", str(steps)],
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0 or not target.is_file():
+    if result.returncode != 0 or not version_file.is_file():
         error = (result.stderr or result.stdout or "render failed").strip().splitlines()[-1:]
         await portraits.mark_failed(asset["id"], error[0] if error else "render failed")
         info("portraits", f"render failed for {name}/{asset['occasion']}: {error}")
         return False
+    # The engine reads the live emotion image; the versioned file is the history.
+    shutil.copyfile(version_file, target)
+    portraits.set_live_version(name, emotion, version)
     await portraits.mark_ready(
         asset["id"], str(target), model=MODEL, seed=None, width=512, height=512
     )
-    info("portraits", f"rendered {name}/{asset['occasion']} -> {target}")
+    info("portraits", f"rendered {name}/{asset['occasion']} -> v{version} {version_file.name} (live: {target.name})")
     return True
 
 
@@ -64,12 +69,14 @@ async def main() -> int:
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--character", default=None,
                         help="only this character (full-spectrum waves for one person)")
+    parser.add_argument("--occasion", default=None,
+                        help="only this occasion key (with --character: one frame test)")
     parser.add_argument("--steps", type=int, default=14)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     await Database.init()
-    queue = await portraits.pending(args.session, args.limit, args.character)
+    queue = await portraits.pending(args.session, args.limit, args.character, args.occasion)
     if not queue:
         print(f"queue empty for session {args.session}")
         await Database.close()

@@ -46,6 +46,10 @@ EMOTIONS: dict[str, str] = {
     "intimate": "soft-lidded gaze, close and warm",
     "mourning": "grief, restrained, dark clothes",
     "battle": "focused, weapon ready, smoke around",
+    # Hair states: the same face, the hair worn up or down. The clause comes last
+    # in the prompt, so it overrides whatever the appearance prose says.
+    "bun": "hair gathered up into a neat bun, formal and composed",
+    "unbun": "hair worn loose and long, falling around the shoulders",
 }
 
 # occasion -> (default emotion, where the game raises it)

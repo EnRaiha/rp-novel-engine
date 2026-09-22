@@ -54,6 +54,9 @@ async def main() -> int:
     parser.add_argument("--scope", choices=("all", "wife", "beauty", "failed"), default="wife")
     parser.add_argument("--character", default=None, help="limit the scope to one name")
     parser.add_argument("--occasion", default=None, help="only this occasion key (e.g. portrait)")
+    parser.add_argument("--occasions", default=None,
+                        help="comma list of occasion keys to queue, creating rows when missing"
+                             " (e.g. bun,unbun)")
     parser.add_argument("--create-portrait", action="store_true",
                         help="queue the neutral portrait for characters that have no rows")
     parser.add_argument("--dry-run", action="store_true")
@@ -80,6 +83,8 @@ async def main() -> int:
         occasions = [row["occasion"] for row in assets]
         if args.occasion:
             occasions = [occasion for occasion in occasions if occasion == args.occasion]
+        extra = [key.strip() for key in (args.occasions or "").split(",") if key.strip()]
+        occasions += [key for key in extra if key not in occasions]
         if not occasions and args.create_portrait:
             occasions = ["portrait"]
         if not occasions:

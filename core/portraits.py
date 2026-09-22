@@ -48,8 +48,8 @@ EMOTIONS: dict[str, str] = {
     "battle": "focused, weapon ready, smoke around",
     # Hair states: the same face, the hair worn up or down. The clause comes last
     # in the prompt, so it overrides whatever the appearance prose says.
-    "bun": "hair pulled up into a neat bun, no loose length, updo",
-    "unbun": "hair fully loose and down, no tie or clip, hanging free past the shoulders",
+    "bun": "hair gathered up into a neat bun, updo, no loose length",
+    "unbun": "hair fully loose and down, hanging free, no tie or clip",
 }
 
 # occasion -> (default emotion, where the game raises it)
@@ -281,8 +281,16 @@ HAIR_COLOURS = {
 }
 
 
+HAIR_LENGTHS = ("shoulder-length", "mid-back", "waist-length", "floor-length",
+                "very long", "long", "short", "cropped", "shaved")
+
+
 def _hair_clause(text: str) -> str:
-    """`Black hair` — the hair's colour, taken from the dossier prose."""
+    """`Black hair, very long` — colour and length, taken from the dossier prose.
+
+    The face clause is truncated for the model's attention, so the hair is
+    repeated near the end of the prompt where it still carries weight.
+    """
     for sentence in re.split(r"(?<=[.!?])\s+", text or ""):
         if not re.search(r"\bhair\b", sentence, re.I):
             continue
@@ -290,8 +298,15 @@ def _hair_clause(text: str) -> str:
         for word in re.findall(r"[A-Za-z]+", sentence):
             if word.lower() in HAIR_COLOURS and word.lower() not in [c.lower() for c in colours]:
                 colours.append(word)
+        lowered = sentence.lower()
+        lengths = [length for length in HAIR_LENGTHS if length in lowered]
+        parts: list[str] = []
         if colours:
-            return f"{' '.join(colours[:2])} hair"
+            parts.append(f"{' '.join(colours[:2])} hair")
+        if lengths:
+            parts.append(max(lengths, key=len))
+        if parts:
+            return ", ".join(parts)
     return ""
 
 
@@ -318,9 +333,9 @@ def build_prompt(character: dict[str, Any], emotion: str, *, sheet: str = "") ->
         )
         if part
     )
-    # A hair variant repeats the described hair — colour included — right before
-    # the bun/loose instruction, or the model renders a generic updo.
-    hair = _hair_clause(face) if emotion in HAIR_EMOTIONS else ""
+    # Colour and length sit near the end of the prompt, where they still carry
+    # weight after the face clause has been truncated.
+    hair = _hair_clause(face)
     tail = f"{hair}; {fragment}" if hair else fragment
     suffix = style()["suffix"]
     return f"{identity}; {tail}; {suffix}" if identity else f"{tail}; {suffix}"

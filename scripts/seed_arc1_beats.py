@@ -41,11 +41,21 @@ BEATS: tuple[tuple[str, str, str, bool, int, str | None], ...] = (
     ("test-the-rule", "general", "confrontation", False, 20, None),
 )
 
+# The King persona's register beats, carried over from the original arc.
+PERSONA_BEATS: tuple[tuple[str, str, str, bool, int, str | None], ...] = (
+    ("aloof-receive-without-answering", "aloof", "lockdown", False, 5, None),
+    ("mentor-lay-the-burden", "mentor", "lockdown", False, 5, None),
+    ("tyrant-pronounce-punishment", "tyrant", "lockdown", False, 5, None),
+    ("general-order-the-withdrawal", "general", "lockdown", False, 5, None),
+)
+
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Seed Arc I beats for a session")
     parser.add_argument("--session", type=int, required=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--with-persona-beats", action="store_true",
+                        help="also seed the King persona's register beats (aloof/mentor/tyrant)")
     args = parser.parse_args()
 
     await Database.init()
@@ -60,8 +70,9 @@ async def main() -> int:
         await Database.close()
         return 0
 
+    beats = BEATS + (PERSONA_BEATS if args.with_persona_beats else ())
     seeded = 0
-    for name, trait, stage, required, rpp, latch in BEATS:
+    for name, trait, stage, required, rpp, latch in beats:
         await Database.execute(
             "INSERT INTO maya_rp.ooc_milestones"
             " (session_id, name, trait, stage, required, rpp_reward, latch_ruleset)"

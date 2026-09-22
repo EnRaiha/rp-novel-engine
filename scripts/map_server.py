@@ -264,6 +264,7 @@ CHAR_EDITABLE = (
 )
 CHAR_FILES = ("sheet", "voice", "lore", "intro", "play-guide")
 CHARACTERS_ROOT = Path.home() / "Bumi-Hijau" / "adventures" / "tkg" / "characters"
+STORY_PATH = Path(os.environ.get("TKG_STORY_PATH", str(CHARACTERS_ROOT.parent / "story.md")))
 
 
 def _slug(name: str) -> str:
@@ -440,6 +441,52 @@ def api_character_file(cid):
         backup.write_text(path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
     path.write_text(content, encoding="utf-8")
     return jsonify({"ok": True, "field": field, "path": str(path), "bytes": len(content.encode())})
+
+
+@APP.route("/api/ooc/context")
+@require_auth
+def api_ooc_context():
+    """What the OOC engine holds for a session: stage, gates, suspicion, audits.
+
+    Read-only mirror of the state the harness injects each turn, so the play page
+    can show the player why the narrator behaves the way it does.
+    """
+    sid = int(request.args.get("session") or 3)
+    conn = db()
+    cur = conn.cursor()
+    state = qp(cur, "SELECT arc_stage, deviation, roleplay_points, audits, findings, debuff, updated_at"
+                    " FROM maya_rp.ooc_system_state WHERE session_id=%s", (sid,), one=True) or {}
+    milestones = qp(cur, "SELECT name, trait, stage, required, rpp_reward, completed_at, expires_at"
+                         " FROM maya_rp.ooc_milestones WHERE session_id=%s ORDER BY stage, name", (sid,))
+    suspicion = qp(cur, """SELECT c.name, s.suspicion, s.last_reason, s.updated_at
+                           FROM maya_rp.ooc_suspicion s
+                           JOIN maya_rp.characters c ON c.id = s.observer_id
+                           WHERE s.session_id = %s ORDER BY s.suspicion DESC, c.name""", (sid,))
+    audits = qp(cur, "SELECT rule_id, layer, disposition, delta, deviation_after, turn_ref, created_at"
+                     " FROM maya_rp.ooc_audit_events WHERE session_id=%s ORDER BY id DESC LIMIT 6", (sid,))
+    directives = qp(cur, "SELECT id, note, created_at FROM maya_rp.ooc_directives"
+                         " WHERE session_id=%s ORDER BY id DESC LIMIT 10", (sid,))
+    conn.close()
+
+    stage = str(state.get("arc_stage") or "lockdown")
+    arc_file = {"lockdown": "act-1.md", "selective": "act-2.md", "confrontation": "act-3.md"}.get(stage)
+    arc_text = ""
+    if arc_file:
+        path = STORY_PATH.parent / "arcs" / arc_file
+        if path.is_file():
+            arc_text = path.read_text(encoding="utf-8", errors="replace")
+    story = STORY_PATH.read_text(encoding="utf-8", errors="replace") if STORY_PATH.is_file() else ""
+    return jsonify({
+        "session_id": sid,
+        "stage": stage,
+        "state": {key: (str(value) if key == "updated_at" and value else value) for key, value in dict(state).items()},
+        "story": story,
+        "arc": {"file": arc_file, "text": arc_text},
+        "milestones": [dict(row) for row in milestones],
+        "suspicion": [dict(row) for row in suspicion],
+        "audits": [dict(row) for row in audits],
+        "directives": [dict(row) for row in directives],
+    })
 
 
 @APP.route("/api/status")

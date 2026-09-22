@@ -44,7 +44,8 @@ async def render_one(asset: dict, *, steps: int, dry_run: bool) -> bool:
     # the positive text only.
     prompt = asset["prompt"] or ""
     result = subprocess.run(
-        [sys.executable, str(GENERATOR), prompt, "-o", str(version_file), "--steps", str(steps)],
+        [sys.executable, str(GENERATOR), prompt, "-o", str(version_file), "--steps", str(steps),
+         "--negative", portraits.style()["negative"]],
         capture_output=True,
         text=True,
     )

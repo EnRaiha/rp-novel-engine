@@ -70,6 +70,35 @@ OCCASIONS: dict[str, tuple[str, tuple[str, ...]]] = {
 STYLE_SUFFIX = "cinematic lighting, detailed face, sci-fi, 512x512, upper body portrait"
 NEGATIVE_PROMPT = "lowres, blurry, watermark, text, extra limbs, deformed, bad anatomy"
 
+# Render styles. `semi` is the first generation's look — a stylized 3D game
+# character, not a photo. `anime` is flat cel-shaded 2D. `real` is the
+# photoreal pass the dossiers first produced. Chosen by TKG_PORTRAIT_STYLE, so a
+# batch can switch style without touching code.
+STYLES: dict[str, dict[str, str]] = {
+    "semi": {
+        "suffix": "stylized 3D game character render, soft shading, clean silhouette,"
+                  " expressive face, sci-fi, 512x512, upper body portrait",
+        "negative": "photo, photorealistic, realistic skin texture, lowres, blurry,"
+                    " watermark, text, extra limbs, deformed, bad anatomy",
+    },
+    "anime": {
+        "suffix": "anime style, 2D illustration, cel shading, clean lineart, vibrant colors,"
+                  " expressive face, sci-fi, 512x512, upper body portrait",
+        "negative": "photorealistic, photo, 3d render, realistic, lowres, blurry,"
+                    " watermark, text, extra limbs, deformed, bad anatomy",
+    },
+    "real": {
+        "suffix": STYLE_SUFFIX,
+        "negative": NEGATIVE_PROMPT,
+    },
+}
+
+
+def style(name: str | None = None) -> dict[str, str]:
+    """The render style table for `TKG_PORTRAIT_STYLE` (default `semi`)."""
+    key = (name or os.environ.get("TKG_PORTRAIT_STYLE") or "semi").strip().lower()
+    return STYLES.get(key, STYLES["semi"])
+
 
 def parse_traits(value: Any) -> list[str]:
     """Traits as stored: a JSON list, JSON text, or a Postgres array string."""
@@ -263,7 +292,8 @@ def build_prompt(character: dict[str, Any], emotion: str, *, sheet: str = "") ->
         )
         if part
     )
-    return f"{identity}; {fragment}; {STYLE_SUFFIX}" if identity else f"{fragment}; {STYLE_SUFFIX}"
+    suffix = style()["suffix"]
+    return f"{identity}; {fragment}; {suffix}" if identity else f"{fragment}; {suffix}"
 
 
 async def find_character(session_id: int, name: str) -> dict[str, Any] | None:

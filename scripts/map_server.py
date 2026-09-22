@@ -8,7 +8,8 @@ Serves:
 
 Run:  python3 scripts/map_server.py [--port 3460]
 """
-import json, re, sys, argparse, os, base64, functools
+import json, re, sys, argparse, os, base64, functools, time
+from pathlib import Path
 from flask import Flask, jsonify, send_from_directory, Response, request
 import psycopg2
 
@@ -72,6 +73,13 @@ def q(cur, sql):
     cur.execute(sql)
     cols = [d[0] for d in cur.description] if cur.description else []
     return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+def qp(cur, sql, params=(), one=False):
+    """Parameterized companion to `q` for the workbench endpoints."""
+    cur.execute(sql, params)
+    cols = [d[0] for d in cur.description] if cur.description else []
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return (rows[0] if rows else None) if one else rows
 
 def load_map_data():
     conn = db()
@@ -236,6 +244,144 @@ def api_roster():
 @require_auth
 def api_play_url():
     return jsonify({"url": _play_url()})
+
+
+
+
+# ── character workbench ─────────────────────────────────────────────────────
+# Review and edit one character: the database row (a whitelisted subset), the
+# sheet and the four persona-style field files, plus portraits, OOC suspicion
+# and the events that mention them. Every file write keeps a timestamped .bak.
+
+CHAR_EDITABLE = (
+    "role", "archetype", "character_type", "status", "presence", "scene_location",
+    "bond", "bond_level", "romance_flag", "romance_stage", "morality", "is_spouse",
+    "importance", "voice_profile", "dialogue_style", "appearance", "description",
+    "current_outfit", "species", "house_name", "background", "clearance_level",
+    "controlled_by", "relationship_to_player", "last_seen_day", "origin_system",
+    "beauty_standard", "dream_essence_affinity", "inventory_jsonb", "wardrobe_jsonb",
+    "profile_jsonb",
+)
+CHAR_FILES = ("sheet", "voice", "lore", "intro", "play-guide")
+CHARACTERS_ROOT = Path.home() / "Bumi-Hijau" / "adventures" / "tkg" / "characters"
+
+
+def _slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-") or "unknown"
+
+
+@APP.route("/characters")
+@require_auth
+def characters_page():
+    return send_from_directory(ASSETS, "characters.html")
+
+
+@APP.route("/api/characters")
+@require_auth
+def api_characters():
+    conn = db()
+    cur = conn.cursor()
+    rows = q(cur, """
+        SELECT c.id, c.name, c.role, c.archetype, c.character_type, c.status, c.presence,
+               c.bond, c.romance_stage, c.is_spouse, c.importance, c.species,
+               (SELECT count(*) FROM maya_rp.character_assets a
+                 WHERE a.character_id = c.id AND a.status = 'ready') AS portraits
+        FROM maya_rp.characters c
+        ORDER BY COALESCE(c.bond,0) DESC, c.name
+    """)
+    conn.close()
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["slug"] = _slug(row["name"])
+        out.append(item)
+    return jsonify(out)
+
+
+@APP.route("/api/characters/<int:cid>")
+@require_auth
+def api_character(cid):
+    conn = db()
+    cur = conn.cursor()
+    row = qp(cur, "SELECT * FROM maya_rp.characters WHERE id = %s", (cid,), one=True)
+    if row is None:
+        conn.close()
+        return jsonify({"error": "no such character"}), 404
+    name = row["name"]
+    root = CHARACTERS_ROOT / _slug(name)
+    files = {}
+    for field in CHAR_FILES:
+        path = root / f"{field}.md"
+        files[field] = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+    from core import portraits
+
+    assets = qp(cur, "SELECT occasion, status, image_path, model, updated_at FROM maya_rp.character_assets"
+                     " WHERE character_id=%s ORDER BY occasion", (cid,))
+    for asset in assets:
+        asset["emotion"] = portraits.OCCASIONS.get(asset["occasion"], (asset["occasion"], ()))[0]
+    suspicion = qp(cur, "SELECT s.observer_id, s.suspicion, s.last_reason, s.updated_at"
+                        " FROM maya_rp.ooc_suspicion s WHERE s.session_id = %s AND s.observer_id = %s",
+                  (row["session_id"], cid))
+    events = qp(cur, "SELECT id, happened_at, event_type, COALESCE(narrative_title, title) AS title, importance"
+                     " FROM maya_rp.events WHERE session_id=%s AND (title ILIKE %s OR description ILIKE %s)"
+                     " ORDER BY happened_at DESC LIMIT 12",
+               (row["session_id"], f"%{name}%", f"%{name}%"))
+    conn.close()
+    return jsonify({
+        "character": dict(row),
+        "slug": _slug(name),
+        "files": files,
+        "assets": [dict(a) for a in assets],
+        "suspicion": [dict(s) for s in suspicion],
+        "events": [dict(e) for e in events],
+        "editable": list(CHAR_EDITABLE),
+    })
+
+
+@APP.route("/api/characters/<int:cid>", methods=["POST"])
+@require_auth
+def api_character_update(cid):
+    payload = request.get_json(silent=True) or {}
+    updates = {k: v for k, v in payload.items() if k in CHAR_EDITABLE}
+    if not updates:
+        return jsonify({"error": "no editable fields in payload", "editable": list(CHAR_EDITABLE)}), 400
+    assignments = ", ".join(f"{col} = %s" for col in updates)
+    values = [None if v == "" else v for v in updates.values()]
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE maya_rp.characters SET {assignments} WHERE id = %s RETURNING id, name", values + [cid])
+    updated = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if updated is None:
+        return jsonify({"error": "no such character"}), 404
+    return jsonify({"ok": True, "id": updated["id"], "fields": list(updates)})
+
+
+@APP.route("/api/characters/<int:cid>/file", methods=["POST"])
+@require_auth
+def api_character_file(cid):
+    payload = request.get_json(silent=True) or {}
+    field = str(payload.get("field") or "")
+    content = payload.get("content")
+    if field not in CHAR_FILES:
+        return jsonify({"error": f"field must be one of {list(CHAR_FILES)}"}), 400
+    if not isinstance(content, str):
+        return jsonify({"error": "content must be a string"}), 400
+    conn = db()
+    cur = conn.cursor()
+    row = qp(cur, "SELECT name FROM maya_rp.characters WHERE id = %s", (cid,), one=True)
+    conn.close()
+    if row is None:
+        return jsonify({"error": "no such character"}), 404
+    root = CHARACTERS_ROOT / _slug(row["name"])
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{field}.md"
+    if path.is_file():
+        backup = path.with_suffix(f".md.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        backup.write_text(path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+    path.write_text(content, encoding="utf-8")
+    return jsonify({"ok": True, "field": field, "path": str(path), "bytes": len(content.encode())})
 
 
 @APP.route("/api/status")

@@ -46,11 +46,20 @@ EMOTIONS: dict[str, str] = {
     "intimate": "soft-lidded gaze, close and warm",
     "mourning": "grief, restrained, dark clothes",
     "battle": "focused, weapon ready, smoke around",
-    # Hair states: the same face, the hair worn up or down. The clause comes last
-    # in the prompt, so it overrides whatever the appearance prose says.
+    # Hair states: the same face, worn a different way. The clause comes last in
+    # the prompt, so it overrides whatever the appearance prose says. `bun` and
+    # `tudung` are the professional-attire options.
     "bun": "hair gathered up into a neat bun, updo, no loose length",
     "unbun": "hair fully loose and down, hanging free, no tie or clip",
+    "braid": "hair in a single long braid over one shoulder",
+    "ponytail": "hair in a high ponytail, ends falling",
+    "halfup": "hair half-up in a small clasp, the rest falling loose",
+    "tudung": "wearing a neat hijab headscarf that covers the hair entirely,"
+              " modest professional attire, soft fabric framing the face",
 }
+
+# Hair is hidden under a tudung, so its colour and length clause is dropped.
+NO_HAIR_CLAUSE = {"tudung"}
 
 # occasion -> (default emotion, where the game raises it)
 OCCASIONS: dict[str, tuple[str, tuple[str, ...]]] = {
@@ -134,7 +143,11 @@ def character_dir(name: str, cid: int | None = None) -> Path:
     """
     slug = slugify(name)
     if cid is not None:
-        return CHARACTERS_ROOT / f"{int(cid)}-{slug}"
+        candidate = CHARACTERS_ROOT / f"{int(cid)}-{slug}"
+        if candidate.is_dir():
+            return candidate
+        # A relived session clones the cast with new ids while the folders keep
+        # the original ones, so fall through to the slug match below.
     direct = CHARACTERS_ROOT / slug
     if direct.is_dir():
         return direct
@@ -335,7 +348,7 @@ def build_prompt(character: dict[str, Any], emotion: str, *, sheet: str = "") ->
     )
     # Colour and length sit near the end of the prompt, where they still carry
     # weight after the face clause has been truncated.
-    hair = _hair_clause(face)
+    hair = "" if emotion in NO_HAIR_CLAUSE else _hair_clause(face)
     tail = f"{hair}; {fragment}" if hair else fragment
     suffix = style()["suffix"]
     return f"{identity}; {tail}; {suffix}" if identity else f"{tail}; {suffix}"

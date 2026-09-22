@@ -284,8 +284,16 @@ def api_characters():
     rows = q(cur, """
         SELECT c.id, c.name, c.role, c.archetype, c.character_type, c.status, c.presence,
                c.bond, c.romance_stage, c.is_spouse, c.importance, c.species,
+               c.beauty_standard, c.beauty_catalog_id,
                (SELECT count(*) FROM maya_rp.character_assets a
-                 WHERE a.character_id = c.id AND a.status = 'ready') AS portraits
+                 WHERE a.character_id = c.id AND a.status = 'ready') AS portraits,
+               (SELECT count(*) FROM maya_rp.character_assets a
+                 WHERE a.character_id = c.id AND a.status = 'pending') AS portraits_pending,
+               (SELECT count(*) FROM maya_rp.character_assets a
+                 WHERE a.character_id = c.id AND a.status = 'failed') AS portraits_failed,
+               (c.appearance IS NULL OR btrim(c.appearance) = '') AS appearance_blank,
+               (c.background IS NULL OR btrim(c.background) = '') AS background_blank,
+               (c.species IS NULL OR btrim(c.species) = '') AS species_blank
         FROM maya_rp.characters c
         ORDER BY COALESCE(c.bond,0) DESC, c.name
     """)

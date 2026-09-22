@@ -48,8 +48,8 @@ EMOTIONS: dict[str, str] = {
     "battle": "focused, weapon ready, smoke around",
     # Hair states: the same face, the hair worn up or down. The clause comes last
     # in the prompt, so it overrides whatever the appearance prose says.
-    "bun": "hair gathered up into a neat bun, formal and composed",
-    "unbun": "hair worn loose and long, falling around the shoulders",
+    "bun": "hair pulled up into a neat bun, no loose length, updo",
+    "unbun": "hair fully loose and down, no tie or clip, hanging free past the shoulders",
 }
 
 # occasion -> (default emotion, where the game raises it)
@@ -272,11 +272,26 @@ def _outfit(value: Any) -> str:
 HAIR_EMOTIONS = {"bun", "unbun"}
 
 
+# Colour words that may describe hair; the hair variant reuses only these, so
+# "pinned back" in the dossier prose cannot fight a loose-hair instruction.
+HAIR_COLOURS = {
+    "black", "brown", "blonde", "blond", "fair", "pale", "silver", "white", "red",
+    "auburn", "copper", "grey", "gray", "dark", "jet", "raven", "gold", "golden",
+    "platinum", "chestnut", "ash", "bronze", "honey", "cream", "snow",
+}
+
+
 def _hair_clause(text: str) -> str:
-    """The sentence that names the hair, so a hair variant keeps its colour."""
+    """`Black hair` — the hair's colour, taken from the dossier prose."""
     for sentence in re.split(r"(?<=[.!?])\s+", text or ""):
-        if re.search(r"\bhair\b", sentence, re.I) and len(sentence) <= 220:
-            return sentence.strip()
+        if not re.search(r"\bhair\b", sentence, re.I):
+            continue
+        colours: list[str] = []
+        for word in re.findall(r"[A-Za-z]+", sentence):
+            if word.lower() in HAIR_COLOURS and word.lower() not in [c.lower() for c in colours]:
+                colours.append(word)
+        if colours:
+            return f"{' '.join(colours[:2])} hair"
     return ""
 
 

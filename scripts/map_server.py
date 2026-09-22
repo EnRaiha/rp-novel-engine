@@ -334,6 +334,11 @@ def api_character(cid):
                   "live": portraits.live_version(name, emotion, cid)}
         for emotion in emotion_keys
     }
+    # A frame on disk is shown whether or not its queue row is still pending.
+    live_files = {
+        emotion: portraits.emotion_path(name, emotion, cid).is_file()
+        for emotion in emotion_keys
+    }
     suspicion = qp(cur, "SELECT s.observer_id, s.suspicion, s.last_reason, s.updated_at"
                         " FROM maya_rp.ooc_suspicion s WHERE s.session_id = %s AND s.observer_id = %s",
                   (row["session_id"], cid))
@@ -350,6 +355,7 @@ def api_character(cid):
         "files": files,
         "assets": [dict(a) for a in assets],
         "versions": versions,
+        "liveFiles": live_files,
         "suspicion": [dict(s) for s in suspicion],
         "events": [dict(e) for e in events],
         "editable": list(CHAR_EDITABLE),

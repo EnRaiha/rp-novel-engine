@@ -269,6 +269,17 @@ def _outfit(value: Any) -> str:
     return ""
 
 
+HAIR_EMOTIONS = {"bun", "unbun"}
+
+
+def _hair_clause(text: str) -> str:
+    """The sentence that names the hair, so a hair variant keeps its colour."""
+    for sentence in re.split(r"(?<=[.!?])\s+", text or ""):
+        if re.search(r"\bhair\b", sentence, re.I) and len(sentence) <= 220:
+            return sentence.strip()
+    return ""
+
+
 def build_prompt(character: dict[str, Any], emotion: str, *, sheet: str = "") -> str:
     """The render prompt for one character and occasion.
 
@@ -292,8 +303,12 @@ def build_prompt(character: dict[str, Any], emotion: str, *, sheet: str = "") ->
         )
         if part
     )
+    # A hair variant repeats the described hair — colour included — right before
+    # the bun/loose instruction, or the model renders a generic updo.
+    hair = _hair_clause(face) if emotion in HAIR_EMOTIONS else ""
+    tail = f"{hair}; {fragment}" if hair else fragment
     suffix = style()["suffix"]
-    return f"{identity}; {fragment}; {suffix}" if identity else f"{fragment}; {suffix}"
+    return f"{identity}; {tail}; {suffix}" if identity else f"{tail}; {suffix}"
 
 
 async def find_character(session_id: int, name: str) -> dict[str, Any] | None:

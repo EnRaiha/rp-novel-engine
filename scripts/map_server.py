@@ -495,6 +495,36 @@ def api_ooc_context():
     })
 
 
+@APP.route("/api/ooc/trace")
+@require_auth
+def api_ooc_trace():
+    """The engine's own record of the last turns: audits, deltas, beats.
+
+    This is what the narration was actually billed for — the read-out that makes
+    the audit visible instead of implied.
+    """
+    sid = int(request.args.get("session") or 3)
+    limit = max(1, min(50, int(request.args.get("limit") or 12)))
+    conn = db()
+    cur = conn.cursor()
+    state = qp(cur, "SELECT arc_stage, deviation, roleplay_points, audits, findings, debuff, updated_at"
+                    " FROM maya_rp.ooc_system_state WHERE session_id=%s", (sid,), one=True) or {}
+    audits = qp(cur, "SELECT id, rule_id, layer, disposition, skip_reason, delta, deviation_after,"
+                     " suspicion_delta, turn_ref, created_at"
+                     " FROM maya_rp.ooc_audit_events WHERE session_id=%s ORDER BY id DESC LIMIT %s",
+                (sid, limit))
+    beats = qp(cur, "SELECT name, trait, stage, rpp_reward, completed_at, expires_at"
+                    " FROM maya_rp.ooc_milestones WHERE session_id=%s AND completed_at IS NOT NULL"
+                    " ORDER BY completed_at DESC LIMIT 5", (sid,))
+    conn.close()
+    return jsonify({
+        "session_id": sid,
+        "state": {key: (str(value) if key == "updated_at" and value else value) for key, value in dict(state).items()},
+        "audits": [dict(row) for row in audits],
+        "completed_beats": [dict(row) for row in beats],
+    })
+
+
 @APP.route("/api/status")
 @require_auth
 def api_status():

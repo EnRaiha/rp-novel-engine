@@ -62,7 +62,7 @@ from core import ooc  # noqa: E402
 from core.config import Config  # noqa: E402
 from core.db import Database  # noqa: E402
 
-CALLS = ("state", "turn", "canon", "portrait", "context", "persona", "inspect", "direct")
+CALLS = ("state", "turn", "canon", "portrait", "context", "persona", "inspect", "direct", "slaves")
 
 
 async def _adopt_state_file(request: dict) -> None:
@@ -209,6 +209,31 @@ async def handle(request: dict) -> dict:
         if not name:
             return {"ok": False, "error": "inspect needs a character"}
         return {"ok": True, "call": call, "session_id": sid, **(await portraits.inspect_line(sid, name))}
+
+    if call == "slaves":
+        lot = str(request.get("lot") or "").strip()
+        status = str(request.get("status") or "").strip()
+        try:
+            limit = max(1, min(200, int(request.get("limit") or 25)))
+            offset = max(0, int(request.get("offset") or 0))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "slaves needs numeric limit/offset"}
+        where = ["session_id=$1"]
+        params: list = [sid]
+        if lot:
+            params.append(f"%{lot}%")
+            where.append(f"assigned_to ILIKE ${len(params)}")
+        if status:
+            params.append(status)
+            where.append(f"status = ${len(params)}")
+        clause = " AND ".join(where)
+        total = await Database.fetchval(f"SELECT count(*) FROM maya_rp.slaves WHERE {clause}", *params)
+        rows = await Database.fetch(
+            f"SELECT id, name, species, gender, age, role, cost, status, assigned_to"
+            f" FROM maya_rp.slaves WHERE {clause} ORDER BY id LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}",
+            *params, limit, offset)
+        return {"ok": True, "call": call, "session_id": sid, "total": int(total or 0),
+                "offset": offset, "rows": [dict(row) for row in rows]}
 
     if call == "direct":
         from core import campaign

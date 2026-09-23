@@ -8,7 +8,7 @@ Serves:
 
 Run:  python3 scripts/map_server.py [--port 3460]
 """
-import json, re, sys, argparse, os, base64, functools, time
+import json, re, sys, argparse, os, base64, functools, time, subprocess
 from pathlib import Path
 from flask import Flask, jsonify, send_from_directory, Response, request
 import psycopg2
@@ -493,6 +493,41 @@ def api_ooc_context():
         "audits": [dict(row) for row in audits],
         "directives": [dict(row) for row in directives],
     })
+
+
+@APP.route("/api/ooc/direct", methods=["POST"])
+@require_auth
+def api_ooc_direct():
+    """Record a director note (out-of-character correction) for the session.
+
+    The map server's database role is read-only, so the write goes through the
+    engine bridge — the same path the play session's own tool uses.
+    """
+    payload = request.get_json(silent=True) or {}
+    note = str(payload.get("note") or "").strip()
+    if not note:
+        return jsonify({"error": "note is required"}), 400
+    sid = int(payload.get("session") or 3)
+    bridge = Path(__file__).resolve().parent / "ooc_bridge.py"
+    request_body = json.dumps({"call": "direct", "session_id": sid, "note": note[:2000]})
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(bridge)], input=request_body, capture_output=True, text=True,
+            cwd=str(bridge.parent.parent), timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "the engine bridge timed out"}), 504
+    reply = {}
+    for line in (completed.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                reply = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    if reply.get("ok") is not True:
+        return jsonify({"error": reply.get("error") or "the bridge refused the note"}), 502
+    return jsonify({"ok": True, "session_id": sid, "directive_id": reply.get("directive_id")})
 
 
 @APP.route("/api/ooc/trace")

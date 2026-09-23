@@ -175,6 +175,14 @@ def render_blocks(blocks: dict[str, Any]) -> str:
         lines.append("[ACT]")
         lines.append(act)
 
+    notes = blocks.get("director_notes") or []
+    if notes:
+        lines.append("[DIRECTOR NOTES — out-of-character, follow them]")
+        for note in reversed(notes):  # newest last, so the last word is the latest note
+            text_note = " ".join(str(note.get("note") or "").split())
+            if text_note:
+                lines.append(f"- {text_note[:400]}")
+
     events = blocks.get("recent_events") or []
     if events:
         lines.append("[RECENT EVENTS]")
@@ -249,6 +257,7 @@ async def build_context(
     story = await story_brief(sid)
     blocks: dict[str, Any] = {
         "act": act_line(stage, arcs_root_for(brief)),
+        "director_notes": await campaign.directives(sid, limit=5),
         "recent_events": await recent_events(sid, events),
         "companions": await companions_of_note(sid),
         "goals": await current_goals(sid),

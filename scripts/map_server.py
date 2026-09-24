@@ -81,6 +81,29 @@ def qp(cur, sql, params=(), one=False):
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     return (rows[0] if rows else None) if one else rows
 
+def ooc_session(requested=None):
+    """Session an engine view should read.
+
+    An explicit number is honoured; `auto` (or nothing) follows the campaign the
+    engine touched last, so the play panels track the live campaign instead of a
+    hardcoded default that goes stale the moment the campaign restarts.
+    """
+    value = str(requested or "").strip().lower()
+    if value and value != "auto":
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    conn = db()
+    try:
+        row = qp(conn.cursor(),
+                 "SELECT session_id FROM maya_rp.ooc_system_state"
+                 " ORDER BY updated_at DESC NULLS LAST LIMIT 1", one=True)
+    finally:
+        conn.close()
+    return int(row["session_id"]) if row else 0
+
+
 def load_map_data():
     conn = db()
     cur = conn.cursor()
@@ -451,7 +474,7 @@ def api_ooc_context():
     Read-only mirror of the state the harness injects each turn, so the play page
     can show the player why the narrator behaves the way it does.
     """
-    sid = int(request.args.get("session") or 3)
+    sid = ooc_session(request.args.get("session"))
     conn = db()
     cur = conn.cursor()
     state = qp(cur, "SELECT arc_stage, deviation, roleplay_points, audits, findings, debuff, updated_at"
@@ -507,7 +530,7 @@ def api_ooc_direct():
     note = str(payload.get("note") or "").strip()
     if not note:
         return jsonify({"error": "note is required"}), 400
-    sid = int(payload.get("session") or 3)
+    sid = ooc_session(payload.get("session"))
     bridge = Path(__file__).resolve().parent / "ooc_bridge.py"
     request_body = json.dumps({"call": "direct", "session_id": sid, "note": note[:2000]})
     try:
@@ -538,7 +561,7 @@ def api_ooc_trace():
     This is what the narration was actually billed for — the read-out that makes
     the audit visible instead of implied.
     """
-    sid = int(request.args.get("session") or 3)
+    sid = ooc_session(request.args.get("session"))
     limit = max(1, min(50, int(request.args.get("limit") or 12)))
     conn = db()
     cur = conn.cursor()

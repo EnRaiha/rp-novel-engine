@@ -534,7 +534,8 @@ async def audit(
         row = await Database.fetchrow(
             "UPDATE maya_rp.ooc_system_state SET deviation=$2, roleplay_points=roleplay_points+$3,"
             " audits=audits+1, findings=findings+$4, debuff=$5, updated_at=now()"
-            " WHERE session_id=$1 RETURNING session_id, arc_stage, deviation, roleplay_points, audits, findings",
+            " WHERE session_id=$1 RETURNING session_id, arc_stage, deviation, roleplay_points, audits, findings,"
+            " debuff, updated_at",
             sid,
             deviation,
             award,
@@ -622,6 +623,9 @@ async def set_stage(session_id: int | None, stage: str) -> dict[str, Any]:
         sid,
         stage,
     )
+    # The harness reads its own file, so a stage change that stays in the
+    # database leaves the banner one stage behind until the next audit.
+    await mirror_state_file(sid)
     return dict(row)
 
 
@@ -1322,7 +1326,6 @@ async def advance_stage(
         )
         raise ValueError(f"arc stage {readiness['next']!r} gates unmet: {unmet}")
     row = await set_stage(sid, readiness["next"])
-    await mirror_state_file(sid)
     return {"ok": True, "stage": row["arc_stage"], "from": readiness["stage"], "gates": readiness["gates"]}
 
 

@@ -250,6 +250,23 @@ class TestLedger:
         assert latest["match_len"] > 0
         assert "Tears" not in str(latest)
 
+    async def test_audit_state_row_carries_the_canonical_field_set(self, scratch_session):
+        """The harness maps the audit's own row, so a dropped column poisons it.
+
+        `debuff` went missing from this RETURNING list once: the plugin mapped the
+        absent key to `undefined`, which is not lossless JSON, and every later
+        `ooc_status` call failed on a state the engine had already written.
+        """
+        from core import ooc
+
+        result = await ooc.audit("Quiet assessment of the ledger.", SCRATCH_SESSION, traits=("aloof",))
+        row = result["state"]
+        assert row is not None, "an audit returns the row it just wrote"
+        assert set(row) == set(await ooc.state(SCRATCH_SESSION)), (
+            "the audit row must carry every column `ooc.state` exposes, or the plugin's "
+            "state mapper fills the gap with `undefined`"
+        )
+
     async def test_clean_audit_decays_at_selective(self, scratch_session):
         from core import ooc
 

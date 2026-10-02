@@ -484,6 +484,41 @@ async def cmd_council():
         if len(sys.argv) < 5:
             print(usage); await Database.close(); return
         out = await council.revoke_title(sid, sys.argv[3], sys.argv[4])
+    elif action == "vote":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        seats = await council.get_cabinet_seats(sid)
+        votes = [{"position": "aye"}] * int(sys.argv[3]) + [{"position": "nay"}] * int(sys.argv[4])
+        if len(sys.argv) > 5:
+            votes += [{"position": "abstain"}] * int(sys.argv[5])
+        out = council.calculate_vote(seats, votes)
+    elif action == "promote":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        seats = await council.get_cabinet_seats(sid)
+        seat = next((s for s in seats if str(s.get("title", "")).lower() == sys.argv[3].lower()), None)
+        if seat is None:
+            out = {"error": f"no seat titled '{sys.argv[3]}' in session {sid}"}
+        else:
+            # `promote_seat` computes the new seat and writes nothing, so the boundary has to persist it
+            # or the promotion is a sentence that never happened.
+            promoted = council.promote_seat(seat, sys.argv[4])
+            await Database.execute(
+                "UPDATE maya_rp.cabinet_hierarchy SET holder=$1 WHERE id=$2", sys.argv[4], seat["id"])
+            out = {"seat": promoted.get("title"), "holder": promoted.get("holder"), "persisted": True}
+    elif action == "plot":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        seats = await council.get_cabinet_seats(sid)
+        out = council.generate_plot(sys.argv[3], {}, seats)
+    elif action == "expose":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = council.check_exposure(json.loads(sys.argv[3]))
+    elif action == "phase":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = council.execute_phase(json.loads(sys.argv[3]), int(sys.argv[4]))
     elif action == "hooks":
         rows = await Database.fetch(
             "SELECT system_name, status, controlling_faction, governor_name, fleet_presence"

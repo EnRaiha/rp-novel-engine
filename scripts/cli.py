@@ -93,6 +93,56 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_character():
+    """character <name> {item|outfit|wear|profile} <json|id> — hand a character something new.
+
+    One command for four mutations, because four commands is four places to forget one.
+    """
+    await Database.init()
+    usage = """Usage: cli.py character "<name>" item '{"name": "..."}'
+       cli.py character "<name>" outfit '{"id": "...", "name": "..."}'
+       cli.py character "<name>" wear <outfit-id>
+       cli.py character "<name>" profile '{"face": "..."}'"""
+    if len(sys.argv) < 5:
+        print(usage)
+        await Database.close()
+        return
+    name, action, payload = sys.argv[2], sys.argv[3], sys.argv[4]
+    from modules.character_profile import grant
+    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
+    row = await Database.fetchrow(
+        # Wildcards go in the parameter, not in the SQL: building them in the statement needs
+        # four levels of quoting and one of them always wins.
+        "SELECT id FROM maya_rp.characters WHERE session_id=$1 AND name ILIKE $2"
+        " ORDER BY importance DESC NULLS LAST, id LIMIT 1", sid, f"%{name}%")
+    if not row:
+        print(f"no character named {name} in session {sid}")
+        await Database.close()
+        return
+    kwargs = {"session_id": sid}
+    try:
+        if action == "item":
+            kwargs["item"] = json.loads(payload)
+        elif action == "outfit":
+            kwargs["outfit"] = json.loads(payload)
+        elif action == "profile":
+            kwargs["profile"] = json.loads(payload)
+        elif action == "wear":
+            kwargs["wear"] = payload
+        else:
+            print(usage)
+            await Database.close()
+            return
+        applied = await grant(int(row["id"]), **kwargs)
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"refused: {exc}")
+        await Database.close()
+        return
+    for field, what in applied.items():
+        print(f"  {field}: {what}")
+    await Database.close()
+
+
 async def cmd_load():
     """load <file.sav> [--keep-session] — restore PG from a .sav snapshot."""
     await Database.init()
@@ -2067,6 +2117,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_schema())
     elif cmd == "sync-pack":
         asyncio.run(cmd_sync_pack())
+    elif cmd == "character":
+        asyncio.run(cmd_character())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

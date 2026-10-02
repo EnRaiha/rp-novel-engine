@@ -17,6 +17,24 @@ from core.log import info
 
 # ─── Profile CRUD ──────────────────────────────────────────────────────
 
+def _as_list(value: str | None, field: str) -> list:
+    """Decode a jsonb column that must hold a list.
+
+    Nine characters carried `{}` in `inventory_jsonb` — an empty dict where a list belongs, written
+    by a seeding pass. `add_item` called `.append` on it and raised AttributeError, which is why the
+    caller-less function had never worked for those nine. Empty is coerced and reported; anything
+    else with contents is left alone rather than silently reshaped.
+    """
+    if not value:
+        return []
+    decoded = json.loads(value) if isinstance(value, str) else value
+    if isinstance(decoded, list):
+        return decoded
+    if isinstance(decoded, dict) and not decoded:
+        return []
+    raise ValueError(f"{field} holds a {type(decoded).__name__} with contents, not a list")
+
+
 async def update_profile(character_id: int, profile_data: dict, session_id: int = None):
     """Set the static physical profile of a character (face, body, voice)."""
     if session_id is None:
@@ -36,7 +54,7 @@ async def add_to_wardrobe(character_id: int, outfit: dict, session_id: int = Non
         "SELECT wardrobe_jsonb FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
         character_id, session_id,
     )
-    wardrobe = json.loads(current) if current else []
+    wardrobe = _as_list(current, "wardrobe_jsonb")
     wardrobe.append(outfit)
     await Database.execute(
         "UPDATE maya_rp.characters SET wardrobe_jsonb = $1 WHERE id = $2 AND session_id = $3",
@@ -52,14 +70,14 @@ async def set_outfit(character_id: int, outfit_id: str, session_id: int = None):
         "SELECT wardrobe_jsonb FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
         character_id, session_id,
     )
-    wardrobe = json.loads(wardrobe_raw) if wardrobe_raw else []
+    wardrobe = _as_list(wardrobe_raw, "wardrobe_jsonb")
     outfit = next((o for o in wardrobe if o.get("id") == outfit_id), None)
     if outfit:
         await Database.execute(
             "UPDATE maya_rp.characters SET current_outfit = $1 WHERE id = $2 AND session_id = $3",
             json.dumps(outfit), character_id, session_id,
         )
-        info("profile", f"{outfit.get('name', 'Unknown')} equipped", char_id=character_id)
+        info("profile", f"{outfit.get('name', 'Unknown')} equipped for character {character_id}")
 
 
 async def add_item(character_id: int, item: dict, session_id: int = None):
@@ -70,12 +88,46 @@ async def add_item(character_id: int, item: dict, session_id: int = None):
         "SELECT inventory_jsonb FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
         character_id, session_id,
     )
-    inv = json.loads(current) if current else []
+    inv = _as_list(current, "inventory_jsonb")
     inv.append(item)
     await Database.execute(
         "UPDATE maya_rp.characters SET inventory_jsonb = $1 WHERE id = $2 AND session_id = $3",
         json.dumps(inv), character_id, session_id,
     )
+
+
+async def grant(character_id: int, *, item: dict | None = None, outfit: dict | None = None,
+                profile: dict | None = None, wear: str | None = None,
+                session_id: int | None = None) -> dict[str, str]:
+    """The one way anything hands a character something new.
+
+    `add_item`, `add_to_wardrobe`, `update_profile` and `set_outfit` were four separate unwired
+    functions, which is four places for a caller to forget one. Everything that changes what a
+    character owns or wears arrives here, and this is what the CLI and the engine call.
+
+    @param character_id - whose record changes.
+    @param item - one inventory entry.
+    @param outfit - one wardrobe entry.
+    @param profile - the physical profile: face, body, voice.
+    @param wear - an outfit id already in the wardrobe, to put on.
+    @returns what changed, keyed by field, for the caller to report.
+    """
+    applied: dict[str, str] = {}
+    if profile is not None:
+        await update_profile(character_id, profile, session_id)
+        applied["profile"] = "updated"
+    if outfit is not None:
+        await add_to_wardrobe(character_id, outfit, session_id)
+        applied["wardrobe"] = f"added {outfit.get('name') or outfit.get('id') or 'outfit'}"
+    if item is not None:
+        await add_item(character_id, item, session_id)
+        applied["inventory"] = f"added {item.get('name') or item.get('id') or 'item'}"
+    if wear is not None:
+        await set_outfit(character_id, wear, session_id)
+        applied["wearing"] = wear
+    if not applied:
+        raise ValueError("grant needs at least one of item, outfit, profile or wear")
+    return applied
 
 
 # ─── Auto-Dress ────────────────────────────────────────────────────────

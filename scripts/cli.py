@@ -93,6 +93,88 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_fleet():
+    """fleet {list | create "<name>" [formation] | assign "<ship>" "<fleet>" [position] |
+    battle "<fleet>" ["tactic"] [threat]}
+
+    Formations the schema allows: wall, crescent, spearhead, screen, arrow, scatter.
+
+    Three entry points of `modules/fleet.py` had no caller: the fleet builder, the ship assignment and
+    the battle. The tick and the listing ran against fleets nothing could form.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py fleet list\n'
+             '       cli.py fleet create "<name>" ["formation"]\n'
+             '       cli.py fleet assign "<ship>" "<fleet>" [position]\n'
+             '       cli.py fleet battle "<fleet>" ["tactic"] [threat]')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "list"
+    from modules import fleet
+    if action == "create":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        formation = sys.argv[4] if len(sys.argv) > 4 else "spearhead"
+        out = await fleet.create_fleet(sys.argv[3], formation, sid)
+    elif action == "assign":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        position = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+        out = await fleet.assign_ship(sys.argv[3], sys.argv[4], position, sid)
+    elif action == "battle":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        tactic = sys.argv[4] if len(sys.argv) > 4 else "balanced"
+        threat = int(sys.argv[5]) if len(sys.argv) > 5 else 100
+        out = await fleet.fleet_battle(sys.argv[3], tactic, threat, sid)
+    else:
+        rows = await fleet.list_fleets(sid)
+        out = {"fleets": len(rows)}
+        for row in rows[:10]:
+            print(f"  {row}")
+    if not out:
+        print("  no result")
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
+async def cmd_career():
+    """career {shortage | specialize <crew-id> "<specialization>" | promote <crew-id> |
+    award <crew-id> <xp> ["source"]}
+
+    Three entry points of `modules/crew_career.py` had no caller: the specialization, the promotion and
+    the shortage report. A crew member could earn experience and never spend it.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py career shortage\n'
+             '       cli.py career specialize <crew-id> "<specialization>"\n'
+             '       cli.py career promote <crew-id>\n'
+             '       cli.py career award <crew-id> <xp> ["source"]')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "shortage"
+    from modules import crew_career
+    if action == "specialize":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await crew_career.assign_specialization(int(sys.argv[3]), sys.argv[4], sid)
+    elif action == "promote":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await crew_career.promote_crew(int(sys.argv[3]), sid)
+    elif action == "award":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        source = sys.argv[5] if len(sys.argv) > 5 else "manual"
+        out = await crew_career.award(int(sys.argv[3]), int(sys.argv[4]), source, sid)
+    else:
+        out = await crew_career.talent_shortage(sid)
+    if not out:
+        print("  no result")
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
 async def cmd_spy():
     """spy {build "<type>" "<name>" | deploy "<name>" "<lane>" | hack "<name>" <operation> <target> |
     cloaks | anticloak "<system>" <level>}
@@ -2832,6 +2914,10 @@ if __name__ == "__main__":
         asyncio.run(cmd_spy())
     elif cmd in ("tech", "tech-tree", "labs"):
         asyncio.run(cmd_tech())
+    elif cmd in ("fleet", "fleets"):
+        asyncio.run(cmd_fleet())
+    elif cmd in ("career", "crew-career"):
+        asyncio.run(cmd_career())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

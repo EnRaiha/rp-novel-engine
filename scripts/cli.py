@@ -93,6 +93,52 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_social():
+    """social {tick | mutiny | morale <delta> [reason] | events <type> | relation <a> <b> | bond <a> <b> <delta>}
+
+    The social cluster had no door: update_morale was a second, unused morale writer, and the event,
+    tension and relationship helpers were reachable from nothing while the tick reported only a number.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py social tick | mutiny\n'
+             '       cli.py social morale <delta> ["reason"]\n'
+             '       cli.py social events <event-type>\n'
+             '       cli.py social relation <char-a> <char-b>\n'
+             '       cli.py social bond <char-a> <char-b> <delta>')
+    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
+    action = sys.argv[2] if len(sys.argv) > 2 else "tick"
+    from modules import social
+    if action == "mutiny":
+        out = await social.calculate_mutiny_risk(sid)
+    elif action == "morale":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        reason = sys.argv[4] if len(sys.argv) > 4 else ""
+        before = await social._get_fleet_morale(sid)
+        after = await social.update_morale(sid, int(sys.argv[3]), reason)
+        out = {"before": before, "after": after, "delta": int(sys.argv[3]), "reason": reason}
+    elif action == "events":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = social.get_social_event_config(sys.argv[3])
+        out = {"config_keys": len(out), "event_type": social.detect_event_type(sys.argv[3])}
+    elif action == "relation":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await social.get_relationship(sid, int(sys.argv[3]), int(sys.argv[4])) or {"relationship": "none"}
+    elif action == "bond":
+        if len(sys.argv) < 6:
+            print(usage); await Database.close(); return
+        out = await social.shift_bond(sid, int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]))
+    else:
+        out = await social.run_tick(sid)
+    if not out:
+        print("  no result")
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
 async def cmd_wonders():
     """wonders {overview | explore <discovery-id> [fleet-power] | hunt <encounter-id> [power] |
     tame <encounter-id> [skill]}
@@ -2419,6 +2465,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_horror())
     elif cmd in ("wonders", "wonder"):
         asyncio.run(cmd_wonders())
+    elif cmd in ("social", "morale"):
+        asyncio.run(cmd_social())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

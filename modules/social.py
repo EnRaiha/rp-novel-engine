@@ -373,7 +373,11 @@ async def calculate_mutiny_risk(
     crew = await test_crew_loyalty(session_id)
     total = len(crew)
     if total == 0:
-        return {"risk_level": "none", "probability": 0, "stage": "none", "ringleaders": []}
+        # Every early return must carry the same keys, or a caller that reads the new field gets a
+        # KeyError on exactly the session that has no crew, which is the session most likely to be
+        # asked why nothing is happening.
+        return {"risk_level": "none", "probability": 0, "stage": "none", "ringleaders": [],
+                "network_ringleaders": []}
 
     disloyal = [c for c in crew if c["loyalty_flag"] == "disloyal"]
     wavering = [c for c in crew if c["loyalty_flag"] == "wavering"]
@@ -394,11 +398,16 @@ async def calculate_mutiny_risk(
 
     risk = "critical" if ratio > 0.5 else "high" if ratio > 0.3 else "moderate" if ratio > 0.15 else "low"
 
+    # `get_ringleaders` ranks by crew network centrality rather than by loyalty score, so it finds the
+    # influential malcontents the score list misses. It was unreachable; it is a second signal now.
+    network_ringleaders = await get_ringleaders(session_id, crew)
+
     return {
         "risk_level": risk,
         "probability": round(prob * 100),
         "stage": stage,
         "ringleaders": ringleaders[:5],
+        "network_ringleaders": network_ringleaders[:5],
         "disloyal_count": len(disloyal),
         "wavering_count": len(wavering),
         "loyal_count": total - len(disloyal) - len(wavering),
@@ -740,6 +749,10 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
         mutiny = await calculate_mutiny_risk(session_id)
         fleet_morale = await _get_fleet_morale(session_id)
         morale = get_morale_status(fleet_morale)
+        # Two pure helpers the tick never called: they turn the number into the sentence a GM reads,
+        # which is why they existed and why nothing showed them.
+        tension = get_tension_narrative(fleet_morale)
+        pending = get_pending_events(fleet_morale)
         # §6.1 — read-only: the OOC meter colours the tick, it is never written here.
         reading = await ooc.suspicion_reading(session_id)
 
@@ -748,6 +761,8 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
         return {
             "fleet_morale": fleet_morale,
             "morale_status": morale["status"],
+            "tension": tension,
+            "pending_events": pending,
             "mutiny_risk": mutiny["risk_level"],
             "mutiny_probability": mutiny["probability"],
             "mutiny_stage": mutiny["stage"],

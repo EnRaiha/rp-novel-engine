@@ -102,7 +102,10 @@ async def apply_holiday(date: dict, session_id: int):
     bonus = h.get("bonus", 0)
     if bonus != 0:
         await Database.execute(
-            "UPDATE maya_rp.crew_roster SET morale=LEAST(100, morale+$1) WHERE session_id=$2",
+            # GREATEST(0, ...) as well as LEAST(100, ...): the ceiling was there and the floor was
+            # not, so a bad event could drive crew morale negative and the tick would report it.
+            "UPDATE maya_rp.crew_roster SET morale=GREATEST(0, LEAST(100, morale+$1))"
+            " WHERE session_id=$2",
             bonus, session_id)
         spend = max(0, bonus) * 2000
         if spend:

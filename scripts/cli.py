@@ -1492,6 +1492,7 @@ async def cmd_ooc():
       cli.py ooc status [--session N]
       cli.py ooc audit "<text>" [--layer=dialogue|somatic|tool] [--trait=aloof,mentor]
                                      [--magic=well:close_wound,sight:read] [--witnessed] [--instrument]
+                                     [--preview]   # answer the price without writing anything
                                 [--evidence] [--turn=REF]
       cli.py ooc persona [--slug=…]                    # voice/lore/intro/play-guide summary
       cli.py ooc portrait <name> [occasion]            # preset image lookup or queue
@@ -1566,12 +1567,13 @@ async def cmd_ooc():
                 magic_acts=magic,
                 magic_witnessed="--witnessed" in flags,
                 magic_instrument="--instrument" in flags,
+                preview="--preview" in flags,
             )
         except ooc.FrozenSession as exc:
             print(f"refused: {exc}", file=sys.stderr)
             return
         print(f"layer={result['layer']} rules={result['rules']} disposition={result['disposition']}"
-              + (f" ({result['skip_reason']})" if result["skip_reason"] else ""))
+              + (f" ({result['skip_reason']})" if result.get("skip_reason") else ""))
         for finding in result["findings"]:
             print(f"  ✖ [{finding['rule_id']}] {finding['kind']}/{finding['layer']} +{finding['delta']}  «{finding['match']}»")
         if result.get("magic_delta"):
@@ -1590,7 +1592,10 @@ async def cmd_ooc():
         for beat in result.get("beats_completed", []):
             print(f"  ★ beat complete {beat['name']}  rpp +{beat['rpp_reward']}"
                   + (f"  latch={beat['latched_ruleset']}" if beat.get("latched_ruleset") else ""))
-        print(f"  audit_event #{result['audit_event_id']}")
+        if result.get("preview"):
+            print("  preview: nothing written")
+        else:
+            print(f"  audit_event #{result['audit_event_id']}")
     elif sub == "rules":
         stage = flag("stage")
         rules = await ooc.effective_rules(session, traits, stage)

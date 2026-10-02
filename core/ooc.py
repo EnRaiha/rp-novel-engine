@@ -563,6 +563,7 @@ async def audit(
             "loophole_score": score,
             "rpp_award": award,
             "disposition": "flagged" if findings else ("exempt" if exempted else "no_match"),
+            "skip_reason": None,
             "suspicion_delta": 0 if standing_down else int(magic["suspicion"]),
             "suspicion_reason": "magic" if not standing_down and magic["suspicion"] else None,
             "magic": magic,

@@ -75,3 +75,22 @@ class TestDeclaration:
 
     def test_blanks_are_dropped(self):
         assert cost.declared_acts(["sight:read", "  ", ""]) == ["sight:read"]
+
+
+class TestPreviewShape:
+    """A preview must answer in the same shape as a real audit, minus the write.
+
+    The CLI printer reads `skip_reason` from the result, and the preview path did not carry
+    it, so the first preview run crashed after the audit had already answered. Nothing was
+    written, which is the property that matters, but a caller cannot rely on a return shape
+    that differs by path.
+    """
+
+    def test_every_key_the_real_path_returns_is_present_in_the_preview(self):
+        import inspect
+
+        import core.ooc as ooc
+
+        source = inspect.getsource(ooc.audit)
+        assert '"skip_reason": None,' in source, "preview must declare skip_reason"
+        assert '"preview": True,' in source

@@ -93,6 +93,62 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_tail():
+    """tail {batch <class> <tier> <type> <count> ["prefix"] | close | prompt | state <character-id> |
+    pirate <pirate-json> | start | recall <event-id> "<title>" "<desc>" "<query>" | endings |
+    refit "<ship>"}
+
+    The last ten caller-less functions, one per module. Each is the only door its module was missing.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py tail batch <class> <tier> <type> <count> ["prefix"] | close | prompt\n'
+             '       cli.py tail state <character-id> | pirate <pirate-json> | start | endings\n'
+             '       cli.py tail recall <event-id> "<title>" "<desc>" "<query>" | refit "<ship>"')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "close"
+    from core import campaign, dramatic_structure, memory, session_rituals
+    from core.decision_models import pirate_event_features
+    from modules import image_gen, physical_state, refit, ship_generation
+    if action == "batch":
+        if len(sys.argv) < 7:
+            print(usage); await Database.close(); return
+        prefix = sys.argv[7] if len(sys.argv) > 7 else None
+        out = await ship_generation.generate_batch(sys.argv[3], int(sys.argv[4]), sys.argv[5],
+                                                   int(sys.argv[6]), prefix, sid)
+    elif action == "prompt":
+        out = await image_gen.generate_prompt(sid)
+    elif action == "state":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await physical_state.get_state(int(sys.argv[3]), sid)
+    elif action == "pirate":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = pirate_event_features(json.loads(sys.argv[3]))
+    elif action == "start":
+        out = await dramatic_structure.session_start(sid)
+    elif action == "recall":
+        if len(sys.argv) < 7:
+            print(usage); await Database.close(); return
+        out = await memory.store_and_recall(int(sys.argv[3]), sys.argv[4], sys.argv[5], sys.argv[6], sid)
+    elif action == "endings":
+        out = await campaign.triggered_endings(sid)
+    elif action == "refit":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await refit.upgrade_ship(sys.argv[3], sid)
+    else:
+        out = await session_rituals.generate_close(sid)
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
+        print("  no result")
+    else:
+        print(f"  result: {out}")
+    await Database.close()
+
+
 async def cmd_misc():
     """misc {herring <investigation-id> | influence <faction> | salvage "<ship-class>" | redacted |
     guard "<action>" | link <decision-id> <event-id> | news-read <article-id> "<headline>"}
@@ -3633,6 +3689,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_war())
     elif cmd in ("misc", "odds"):
         asyncio.run(cmd_misc())
+    elif cmd in ("tail", "last"):
+        asyncio.run(cmd_tail())
     elif cmd in ("encounter", "encounters", "events"):
         asyncio.run(cmd_encounter())
     else:

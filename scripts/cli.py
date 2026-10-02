@@ -93,6 +93,56 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_mega():
+    """mega {types | status | start <type-id> [sector-id] [territory-id] | port-types | ports |
+    build-port <territory-id> <port-type-id> [name] | upgrade-port <port-id> <upgrade>}
+
+    Seven entry points of `modules/megastructures_ports.py` had no caller: the two catalogues, the two
+    status readers, the two builders and the port upgrader. `run_tick` advanced megastructures that
+    nothing could start.
+    """
+    await Database.init()
+    usage = ("Usage: cli.py mega types | status | start <type-id> [sector-id] [territory-id]\n"
+             "       cli.py mega port-types | ports\n"
+             "       cli.py mega build-port <territory-id> <port-type-id> [name]\n"
+             "       cli.py mega upgrade-port <port-id> <upgrade-name>")
+    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
+    action = sys.argv[2] if len(sys.argv) > 2 else "status"
+    from modules import megastructures_ports as mp
+    if action == "types":
+        for row in await mp.get_megastructure_types():
+            print(f"  #{row['id']} {row['name']} · tier {row.get('fantasy_tier')}")
+        await Database.close(); return
+    if action == "port-types":
+        for row in await mp.get_port_types():
+            print(f"  #{row['id']} {row['name']} · {row.get('category')}"
+                  f" · {row.get('build_cost_credits')} credits")
+        await Database.close(); return
+    if action == "start":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        sector = int(sys.argv[4]) if len(sys.argv) > 4 else None
+        territory = int(sys.argv[5]) if len(sys.argv) > 5 else None
+        out = await mp.start_construction(sid, int(sys.argv[3]), sector, territory)
+    elif action == "build-port":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        name = sys.argv[5] if len(sys.argv) > 5 else None
+        out = await mp.build_port(sid, int(sys.argv[3]), int(sys.argv[4]), name)
+    elif action == "upgrade-port":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await mp.upgrade_port(sid, int(sys.argv[3]), sys.argv[4])
+    elif action == "ports":
+        out = {"ports": len(await mp.get_port_overview(sid))}
+    else:
+        out = {"megastructures": len(await mp.get_megastructure_status(sid)),
+               "ports": len(await mp.get_port_overview(sid))}
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
 async def cmd_build():
     """build {types <category> | list | show <id> | new <type-id> [name] | upgrade <id>} — facilities.
 
@@ -2276,6 +2326,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_cargo())
     elif cmd == "build" or cmd == "infra":
         asyncio.run(cmd_build())
+    elif cmd in ("mega", "megastructure", "port", "ports"):
+        asyncio.run(cmd_mega())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

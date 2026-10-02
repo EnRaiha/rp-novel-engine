@@ -123,10 +123,18 @@ async def advance_megastructure(session_id: int, game_days: float = 0.5):
                            f"🎉 Megastructure Complete: {const['name']}",
                            f"The {const['name']} is fully operational!", 5)
 
-async def get_megastructure_status():
-    """View all megastructures in construction/completed."""
+async def get_megastructure_status(session_id: int | None = None):
+    """This session's megastructures, in construction or completed.
+
+    Reviewed 2026-10-03 before wiring. Neither this nor `get_port_overview` scoped by session: the
+    view behind it exposed no `session_id` at all, so playing Arc I listed the frozen campaign's
+    construction sites. Migration 129 adds the column; this asks for it.
+    """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     return [dict(r) for r in await Database.fetch(
-        "SELECT * FROM maya_rp.megastructure_status ORDER BY status, estimated_completion"
+        "SELECT * FROM maya_rp.megastructure_status WHERE session_id = $1"
+        " ORDER BY status, estimated_completion", session_id
     )]
 
 async def _apply_benefits(session_id: int, const: dict):
@@ -191,12 +199,12 @@ async def build_port(session_id: int, territory_id: int, port_type_id: int, name
     ok, msg = await _check_afford(session_id, total_cost)
     if not ok:
         return {"error": f"Insufficient resources: {msg}"}
-    await _deduct_resources(session_id, total_cost)
+    charged = await _deduct_resources(session_id, total_cost)
 
     if not name:
         name = f"{pt['name']} {random.randint(100, 999)}"
 
-    pid = await Database.fetchrow("""
+    rid = await Database.fetchrow("""
         INSERT INTO maya_rp.ports (session_id, territory_id, port_type_id, name, level, built_at, status)
         VALUES ($1, $2, $3, $4, 1, NOW(), 'active') RETURNING id
     """, session_id, territory_id, port_type_id, name)
@@ -204,8 +212,8 @@ async def build_port(session_id: int, territory_id: int, port_type_id: int, name
     await _log(session_id, "infrastructure",
                f"🏗️ Port Built: {name}",
                f"Constructed {pt['name']} in territory #{territory_id}.", 3)
+    return {"port_id": rid["id"], "name": name, "type": pt["name"], "charged": charged}
 
-    return {"port_id": pid["id"], "name": name, "type": pt["name"]}
 
 async def upgrade_port(session_id: int, port_id: int, upgrade_name: str) -> dict:
     """Upgrade a port with a named upgrade."""
@@ -244,10 +252,13 @@ async def upgrade_port(session_id: int, port_id: int, upgrade_name: str) -> dict
 
     return {"port_id": port_id, "new_level": new_level, "upgrade": upgrade_name}
 
-async def get_port_overview():
-    """View all ports."""
+async def get_port_overview(session_id: int | None = None):
+    """This session's ports."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
     return [dict(r) for r in await Database.fetch(
-        "SELECT * FROM maya_rp.port_overview ORDER BY territory_name, name"
+        "SELECT * FROM maya_rp.port_overview WHERE session_id = $1 ORDER BY territory_name, name",
+        session_id
     )]
 
 # ============================================================

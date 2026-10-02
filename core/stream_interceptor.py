@@ -19,6 +19,8 @@ Performance (2026-08-04 optimization pass):
   - Pre-filter gate + circuit breaker keep embed calls rare and stalls zero.
 """
 import re
+
+from core.text_processor import enforce_ds_register
 import time
 from typing import AsyncGenerator, Any
 
@@ -160,8 +162,13 @@ class StreamInterceptor:
         return self.TAG_PATTERN.sub(repl, line)
 
     def expand_text(self, text: str) -> str:
-        """Sync convenience — expand all tags in a complete string."""
-        return self.expand_line(text)
+        """Sync convenience — expand all tags in a complete string, then hold the register.
+
+        This is the boundary where a finished string stops being model output and becomes canon
+        prose, so the register pass belongs here rather than at every caller: `fade to black` and a
+        clinical term are both defects of the same surface.
+        """
+        return enforce_ds_register(self.expand_line(text))
 
     # ── semantic tier (in-memory) ────────────────────────────────
 

@@ -6,7 +6,6 @@ from erotic-playbook.md §9, keeping prose consistent with the
 established literary register.
 """
 import re
-import random
 
 # Clinical/Mechanical -> Literary/Metaphorical (DS Register)
 REPLACEMENT_LEXICON = {
@@ -33,22 +32,48 @@ REPLACEMENT_LEXICON = {
 }
 
 
-def enforce_ds_register(text: str) -> str:
-    """
-    Process LLM output: replace flagged clinical terms with sensory
-    metaphors. Returns transformed text.
+def _apply(text: str) -> tuple[str, dict[str, int]]:
+    """The register pass, once.
+
+    @returns the transformed text and how many substitutions each pattern made.
     """
     processed = text
+    counts: dict[str, int] = {}
     for pattern, replacements in REPLACEMENT_LEXICON.items():
+        made = [0]
         if isinstance(replacements, list):
-            def replacer(match, _choices=replacements):
-                return random.choice(_choices)
+            def replacer(_match, _choices=replacements, _made=made):
+                # Deterministic by occurrence: the first match always gets the first phrasing, the
+                # second the second, and it wraps. `random.choice` used to decide this, which meant
+                # the same input produced different canon prose on every call.
+                choice = _choices[_made[0] % len(_choices)]
+                _made[0] += 1
+                return choice
             processed = re.sub(pattern, replacer, processed, flags=re.IGNORECASE)
         else:
-            processed = re.sub(pattern, replacements, processed, flags=re.IGNORECASE)
-    return processed
+            processed, n = re.subn(pattern, replacements, processed, flags=re.IGNORECASE)
+            made[0] = n
+        if made[0]:
+            counts[pattern] = made[0]
+    return processed, counts
 
 
-def ds_register_delta(original: str, processed: str) -> int:
-    """How many terms were transformed (for logging)."""
-    return sum(1 for a, b in zip(original, processed) if a != b) if len(original) == len(processed) else -1
+def enforce_ds_register(text: str) -> str:
+    """Process LLM output: replace flagged clinical terms with sensory metaphors."""
+    return _apply(text)[0]
+
+
+def register_report(text: str) -> dict[str, int]:
+    """How many substitutions each pattern makes, for logging and tests."""
+    return _apply(text)[1]
+
+
+def ds_register_delta(original: str, processed: str | None = None) -> int:
+    """How many terms were transformed.
+
+    The old body compared the two strings character by character and required them to be the same
+    length, so a replacement that changed the length — which most of them do, `sex` becomes
+    `the union` — returned -1. It counted nothing, ever. The count comes from the pattern matches in
+    the original instead, and `processed` is accepted only for callers that still pass it.
+    """
+    return sum(register_report(original).values())

@@ -344,6 +344,11 @@ async def handle(request: dict) -> dict:
         action_evidence=await ooc.evidence_from_actions(sid, actions),
         context=request.get("context"),
         turn_ref=request.get("turn_ref"),
+        # Magic is declared by the caller: the engine cannot read it out of prose. A turn
+        # that declares nothing prices at zero, which is the honest default.
+        magic_acts=request.get("magic_acts") or (),
+        magic_witnessed=bool(request.get("magic_witnessed")),
+        magic_instrument=bool(request.get("magic_instrument")),
         preview=bool(request.get("preview")),
     )
     result["call"] = call

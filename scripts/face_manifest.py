@@ -245,12 +245,43 @@ def match_keys(name: str) -> list[str]:
     return keys
 
 
-def json_row(r: dict) -> dict:
-    """The same row as `render` prints, with `exists` named for what it means."""
+def prune_shared_keys(names: list[str]) -> dict[str, list[str]]:
+    """Keys for every character, with the cross-collisions removed.
+
+    A single-word epithet is a useful key until it is also part of somebody else's name. `Queen`
+    is a key for `Rook Thorn (Queen)` and it sits inside `Queen Onyx Sable`, so prose about Onyx
+    would attach Thorn as well. The measured cases were `Queen`, and any title word shared by two
+    characters.
+
+    Multi-word keys are kept: `Pirate Queen` is shared by 21 characters, and the resolver refuses a
+    key that maps to more than one of them, which is the correct answer rather than a wrong face.
+
+    @param names - every character name in the manifest.
+    @returns {name: keys} where no key is both one word and a substring of another name.
+    """
+    lowered = [name.lower() for name in names]
+    out: dict[str, list[str]] = {}
+    for index, name in enumerate(names):
+        keys = []
+        for key in match_keys(name):
+            if len(key.split()) == 1:
+                others = [other for position, other in enumerate(lowered) if position != index]
+                if any(key.lower() in other for other in others):
+                    continue
+            keys.append(key)
+        out[name] = keys
+    return out
+
+
+def json_row(r: dict, keys: list[str] | None = None) -> dict:
+    """The same row as `render` prints, with `exists` named for what it means.
+
+    @param keys - the pruned key list for this character, from `prune_shared_keys`.
+    """
     return {
         "id": r["id"],
         "name": r["name"],
-        "keys": match_keys(r["name"]),
+        "keys": keys if keys is not None else match_keys(r["name"]),
         "twin": r["twin"],
         "tier": r["tier"],
         "key": r["key"],
@@ -263,12 +294,15 @@ def json_row(r: dict) -> dict:
 
 def render_json(rows: list[dict], chars: int, generated_at: str, out: pathlib.Path) -> str:
     """The same rows as `render`, as JSON for the attachment plugin."""
+    # One word keys that also sit inside another character's name are dropped here, in a batch,
+    # because the check needs every name at once.
+    pruned = prune_shared_keys(sorted({str(r["name"]) for r in rows}))
     payload = {
         "generated_at": generated_at,
         "session": ACTIVE_SESSION,
         "characters": chars,
         "keys": len(KEYS),
-        "rows": [json_row(r) for r in rows],
+        "rows": [json_row(r, pruned.get(r["name"])) for r in rows],
     }
     text = json.dumps(payload, indent=1) + "\n"
     out.parent.mkdir(parents=True, exist_ok=True)

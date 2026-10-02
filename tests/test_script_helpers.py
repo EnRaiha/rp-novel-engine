@@ -181,3 +181,30 @@ class TestBeautyListKeepsExistingIds:
 
         source = inspect.getsource(beauty_list.main)
         assert "CATALOG_CEILING" in source, "the start point must ignore the synthetic ceiling"
+
+
+class TestSharedKeyPruning:
+    """A one-word key that sits inside another name is not a key.
+
+    Measured case: `Queen` was a key for Rook Thorn (Queen) and it also sits inside `Queen Onyx
+    Sable`, so prose about Onyx attached Thorn as well. The browser decorator showed two faces for
+    one name, which is exactly the kind of wrongness a reader notices and a test does not.
+    """
+
+    def test_a_borrowed_one_word_key_is_dropped(self):
+        pruned = face_manifest.prune_shared_keys(["Rook Thorn (Queen)", "Queen Onyx Sable"])
+        assert "Queen" not in pruned["Rook Thorn (Queen)"]
+
+    def test_the_full_name_and_the_stem_survive(self):
+        pruned = face_manifest.prune_shared_keys(["Rook Thorn (Queen)", "Queen Onyx Sable"])
+        assert "Rook Thorn (Queen)" in pruned["Rook Thorn (Queen)"]
+        assert "Rook Thorn" in pruned["Rook Thorn (Queen)"]
+
+    def test_a_key_no_other_name_borrows_is_kept(self):
+        pruned = face_manifest.prune_shared_keys(["Maya al-Dabaran (Anchor)", "Celestine Voss"])
+        assert "Anchor" in pruned["Maya al-Dabaran (Anchor)"]
+
+    def test_a_multi_word_key_shared_by_many_is_kept(self):
+        """`Pirate Queen` maps to 21 characters, and the resolver refuses it. That is correct."""
+        pruned = face_manifest.prune_shared_keys(["Alpha Pirate Queen", "Beta Pirate Queen"])
+        assert any("Pirate Queen" in key for key in pruned["Alpha Pirate Queen"])

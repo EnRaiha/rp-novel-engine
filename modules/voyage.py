@@ -39,6 +39,15 @@ WORMHOLE_COLLAPSE_PCT = 30        # decaying wormhole: d100 <= 30 → collapse
 BLACK_HOLE_SLINGSHOT_DC = 0.75    # d100 roll vs hazard*100: >= pass → clean
 
 
+def _num(value, default: float) -> float:
+    """Read a numeric column, falling back only when the column is NULL.
+
+    `value or default` treats a real 0 as missing: a wormhole at stability 0,
+    a slingshot multiplier of 0, a hazard of 0. Tests assert the difference.
+    """
+    return default if value is None else float(value)
+
+
 async def wormhole_status(session_id: int | None = None) -> list[dict]:
     """List all wormholes with their pair endpoints and health."""
     if session_id is None:
@@ -69,16 +78,17 @@ async def wormhole_jump(name: str, session_id: int | None = None) -> dict:
            FROM maya_rp.wormholes w
            JOIN maya_rp.sectors e ON e.id = w.entry_sector_id
            JOIN maya_rp.sectors x ON x.id = w.exit_sector_id
-           WHERE w.session_id=$1 AND w.name ILIKE $2""",
+           WHERE w.session_id=$1 AND w.name ILIKE $2
+           ORDER BY w.id LIMIT 1""",
         session_id, f"%{name}%")
     if not row:
         raise ValueError(f"No wormhole named {name!r}")
     if row["status"] == "collapsed":
         raise ValueError(f"Wormhole {row['name']} has COLLAPSED — no passage.")
     dist = euclidean((row["ex"] or 0, row["ey"] or 0), (row["xx"] or 0, row["xy"] or 0))
-    travel_days = dist * float(row["travel_multiplier"] or 0.1) * GRID_HOURS_PER_UNIT / 24.0
+    travel_days = dist * _num(row["travel_multiplier"], 0.1) * GRID_HOURS_PER_UNIT / 24.0
     return {"id": row["id"], "name": row["name"], "status": row["status"],
-            "stability": float(row["stability"] or 1.0), "entry": row["entry_name"],
+            "stability": _num(row["stability"], 1.0), "entry": row["entry_name"],
             "exit": row["exit_name"], "travel_days": travel_days,
             "entry_z": row["ez"], "exit_z": row["xz"],
             "collapsed": row["status"] == "collapsed"}
@@ -140,17 +150,19 @@ async def black_hole_slingshot(bh_name: str, session_id: int | None = None,
                   b.time_dilation_ratio, s.name AS sector, s.x_coord, s.y_coord, s.z_coord
            FROM maya_rp.black_holes b
            JOIN maya_rp.sectors s ON s.id = b.sector_id
-           WHERE b.session_id=$1 AND b.name ILIKE $2""",
+           WHERE b.session_id=$1 AND b.name ILIKE $2
+           ORDER BY b.id LIMIT 1""",
         session_id, f"%{bh_name}%")
     if not row:
         raise ValueError(f"No black hole named {bh_name!r}")
+    hazard = _num(row["hazard_level"], BLACK_HOLE_SLINGSHOT_DC)
     roll = r.randint(1, 100)
-    pass_dc = int((row["hazard_level"] or 0.85) * 100)
+    pass_dc = int(hazard * 100)
     ok = roll >= pass_dc
     return {"id": row["id"], "name": row["name"], "sector": row["sector"],
-            "hazard_level": float(row["hazard_level"] or 0.85),
-            "slingshot_multiplier": float(row["slingshot_multiplier"] or 0.6),
-            "time_dilation_ratio": float(row["time_dilation_ratio"] or 4.0),
+            "hazard_level": hazard,
+            "slingshot_multiplier": _num(row["slingshot_multiplier"], 0.6),
+            "time_dilation_ratio": _num(row["time_dilation_ratio"], 4.0),
             "roll": roll, "pass_dc": pass_dc, "ok": ok}
 
 
@@ -207,6 +219,17 @@ HIDDEN_THREAD_SLIPPED_PROFIT = 0.50  # slipped away → half profit (cargo dumpe
 ACTS = ("sneak", "run", "guard", "bribe")
 
 
+def _require_act(act: str) -> str:
+    """The act decides the stakes; an unknown name is a caller error, not a default.
+
+    Every hidden-thread model branches on act. A typo used to fall through to
+    the catch-all branch and read as a minor loss — the run looked resolved.
+    """
+    if act not in ACTS:
+        raise ValueError(f"act must be one of {ACTS}, got {act!r}")
+    return act
+
+
 def hidden_thread_margin(
     act: str = "sneak",
     has_guide: bool = True,
@@ -224,6 +247,7 @@ def hidden_thread_margin(
     negotiates better (+5%); hot cargo is worth more on the black market
     (+8% per level) — which is exactly why it attracts attention.
     """
+    _require_act(act)
     r = rng or random
     margin = r.uniform(HIDDEN_THREAD_MARGIN_MIN, HIDDEN_THREAD_MARGIN_MAX)
     margin += HIDDEN_THREAD_MARGIN_ACT.get(act, 0.0)
@@ -247,6 +271,7 @@ def hidden_thread_danger(
 
     Base 10-20%, plus act/guide/heat modifiers, minus prep/equip/knowledge.
     """
+    _require_act(act)
     r = rng or random
     danger = r.uniform(HIDDEN_THREAD_BASE_MIN, HIDDEN_THREAD_BASE_MAX)
     if act == "run":
@@ -277,25 +302,30 @@ def hidden_thread_outcome(
       bribe → bought out: 0-5% loss, credits spent
     Returns {loss, outcome, chased} where chased=True means "caught/interdicted".
     """
+    _require_act(act)
     r = rng or random
     gear = prep_level + equip_level + knowledge_level + (1 if has_guide else 0)
+    escape = (0.0, HIDDEN_THREAD_ESCAPE_LOSS_MAX)
     if act == "sneak":
         if gear >= HIDDEN_THREAD_SNEAK_GEAR:
-            loss = max(0, int((ship_count or 0) * r.uniform(0, HIDDEN_THREAD_ESCAPE_LOSS_MAX)))
-            return {"loss": loss, "outcome": "slipped_away", "chased": False}
-        loss = max(1, int((ship_count or 0) * r.uniform(HIDDEN_THREAD_LOSS_MIN, HIDDEN_THREAD_LOSS_MAX)))
-        return {"loss": loss, "outcome": "caught", "chased": True}
+            return {"loss": hidden_thread_loss(ship_count, r, band=escape, minimum=0),
+                    "outcome": "slipped_away", "chased": False}
+        return {"loss": hidden_thread_loss(ship_count, r),
+                "outcome": "caught", "chased": True}
     if act == "run":
-        loss = max(1, int((ship_count or 0) * r.uniform(HIDDEN_THREAD_RUN_LOSS_MIN, HIDDEN_THREAD_RUN_LOSS_MAX)))
-        return {"loss": loss, "outcome": "chased_down", "chased": True}
+        return {"loss": hidden_thread_loss(
+                    ship_count, r, band=(HIDDEN_THREAD_RUN_LOSS_MIN, HIDDEN_THREAD_RUN_LOSS_MAX)),
+                "outcome": "chased_down", "chased": True}
     if act == "guard":
-        loss = max(1, int((ship_count or 0) * r.uniform(HIDDEN_THREAD_LOSS_MIN, HIDDEN_THREAD_LOSS_MAX)))
-        return {"loss": loss, "outcome": "engaged", "chased": True}
+        return {"loss": hidden_thread_loss(ship_count, r),
+                "outcome": "engaged", "chased": True}
     if act == "bribe":
-        loss = max(0, int((ship_count or 0) * r.uniform(0, HIDDEN_THREAD_ESCAPE_LOSS_MAX)))
-        return {"loss": loss, "outcome": "bought_out", "chased": False}
-    loss = max(1, int((ship_count or 0) * r.uniform(HIDDEN_THREAD_LOSS_MIN, HIDDEN_THREAD_LOSS_MAX)))
-    return {"loss": loss, "outcome": "caught", "chased": True}
+        return {"loss": hidden_thread_loss(ship_count, r, band=escape, minimum=0),
+                "outcome": "bought_out", "chased": False}
+    # An act added to ACTS without a branch here lands in the catch-all; a
+    # misspelt act never reaches it (see _require_act).
+    return {"loss": hidden_thread_loss(ship_count, r),
+            "outcome": "caught", "chased": True}
 
 _GRID_RE = r'^\s*(-?\d+(?:\.\d+)?)\s*[,\-x]\s*(-?\d+(?:\.\d+)?)\s*$'
 
@@ -328,16 +358,24 @@ async def compute_travel(
     session_id: int | None = None,
 ) -> dict:
     """Compute travel_hours + travel_days from whatever is known.
-    Priority: explicit ly > explicit units > coordinate euclidean > sector_connections lookup."""
+    Priority: explicit ly > explicit units > coordinate euclidean > sector_connections lookup.
+
+    An explicit distance of 0 is a distance, not a missing argument: `if distance_ly:`
+    let 0 fall through to the coordinate branch and raised when no coords were given.
+    """
     if session_id is None:
         session_id = Config.SESSION_ID
 
-    if distance_ly:
+    if distance_ly is not None:
+        if distance_ly < 0:
+            raise ValueError(f"distance_ly cannot be negative, got {distance_ly}")
         travel_hours = distance_ly / LY_PER_DAY * 24.0
         return {"travel_hours": travel_hours, "travel_days": distance_ly / LY_PER_DAY,
                 "distance_ly": distance_ly, "distance_units": None, "mode": "ly"}
 
-    if distance_units:
+    if distance_units is not None:
+        if distance_units < 0:
+            raise ValueError(f"distance_units cannot be negative, got {distance_units}")
         travel_hours = distance_units * GRID_HOURS_PER_UNIT
         return {"travel_hours": travel_hours, "travel_days": travel_hours / 24.0,
                 "distance_ly": None, "distance_units": distance_units, "mode": "units"}
@@ -430,6 +468,16 @@ async def gate_crossing(z1, z2, session_id: int | None = None) -> dict:
             "pirate_density": float(r.get("pirate_density") or 0.0)}
 
 
+async def _charge_treasury(sql: str, *args) -> bool:
+    """Run a treasury UPDATE and report whether it touched a row.
+
+    asyncpg returns the status tag ('UPDATE 1', 'UPDATE 0'). A session with no
+    resources row would otherwise book a toll or a profit that never moved.
+    """
+    tag = await Database.execute(sql, *args)
+    return not (isinstance(tag, str) and tag.split()[-1:] == ["0"])
+
+
 async def register(
     voyage_name: str,
     origin: str | None = None,
@@ -467,6 +515,20 @@ async def register(
     if session_id is None:
         session_id = Config.SESSION_ID
 
+    # ── Input validation (checklist: quantities checked before they are used) ──
+    # A negative prep level RAISED the danger instead of lowering it, and a
+    # negative cargo_value silently booked a loss-making run.
+    if not voyage_name or not str(voyage_name).strip():
+        raise ValueError("voyage_name is required — it titles every arrival event")
+    if ship_count < 0:
+        raise ValueError(f"ship_count cannot be negative, got {ship_count}")
+    if cargo_value < 0:
+        raise ValueError(f"cargo_value cannot be negative, got {cargo_value}")
+    for _label, _level in (("prep_level", prep_level), ("equip_level", equip_level),
+                           ("knowledge_level", knowledge_level), ("cargo_heat", cargo_heat)):
+        if _level < 0:
+            raise ValueError(f"{_label} cannot be negative, got {_level}")
+
     gd = depart_day if depart_day is not None else await Database.fetchval(
         "SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id) or 1
 
@@ -479,8 +541,7 @@ async def register(
     transit_name = None
     dilation_days = 0
     if via_hidden:
-        if act not in ACTS:
-            raise ValueError(f"act must be one of {ACTS}, got {act!r}")
+        _require_act(act)
         danger_pct = hidden_thread_danger(
             act=act, has_guide=bool(guide), prep_level=prep_level,
             equip_level=equip_level, knowledge_level=knowledge_level,
@@ -542,11 +603,18 @@ async def register(
     if lane_type == "gate":
         internal_gate_cost = int((t.get("toll_credits") or 0) * GATE_INTERNAL_COST_SHARE)
     toll_paid = internal_gate_cost
+    toll_charged = False
     if lane_type == "gate" and toll_paid > 0:
-        # treasury absorbs the internal cost (Setia fleet free, treasury pays)
-        await Database.execute(
+        # treasury absorbs the internal cost (Setia fleet free, treasury pays).
+        # No resources row = no money moved: report the toll as uncharged
+        # rather than booking a cost the treasury never paid.
+        toll_charged = await _charge_treasury(
             "UPDATE maya_rp.resources SET credits=credits-$1 WHERE session_id=$2",
             toll_paid, session_id)
+        if not toll_charged:
+            info("voyage", f"{voyage_name}: session {session_id} has no resources row — "
+                           f"{toll_paid:,}C internal gate toll NOT charged")
+            toll_paid = 0
 
     vid = await Database.fetchval(
         """INSERT INTO maya_rp.voyages
@@ -580,13 +648,25 @@ async def register(
             "depart_day": gd, "arrive_day": arrive_day, "status": "in_transit",
             "via_hidden": via_hidden, "act": act, "danger_pct": danger_pct,
             "transit_kind": transit_kind, "transit_name": transit_name,
-            "dilation_days": dilation_days, "lane_type": lane_type, "toll_paid": toll_paid}
+            "dilation_days": dilation_days, "lane_type": lane_type, "toll_paid": toll_paid,
+            "toll_charged": toll_charged}
 
 
-def hidden_thread_loss(ship_count: int, rng: random.Random | None = None) -> int:
-    """Ships lost when a hidden-thread run is interdicted (10-30%, min 1)."""
+def hidden_thread_loss(
+    ship_count: int,
+    rng: random.Random | None = None,
+    band: tuple[float, float] = (HIDDEN_THREAD_LOSS_MIN, HIDDEN_THREAD_LOSS_MAX),
+    minimum: int = 1,
+) -> int:
+    """Ships lost when a hidden-thread run is interdicted.
+
+    `band` is the loss fraction range: interdiction 10-30%, a reckless run
+    30-50%, an escape 0-5%. `minimum=1` books a hull for a caught run; an
+    escape passes 0 because a graze can cost nothing.
+    """
     r = rng or random
-    return max(1, int((ship_count or 0) * r.uniform(HIDDEN_THREAD_LOSS_MIN, HIDDEN_THREAD_LOSS_MAX)))
+    lo, hi = band
+    return max(minimum, int((ship_count or 0) * r.uniform(lo, hi)))
 
 
 async def advance(session_id: int | None = None) -> dict:
@@ -619,6 +699,8 @@ async def advance(session_id: int | None = None) -> dict:
     profit_total = 0
     collapses = 0
     slingshot_fails = 0
+    lost_voyages: list[str] = []
+    unbooked_credits = 0
     for a in arrived:
         arrivals += 1
         # ── PIRATE ENCOUNTER on standard lanes (2026-08-15 Izzat canon) ──
@@ -655,24 +737,39 @@ async def advance(session_id: int | None = None) -> dict:
             await Database.execute(
                 "UPDATE maya_rp.voyages SET collapse_roll=$1 WHERE id=$2",
                 collapse_roll, a["id"])
-            # decaying holes pop; stable hub-fed ones don't
+            # decaying holes pop; stable hub-fed ones don't. The name search is
+            # session-scoped: a same-named hole in another campaign must not
+            # decide whether THIS session's ships survive the crossing.
             stab = await Database.fetchval(
-                "SELECT stability FROM maya_rp.wormholes WHERE name ILIKE $1",
-                f"%{a['transit_name'] or ''}%") or 1.0
+                "SELECT stability FROM maya_rp.wormholes "
+                "WHERE session_id=$1 AND name ILIKE $2 ORDER BY id LIMIT 1",
+                session_id, f"%{a['transit_name'] or ''}%")
+            if stab is None:
+                stab = 1.0
             if float(stab) < 0.99 and collapse_roll <= WORMHOLE_COLLAPSE_PCT:
                 collapses += 1
+                lost = a["ship_count"] or 0
+                lost_voyages.append(a["voyage_name"])
+                # The event text claims the ships are gone. Book it: the voyage
+                # ends 'lost' with the hulls counted, not 'arrived' at full
+                # strength with the loss living only in prose.
+                await Database.execute(
+                    """UPDATE maya_rp.voyages
+                       SET status='lost', loss_ships=$1 WHERE id=$2""",
+                    lost, a["id"])
                 await Database.execute(
                     """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
                        VALUES ($1, 'wormhole_collapse', $2, $3, 5)""",
                     session_id,
                     f"WORMHOLE COLLAPSED — {a['voyage_name']}",
                     f"{a['voyage_name']} was inside {a['transit_name']} when it popped "
-                    f"on day {a['arrive_day']}: {a['ship_count'] or '?'} ship(s) lost to "
+                    f"on day {a['arrive_day']}: {lost or '?'} ship(s) lost to "
                     f"the exotic-matter cascade near {a['destination']} "
                     f"(collapse roll {collapse_roll} ≤ {WORMHOLE_COLLAPSE_PCT}).",
                 )
                 info("voyage", f"WORMHOLE COLLAPSE: {a['voyage_name']} "
-                               f"({a['transit_name']}, roll {collapse_roll})")
+                               f"({a['transit_name']}, roll {collapse_roll}, "
+                               f"{lost} ship(s) lost)")
                 continue
             await Database.execute(
                 """INSERT INTO maya_rp.events (session_id, event_type, title, description)
@@ -768,10 +865,16 @@ async def advance(session_id: int | None = None) -> dict:
                     prep_level=a["prep_level"] or 0, equip_level=a["equip_level"] or 0,
                     knowledge_level=a["knowledge_level"] or 0, cargo_heat=a["cargo_heat"] or 0)
                 profit = int((a["cargo_value"] or 0) * margin)
+                credited = False
                 if profit > 0:
-                    await Database.execute(
+                    credited = await _charge_treasury(
                         "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2",
                         profit, session_id)
+                    if not credited:
+                        unbooked_credits += profit
+                        info("voyage", f"{a['voyage_name']}: +{profit:,}C earned but "
+                                       f"session {session_id} has no resources row — "
+                                       f"NOT credited")
                 await Database.execute(
                     """UPDATE maya_rp.voyages SET reward_credits=$1 WHERE id=$2""",
                     profit, a["id"])
@@ -782,11 +885,15 @@ async def advance(session_id: int | None = None) -> dict:
                     f"Clean run — {a['voyage_name']}",
                     f"{a['voyage_name']} slipped through a hidden thread and landed on day "
                     f"{a['arrive_day']}: cargo sold at {margin*100:.0f}% margin, "
-                    f"{profit:,}C credited. (roll {roll} > danger {danger}%, {act} run, "
-                    f"tag {a['fleet_tag'] or '—'}).",
+                    + (f"{profit:,}C credited." if credited else
+                       f"{profit:,}C NOT credited — no treasury row for this session.")
+                    + f" (roll {roll} > danger {danger}%, {act} run, "
+                      f"tag {a['fleet_tag'] or '—'}).",
                 )
-                profit_total += profit
-                info("voyage", f"CLEAN: {a['voyage_name']} +{profit:,}C (roll {roll} > {danger}%)")
+                if credited:
+                    profit_total += profit
+                info("voyage", f"CLEAN: {a['voyage_name']} +{profit:,}C "
+                               f"{'booked' if credited else 'UNBOOKED'} (roll {roll} > {danger}%)")
                 continue
             # ── DETECTED — the act determines the outcome ──
             interdictions += 1
@@ -858,6 +965,7 @@ async def advance(session_id: int | None = None) -> dict:
     return {"arrivals": arrivals, "interdictions": interdictions, "clean_runs": clean_runs,
             "profit_credits": profit_total, "collapses": collapses,
             "slingshot_fails": slingshot_fails,
+            "lost": lost_voyages, "unbooked_credits": unbooked_credits,
             "arrived": [a["voyage_name"] for a in arrived]}
 
 

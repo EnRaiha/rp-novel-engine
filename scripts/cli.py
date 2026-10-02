@@ -484,6 +484,29 @@ async def cmd_council():
         if len(sys.argv) < 5:
             print(usage); await Database.close(); return
         out = await council.revoke_title(sid, sys.argv[3], sys.argv[4])
+    elif action == "decree":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        details = json.loads(sys.argv[4]) if len(sys.argv) > 4 else {}
+        out = await council.issue_decree(sid, sys.argv[3], details)
+    elif action == "crisis":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = council.trigger_crisis(sys.argv[3])
+    elif action == "escalate":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        advance = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+        out = council.escalate_crisis(council.trigger_crisis(sys.argv[3]), advance)
+    elif action == "meeting":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = council.convene_meeting(sys.argv[3], {"session_id": sid})
+    elif action == "brief":
+        decrees = await Database.fetch(
+            "SELECT * FROM maya_rp.cabinet_decrees WHERE session_id=$1 ORDER BY id DESC LIMIT 20",
+            sid)
+        out = council.situation_briefing([dict(r) for r in decrees], [], [])
     elif action == "status":
         seats = await council.get_cabinet_seats(sid)
         print(council.status_report(seats))

@@ -74,10 +74,13 @@ async def main() -> int:
                         help="only this occasion key (with --character: one frame test)")
     parser.add_argument("--steps", type=int, default=14)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--order", default="id", choices=tuple(portraits.QUEUE_ORDERS),
+                        help="queue order: id (default, oldest queued first), bond, or name")
     args = parser.parse_args()
 
     await Database.init()
-    queue = await portraits.pending(args.session, args.limit, args.character, args.occasion)
+    queue = await portraits.pending(args.session, args.limit, args.character, args.occasion,
+                                    order=args.order)
     if not queue:
         print(f"queue empty for session {args.session}")
         await Database.close()

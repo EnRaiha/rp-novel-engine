@@ -434,14 +434,30 @@ async def queue(session_id: int, name: str, occasion: str) -> dict[str, Any]:
     }
 
 
+#: How a render queue may be ordered. `id` is the default because it is the order the rows
+#: were queued, which is stable and needs no judgement. `bond` puts the closest partners
+#: first, and `name` is alphabetical. The order is a lever because "oldest first" is not a
+#: statement about who matters: queueing 35 wives by id renders Rika Voss before Maya.
+QUEUE_ORDERS: dict[str, str] = {
+    "id": "a.id",
+    "bond": "c.bond_level DESC NULLS LAST, a.id",
+    "name": "c.name, a.id",
+}
+
+
 async def pending(
-    session_id: int, limit: int = 10, character: str | None = None, occasion: str | None = None
+    session_id: int, limit: int = 10, character: str | None = None, occasion: str | None = None,
+    order: str = "id",
 ) -> list[dict[str, Any]]:
-    """Queued renders, oldest first; optionally only one character's or occasion's.
+    """Queued renders; optionally only one character's or occasion's, in a chosen order.
 
     The filter runs in SQL, before the limit: filtering an already-limited page
     silently drops a character whose rows sit at the end of the queue.
+
+    @param order - a key of `QUEUE_ORDERS`. Default `id`, oldest queued first.
     """
+    if order not in QUEUE_ORDERS:
+        raise ValueError(f"unknown queue order {order!r}; use one of {', '.join(QUEUE_ORDERS)}")
     sql = ("SELECT a.id, a.occasion, a.prompt, a.negative_prompt, c.name"
            " FROM maya_rp.character_assets a JOIN maya_rp.characters c ON c.id = a.character_id"
            " WHERE a.session_id=$1 AND a.status='pending'")
@@ -452,7 +468,7 @@ async def pending(
     if occasion:
         params.append(occasion)
         sql += f" AND a.occasion=${len(params)}"
-    sql += " ORDER BY a.id LIMIT $2"
+    sql += f" ORDER BY {QUEUE_ORDERS[order]} LIMIT $2"
     rows = await Database.fetch(sql, *params)
     return [dict(row) for row in rows]
 

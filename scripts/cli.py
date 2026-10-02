@@ -10,7 +10,23 @@ from core.db import Database
 from core.state import StateManager
 from scripts.orchestrator import run_full_tick, MODULE_MAP
 
-SID = Config.SESSION_ID
+SID = Config.SESSION_ID  # process default; the __main__ block re-resolves per run
+
+
+def take_session_flag(argv: list[str]) -> tuple[str | None, list[str]]:
+    """Pull `--session N` and `--session=N` out of argv. Both forms count."""
+    explicit, rest, i = None, [], 0
+    while i < len(argv):
+        item = argv[i]
+        if item == "--session" and i + 1 < len(argv):
+            explicit, i = argv[i + 1], i + 2
+            continue
+        if item.startswith("--session="):
+            explicit, i = item.split("=", 1)[1], i + 1
+            continue
+        rest.append(item)
+        i += 1
+    return explicit, rest
 
 
 async def cmd_status():
@@ -1494,6 +1510,7 @@ async def cmd_ooc():
       cli.py ooc prune [DAYS]
     """
     from core import campaign, ooc
+    from core import session as session_policy
 
     flags = [a for a in sys.argv[2:] if a.startswith("--")]
     args = [a for a in sys.argv[2:] if not a.startswith("--")]
@@ -1505,7 +1522,7 @@ async def cmd_ooc():
         return default
 
     sub = args[0] if args else "status"
-    session = int(flag("session", str(Config.SESSION_ID)) or Config.SESSION_ID)
+    session = int(flag("session", str(SID)) or SID)
     traits = tuple((flag("trait", "general") or "general").split(","))
     context = {
         key: value
@@ -1523,6 +1540,8 @@ async def cmd_ooc():
         print(f"  roleplay pts   {row['roleplay_points']}")
         print(f"  audits         {row['audits']}   findings {row['findings']}")
         print(f"  debuff         {row['debuff'] or '—'}")
+        if session_policy.is_frozen(session):
+            print("  frozen         reference only; GM MAYA maintenance to write")
         if penalty:
             print(f"  active effect  {penalty[1]}")
         # §6.2 — a required beat past its window is reported, never billed.
@@ -1533,15 +1552,19 @@ async def cmd_ooc():
         if len(args) < 2:
             print('Usage: cli.py ooc audit "<text>" [--layer=…] [--trait=…] [--evidence]')
             sys.exit(1)
-        result = await ooc.audit(
-            " ".join(args[1:]),
-            session,
-            layer=flag("layer", ooc.LAYER_DIALOGUE) or ooc.LAYER_DIALOGUE,
-            traits=traits,
-            action_evidence="--evidence" in flags,
-            context=context,
-            turn_ref=flag("turn"),
-        )
+        try:
+            result = await ooc.audit(
+                " ".join(args[1:]),
+                session,
+                layer=flag("layer", ooc.LAYER_DIALOGUE) or ooc.LAYER_DIALOGUE,
+                traits=traits,
+                action_evidence="--evidence" in flags,
+                context=context,
+                turn_ref=flag("turn"),
+            )
+        except ooc.FrozenSession as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return
         print(f"layer={result['layer']} rules={result['rules']} disposition={result['disposition']}"
               + (f" ({result['skip_reason']})" if result["skip_reason"] else ""))
         for finding in result["findings"]:
@@ -1802,6 +1825,18 @@ async def cmd_ooc():
 
 
 if __name__ == "__main__":
+    explicit, sys.argv = take_session_flag(sys.argv)
+    try:
+        from core.session import resolve_session
+
+        resolved = resolve_session(explicit)
+    except RuntimeError as exc:
+        print(f"session: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if resolved is None:
+        print("session: maintenance mode resolves no arc; pass --session=<id>", file=sys.stderr)
+        sys.exit(2)
+    SID = int(resolved)
     if len(sys.argv) < 2:
         print(
             "Usage: python3 scripts/cli.py {status|tick|save|export|config|health|modules|run|query} [args]"

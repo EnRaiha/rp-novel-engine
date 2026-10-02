@@ -61,6 +61,7 @@ _load_env_file()
 from core import ooc  # noqa: E402
 from core.config import Config  # noqa: E402
 from core.db import Database  # noqa: E402
+from core.session import resolve_session
 
 CALLS = ("state", "turn", "canon", "portrait", "context", "persona", "inspect", "direct", "slaves")
 
@@ -164,7 +165,7 @@ async def _flush_context_mirror() -> None:
 def _session(request: dict) -> int:
     """Session key for one request, defaulting to the configured campaign."""
     value = request.get("session_id")
-    return int(value if value is not None else Config.SESSION_ID)
+    return resolve_session(value)
 
 
 async def handle(request: dict) -> dict:

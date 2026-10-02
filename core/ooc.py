@@ -112,6 +112,36 @@ SUSPICION_CERTAIN = 90
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _maintenance_active():
+    try:
+        from core import maintenance
+        return maintenance.active()
+    except Exception:
+        return False
+
+
+class FrozenSession(PermissionError):
+    """A write aimed at a reference-only campaign."""
+
+
+def _session_key(session_id):
+    """Session for one call: an explicit id wins, otherwise the engine resolves."""
+    from core.session import resolve_session
+    sid = resolve_session(session_id)
+    if sid is None:
+        raise RuntimeError("maintenance mode resolves no session; name one explicitly")
+    return int(sid)
+
+
+def _refuse_frozen(sid: int) -> None:
+    """A frozen campaign is read-only reference; maintenance is the only way in."""
+    from core.session import is_frozen
+    if is_frozen(sid) and not _maintenance_active():
+        raise FrozenSession(
+            f"session {sid} is frozen for reference; arm GM MAYA maintenance to write it"
+        )
+
+
 def _is_wordish(char: str | None) -> bool:
     return char is not None and (char.isalnum() or char == "_")
 
@@ -236,6 +266,8 @@ def audit_text(text: str, rules: Sequence[OocRule], layer: str = LAYER_DIALOGUE)
     @param layer - surface of `text`: `dialogue`, `somatic`, or `tool`.
     @returns findings in rule order.
     """
+    if _maintenance_active():
+        return []
     if not text:
         return []
     bounded = text[:MAX_AUDIT_CHARS]
@@ -350,7 +382,7 @@ async def state(session_id: int | None = None) -> dict[str, Any]:
     @param session_id - session key; defaults to the configured campaign session.
     @returns state row as a dict.
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     row = await Database.fetchrow(
         "SELECT session_id, arc_stage, deviation, roleplay_points, audits, findings, debuff, updated_at"
         " FROM maya_rp.ooc_system_state WHERE session_id=$1",
@@ -387,7 +419,7 @@ async def effective_rules(
     @param stage - arc stage; read from state when omitted.
     @returns resolved rules, campaign rows first.
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     if stage is None:
         stage = (await state(sid))["arc_stage"]
     latched = await Database.fetch(
@@ -457,7 +489,13 @@ async def audit(
     @returns the audit result: findings, new deviation, stage, debuff, award,
         and any scripted beats this turn's prose proved (§6.3).
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
+    if not preview:
+        _refuse_frozen(sid)
+    # GM MAYA maintenance: the register guard stands down, so no rule bills this
+    # turn. The audit row is still written, marked as such, so the ledger shows
+    # why the deviation did not move instead of showing a gap.
+    standing_down = _maintenance_active()
     current = await state(sid)
     stage = current["arc_stage"]
     rules = await effective_rules(sid, traits, stage)
@@ -466,7 +504,7 @@ async def audit(
     rules = [rule for rule in rules if rule.kind != "scripted_beat"]
     raw_findings = audit_text(text, rules, layer)
     # M4: a reveal a present character cannot know is a finding of its own kind.
-    knowledge = await knowledge_findings(sid, text, rules, layer)
+    knowledge = [] if standing_down else await knowledge_findings(sid, text, rules, layer)
     if knowledge:
         raw_findings = list(raw_findings) + knowledge
 
@@ -482,9 +520,10 @@ async def audit(
     exempted = [finding for finding in raw_findings if finding.rule_id in live]
     findings = [finding for finding in raw_findings if finding.rule_id not in live]
 
-    delta = sum(finding.delta for finding in findings)
+    delta = 0 if standing_down else sum(finding.delta for finding in findings)
     decay = STAGE_THRESHOLDS.get(stage, STAGE_THRESHOLDS["lockdown"])["decay"]
-    deviation = max(0, min(100, int(current["deviation"]) - (decay if not findings else 0) + delta))
+    settled = 0 if standing_down or findings else decay
+    deviation = max(0, min(100, int(current["deviation"]) - settled + delta))
     award, score = rpp_award(text, findings, action_evidence=action_evidence)
     debuff = debuff_for(deviation, stage)
     if preview:
@@ -521,7 +560,9 @@ async def audit(
 
     matched = "\u0000".join(finding.match for finding in findings + exempted)
     fingerprint = hashlib.sha256(matched.encode("utf-8")).hexdigest() if matched else None
-    if findings:
+    if standing_down:
+        disposition, skip_reason = "skipped", "maintenance"
+    elif findings:
         disposition, skip_reason = "flagged", None
     elif exempted:
         disposition, skip_reason = "exempt", "exempt"
@@ -615,7 +656,7 @@ async def set_stage(session_id: int | None, stage: str) -> dict[str, Any]:
     """
     if stage not in STAGES:
         raise ValueError(f"unknown stage {stage!r}; expected one of {', '.join(STAGES)}")
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     await state(sid)  # ensure the row exists
     row = await Database.fetchrow(
         "UPDATE maya_rp.ooc_system_state SET arc_stage=$2, updated_at=now() WHERE session_id=$1"
@@ -642,7 +683,7 @@ async def companion_ids(session_id: int | None = None) -> list[int]:
     @param session_id - session key.
     @returns companion ids (romance flag, spouse, or a bond above zero).
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     rows = await Database.fetch(
         "SELECT id FROM maya_rp.characters WHERE session_id=$1"
         " AND status IS DISTINCT FROM 'dead'"
@@ -659,7 +700,7 @@ async def observer_id(session_id: int | None = None) -> int | None:
     @param session_id - session key.
     @returns a character id, or None when the session has no living cast.
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     row = await Database.fetchrow(
         "SELECT id FROM maya_rp.characters WHERE session_id=$1 AND status IS DISTINCT FROM 'dead'"
         " ORDER BY (romance_flag IS TRUE OR is_spouse IS TRUE) DESC,"
@@ -718,7 +759,7 @@ async def milestones(
     @param due_only - return only beats not yet completed.
     @returns milestone rows, incomplete first.
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     if stage is None:
         stage = (await state(sid))["arc_stage"]
     wanted = sorted({trait for trait in traits if trait} | {"general"})
@@ -795,7 +836,7 @@ async def complete_milestone(
     """
     if not name:
         raise ValueError("complete_milestone needs a milestone name")
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     milestone = await Database.fetchrow(
         "SELECT id, name, trait, stage, required, rpp_reward, latch_ruleset FROM maya_rp.ooc_milestones"
         " WHERE session_id=$1 AND name=$2",
@@ -871,7 +912,7 @@ async def beats_from_prose(
     """
     if not text:
         return []
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     stage = (await state(sid))["arc_stage"]
     completed: list[dict[str, Any]] = []
     for beat in await milestones(sid, traits=traits, stage=stage, due_only=True):
@@ -919,7 +960,7 @@ async def exemptions(session_id: int | None = None) -> list[dict[str, Any]]:
     @param session_id - session key.
     @returns exemption rows, newest first.
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     rows = await Database.fetch(
         "SELECT id, rule_id, action_key, condition, cost_rpp, permanent, expires_at, purchased_at,"
         " (permanent OR expires_at > now()) AS live"
@@ -938,7 +979,7 @@ async def live_exemptions(
     @param context - scene facts for condition tests.
     @returns `rule_id -> action_key` for every exemption that applies now.
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     rows = await Database.fetch(
         "SELECT rule_id, action_key, condition FROM maya_rp.ooc_exemptions"
         " WHERE session_id=$1 AND (permanent OR expires_at > now())",
@@ -974,7 +1015,7 @@ async def buy_exemption(
     """
     if not rule_id or not action_key:
         raise ValueError("buy_exemption needs rule_id and action_key")
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     rule = await Database.fetchrow(
         "SELECT id, delta FROM maya_rp.ooc_rules WHERE id=$1", rule_id
     )
@@ -1035,7 +1076,7 @@ async def suspicion(session_id: int | None = None) -> list[dict[str, Any]]:
     @param session_id - session key.
     @returns suspicion rows joined to the observer's name.
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     rows = await Database.fetch(
         "SELECT s.observer_id, c.name, s.suspicion, s.last_reason, s.last_event_id, s.updated_at"
         " FROM maya_rp.ooc_suspicion s LEFT JOIN maya_rp.characters c ON c.id = s.observer_id"
@@ -1118,7 +1159,7 @@ async def observer_ids(session_id: int | None = None) -> list[int]:
     @param session_id - session key.
     @returns character ids, scene-present first.
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     present = await Database.fetch(
         "SELECT id FROM maya_rp.characters"
         " WHERE session_id=$1 AND presence='present' AND status IS DISTINCT FROM 'dead'"
@@ -1147,7 +1188,7 @@ async def bump_suspicion(
     @param event_id - audit event that caused it.
     @returns the observer's new suspicion.
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     target = observer if observer is not None else await observer_id(sid)
     if target is None:
         return {"ok": False, "reason": "no_observer"}
@@ -1266,7 +1307,7 @@ async def stage_readiness(
     @param traits - persona trait composition.
     @returns the next stage, each gate's requirement and current value, and the verdict.
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     current = await state(sid)
     stage = current["arc_stage"]
     index = STAGE_ORDER.index(stage)
@@ -1310,7 +1351,7 @@ async def advance_stage(
     @param traits - persona trait composition.
     @returns the new stage, or the gate that stopped it.
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     readiness = await stage_readiness(sid, traits)
     if readiness["next"] is None:
         return {"ok": False, "reason": "last_stage", "stage": readiness["stage"]}
@@ -1344,7 +1385,7 @@ async def mirror_state_file(session_id: int | None = None) -> str:
     @param session_id - session key.
     @returns the path written.
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    sid = _session_key(session_id)
     current = await state(sid)
     path = state_file_path()
     entries: list[dict[str, Any]] = []

@@ -10,8 +10,18 @@ class TestConfig:
         assert "rp_engine" in Config.DSN
         assert "maya_memory" in Config.DSN
 
-    def test_session_id(self):
-        assert Config.SESSION_ID == 3
+    def test_session_id_follows_the_arc(self, tmp_path, monkeypatch):
+        """The process default comes from the engine's single session source."""
+        from core import session
+        from core.config import _default_session
+
+        monkeypatch.setattr(session, "ACTIVE_ARC", tmp_path / "active_arc")
+        monkeypatch.delenv("RP_SESSION", raising=False)
+        assert isinstance(Config.SESSION_ID, int)
+        (tmp_path / "active_arc").write_text("5\n")
+        assert _default_session() == 5
+        (tmp_path / "active_arc").unlink()
+        assert _default_session() == 3  # no arc file: the legacy TKG campaign
 
     def test_paths_exist(self):
         assert os.path.isdir(Config.ROOT)

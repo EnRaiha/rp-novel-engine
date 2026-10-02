@@ -11,12 +11,13 @@ from core.config import Config
 from core.db import Database
 from core.log import info
 from core.memory import embed_text
+from core.session import resolve_session
 
 
 async def handle(action: str, params: dict = None) -> dict:
     params = params or {}
     await Database.init()
-    sid = Config.SESSION_ID
+    sid = resolve_session((params or {}).get("session"))
     result = {"action": action, "status": "error", "data": None}
     try:
         if action == "briefing":

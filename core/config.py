@@ -12,6 +12,16 @@ import os
 from typing import ClassVar
 
 
+def _default_session() -> int:
+    """Resolve the process default from the engine's single session source."""
+    try:
+        from core.session import resolve_session
+
+        return int(resolve_session())
+    except Exception:
+        return 3  # no arc file and no override: the legacy TKG campaign
+
+
 class Config:
     """Static config — imported directly, no instantiation needed."""
 
@@ -27,8 +37,10 @@ class Config:
     DB_TIMEOUT: ClassVar[int] = 30  # seconds
 
     # ─── Session ────────────────────────────────────────────────
-    # TKG = session_id 3. Everything else has been purged.
-    SESSION_ID: ClassVar[int] = 3
+    # The default every module inherits, resolved once at import from the single
+    # source: RP_SESSION, then the active-arc file, then the legacy TKG id. Entry
+    # points that must not guess (cli.py, the bridges) resolve_per_call instead.
+    SESSION_ID: ClassVar[int] = _default_session()
 
     # ─── Paths ──────────────────────────────────────────────────
     ROOT: ClassVar[str] = os.path.dirname(

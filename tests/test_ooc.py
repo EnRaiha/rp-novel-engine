@@ -1099,3 +1099,59 @@ class TestMirror:
         await ooc.mirror_state_file(SCRATCH_SESSION)
         entries = json.loads(path.read_text())
         assert {item["sessionId"] for item in entries} == {3, SCRATCH_SESSION}
+
+
+class TestMaintenanceStandDown:
+    """GM MAYA armed: the turn is recorded, the number stands still."""
+
+    @pytest.fixture()
+    def armed(self, tmp_path, monkeypatch):
+        from core import maintenance
+
+        monkeypatch.setattr(maintenance, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(maintenance, "STATE_FILE", tmp_path / "maintenance.json")
+        monkeypatch.setattr(maintenance, "PLAY_FLAG", tmp_path / "play.lock")
+        maintenance.arm(maintenance.PHRASE, source="test")
+        yield maintenance
+        maintenance.disarm("test")
+
+    async def test_recorded_as_skipped_without_billing(self, scratch_session, armed):
+        from core import ooc
+
+        # A stage whose clean turn settles 2 deviation proves the settle is held too.
+        await Database.execute(
+            "UPDATE maya_rp.ooc_system_state SET deviation=10, arc_stage='selective' WHERE session_id=$1",
+            SCRATCH_SESSION,
+        )
+        result = await ooc.audit(
+            'Tears streak her cheek. "I am fine."', SCRATCH_SESSION, traits=("aloof",), turn_ref="maint"
+        )
+        assert result["disposition"] == "skipped"
+        assert result["skip_reason"] == "maintenance"
+        assert result["findings"] == []
+        assert result["delta"] == 0
+        assert result["deviation"] == 10, "maintenance must not bill or settle the deviation"
+        row = await Database.fetch(
+            "SELECT disposition, skip_reason, delta FROM maya_rp.ooc_audit_events"
+            " WHERE session_id=$1 ORDER BY id DESC LIMIT 1",
+            SCRATCH_SESSION,
+        )
+        assert (row[0]["disposition"], row[0]["skip_reason"], row[0]["delta"]) == (
+            "skipped",
+            "maintenance",
+            0,
+        )
+
+    async def test_a_frozen_campaign_refuses_the_write(self, scratch_session, tmp_path, monkeypatch):
+        from core import session as session_policy
+        from core import ooc
+
+        monkeypatch.setattr(session_policy, "FROZEN", tmp_path / "frozen_sessions")
+        session_policy.set_frozen([SCRATCH_SESSION])
+        with pytest.raises(ooc.FrozenSession):
+            await ooc.audit("Quiet assessment of the ledger.", SCRATCH_SESSION, traits=("aloof",))
+        # A preview reads and answers; it must stay free on a frozen campaign.
+        preview = await ooc.audit(
+            "Quiet assessment of the ledger.", SCRATCH_SESSION, traits=("aloof",), preview=True
+        )
+        assert preview["preview"] is True

@@ -484,6 +484,62 @@ async def cmd_council():
         if len(sys.argv) < 5:
             print(usage); await Database.close(); return
         out = await council.revoke_title(sid, sys.argv[3], sys.argv[4])
+    elif action == "hooks":
+        rows = await Database.fetch(
+            "SELECT system_name, status, controlling_faction, governor_name, fleet_presence"
+            " FROM maya_rp.territory WHERE session_id=$1 LIMIT 200", sid)
+        seats = await council.get_cabinet_seats(sid)
+        # `generate_mystery_hooks` reads `cabinet_control`, a field the territory table does not have, so
+        # fed raw rows it always saw the default 100 and never produced a hook. The control is computed
+        # by the module's own rule rather than invented here.
+        enriched = []
+        for row in rows:
+            item = dict(row)
+            item["cabinet_control"] = council.calculate_territory_control(item, seats)
+            enriched.append(item)
+        hooks = council.generate_mystery_hooks(enriched)
+        out = {"hooks": len(hooks)}
+        for hook in hooks[:5]:
+            print(f"  {hook.get('system')}: {hook.get('hook')}")
+    elif action == "wife":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        seats = await council.get_cabinet_seats(sid)
+        seat = next((s for s in seats if str(s.get("title", "")).lower() == sys.argv[3].lower()), None)
+        if seat is None:
+            out = {"error": f"no seat titled '{sys.argv[3]}' in session {sid}"}
+        else:
+            hours = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+            decrees = await Database.fetchval(
+                "SELECT count(*) FROM maya_rp.cabinet_decrees WHERE session_id=$1 AND status='executing'",
+                sid) or 0
+            out = {"seat": seat.get("title"), "wife_status": council.get_wife_status(seat, decrees, hours)}
+    elif action == "control":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        row = await Database.fetchrow(
+            "SELECT system_name, status, controlling_faction, governor_name, fleet_presence"
+            " FROM maya_rp.territory WHERE session_id=$1 AND system_name ILIKE $2 LIMIT 1",
+            sid, f"%{sys.argv[3]}%")
+        if row is None:
+            out = {"error": f"no territory matching '{sys.argv[3]}' in session {sid}"}
+        else:
+            seats = await council.get_cabinet_seats(sid)
+            out = {"system": row["system_name"],
+                   "control": council.calculate_territory_control(dict(row), seats)}
+    elif action == "contest":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        action_name = sys.argv[5] if len(sys.argv) > 5 else "policy"
+        out = council.influence_contest(int(sys.argv[3]), int(sys.argv[4]), action_name)
+    elif action == "exposure":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = council.shadow_exposure_risk(int(sys.argv[3]), int(sys.argv[4]))
+    elif action == "override":
+        seats = await council.get_cabinet_seats(sid)
+        consul = next((s for s in seats if s.get("tier") == 0), None)
+        out = council.consul_override(consul)
     elif action == "decree":
         if len(sys.argv) < 4:
             print(usage); await Database.close(); return

@@ -256,6 +256,11 @@ async def _fk_child_columns() -> list[tuple[str, str, str]]:
 
 # ─── Export ─────────────────────────────────────────────────────────────
 
+#: Above this many parent ids the child is exported whole rather than filtered: an `= ANY($1)` with
+#: hundreds of thousands of values costs more than the rows it saves.
+MAX_IN_FILTER_IDS = 250_000
+
+
 class SaveIncomplete(RuntimeError):
     """A save could not read every table, so no file was written.
 
@@ -287,16 +292,65 @@ async def export_sav(session_id: int = 3, out_dir: str | None = None) -> str:
     ordered = list(reversed(fk_wipe_order(set(session_scoped) | set(global_tables), fks)))
     session_set = set(session_scoped)
 
+    # A table with no session_id takes its session from a parent. Without this map the export dumps
+    # every row of every such table: the session-5 checkpoint of 2026-10-02 carried 109,149
+    # ship_armaments and 41,594 fleet_members rows that all belonged to frozen session 3, and the
+    # restore wipes before it loads, so those numbers were a rewrite waiting to happen.
+    # A child may carry more than one foreign key into the session's tables (fleet_members points at
+    # both a fleet and a ship), so all of them are kept and a row belongs to the session when any of
+    # them does.
+    # Which session-scoped tables can be filtered against at all. Asked once, because a table with no
+    # rows still means "this session owns none", and reading that as "no filter" let session 3's 24
+    # territory_resources rows ride along in a session-5 save.
+    has_id = {r["table_name"] for r in await Database.fetch(
+        "SELECT table_name FROM information_schema.columns "
+        "WHERE table_schema='maya_rp' AND column_name='id'")}
+    child_of: dict[str, list[tuple[str, str]]] = {}
+    for child, parent, column in await _fk_child_columns():
+        if parent in session_set and child not in session_set:
+            child_of.setdefault(child, []).append((parent, column))
+
     tables: dict[str, object] = {}
     failed: dict[str, str] = {}
+    exported_ids: dict[str, list[int]] = {}
+    partial: list[str] = []      # session-less tables carried only in part, or not at all
+    unfiltered: list[str] = []   # session-less tables with no session-scoped parent: honestly global
     for t in ordered:
         try:
             if t in session_set:
                 rows = await Database.fetch(
                     f"SELECT * FROM maya_rp.{t} WHERE session_id=$1", session_id)
+            elif t in child_of and any(parent in exported_ids for parent, _ in child_of[t]):
+                clauses, params = [], []
+                too_wide = False
+                for parent, column in child_of[t]:
+                    ids = exported_ids.get(parent)
+                    if ids is None:
+                        continue
+                    if not ids:
+                        continue
+                    if len(ids) > MAX_IN_FILTER_IDS:
+                        too_wide = True
+                        break
+                    params.append(ids)
+                    clauses.append(f"{column} = ANY(${len(params)})")
+                if too_wide:
+                    rows = await Database.fetch(f"SELECT * FROM maya_rp.{t}")
+                    unfiltered.append(t)
+                elif not clauses:
+                    rows = []
+                else:
+                    rows = await Database.fetch(
+                        f"SELECT * FROM maya_rp.{t} WHERE " + " OR ".join(clauses), *params)
+                partial.append(t)
             else:
                 rows = await Database.fetch(f"SELECT * FROM maya_rp.{t}")
+                unfiltered.append(t)
             tables[t] = [dict(r) for r in rows]
+            if t in session_set and t in has_id:
+                # Recorded even when empty: `ooc_suspicion` and its neighbours key on
+                # (session_id, observer_id) and carry no id, so they are skipped.
+                exported_ids[t] = [int(r["id"]) for r in rows]
         except Exception as e:
             failed[t] = str(e)
             error("savegame", f"export table {t} failed: {e}")
@@ -314,6 +368,10 @@ async def export_sav(session_id: int = 3, out_dir: str | None = None) -> str:
                 "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id)),
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "session_id": session_id,
+            # A restore must not touch a table this file carries only in part, or the wipe deletes
+            # rows the file cannot put back.
+            "partial_tables": partial,
+            "unfiltered_tables": unfiltered,
         },
         "tables": tables,
     }
@@ -383,7 +441,13 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
             session_scoped, global_tables = classify_tables(
                 all_tables, has_sid, vector_tables, EXCLUDED_TABLES)
             session_set = set(session_scoped)
-            wipe_set = (set(session_scoped) | set(global_tables)) - {"sessions"}
+            # A table the file carries only in part must not be wiped: the wipe would delete rows the
+            # file cannot put back. Session 3's 109,149 ship_armaments would have gone that way.
+            partial = set(data.get("header", {}).get("partial_tables") or [])
+            if partial:
+                info("savegame", f"restore leaves {len(partial)} partially carried table(s) untouched: "
+                                 + ", ".join(sorted(partial)[:6]))
+            wipe_set = ((set(session_scoped) | set(global_tables)) - {"sessions"}) - partial
             order = fk_wipe_order(wipe_set, fks)
             fk_cols = await _fk_child_columns()
             # Tables left OUT of the wipe (excluded logs, vector/RAG tables) can
@@ -450,6 +514,11 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
         udts = await _column_udts(list(tables))
         gens = await _generated_columns(list(tables))
         for t, rows in tables.items():
+            if t in partial:
+                # Same reason as the wipe: a table carried in part cannot be restored without
+                # deleting what the file never had.
+                skipped_tables += 1
+                continue
             if not isinstance(rows, list) or not rows:
                 continue
             if isinstance(rows[0], dict) and "__error__" in rows[0]:

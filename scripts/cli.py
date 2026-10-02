@@ -93,6 +93,57 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_bond():
+    """bond {ranking | shift <action> [quality] | heal <character-id> "<activity>" |
+    release <character-id> | aftercare <target-id> <initiator-id>}
+
+    Five entry points of `modules/romance.py` had no caller. All five touch engine tables only
+    (`romance_arcs`, `characters`, `intimacy_events`, `sessions`), which is what the house rule requires:
+    private scenes live in engine state and never in a file or the novel.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py bond ranking\n'
+             '       cli.py bond shift <action> [quality-word]\n'
+             '       cli.py bond heal <character-id> "<activity>"\n'
+             '       cli.py bond release <character-id>\n'
+             '       cli.py bond aftercare <target-id> <initiator-id>')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "ranking"
+    from modules import romance
+    if action == "shift":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        # The second argument is a quality word, not a number: the function lowercases it and looks it
+        # up in BOND_SHIFT_MATRIX. Passing an int raised AttributeError on the first run.
+        quality = sys.argv[4] if len(sys.argv) > 4 else "neutral"
+        out = romance.calculate_bond_shift(sys.argv[3], quality)
+    elif action == "heal":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await romance.process_healing(int(sys.argv[3]), sys.argv[4], sid)
+    elif action == "release":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await romance.release_and_heal(int(sys.argv[3]), sid)
+    elif action == "aftercare":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await romance.process_aftercare(int(sys.argv[3]), int(sys.argv[4]), sid)
+    else:
+        rows = await romance.get_bond_ranking(sid)
+        out = {"ranked": len(rows)}
+        for row in rows[:10]:
+            print(f"  {row}")
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
+        print("  no result")
+    else:
+        print(f"  result: {out}")
+    await Database.close()
+
+
 async def cmd_shipyard():
     """shipyard {shortage | build <class> <tier> <type> "<name>" "<location>" |
     capacity <required-crew> | assign <ship-id> <required-crew>}
@@ -3024,6 +3075,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_career())
     elif cmd in ("shipyard", "ship-building", "build-ship"):
         asyncio.run(cmd_shipyard())
+    elif cmd in ("bond", "romance"):
+        asyncio.run(cmd_bond())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

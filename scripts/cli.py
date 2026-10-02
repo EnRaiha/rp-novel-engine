@@ -93,6 +93,60 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_forge():
+    """forge {weapons | blueprints | design <name> <category> <damage> <range> <slot> <tier> |
+    produce <blueprint> [qty] | upgrades <weapon-id> | fit <weapon-id> "<upgrade>"}
+
+    Six entry points of `modules/weapon_design.py` had no caller: the two catalogues, the designer, the
+    production line, the upgrade list and the fitting. `apply_upgrade` had been repaired in this review
+    and still had no caller, which is the state this command exists to end.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py forge weapons | blueprints | upgrades <weapon-id>\n'
+             '       cli.py forge design <name> <category> <damage> <range> <slot> <tier>\n'
+             '       cli.py forge produce "<blueprint>" [qty]\n'
+             '       cli.py forge fit <weapon-id> "<upgrade-name>"')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "weapons"
+    from modules import weapon_design as wd
+    if action == "blueprints":
+        rows = await wd.list_blueprints()
+        out = {"blueprints": len(rows)}
+        for row in rows[:10]:
+            print(f"  #{row.get('id')} {row.get('name')} · {row.get('category')}"
+                  f" · dmg {row.get('base_damage')}")
+    elif action == "design":
+        if len(sys.argv) < 9:
+            print(usage); await Database.close(); return
+        out = await wd.design_blueprint(sys.argv[3], sys.argv[4], int(sys.argv[5]), int(sys.argv[6]),
+                                        sys.argv[7], int(sys.argv[8]), sid)
+    elif action == "produce":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        qty = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+        out = await wd.produce_weapons(sys.argv[3], qty, sid)
+    elif action == "upgrades":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        rows = await wd.list_upgrades(int(sys.argv[3]))
+        out = {"upgrades": len(rows)}
+        for row in rows[:10]:
+            print(f"  {row.get('upgrade_name')} · {row.get('effect_type')} {row.get('effect_value')}"
+                  f" · {row.get('cost')} credits")
+    elif action == "fit":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await wd.apply_upgrade(int(sys.argv[3]), sys.argv[4], session_id=sid)
+    else:
+        rows = await wd.list_weapons()
+        out = {"weapons": len(rows)}
+    if not out:
+        print("  no result")
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
 async def cmd_council():
     """council {seats | status | cohesion | route "<task>" | authority [hours] | plots [quality] |
     assign <crew-id> <role> | thwart <id> <method> | titles | revoke "<system>" "<reason>"}
@@ -2685,6 +2739,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_map())
     elif cmd in ("council", "cabinet"):
         asyncio.run(cmd_council())
+    elif cmd in ("forge", "weapon", "weapons"):
+        asyncio.run(cmd_forge())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

@@ -22,7 +22,11 @@ async def list_blueprints() -> list[dict]:
 async def design_blueprint(name: str, category: str, damage: int, range_m: int, slot: str, tier: int,
                             session_id: int | None = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
-    exists = await Database.fetchval("SELECT id FROM maya_rp.weapon_blueprints WHERE LOWER(name)=LOWER($1)", name)
+    # No session filter here on purpose: `weapon_blueprints` is a shared armoury with no session_id
+    # column, so a blueprint name is global. Adding the filter raised UndefinedColumnError, which the
+    # test caught within a minute of the mistake.
+    exists = await Database.fetchval(
+        "SELECT id FROM maya_rp.weapon_blueprints WHERE LOWER(name)=LOWER($1)", name)
     if exists: return {"error": f"Blueprint '{name}' already exists"}
 
     cost_credits = damage * 200 + range_m * 50 + tier * 500
@@ -46,7 +50,8 @@ async def produce_weapons(blueprint: str, qty: int = 1, session_id: int | None =
     if session_id is None: session_id = Config.SESSION_ID
     bp = await Database.fetchrow(
         "SELECT id, name, category, base_damage, base_range, slot_size, tier_required, "
-        "alloy_cost, credit_cost, research_cost FROM maya_rp.weapon_blueprints WHERE LOWER(name)=LOWER($1)",
+        "alloy_cost, credit_cost, research_cost FROM maya_rp.weapon_blueprints"
+        " WHERE LOWER(name)=LOWER($1)",
         blueprint)
     if not bp: return {"error": f"Blueprint '{blueprint}' not found"}
 

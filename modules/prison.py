@@ -398,8 +398,16 @@ async def interrogate(
 
 
 def get_interrogation_tier_info(tier: str) -> dict[str, Any]:
-    """Return tier config. Ported from InterrogationOps.getTierInfo()."""
-    return INTERROGATION_TIERS.get(tier, INTERROGATION_TIERS["standard"])
+    """Return tier config, or say the tier does not exist.
+
+    The old body fell back to `standard` for any unknown name, so `soft` and `standard` printed the
+    same configuration and a typo read as a real tier. A caller asking for a tier that is not there
+    gets an answer that names the alternatives.
+    """
+    if tier in INTERROGATION_TIERS:
+        return INTERROGATION_TIERS[tier]
+    return {"error": f"unknown interrogation tier '{tier}'",
+            "available": sorted(INTERROGATION_TIERS)}
 
 
 # ─── Prisoner Conversion ─────────────────────────────────────────

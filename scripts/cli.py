@@ -93,6 +93,80 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_prison():
+    """prison {capture <count> <faction> | cells | tiers | hold <id> | paths <id> | convert <id> <path> |
+    intel <id> <investigation-id> "<text>" | intimacy <id> <path> | secure <id> [level] [guards] |
+    counter <id> "<measure>" | death <id> "<cause>"}
+
+    Eleven entry points of `modules/prison.py` had no caller, and they are the module's whole surface:
+    `resolve_capture` is the door prisoners come through, and nothing could open it, so the live paths
+    (interrogate, check_conversion, process_escapes) could only ever run against prisoners nothing could
+    create.
+    """
+    await Database.init()
+    usage = ("Usage: cli.py prison capture <count> <faction> | cells | tiers | hold <prisoner-id>\n"
+             "       cli.py prison paths <id> | convert <id> <path> | intimacy <id> <path>\n"
+             "       cli.py prison intel <id> <investigation-id> \"<text>\"\n"
+             "       cli.py prison secure <id> [level] [guards] | counter <id> \"<measure>\"\n"
+             "       cli.py prison death <id> \"<cause>\"")
+    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
+    action = sys.argv[2] if len(sys.argv) > 2 else "cells"
+    from modules import prison
+    if action == "capture":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        rows = await prison.resolve_capture(int(sys.argv[3]), sys.argv[4], session_id=sid)
+        out = {"prisoners_taken": len(rows)}
+        for row in rows[:5]:
+            print(f"  {row.get('name')} · {row.get('rank')}")
+    elif action == "tiers":
+        for tier in sorted(prison.INTERROGATION_TIERS):
+            cfg = prison.get_interrogation_tier_info(tier)
+            print(f"  {tier}: {cfg}")
+        await Database.close(); return
+    elif action == "hold":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await prison.assign_cell(int(sys.argv[3]), sid)
+    elif action == "paths":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = {"paths": await prison.get_available_intimacy_paths(int(sys.argv[3]), session_id=sid)}
+    elif action == "convert":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await prison.execute_conversion(int(sys.argv[3]), sys.argv[4], sid)
+    elif action == "intimacy":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await prison.initiate_intimacy(int(sys.argv[3]), sys.argv[4], session_id=sid)
+    elif action == "intel":
+        if len(sys.argv) < 6:
+            print(usage); await Database.close(); return
+        out = await prison.feed_intel_to_investigation(int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sid)
+    elif action == "secure":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        level = sys.argv[4] if len(sys.argv) > 4 else "standard"
+        guards = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+        out = await prison.upgrade_security(int(sys.argv[3]), level, guards, sid)
+    elif action == "counter":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await prison.apply_countermeasure(int(sys.argv[3]), sys.argv[4], sid)
+    elif action == "death":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await prison.record_death(int(sys.argv[3]), sys.argv[4], sid)
+    else:
+        out = await prison.get_fleet_capacity(sid)
+    if not out:
+        print("  no result")
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
 async def cmd_social():
     """social {tick | mutiny | morale <delta> [reason] | events <type> | relation <a> <b> | bond <a> <b> <delta>}
 
@@ -2467,6 +2541,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_wonders())
     elif cmd in ("social", "morale"):
         asyncio.run(cmd_social())
+    elif cmd in ("prison", "prisoner", "capture"):
+        asyncio.run(cmd_prison())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

@@ -93,6 +93,54 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_horror():
+    """horror {measures | assets | threats | detail <id> | contain <id> <measure> | eradicate <id> [strategy]}
+
+    Six entry points of `modules/space_horror.py` had no caller, and the module is the bug war: the
+    subsystem the five-plane gradient puts one plane from the human core. Nothing could read a threat,
+    apply a containment measure or launch an eradication, while the tick advanced infestations.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py horror measures | assets | threats\n'
+             '       cli.py horror detail <infestation-id>\n'
+             '       cli.py horror contain <infestation-id> "<measure name>"\n'
+             '       cli.py horror eradicate <infestation-id> [strategy]')
+    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
+    action = sys.argv[2] if len(sys.argv) > 2 else "threats"
+    from modules import space_horror as sh
+    if action == "measures":
+        for row in await sh.get_containment_measures():
+            print(f"  {row['name']} · {row.get('effect') or row.get('description') or ''}")
+        await Database.close(); return
+    if action == "assets":
+        for row in await sh.get_bug_war_assets():
+            print(f"  {row.get('name')} · {row.get('type')}")
+        await Database.close(); return
+    if action == "detail":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await sh.get_infestation_detail(int(sys.argv[3]), sid)
+    elif action == "contain":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await sh.apply_containment(sid, int(sys.argv[3]), sys.argv[4])
+    elif action == "eradicate":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        strategy = sys.argv[4] if len(sys.argv) > 4 else "systematic"
+        out = await sh.launch_eradication(sid, int(sys.argv[3]), strategy)
+    else:
+        rows = await sh.get_active_threats(sid)
+        out = {"threats": len(rows)}
+        for row in rows:
+            print(f"  #{row.get('id')} {row.get('name')} · {row.get('status')}")
+    if not out:
+        print("  no result")
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
 async def cmd_mega():
     """mega {types | status | start <type-id> [sector-id] [territory-id] | port-types | ports |
     build-port <territory-id> <port-type-id> [name] | upgrade-port <port-id> <upgrade>}
@@ -2328,6 +2376,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_build())
     elif cmd in ("mega", "megastructure", "port", "ports"):
         asyncio.run(cmd_mega())
+    elif cmd in ("horror", "infestation", "swarm"):
+        asyncio.run(cmd_horror())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

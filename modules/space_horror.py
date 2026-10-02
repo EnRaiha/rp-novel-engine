@@ -125,10 +125,11 @@ async def get_containment_measures() -> list:
 async def apply_containment(session_id: int, infestation_id: int, measure_name: str) -> dict:
     """Apply a containment measure to slow the infestation."""
     inf = await Database.fetchrow(
-        "SELECT * FROM maya_rp.infestation_instances WHERE id = $1", infestation_id
+        "SELECT * FROM maya_rp.infestation_instances WHERE id = $1 AND session_id = $2",
+        infestation_id, session_id
     )
     if not inf:
-        return {"error": "Infestation not found."}
+        return {"error": f"Infestation {infestation_id} not found in session {session_id}."}
 
     measure = await Database.fetchrow(
         "SELECT * FROM maya_rp.containment_measures WHERE name = $1", measure_name
@@ -178,10 +179,12 @@ async def launch_eradication(session_id: int, infestation_id: int,
                               strategy: str = "systematic", assets: list = None) -> dict:
     """Launch a military campaign to eradicate an infestation."""
     inf = await Database.fetchrow(
-        "SELECT * FROM maya_rp.infestation_instances WHERE id = $1", infestation_id
+        "SELECT * FROM maya_rp.infestation_instances WHERE id = $1 AND session_id = $2",
+        infestation_id, session_id
     )
     if not inf or inf["status"] in ("destroyed", "eradicated"):
-        return {"error": "Infestation not found or already gone."}
+        return {"error": f"Infestation {infestation_id} not found in session {session_id},"
+                         f" or already gone."}
 
     cid = await Database.fetchrow("""
         INSERT INTO maya_rp.eradication_campaigns
@@ -277,13 +280,20 @@ async def _generate_campaign_event(session_id: int, camp: dict, inf: dict):
                f"⚡ CAMPAIGN: {etype.replace('_',' ').upper()}", desc, 3)
 
 async def get_active_threats(session_id: int) -> list:
-    """List all active infestation threats."""
+    """This session's active infestation threats.
+
+    The signature took a session and the query ignored it: `SELECT * FROM infestation_threats` with no
+    WHERE at all, so Arc I listed the frozen campaign's infestations. A parameter that does nothing is
+    worse than a missing one, because it reads as scoping at every call site.
+    """
     return [dict(r) for r in await Database.fetch(
-        "SELECT * FROM maya_rp.infestation_threats"
+        "SELECT * FROM maya_rp.infestation_threats WHERE session_id = $1", session_id
     )]
 
-async def get_infestation_detail(infestation_id: int) -> dict:
-    """Detailed view of a specific infestation."""
+async def get_infestation_detail(infestation_id: int, session_id: int | None = None) -> dict:
+    """Detailed view of one infestation, from this session."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
     row = await Database.fetchrow("""
         SELECT ii.*, st.name AS stage, st.threat_level, st.description AS stage_description,
                s.name AS sector_name, t.system_name AS territory_name
@@ -291,8 +301,8 @@ async def get_infestation_detail(infestation_id: int) -> dict:
         JOIN maya_rp.infestation_stages st ON st.id = ii.stage_id
         LEFT JOIN maya_rp.sectors s ON s.id = ii.sector_id
         LEFT JOIN maya_rp.territory t ON t.id = ii.territory_id
-        WHERE ii.id = $1
-    """, infestation_id)
+        WHERE ii.id = $1 AND ii.session_id = $2
+    """, infestation_id, session_id)
     return dict(row) if row else {}
 
 # ============================================================

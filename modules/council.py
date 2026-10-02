@@ -15,6 +15,7 @@ Systems:
 """
 
 from __future__ import annotations
+import hashlib
 import random
 import json
 from datetime import datetime
@@ -474,7 +475,13 @@ async def scan_for_plots(session_id: int | None = None, network_quality: int = 0
     for row in rows:
         p = dict(row)
         detect = (network_quality / 100) * (1 - p["difficulty"] / 10) if network_quality > 0 else 0.1
-        if random.random() < detect:
+        # `random.random()` decided this, so scanning the same state twice gave two different answers
+        # and the novel could not reproduce a scan. A digest of the conspiracy and the network quality
+        # keeps the uncertainty while making the same state always report the same way.
+        roll = (int.from_bytes(hashlib.blake2s(
+            f"{session_id}|{p['id']}|{p['current_phase']}|{network_quality}".encode(),
+            digest_size=4).digest(), "big") % 10_000) / 10_000
+        if roll < detect:
             detected.append({
                 "conspiracy_id": p["id"], "plot_type": p["plot_type"],
                 "target": p["target"], "phase": p["current_phase"],

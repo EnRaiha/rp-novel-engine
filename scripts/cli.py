@@ -93,6 +93,59 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_council():
+    """council {seats | cohesion | plots [quality] | assign <crew-id> <role> | thwart <id> <method> |
+    titles | revoke "<system>" "<reason>"}
+
+    The council is a cabinet politics engine with twenty-five unreachable functions. This wires the six
+    that touch the database; the nineteen pure ones (votes, plots, crises, influence) need their own
+    driver and their own round.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py council seats | cohesion | plots [network-quality] | titles\n'
+             '       cli.py council assign <crew-id> <watcher|networker|interrogator>\n'
+             '       cli.py council thwart <conspiracy-id> [method]\n'
+             '       cli.py council revoke "<system-name>" "<reason>"')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "seats"
+    from modules import council
+    if action == "cohesion":
+        # get_cohesion reads a seat list, not a session: it was written as a pure function and the
+        # caller has to fetch the seats first.
+        out = council.get_cohesion(await council.get_cabinet_seats(sid))
+    elif action == "plots":
+        quality = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+        rows = await council.scan_for_plots(sid, quality)
+        out = {"detected": len(rows)}
+        for row in rows[:10]:
+            print(f"  #{row['conspiracy_id']} {row['description']} (phase {row['phase']})")
+    elif action == "assign":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await council.assign_agent(sid, int(sys.argv[3]), sys.argv[4])
+    elif action == "thwart":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        method = sys.argv[4] if len(sys.argv) > 4 else "surveillance"
+        out = await council.thwart_plot(int(sys.argv[3]), method)
+    elif action == "titles":
+        out = {"revocations": await council.check_title_revocation(sid)}
+    elif action == "revoke":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await council.revoke_title(sid, sys.argv[3], sys.argv[4])
+    else:
+        seats = await council.get_cabinet_seats(sid)
+        out = {"seats": len(seats), "valid": council.validate_cabinet(seats)}
+        for seat in seats[:12]:
+            print(f"  {seat.get('seat_name') or seat.get('seat')}: {seat.get('holder_name') or seat.get('holder')}")
+    if not out:
+        print("  no result")
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
 async def cmd_map():
     """map {stats | sectors | planets | colonies | visible | reachable <origin> [jumps] |
     factions | relations <a> <b> | presence | find "<query>" | system "<name>" | reveal "<name>" [level]}
@@ -2607,6 +2660,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_prison())
     elif cmd in ("map", "celestial", "systems"):
         asyncio.run(cmd_map())
+    elif cmd in ("council", "cabinet"):
+        asyncio.run(cmd_council())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

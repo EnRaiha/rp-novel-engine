@@ -14,7 +14,7 @@ import random
 import re
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import info, error
 
 NEWS_TEMPLATES = {
     "fleet": [
@@ -164,8 +164,8 @@ async def generate(session_id: int | None = None) -> list[dict]:
                     "approval=GREATEST(-100,LEAST(100,population_sentiment.approval+$4)), "
                     "last_shift=0, last_shift_reason=$5, updated_at=NOW()",
                     session_id, terr["id"], delta, delta, f"news: {category}")
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - reported below
+        error("news", f"generate: {e}")
     return articles
 
 

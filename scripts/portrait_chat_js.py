@@ -26,6 +26,13 @@ VAULT = pathlib.Path(__file__).resolve().parents[2]
 MANIFEST = VAULT / "adventures/tkg-arc1-restart/prototype/faces/manifest.json"
 OUT = pathlib.Path.home() / ".config/dsh-auth/portrait-chat.js"
 PATH_PREFIX = "adventures/tkg/characters/"
+
+#: Short forms the King declared. The unique-first-name rule refuses a name two characters answer to,
+#: and that refusal is right: guessing a face between two people is worse than showing none. Two
+#: characters answer to `Maya`, so the King named the one he means (2026-10-02).
+DECLARED_SHORT_FORMS: dict[str, list[str]] = {
+    "Maya al-Dabaran (Anchor)": ["Maya"],
+}
 NEUTRAL = "neutral"
 
 
@@ -134,6 +141,28 @@ TEMPLATE = r"""/**
     if (typeof text !== 'string' || text === '') return []
     var picked = []
     var seen = {}
+    // 0. the model's own marker: `Portrait: <name> (id N), <key>`. This is the King's answer to how the
+    // emotion is chosen: the writer knows the emotion of the scene it just wrote, so the writer says
+    // so and the token table below is only a fallback. Nothing calls a model from the browser, which
+    // would need a key in every page, a second of latency per turn, and money per turn. The name may itself
+    // carry parentheses, so the tag is found by the `(id` form, which a name never contains.
+    var marker = /Portrait:\s*(.+?)\s*\(id\s+(\d+)\)\s*,\s*([a-z]+)/gi
+    var declared = []
+    var hit
+    while ((hit = marker.exec(text)) !== null) {
+      var known = null
+      for (var m = 0; m < KEYS.length; m += 1) { if (KEYS[m].id === Number(hit[2])) { known = KEYS[m]; break } }
+      if (known === null) continue
+      // A marker carries both a name and an id. If they disagree, one of them is wrong, and a wrong
+      // face is worse than none: the marker is refused rather than resolved by the id alone.
+      var declared_name = hit[1].trim().toLowerCase()
+      var agrees = known.keys.some(function (key) { return key.toLowerCase() === declared_name })
+      if (!agrees) continue
+      if (seen[known.name]) continue
+      seen[known.name] = true
+      declared.push({ name: known.name, path: known.paths[hit[3]] || known.paths.neutral,
+        emotion: known.paths[hit[3]] ? hit[3] : 'neutral' })
+    }
     // 1. the id pass: exact, and it claims the character outright.
     var idPattern = /\\(id (\\d+)\\)/g
     var match
@@ -159,6 +188,7 @@ TEMPLATE = r"""/**
       picked.push(candidates[0])
       if (picked.length >= CAP) break
     }
+    if (declared.length) return declared.slice(0, CAP)
     var emotion = emotionFor(text)
     return picked.slice(0, CAP).map(function (entry) {
       var path = entry.paths[emotion] || entry.paths.neutral
@@ -174,9 +204,23 @@ TEMPLATE = r"""/**
 
   if (typeof document === 'undefined') return
 
+  /** Hide the marker's own paragraph, which is a system line rather than prose. */
+  function hideMarkers(node) {
+    var walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null)
+    var current
+    while ((current = walker.nextNode())) {
+      if (current.nodeValue.indexOf('Portrait:') === -1) continue
+      var holder = current.parentElement
+      if (holder && holder.textContent.trim().indexOf('Portrait:') === 0) {
+        holder.style.display = 'none'
+      }
+    }
+  }
+
   /** Attach the strip above a turn's prose, once. */
   function decorate(node) {
     if (node.dataset.portraitDone === '1') return
+    hideMarkers(node)
     var text = node.innerText || node.textContent || ''
     var found = pick(text)
     node.dataset.portraitDone = '1'
@@ -235,6 +279,9 @@ def render() -> str:
         if first:
             first_owner.setdefault(first.lower(), set()).add(row["n"])
     for row in table:
+        for declared in DECLARED_SHORT_FORMS.get(row["n"], []):
+            if declared not in row["k"]:
+                row["k"].append(declared)
         first = row["n"].split()[0] if row["n"].split() else ""
         if first and len(first_owner.get(first.lower(), set())) == 1 and first not in row["k"]:
             row["k"].append(first)

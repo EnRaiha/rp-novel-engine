@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from core.db import Database
 from core.events import EventBus
 from core.utils import calc_game_days
+from core.log import error
 
 # ── WAR MACHINE ──
 
@@ -24,7 +25,7 @@ async def _den_regen(session_id: int):
     """Den regeneration (2026-08-14): dens with a LIVING Pirate Queen or King
     rebuild their fleet each tick up to fleet_cap. Both leaders dead → regen
     stops — kill the crown, kill the swarm."""
-    from core.log import info
+    from core.log import info, error
     bases = await Database.fetch(
         "SELECT id, faction_id, regen_per_tick, fleet_cap, name FROM maya_rp.pirate_bases "
         "WHERE status='active' AND COALESCE(regen_per_tick,0) > 0")
@@ -190,8 +191,8 @@ async def _attack(session_id: int):
                            {"src": "ai_policy", "policy": "STANDARD UNIFORMITY",
                             "cond": cond, "act": "check_first"},
                            policy, None, group, session_id)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - reported below
+        error("pirates", f"_attack: {e}")
     # doctrine modifiers: aggression trades loot for risk
     _AGGRO = {"bullet": 1.0, "clear_all": 1.0, "bullet_or_ransom": 0.9,
               "check_first": 0.97, "confirm_first": 0.95, "debt_bound": 0.9,
@@ -242,8 +243,8 @@ async def _attack(session_id: int):
                 "INSERT INTO maya_rp.pirate_raids (pirate_faction_id, target_territory_id, raid_type, loot_credits, outcome, description) "
                 "VALUES ($1,$2,'intercept',0,'fate', $3)",
                 pf["id"], t["id"], f"Intercepted raid crew fate [{group}]: {fate['class']} ({fate['source']})")
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - reported below
+            error("pirates", f"_attack: {e}")
 
 async def _alerts(session_id: int):
     total = await Database.fetchrow("SELECT COALESCE(SUM(pirate_fleet_power),0) AS t FROM factions WHERE is_pirate=true")

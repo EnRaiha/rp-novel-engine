@@ -44,7 +44,7 @@ class Database:
         if cls.pool:
             try:
                 await cls.pool.close()
-            except Exception:
+            except Exception:  # deliberate: a failing close during shutdown must not raise
                 pass
             cls.pool = None
 

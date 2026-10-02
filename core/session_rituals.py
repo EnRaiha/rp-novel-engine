@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import info, error
 
 async def generate_open(session_id: int = None) -> str:
     if session_id is None: session_id = Config.SESSION_ID
@@ -37,8 +37,8 @@ async def generate_open(session_id: int = None) -> str:
             parts.append("**The world around you:**")
             for d in env: parts.append(f"- {d}")
             parts.append("")
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - reported below
+        error("session-rituals", f"generate_open: {e}")
 
     from modules.objectives import objectives_to_prompt
     obj = await objectives_to_prompt(session_id)

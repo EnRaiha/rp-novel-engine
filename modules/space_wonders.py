@@ -3,6 +3,7 @@ import random, json
 from datetime import datetime, timezone
 from core.db import Database
 from core.events import EventBus
+from core.log import error
 
 # ============================================================
 # Planet Operations
@@ -414,5 +415,5 @@ async def _log(sid, category, title, content, importance=2):
             INSERT INTO maya_rp.story_log (session_id, category, title, content, importance, happened_at)
             VALUES (COALESCE($1, 3), $2, $3, $4, $5, NOW())
         """, sid, category, title, content, importance)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - reported below
+        error("space-wonders", f"_log: {e}")

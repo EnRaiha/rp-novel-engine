@@ -5,7 +5,7 @@ import json
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import info, error
 
 async def get_active(session_id: int = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
@@ -156,8 +156,8 @@ async def _register_event_listeners() -> None:
                     ("battle_completed", _on_battle)]:
         try:
             EventBus.on(evt, cb)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - reported below
+            error("objectives", f"_register_event_listeners: {e}")
 
 
 async def _bump_kind(session_id: int, kind: str, amount: int = 1) -> dict:

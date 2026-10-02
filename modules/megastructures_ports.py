@@ -3,6 +3,7 @@ import random, json
 from datetime import datetime, timezone, timedelta
 from core.db import Database
 from core.events import EventBus
+from core.log import error
 
 # ============================================================
 # Megastructure Operations
@@ -302,5 +303,5 @@ async def _log(sid, category, title, content, importance=2):
             "VALUES ($1, $2, $3, $4, $5, NOW())",
             sid, category, title, content, importance
         )
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - reported below
+        error("megastructures-ports", f"_log: {e}")

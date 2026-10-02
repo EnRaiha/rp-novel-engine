@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from core.db import Database
-from core.log import info
+from core.log import info, error
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
 MIN_ROWS = 40          # minimum corpus per model to train
@@ -81,7 +81,8 @@ async def _corpus_decisions(model_name: str, group: str | None = None):
         try:
             inputs = r["inputs"] if isinstance(r["inputs"], dict) else json.loads(r["inputs"])
             out.append((inputs, r["predicted"]))
-        except Exception:
+        except Exception as e:  # noqa: BLE001 - reported below
+            error("train-models", f"_corpus_decisions: {e}")
             continue
     return out
 

@@ -5,7 +5,7 @@ import random
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import info, error
 
 ENCOUNTER_CATEGORIES = {
     "space_phenomena": ["solar_flare", "nebula_storm", "gravity_anomaly", "wormhole", "void_tear"],
@@ -80,8 +80,8 @@ async def run_tick(session_id: int = None) -> dict:
                 try:
                     from modules.chekhov import introduce
                     await introduce("consequence", ev["title"], importance="medium", payoff_window=15, session_id=session_id)
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001 - reported below
+                    error("encounters", f"run_tick: {e}")
                 planted += 1
                 break
         info("events", f"Tick: {len(events)} recent, fired={fired}, planted={planted}")

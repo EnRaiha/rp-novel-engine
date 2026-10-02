@@ -12,6 +12,7 @@ import json, re, sys, argparse, os, base64, functools, time, subprocess
 from pathlib import Path
 from flask import Flask, jsonify, send_from_directory, Response, request
 import psycopg2
+from core.log import error
 
 APP = Flask(__name__, static_folder=None)
 
@@ -44,8 +45,8 @@ def check_auth():
             user, _, pw = decoded.partition(":")
             if user == MAP_USER and pw == MAP_PASS:
                 return True
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - reported below
+            error("map-server", f"check_auth: {e}")
     return False
 
 

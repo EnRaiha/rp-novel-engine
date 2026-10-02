@@ -9,7 +9,7 @@ import asyncio, sys, json, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from core.config import Config
 from core.db import Database
-from core.log import info
+from core.log import info, error
 from core.memory import embed_text
 from core.session import resolve_session
 
@@ -470,8 +470,8 @@ async def handle(action: str, params: dict = None) -> dict:
                         speaker,
                         sid,
                     )
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001 - reported below
+                    error("kilo-bridge", f"handle: {e}")
 
             if category:
                 rows = await Database.fetch(

@@ -57,7 +57,7 @@ SURVIVAL_BIAS = {
 def _log(module: str, msg: str):
     try:
         info(module, msg)
-    except Exception:
+    except Exception:  # deliberate: logging must never raise into its caller
         pass
 
 

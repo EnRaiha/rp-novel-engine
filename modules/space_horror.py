@@ -3,6 +3,7 @@ import random, json
 from datetime import datetime, timezone
 from core.db import Database
 from core.events import EventBus
+from core.log import error
 
 # ============================================================
 # Infestation Management
@@ -358,5 +359,5 @@ async def _log(sid, category, title, content, importance=2):
             "VALUES ($1, $2, $3, $4, $5, NOW())",
             sid, category, title, content, importance
         )
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - reported below
+        error("space-horror", f"_log: {e}")

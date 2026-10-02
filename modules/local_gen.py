@@ -17,7 +17,7 @@ import re
 from typing import Any
 
 from core.db import Database
-from core.log import info
+from core.log import info, error
 from core import deepseek_client as ds
 
 PRIMARY_MODEL = ds.DEFAULT_MODEL
@@ -53,8 +53,8 @@ async def generate(
         gate = check_generation(text)
         if not gate.get("allowed"):
             return "[generation blocked: " + gate.get("reason", "guardrail") + "]"
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - reported below
+        error("local-gen", f"generate: {e}")
     return text
 
 

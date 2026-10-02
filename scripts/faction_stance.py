@@ -6,6 +6,12 @@ Every weight is listed in `WEIGHTS` below so the King can audit and move them.
 
     python3 scripts/faction_stance.py            # compute and store
     python3 scripts/faction_stance.py --show 12  # show the top rows
+    python3 scripts/faction_stance.py --dry-run --lag 0.5   # drift, no write
+
+`--lag` is the distance lag fraction from `modules.unity.lag_fraction`. It is
+0.0 by default, which is the model exactly as it stood before Fasa 5.3. A
+nonzero lag writes nothing today: a uniform lag would be a fabricated number,
+because no faction has a capital or a lane to derive a real one from.
 
 The engine already runs learned pirate models in `core/decision_models.py` (sklearn
 pickles with per-group biases, logged to `ai_decision_log` for retraining). This is
@@ -22,6 +28,8 @@ import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from modules.unity import DRIFT_PER_FULL_LAG, drift  # noqa: E402  (path set above)
 
 # ── the model ────────────────────────────────────────────────────────────
 # sign * weight per feature. trust and reputation pull toward friendship;
@@ -45,8 +53,18 @@ WEIGHTS = {
     "standing:kingdom": +0.35, "standing:friendly": +0.40, "standing:allied": +0.60,
     "standing:neutral": 0.00, "standing:suspicious": -0.20, "standing:hostile": -0.55,
     "standing:unknown": -0.10,
+    # Not a term of the raw sum. The drift is a second normalisation stage: it
+    # subtracts from |score| after the clamp, at DRIFT_PER_FULL_LAG per full lag.
+    # It is listed here so this table publishes every number the model uses, and
+    # marked so nobody adds it to the sum above.
+    "drift:lag": -DRIFT_PER_FULL_LAG,
 }
+# The raw sum is divided by NORMALISER before the clamp. Named rather than
+# inlined because it is published in the thresholds table next to BANDS.
+NORMALISER = 0.75
 BANDS = ((-0.45, "hostile"), (-0.15, "wary"), (0.15, "neutral"), (0.45, "friendly"), (1.01, "allied"))
+# The widest central band is 0.30 wide, which is why the drift constant is 0.35:
+# a full-lag holding must clear at least one band.
 
 
 def _fraction(value) -> float:
@@ -63,10 +81,13 @@ def _hundredth(value) -> float:
         return 0.5
 
 
-def stance(faction: dict) -> dict:
+def stance(faction: dict, lag: float = 0.0) -> dict:
     """Deterministic stance for one faction row.
 
     @param faction - a mapping with the axis and state columns.
+    @param lag - the distance lag fraction, from `modules.unity.lag_fraction`.
+                 0.0 by default, and at 0.0 the result is exactly what this
+                 model returned before the drift existed.
     @returns score in -1..1 and the band it falls in. Pure: no I/O, no RNG.
     """
     score = 0.0
@@ -80,7 +101,10 @@ def stance(faction: dict) -> dict:
     score += WEIGHTS.get("doctrine:" + str(faction.get("doctrine") or "unaligned"), 0.0)
     score += WEIGHTS.get("origin:" + str(faction.get("origin") or "imposed"), 0.0)
     score += WEIGHTS.get("standing:" + str(faction.get("standing") or "unknown"), 0.0)
-    score = round(max(-1.0, min(1.0, score / 0.75)), 4)
+    score = round(max(-1.0, min(1.0, score / NORMALISER)), 4)
+    # Second normalisation stage, after the clamp and before the band. At lag 0
+    # the score passes through untouched.
+    score = round(drift(score, lag), 4)
     band = next(name for edge, name in BANDS if score < edge)
     return {"score": score, "band": band}
 
@@ -89,7 +113,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--show", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--lag", type=float, default=0.0,
+                        help="distance lag fraction, 0..1, from modules.unity.lag_fraction; "
+                             "0.0 by default and inert at 0.0")
     args = parser.parse_args()
+    if args.lag < 0:
+        parser.error("--lag cannot be negative")
+    if args.lag and not args.dry_run:
+        print("--lag needs --dry-run: a uniform lag is a scene input, and no per-faction "
+              "capital and lane exist to derive a real one. Nothing was written.", file=sys.stderr)
+        return 2
 
     import psycopg2
 
@@ -115,8 +148,8 @@ def main() -> int:
                "status")
     rows = [dict(zip(columns, row)) for row in cur.fetchall()]
     # A faction that does not exist yet has no stance to compute.
-    results = [(row, None) if row.get("status") == "not_yet_established" else (row, stance(row))
-               for row in rows]
+    results = [(row, None) if row.get("status") == "not_yet_established"
+               else (row, stance(row, lag=args.lag)) for row in rows]
 
     if args.show:
         for row, verdict in results[: args.show]:
@@ -124,7 +157,7 @@ def main() -> int:
                 print(f"{row['name'][:30]:<30} {'not yet':<9}    -     doc={row['doctrine']}")
                 continue
             print(f"{row['name'][:30]:<30} {verdict['band']:<9} {verdict['score']:+.3f}  "
-                  f"doc={row['doctrine']} origin={row['origin']}")
+                  f"doc={row['doctrine']} origin={row['origin']} lag={args.lag:.2f}")
     if args.dry_run:
         print(f"computed {len(results)} factions, nothing written")
         return 0

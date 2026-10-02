@@ -79,7 +79,26 @@ OCCASIONS: dict[str, tuple[str, tuple[str, ...]]] = {
     "wardrobe": ("neutral", ("wardrobe",)),
 }
 
-STYLE_SUFFIX = "cinematic lighting, detailed face, sci-fi, 512x512, upper body portrait"
+#: Composition. The clause and the latent size must agree, or the model fights the frame: a waist
+#: clause in a square latent still crops at the chest, and a tall latent with a bust clause pads the
+#: bottom. The renderer takes the size from the same entry, so the two cannot drift apart.
+FRAMING: dict[str, dict[str, Any]] = {
+    "bust": {"clause": "head and shoulders portrait, chest-up", "width": 512, "height": 512},
+    "waist": {"clause": "waist-up medium shot, from the top of the head down to the waist, both hands"
+                        " in frame, the hip line visible", "width": 512, "height": 768},
+    "knee": {"clause": "knee-up shot, from the knee to the top of the head, hands visible",
+             "width": 512, "height": 768},
+    "full": {"clause": "full body shot, head to feet, standing", "width": 512, "height": 1024},
+}
+
+#: A crop failure is the most likely outcome of a taller frame, so the negative names it.
+FRAMING_NEGATIVE = "close-up, cropped, cut off, headshot, out of frame"
+
+DEFAULT_FRAMING = "waist"
+
+#: Composition used to live here as `512x512, upper body portrait`. It does not any more: framing is
+#: a parameter, and a style that also states a crop contradicts it.
+STYLE_SUFFIX = "cinematic lighting, detailed face, sci-fi"
 NEGATIVE_PROMPT = "lowres, blurry, watermark, text, extra limbs, deformed, bad anatomy"
 
 # Render styles. `semi` is the first generation's look — a stylized 3D game
@@ -89,13 +108,13 @@ NEGATIVE_PROMPT = "lowres, blurry, watermark, text, extra limbs, deformed, bad a
 STYLES: dict[str, dict[str, str]] = {
     "semi": {
         "suffix": "stylized 3D game character render, soft shading, clean silhouette,"
-                  " expressive face, sci-fi, 512x512, upper body portrait",
+                  " expressive face, sci-fi",
         "negative": "photo, photorealistic, realistic skin texture, lowres, blurry,"
                     " watermark, text, extra limbs, deformed, bad anatomy",
     },
     "anime": {
         "suffix": "anime style, 2D illustration, cel shading, clean lineart, vibrant colors,"
-                  " expressive face, sci-fi, 512x512, upper body portrait",
+                  " expressive face, sci-fi",
         "negative": "photorealistic, photo, 3d render, realistic, lowres, blurry,"
                     " watermark, text, extra limbs, deformed, bad anatomy",
     },
@@ -326,7 +345,8 @@ def _hair_clause(text: str) -> str:
     return ""
 
 
-def build_prompt(character: dict[str, Any], emotion: str, *, sheet: str = "") -> str:
+def build_prompt(character: dict[str, Any], emotion: str, *, sheet: str = "",
+                 framing: str = DEFAULT_FRAMING) -> str:
     """The render prompt for one character and occasion.
 
     The face comes first — the sheet's `## Appearance` prose, else the database
@@ -353,8 +373,9 @@ def build_prompt(character: dict[str, Any], emotion: str, *, sheet: str = "") ->
     # weight after the face clause has been truncated.
     hair = "" if emotion in NO_HAIR_CLAUSE else _hair_clause(face)
     tail = f"{hair}; {fragment}" if hair else fragment
+    frame = FRAMING.get(framing, FRAMING[DEFAULT_FRAMING])["clause"]
     suffix = style()["suffix"]
-    return f"{identity}; {tail}; {suffix}" if identity else f"{tail}; {suffix}"
+    return f"{identity}; {tail}; {frame}; {suffix}" if identity else f"{tail}; {frame}; {suffix}"
 
 
 async def find_character(session_id: int, name: str) -> dict[str, Any] | None:
@@ -400,7 +421,8 @@ async def lookup(session_id: int, name: str, occasion: str) -> dict[str, Any] | 
     return {"character": character, "emotion": emotion, "asset": dict(row)}
 
 
-async def queue(session_id: int, name: str, occasion: str) -> dict[str, Any]:
+async def queue(session_id: int, name: str, occasion: str,
+                framing: str = DEFAULT_FRAMING) -> dict[str, Any]:
     """Queue a render for one character and occasion (idempotent per pair).
 
     @returns the character, the emotion, the built prompt, and the row status.
@@ -409,20 +431,22 @@ async def queue(session_id: int, name: str, occasion: str) -> dict[str, Any]:
     if character is None:
         raise ValueError(f"character not found: {name}")
     emotion = OCCASIONS.get(occasion, (occasion, ()))[0]
-    prompt = build_prompt(character, emotion, sheet=sheet_text(character["name"]))
+    prompt = build_prompt(character, emotion, sheet=sheet_text(character["name"]), framing=framing)
     row = await Database.fetchrow(
         "INSERT INTO maya_rp.character_assets"
-        " (session_id, character_id, kind, occasion, prompt, negative_prompt, status)"
-        " VALUES ($1,$2,'portrait',$3,$4,$5,'pending')"
+        " (session_id, character_id, kind, occasion, prompt, negative_prompt, status, framing)"
+        " VALUES ($1,$2,'portrait',$3,$4,$5,'pending',$6)"
         " ON CONFLICT (character_id, kind, occasion) DO UPDATE"
         " SET prompt=EXCLUDED.prompt, negative_prompt=EXCLUDED.negative_prompt,"
+        "     framing=EXCLUDED.framing,"
         "     status='pending', error=NULL, updated_at=now()"
         " RETURNING id, status, image_path",
         int(session_id),
         character["id"],
         occasion,
         prompt,
-        NEGATIVE_PROMPT,
+        NEGATIVE_PROMPT if framing == "bust" else f"{NEGATIVE_PROMPT}, {FRAMING_NEGATIVE}",
+        framing,
     )
     return {
         "character": character,
@@ -458,7 +482,7 @@ async def pending(
     """
     if order not in QUEUE_ORDERS:
         raise ValueError(f"unknown queue order {order!r}; use one of {', '.join(QUEUE_ORDERS)}")
-    sql = ("SELECT a.id, a.occasion, a.prompt, a.negative_prompt, c.name"
+    sql = ("SELECT a.id, a.occasion, a.prompt, a.negative_prompt, a.framing, c.name"
            " FROM maya_rp.character_assets a JOIN maya_rp.characters c ON c.id = a.character_id"
            " WHERE a.session_id=$1 AND a.status='pending'")
     params: list[Any] = [int(session_id), int(limit)]

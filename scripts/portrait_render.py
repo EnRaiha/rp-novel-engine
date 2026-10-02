@@ -28,6 +28,10 @@ from core.log import info  # noqa: E402
 GENERATOR = Path.home() / "scripts" / "maya-generate"
 MODEL = "Deliberate_v2.safetensors"
 
+#: Composition for a render that is queued from the command line. The queued row already carries the
+#: framing the prompt was built from; this only sets the default for a fresh queue.
+DEFAULT_FRAMING = portraits.DEFAULT_FRAMING
+
 
 async def render_one(asset: dict, *, steps: int, dry_run: bool) -> bool:
     """Render one queued asset; returns True when the row is now ready."""
@@ -43,9 +47,17 @@ async def render_one(asset: dict, *, steps: int, dry_run: bool) -> bool:
     # The negative prompt lives in the ComfyUI workflow's node 7; the CLI takes
     # the positive text only.
     prompt = asset["prompt"] or ""
+    # The latent size comes from the framing this row was queued with, so the picture and the row
+    # cannot disagree about what was rendered.
+    framing = asset.get("framing") or DEFAULT_FRAMING
+    frame = portraits.FRAMING.get(framing, portraits.FRAMING[DEFAULT_FRAMING])
+    size = f"{frame['width']}x{frame['height']}"
+    negative = portraits.style()["negative"]
+    if framing != "bust":
+        negative = f"{negative}, {portraits.FRAMING_NEGATIVE}"
     result = subprocess.run(
         [sys.executable, str(GENERATOR), prompt, "-o", str(version_file), "--steps", str(steps),
-         "--negative", portraits.style()["negative"]],
+         "--size", size, "--negative", negative],
         capture_output=True,
         text=True,
     )
@@ -58,7 +70,8 @@ async def render_one(asset: dict, *, steps: int, dry_run: bool) -> bool:
     shutil.copyfile(version_file, target)
     portraits.set_live_version(name, emotion, version)
     await portraits.mark_ready(
-        asset["id"], str(target), model=MODEL, seed=None, width=512, height=512
+        asset["id"], str(target), model=MODEL, seed=None,
+        width=frame["width"], height=frame["height"],
     )
     info("portraits", f"rendered {name}/{asset['occasion']} -> v{version} {version_file.name} (live: {target.name})")
     return True

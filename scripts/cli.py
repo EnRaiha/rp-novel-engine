@@ -93,6 +93,71 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_map():
+    """map {stats | sectors | planets | colonies | visible | reachable <origin> [jumps] |
+    factions | relations <a> <b> | presence | find "<query>" | system "<name>" | reveal "<name>" [level]}
+
+    Twelve readers of `modules/celestial.py` had no caller. They are the map surface the five-plane
+    geometry will need, and every one of them takes a session and uses it.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py map stats | sectors | planets | colonies | visible | factions | presence\n'
+             '       cli.py map reachable "<origin>" [max-jumps]\n'
+             '       cli.py map relations "<faction-a>" "<faction-b>"\n'
+             '       cli.py map find "<query>" | system "<name>" | reveal "<name>" [level]')
+    # A session flag anywhere in argv shifts every positional index, so the action parses the
+    # stripped list. Without this, `map --session=3 find Bayu` read the flag as the action.
+    ARGS = [a for a in sys.argv if not a.startswith("--session")]
+    sid = int(take_session_flag(sys.argv)[0] or Config.SESSION_ID)
+    action = ARGS[2] if len(ARGS) > 2 else "stats"
+    from modules import celestial as c
+    if action == "sectors":
+        out = await c.get_sector_breakdown(sid)
+    elif action == "planets":
+        out = await c.get_planet_stats(sid)
+    elif action == "colonies":
+        out = await c.get_colonies(sid)
+    elif action == "visible":
+        out = {"visible": len(await c.get_visible_systems(sid, 0))}
+    elif action == "reachable":
+        if len(ARGS) < 4:
+            print(usage); await Database.close(); return
+        jumps = int(ARGS[4]) if len(ARGS) > 4 else 3
+        rows = await c.get_reachable_systems(sid, ARGS[3], jumps)
+        out = {"reachable": len(rows)}
+    elif action == "factions":
+        out = await c.get_faction_territories(sid)
+    elif action == "relations":
+        if len(ARGS) < 5:
+            print(usage); await Database.close(); return
+        out = {"relations": await c.get_faction_relations(sid, ARGS[3], ARGS[4])}
+    elif action == "presence":
+        out = await c.get_faction_presence(sid)
+    elif action == "find":
+        if len(ARGS) < 4:
+            print(usage); await Database.close(); return
+        rows = await c.search_all(sid, ARGS[3])
+        out = {"hits": len(rows)}
+        for row in rows[:10]:
+            print(f"  {row}")
+    elif action == "system":
+        if len(ARGS) < 4:
+            print(usage); await Database.close(); return
+        out = await c.get_system_detail(sid, ARGS[3]) or {"system": "not found"}
+    elif action == "reveal":
+        if len(ARGS) < 4:
+            print(usage); await Database.close(); return
+        level = int(ARGS[4]) if len(ARGS) > 4 else 2
+        out = await c.reveal_system(sid, ARGS[3], level)
+    else:
+        out = await c.get_system_stats(sid)
+    if not out:
+        print("  no result")
+    for key, value in (out or {}).items():
+        print(f"  {key}: {len(value) if isinstance(value, list) else value}")
+    await Database.close()
+
+
 async def cmd_prison():
     """prison {capture <count> <faction> | cells | tiers | hold <id> | paths <id> | convert <id> <path> |
     intel <id> <investigation-id> "<text>" | intimacy <id> <path> | secure <id> [level] [guards] |
@@ -109,13 +174,16 @@ async def cmd_prison():
              "       cli.py prison intel <id> <investigation-id> \"<text>\"\n"
              "       cli.py prison secure <id> [level] [guards] | counter <id> \"<measure>\"\n"
              "       cli.py prison death <id> \"<cause>\"")
-    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
-    action = sys.argv[2] if len(sys.argv) > 2 else "cells"
+    # A session flag anywhere in argv shifts every positional index, so the action parses the
+    # stripped list. Without this, `map --session=3 find Bayu` read the flag as the action.
+    ARGS = [a for a in sys.argv if not a.startswith("--session")]
+    sid = int(take_session_flag(sys.argv)[0] or Config.SESSION_ID)
+    action = ARGS[2] if len(ARGS) > 2 else "cells"
     from modules import prison
     if action == "capture":
-        if len(sys.argv) < 5:
+        if len(ARGS) < 5:
             print(usage); await Database.close(); return
-        rows = await prison.resolve_capture(int(sys.argv[3]), sys.argv[4], session_id=sid)
+        rows = await prison.resolve_capture(int(ARGS[3]), ARGS[4], session_id=sid)
         out = {"prisoners_taken": len(rows)}
         for row in rows[:5]:
             print(f"  {row.get('name')} · {row.get('rank')}")
@@ -125,39 +193,39 @@ async def cmd_prison():
             print(f"  {tier}: {cfg}")
         await Database.close(); return
     elif action == "hold":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        out = await prison.assign_cell(int(sys.argv[3]), sid)
+        out = await prison.assign_cell(int(ARGS[3]), sid)
     elif action == "paths":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        out = {"paths": await prison.get_available_intimacy_paths(int(sys.argv[3]), session_id=sid)}
+        out = {"paths": await prison.get_available_intimacy_paths(int(ARGS[3]), session_id=sid)}
     elif action == "convert":
-        if len(sys.argv) < 5:
+        if len(ARGS) < 5:
             print(usage); await Database.close(); return
-        out = await prison.execute_conversion(int(sys.argv[3]), sys.argv[4], sid)
+        out = await prison.execute_conversion(int(ARGS[3]), ARGS[4], sid)
     elif action == "intimacy":
-        if len(sys.argv) < 5:
+        if len(ARGS) < 5:
             print(usage); await Database.close(); return
-        out = await prison.initiate_intimacy(int(sys.argv[3]), sys.argv[4], session_id=sid)
+        out = await prison.initiate_intimacy(int(ARGS[3]), ARGS[4], session_id=sid)
     elif action == "intel":
-        if len(sys.argv) < 6:
+        if len(ARGS) < 6:
             print(usage); await Database.close(); return
-        out = await prison.feed_intel_to_investigation(int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sid)
+        out = await prison.feed_intel_to_investigation(int(ARGS[3]), int(ARGS[4]), ARGS[5], sid)
     elif action == "secure":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        level = sys.argv[4] if len(sys.argv) > 4 else "standard"
-        guards = int(sys.argv[5]) if len(sys.argv) > 5 else 0
-        out = await prison.upgrade_security(int(sys.argv[3]), level, guards, sid)
+        level = ARGS[4] if len(ARGS) > 4 else "standard"
+        guards = int(ARGS[5]) if len(ARGS) > 5 else 0
+        out = await prison.upgrade_security(int(ARGS[3]), level, guards, sid)
     elif action == "counter":
-        if len(sys.argv) < 5:
+        if len(ARGS) < 5:
             print(usage); await Database.close(); return
-        out = await prison.apply_countermeasure(int(sys.argv[3]), sys.argv[4], sid)
+        out = await prison.apply_countermeasure(int(ARGS[3]), ARGS[4], sid)
     elif action == "death":
-        if len(sys.argv) < 5:
+        if len(ARGS) < 5:
             print(usage); await Database.close(); return
-        out = await prison.record_death(int(sys.argv[3]), sys.argv[4], sid)
+        out = await prison.record_death(int(ARGS[3]), ARGS[4], sid)
     else:
         out = await prison.get_fleet_capacity(sid)
     if not out:
@@ -179,31 +247,34 @@ async def cmd_social():
              '       cli.py social events <event-type>\n'
              '       cli.py social relation <char-a> <char-b>\n'
              '       cli.py social bond <char-a> <char-b> <delta>')
-    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
-    action = sys.argv[2] if len(sys.argv) > 2 else "tick"
+    # A session flag anywhere in argv shifts every positional index, so the action parses the
+    # stripped list. Without this, `map --session=3 find Bayu` read the flag as the action.
+    ARGS = [a for a in sys.argv if not a.startswith("--session")]
+    sid = int(take_session_flag(sys.argv)[0] or Config.SESSION_ID)
+    action = ARGS[2] if len(ARGS) > 2 else "tick"
     from modules import social
     if action == "mutiny":
         out = await social.calculate_mutiny_risk(sid)
     elif action == "morale":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        reason = sys.argv[4] if len(sys.argv) > 4 else ""
+        reason = ARGS[4] if len(ARGS) > 4 else ""
         before = await social._get_fleet_morale(sid)
-        after = await social.update_morale(sid, int(sys.argv[3]), reason)
-        out = {"before": before, "after": after, "delta": int(sys.argv[3]), "reason": reason}
+        after = await social.update_morale(sid, int(ARGS[3]), reason)
+        out = {"before": before, "after": after, "delta": int(ARGS[3]), "reason": reason}
     elif action == "events":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        out = social.get_social_event_config(sys.argv[3])
-        out = {"config_keys": len(out), "event_type": social.detect_event_type(sys.argv[3])}
+        out = social.get_social_event_config(ARGS[3])
+        out = {"config_keys": len(out), "event_type": social.detect_event_type(ARGS[3])}
     elif action == "relation":
-        if len(sys.argv) < 5:
+        if len(ARGS) < 5:
             print(usage); await Database.close(); return
-        out = await social.get_relationship(sid, int(sys.argv[3]), int(sys.argv[4])) or {"relationship": "none"}
+        out = await social.get_relationship(sid, int(ARGS[3]), int(ARGS[4])) or {"relationship": "none"}
     elif action == "bond":
-        if len(sys.argv) < 6:
+        if len(ARGS) < 6:
             print(usage); await Database.close(); return
-        out = await social.shift_bond(sid, int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]))
+        out = await social.shift_bond(sid, int(ARGS[3]), int(ARGS[4]), int(ARGS[5]))
     else:
         out = await social.run_tick(sid)
     if not out:
@@ -225,24 +296,27 @@ async def cmd_wonders():
              '       cli.py wonders explore <discovery-id> [fleet-power]\n'
              '       cli.py wonders hunt <encounter-id> [fleet-power]\n'
              '       cli.py wonders tame <encounter-id> [trainer-skill]')
-    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
-    action = sys.argv[2] if len(sys.argv) > 2 else "overview"
+    # A session flag anywhere in argv shifts every positional index, so the action parses the
+    # stripped list. Without this, `map --session=3 find Bayu` read the flag as the action.
+    ARGS = [a for a in sys.argv if not a.startswith("--session")]
+    sid = int(take_session_flag(sys.argv)[0] or Config.SESSION_ID)
+    action = ARGS[2] if len(ARGS) > 2 else "overview"
     from modules import space_wonders as sw
     if action == "explore":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        power = int(sys.argv[4]) if len(sys.argv) > 4 else 100
-        out = await sw.explore_anomaly(int(sys.argv[3]), power, sid)
+        power = int(ARGS[4]) if len(ARGS) > 4 else 100
+        out = await sw.explore_anomaly(int(ARGS[3]), power, sid)
     elif action == "hunt":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        power = int(sys.argv[4]) if len(sys.argv) > 4 else 100
-        out = await sw.hunt_animal(int(sys.argv[3]), power, sid)
+        power = int(ARGS[4]) if len(ARGS) > 4 else 100
+        out = await sw.hunt_animal(int(ARGS[3]), power, sid)
     elif action == "tame":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        skill = int(sys.argv[4]) if len(sys.argv) > 4 else 5
-        out = await sw.tame_animal(int(sys.argv[3]), skill, sid)
+        skill = int(ARGS[4]) if len(ARGS) > 4 else 5
+        out = await sw.tame_animal(int(ARGS[3]), skill, sid)
     else:
         out = await sw.get_wonders_overview(sid)
     if not out:
@@ -264,8 +338,11 @@ async def cmd_horror():
              '       cli.py horror detail <infestation-id>\n'
              '       cli.py horror contain <infestation-id> "<measure name>"\n'
              '       cli.py horror eradicate <infestation-id> [strategy]')
-    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
-    action = sys.argv[2] if len(sys.argv) > 2 else "threats"
+    # A session flag anywhere in argv shifts every positional index, so the action parses the
+    # stripped list. Without this, `map --session=3 find Bayu` read the flag as the action.
+    ARGS = [a for a in sys.argv if not a.startswith("--session")]
+    sid = int(take_session_flag(sys.argv)[0] or Config.SESSION_ID)
+    action = ARGS[2] if len(ARGS) > 2 else "threats"
     from modules import space_horror as sh
     if action == "measures":
         for row in await sh.get_containment_measures():
@@ -276,18 +353,18 @@ async def cmd_horror():
             print(f"  {row.get('name')} · {row.get('type')}")
         await Database.close(); return
     if action == "detail":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        out = await sh.get_infestation_detail(int(sys.argv[3]), sid)
+        out = await sh.get_infestation_detail(int(ARGS[3]), sid)
     elif action == "contain":
-        if len(sys.argv) < 5:
+        if len(ARGS) < 5:
             print(usage); await Database.close(); return
-        out = await sh.apply_containment(sid, int(sys.argv[3]), sys.argv[4])
+        out = await sh.apply_containment(sid, int(ARGS[3]), ARGS[4])
     elif action == "eradicate":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        strategy = sys.argv[4] if len(sys.argv) > 4 else "systematic"
-        out = await sh.launch_eradication(sid, int(sys.argv[3]), strategy)
+        strategy = ARGS[4] if len(ARGS) > 4 else "systematic"
+        out = await sh.launch_eradication(sid, int(ARGS[3]), strategy)
     else:
         rows = await sh.get_active_threats(sid)
         out = {"threats": len(rows)}
@@ -313,8 +390,11 @@ async def cmd_mega():
              "       cli.py mega port-types | ports\n"
              "       cli.py mega build-port <territory-id> <port-type-id> [name]\n"
              "       cli.py mega upgrade-port <port-id> <upgrade-name>")
-    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
-    action = sys.argv[2] if len(sys.argv) > 2 else "status"
+    # A session flag anywhere in argv shifts every positional index, so the action parses the
+    # stripped list. Without this, `map --session=3 find Bayu` read the flag as the action.
+    ARGS = [a for a in sys.argv if not a.startswith("--session")]
+    sid = int(take_session_flag(sys.argv)[0] or Config.SESSION_ID)
+    action = ARGS[2] if len(ARGS) > 2 else "status"
     from modules import megastructures_ports as mp
     if action == "types":
         for row in await mp.get_megastructure_types():
@@ -326,20 +406,20 @@ async def cmd_mega():
                   f" · {row.get('build_cost_credits')} credits")
         await Database.close(); return
     if action == "start":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        sector = int(sys.argv[4]) if len(sys.argv) > 4 else None
-        territory = int(sys.argv[5]) if len(sys.argv) > 5 else None
-        out = await mp.start_construction(sid, int(sys.argv[3]), sector, territory)
+        sector = int(ARGS[4]) if len(ARGS) > 4 else None
+        territory = int(ARGS[5]) if len(ARGS) > 5 else None
+        out = await mp.start_construction(sid, int(ARGS[3]), sector, territory)
     elif action == "build-port":
-        if len(sys.argv) < 5:
+        if len(ARGS) < 5:
             print(usage); await Database.close(); return
-        name = sys.argv[5] if len(sys.argv) > 5 else None
-        out = await mp.build_port(sid, int(sys.argv[3]), int(sys.argv[4]), name)
+        name = ARGS[5] if len(ARGS) > 5 else None
+        out = await mp.build_port(sid, int(ARGS[3]), int(ARGS[4]), name)
     elif action == "upgrade-port":
-        if len(sys.argv) < 5:
+        if len(ARGS) < 5:
             print(usage); await Database.close(); return
-        out = await mp.upgrade_port(sid, int(sys.argv[3]), sys.argv[4])
+        out = await mp.upgrade_port(sid, int(ARGS[3]), ARGS[4])
     elif action == "ports":
         out = {"ports": len(await mp.get_port_overview(sid))}
     else:
@@ -362,31 +442,34 @@ async def cmd_build():
              '       cli.py build show <instance-id>\n'
              '       cli.py build new <type-id> ["name"]\n'
              '       cli.py build upgrade <instance-id>')
-    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
-    action = sys.argv[2] if len(sys.argv) > 2 else "list"
+    # A session flag anywhere in argv shifts every positional index, so the action parses the
+    # stripped list. Without this, `map --session=3 find Bayu` read the flag as the action.
+    ARGS = [a for a in sys.argv if not a.startswith("--session")]
+    sid = int(take_session_flag(sys.argv)[0] or Config.SESSION_ID)
+    action = ARGS[2] if len(ARGS) > 2 else "list"
     from modules import infrastructure
     if action == "types":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        rows = await infrastructure.get_types_by_category(sys.argv[3])
-        print(f"  {len(rows)} type(s) in {sys.argv[3]}")
+        rows = await infrastructure.get_types_by_category(ARGS[3])
+        print(f"  {len(rows)} type(s) in {ARGS[3]}")
         for row in rows:
             print(f"  #{row['id']} {row['name']} · tier {row.get('fantasy_tier')}"
                   f" · {row.get('build_cost_credits')} credits")
         await Database.close(); return
     if action == "new":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        name = sys.argv[4] if len(sys.argv) > 4 else None
-        out = await infrastructure.build_infrastructure(sid, int(sys.argv[3]), name=name)
+        name = ARGS[4] if len(ARGS) > 4 else None
+        out = await infrastructure.build_infrastructure(sid, int(ARGS[3]), name=name)
     elif action == "show":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        out = await infrastructure.get_infrastructure(int(sys.argv[3]), sid)
+        out = await infrastructure.get_infrastructure(int(ARGS[3]), sid)
     elif action == "upgrade":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        out = await infrastructure.upgrade_infrastructure(sid, int(sys.argv[3]))
+        out = await infrastructure.upgrade_infrastructure(sid, int(ARGS[3]))
     else:
         rows = await infrastructure.list_infrastructure(sid)
         out = {"facilities": len(rows)}
@@ -410,17 +493,20 @@ async def cmd_cargo():
     usage = ('Usage: cli.py cargo create "<item>" <qty> <location-type> <location-id>\n'
              '       cli.py cargo ship <cargo-id> <dest-type> <dest-id> <ship-id>\n'
              '       cli.py cargo status')
-    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
-    action = sys.argv[2] if len(sys.argv) > 2 else "status"
+    # A session flag anywhere in argv shifts every positional index, so the action parses the
+    # stripped list. Without this, `map --session=3 find Bayu` read the flag as the action.
+    ARGS = [a for a in sys.argv if not a.startswith("--session")]
+    sid = int(take_session_flag(sys.argv)[0] or Config.SESSION_ID)
+    action = ARGS[2] if len(ARGS) > 2 else "status"
     from modules import logistics
     if action == "create":
-        if len(sys.argv) < 7:
+        if len(ARGS) < 7:
             print(usage); await Database.close(); return
-        out = await logistics.create_cargo(sys.argv[3], float(sys.argv[4]), sys.argv[5], int(sys.argv[6]), sid)
+        out = await logistics.create_cargo(ARGS[3], float(ARGS[4]), ARGS[5], int(ARGS[6]), sid)
     elif action == "ship":
-        if len(sys.argv) < 7:
+        if len(ARGS) < 7:
             print(usage); await Database.close(); return
-        out = await logistics.transport(int(sys.argv[3]), sys.argv[4], int(sys.argv[5]), int(sys.argv[6]), sid)
+        out = await logistics.transport(int(ARGS[3]), ARGS[4], int(ARGS[5]), int(ARGS[6]), sid)
     else:
         rows = await Database.fetch(
             "SELECT id, item_type, quantity, location_type, location_id FROM maya_rp.cargo"
@@ -443,17 +529,20 @@ async def cmd_science():
     usage = ('Usage: cli.py science mission "<type>"\n'
              '       cli.py science anomaly "<location>"\n'
              '       cli.py science status')
-    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
-    action = sys.argv[2] if len(sys.argv) > 2 else "status"
+    # A session flag anywhere in argv shifts every positional index, so the action parses the
+    # stripped list. Without this, `map --session=3 find Bayu` read the flag as the action.
+    ARGS = [a for a in sys.argv if not a.startswith("--session")]
+    sid = int(take_session_flag(sys.argv)[0] or Config.SESSION_ID)
+    action = ARGS[2] if len(ARGS) > 2 else "status"
     from modules import exoscience
     if action == "mission":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        out = await exoscience.start_mission(sys.argv[3], sid)
+        out = await exoscience.start_mission(ARGS[3], sid)
     elif action == "anomaly":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        out = await exoscience.generate_anomaly(sys.argv[3], sid)
+        out = await exoscience.generate_anomaly(ARGS[3], sid)
     else:
         out = await exoscience.run_tick(sid)
     for key, value in (out or {}).items():
@@ -473,25 +562,28 @@ async def cmd_mystery():
              '       cli.py mystery clue <investigation-id> "<text>" [source]\n'
              '       cli.py mystery deduce <investigation-id> ["note"]\n'
              '       cli.py mystery status')
-    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
-    action = sys.argv[2] if len(sys.argv) > 2 else "status"
+    # A session flag anywhere in argv shifts every positional index, so the action parses the
+    # stripped list. Without this, `map --session=3 find Bayu` read the flag as the action.
+    ARGS = [a for a in sys.argv if not a.startswith("--session")]
+    sid = int(take_session_flag(sys.argv)[0] or Config.SESSION_ID)
+    action = ARGS[2] if len(ARGS) > 2 else "status"
     from modules import mystery
     if action == "new":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        template = sys.argv[4] if len(sys.argv) > 4 else "generic"
-        difficulty = int(sys.argv[5]) if len(sys.argv) > 5 else 5
-        out = await mystery.create_investigation(sid, sys.argv[3], template, difficulty)
+        template = ARGS[4] if len(ARGS) > 4 else "generic"
+        difficulty = int(ARGS[5]) if len(ARGS) > 5 else 5
+        out = await mystery.create_investigation(sid, ARGS[3], template, difficulty)
     elif action == "clue":
-        if len(sys.argv) < 5:
+        if len(ARGS) < 5:
             print(usage); await Database.close(); return
-        source = sys.argv[5] if len(sys.argv) > 5 else "discovery"
-        out = await mystery.add_clue(sid, int(sys.argv[3]), sys.argv[4], source=source)
+        source = ARGS[5] if len(ARGS) > 5 else "discovery"
+        out = await mystery.add_clue(sid, int(ARGS[3]), ARGS[4], source=source)
     elif action == "deduce":
-        if len(sys.argv) < 4:
+        if len(ARGS) < 4:
             print(usage); await Database.close(); return
-        note = sys.argv[4] if len(sys.argv) > 4 else ""
-        out = await mystery.deduce(sid, int(sys.argv[3]), note)
+        note = ARGS[4] if len(ARGS) > 4 else ""
+        out = await mystery.deduce(sid, int(ARGS[3]), note)
     else:
         out = await mystery.run_tick(sid)
     for key, value in (out or {}).items():
@@ -509,13 +601,16 @@ async def cmd_character():
        cli.py character "<name>" outfit '{"id": "...", "name": "..."}'
        cli.py character "<name>" wear <outfit-id>
        cli.py character "<name>" profile '{"face": "..."}'"""
-    if len(sys.argv) < 5:
+    if len(ARGS) < 5:
         print(usage)
         await Database.close()
         return
-    name, action, payload = sys.argv[2], sys.argv[3], sys.argv[4]
+    name, action, payload = ARGS[2], ARGS[3], ARGS[4]
     from modules.character_profile import grant
-    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
+    # A session flag anywhere in argv shifts every positional index, so the action parses the
+    # stripped list. Without this, `map --session=3 find Bayu` read the flag as the action.
+    ARGS = [a for a in sys.argv if not a.startswith("--session")]
+    sid = int(take_session_flag(sys.argv)[0] or Config.SESSION_ID)
     row = await Database.fetchrow(
         # Wildcards go in the parameter, not in the SQL: building them in the statement needs
         # four levels of quoting and one of them always wins.
@@ -2543,6 +2638,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_social())
     elif cmd in ("prison", "prisoner", "capture"):
         asyncio.run(cmd_prison())
+    elif cmd in ("map", "celestial", "systems"):
+        asyncio.run(cmd_map())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

@@ -84,6 +84,10 @@ OCCASIONS: dict[str, tuple[str, tuple[str, ...]]] = {
 #: bottom. The renderer takes the size from the same entry, so the two cannot drift apart.
 FRAMING: dict[str, dict[str, Any]] = {
     "bust": {"clause": "head and shoulders portrait, chest-up", "width": 512, "height": 512},
+    # 4:5 lands the crop at the chest, 2:3 at the hip. The ratio is the stronger lever and the
+    # clause refines it, which is why `chest` is its own entry rather than a longer sentence.
+    "chest": {"clause": "chest-up portrait, from the top of the head down to just below the chest",
+              "width": 512, "height": 640},
     "waist": {"clause": "waist-up medium shot, from the top of the head down to the waist, both hands"
                         " in frame, the hip line visible", "width": 512, "height": 768},
     "knee": {"clause": "knee-up shot, from the knee to the top of the head, hands visible",

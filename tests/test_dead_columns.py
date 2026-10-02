@@ -33,6 +33,14 @@ KNOWN_DEAD: dict[str, set[str]] = {
 }
 
 
+#: Named in code, but only written: `seed_session_map.py` clears these on the copy, and nothing
+#: reads them to decide anything. They are recorded here so the ratchet keeps its meaning, which is
+#: "a column nobody reads", and so a column can only leave KNOWN_DEAD by a deliberate note.
+KNOWN_WRITE_ONLY: dict[str, set[str]] = {
+    "territory": {"last_battle_session", "last_campaign"},
+}
+
+
 def _code() -> str:
     text = ""
     for folder in CODE_DIRS:
@@ -74,7 +82,7 @@ def _dead_columns(table: str) -> set[str]:
 @pytest.mark.parametrize("table", sorted(KNOWN_DEAD))
 def test_no_new_dead_column(table):
     dead = _dead_columns(table)
-    added = dead - KNOWN_DEAD[table]
+    added = dead - KNOWN_DEAD[table] - KNOWN_WRITE_ONLY.get(table, set())
     assert not added, (
         f"{table}: these columns are never named in code: {sorted(added)}. Either read them or "
         f"strike them off KNOWN_DEAD deliberately"
@@ -83,8 +91,13 @@ def test_no_new_dead_column(table):
 
 @pytest.mark.parametrize("table", sorted(KNOWN_DEAD))
 def test_a_column_that_became_live_is_struck_off(table):
+    """A column may leave KNOWN_DEAD only by landing in KNOWN_WRITE_ONLY or by becoming live.
+
+    This is the deliberate step: the ratchet is worth nothing if a column can quietly move from "no
+    code names it" to "one script clears it" without anyone writing down which happened.
+    """
     dead = _dead_columns(table)
-    revived = KNOWN_DEAD[table] - dead
+    revived = KNOWN_DEAD[table] - dead - KNOWN_WRITE_ONLY.get(table, set())
     assert not revived, (
         f"{table}: {sorted(revived)} are now named in code; remove them from KNOWN_DEAD so the "
         f"list keeps meaning something"

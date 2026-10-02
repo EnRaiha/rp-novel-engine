@@ -29,6 +29,8 @@ TABLES = {
     "factions": "SELECT count(*), md5(string_agg(id::text || coalesce(stance,'') || coalesce(stance_score::text,'') || coalesce(stance_at::text,'') || coalesce(systems_held::text,'') || coalesce(scale_class,'') || coalesce(doctrine,'') || coalesce(origin,'') || coalesce(trust::text,''), '|' ORDER BY id)) FROM maya_rp.factions",
     "ships": "SELECT count(*), md5(string_agg(id::text || coalesce(tier::text,'') || coalesce(faction_id::text,'') || coalesce(class_id::text,''), '|' ORDER BY id)) FROM maya_rp.ships",
     "territory": "SELECT count(*), md5(string_agg(id::text || coalesce(controlling_faction,'') || coalesce(contested_by::text,'') || coalesce(updated_at::text,''), '|' ORDER BY id)) FROM maya_rp.territory",
+    "planets": "SELECT count(*), md5(string_agg(id::text || coalesce(session_id::text,'') || coalesce(name,''), '|' ORDER BY id)) FROM maya_rp.planets",
+    "ports": "SELECT count(*), md5(string_agg(id::text || coalesce(name,''), '|' ORDER BY id)) FROM maya_rp.ports",
 }
 
 DRY_RUNS = (
@@ -37,6 +39,7 @@ DRY_RUNS = (
     ("ship_tiers.py", ["--dry-run"]),
     ("ship_fleet.py", ["--dry-run"]),
     ("restore_mythic_tiers.py", ["--dry-run"]),
+    ("seed_session_map.py", ["--dry-run"]),
 )
 
 

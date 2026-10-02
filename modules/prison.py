@@ -317,7 +317,7 @@ async def interrogate(
     row = await Database.fetchrow(
         "SELECT id, name, faction, resistance, intel_value, secrets_jsonb, "
         "interrogations_count, last_interrogation_method, status "
-        "FROM maya_rp.prisoners WHERE id = $1", prisoner_id
+        "FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2", prisoner_id, session_id
     )
     if not row:
         return {"success": False, "error": "Prisoner not found"}
@@ -406,16 +406,19 @@ def get_interrogation_tier_info(tier: str) -> dict[str, Any]:
 
 async def check_conversion(
     prisoner_id: int,
+    session_id: int | None = None,
 ) -> dict[str, Any] | None:
     """
     Check if a prisoner qualifies for any conversion path.
     Ported from PrisonerConversion.checkConversion().
     Returns {path, base_chance, loyalty_cap, narrative} or None.
     """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     row = await Database.fetchrow(
         "SELECT id, name, faction, rank, resistance, interrogations_count, "
         "last_interrogation_method, intimacy_path, held_sessions, status "
-        "FROM maya_rp.prisoners WHERE id = $1", prisoner_id
+        "FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2", prisoner_id, session_id
     )
     if not row:
         return None
@@ -479,8 +482,8 @@ async def execute_conversion(
     chance = cfg["base_chance"]
     # Apply low_rank modifier if applicable
     row = await Database.fetchrow(
-        "SELECT name, faction, rank, cell_ship_id AS ship_id FROM maya_rp.prisoners WHERE id = $1",
-        prisoner_id
+        "SELECT name, faction, rank, cell_ship_id AS ship_id FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2",
+        prisoner_id, session_id
     )
     if row:
         p = dict(row)
@@ -530,7 +533,7 @@ async def record_death(
         "UPDATE maya_rp.prisoners SET status = 'dead', death_cause = $1, death_session = $2 WHERE id = $3",
         cause, session_id, prisoner_id,
     )
-    row = await Database.fetchrow("SELECT name, faction FROM maya_rp.prisoners WHERE id = $1", prisoner_id)
+    row = await Database.fetchrow("SELECT name, faction FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2", prisoner_id, session_id)
     if row:
         info("prison", f"Prisoner {row['name']} died: {cause}")
     return dict(row) if row else None
@@ -588,13 +591,17 @@ async def get_available_intimacy_paths(
     brutality: int = 0,
     charisma: int = 0,
     sessions_since_capture: int = 0,
+    session_id: int | None = None,
 ) -> list[str]:
     """
     Determine available intimacy paths for a prisoner.
     Ported from PrisonerIntimacy.getAvailablePaths().
     """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     row = await Database.fetchrow(
-        "SELECT resistance FROM maya_rp.prisoners WHERE id = $1", prisoner_id
+        "SELECT resistance FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2",
+        prisoner_id, session_id
     )
     if not row:
         return []
@@ -702,7 +709,7 @@ async def _handle_intimacy_risk(
     """Handle risk consequence. Ported from PrisonerIntimacy.handleRisk()."""
     # Fetch prisoner name for narrative
     try:
-        row = await Database.fetchrow("SELECT name, faction FROM maya_rp.prisoners WHERE id = $1", prisoner_id)
+        row = await Database.fetchrow("SELECT name, faction FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2", prisoner_id, session_id)
         name = row["name"] if row else "Unknown"
         faction = row["faction"] if row else "unknown"
     except Exception:
@@ -740,6 +747,8 @@ async def get_fleet_capacity(
     session_id: int | None = None,
 ) -> dict[str, Any]:
     """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     Get fleet-wide cell capacity stats.
     Ported from PrisonState.getFleetCapacity().
     """
@@ -817,14 +826,17 @@ async def assign_cell(
 async def calculate_escape_risk(
     prisoner_id: int,
     sessions_since_capture: int = 0,
+    session_id: int | None = None,
 ) -> dict[str, Any]:
     """
     Calculate escape probability for a prisoner.
     Ported from PrisonState.calculateEscapeRisk().
     """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     row = await Database.fetchrow(
         "SELECT resistance, cell_security, escape_risk_pct, status "
-        "FROM maya_rp.prisoners WHERE id = $1", prisoner_id
+        "FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2", prisoner_id, session_id
     )
     if not row:
         return {"error": "Prisoner not found"}
@@ -898,17 +910,20 @@ async def upgrade_security(
     prisoner_id: int,
     new_level: str = "standard",
     guards: int = 0,
+    session_id: int | None = None,
 ) -> dict[str, Any]:
     """
     Increase security for a prisoner.
     Ported from PrisonState.upgradeSecurity().
     """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     valid = ["minimal", "standard", "maximum", "isolated"]
     if new_level not in valid:
         new_level = "standard"
 
     row = await Database.fetchrow(
-        "SELECT resistance FROM maya_rp.prisoners WHERE id = $1", prisoner_id
+        "SELECT resistance FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2", prisoner_id, session_id
     )
     if not row:
         return {"error": "Prisoner not found"}
@@ -954,7 +969,7 @@ async def apply_countermeasure(
         return None
 
     row = await Database.fetchrow(
-        "SELECT escape_risk_pct FROM maya_rp.prisoners WHERE id = $1", prisoner_id
+        "SELECT escape_risk_pct FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2", prisoner_id, session_id
     )
     if not row:
         return None

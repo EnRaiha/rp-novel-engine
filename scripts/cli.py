@@ -93,6 +93,34 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_science():
+    """science {mission <type> | anomaly <location> | status} — the exoscience board.
+
+    `start_mission` and `generate_anomaly` were the two unreachable entry points of the module:
+    `run_tick` progressed missions and studied anomalies that nothing could create.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py science mission "<type>"\n'
+             '       cli.py science anomaly "<location>"\n'
+             '       cli.py science status')
+    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
+    action = sys.argv[2] if len(sys.argv) > 2 else "status"
+    from modules import exoscience
+    if action == "mission":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await exoscience.start_mission(sys.argv[3], sid)
+    elif action == "anomaly":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await exoscience.generate_anomaly(sys.argv[3], sid)
+    else:
+        out = await exoscience.run_tick(sid)
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
 async def cmd_mystery():
     """mystery {new <title> | clue <inv-id> <text> | deduce <inv-id> [note] | status} — the case file.
 
@@ -2159,6 +2187,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_character())
     elif cmd == "mystery" or cmd == "investigation":
         asyncio.run(cmd_mystery())
+    elif cmd == "science" or cmd == "exoscience":
+        asyncio.run(cmd_science())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

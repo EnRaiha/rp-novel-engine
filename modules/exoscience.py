@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
 """Exoscience — Ported from Rust exoscience.rs. Science missions, anomalies, theories."""
 from __future__ import annotations
+import hashlib
 import random
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import info, warn
+
+def _pace(*parts: object) -> int:
+    """A stable 5..15 pace for one row, derived from the row's own state.
+
+    The tick used `random.randint(5, 15)`, so running it twice on the same state gave two different
+    campaigns. A digest of the row's identity and its progress keeps the variety without losing
+    reproducibility: the same state always advances the same way.
+    """
+    seed = hashlib.blake2s("|".join(str(part) for part in parts).encode(), digest_size=4).digest()
+    return 5 + (int.from_bytes(seed, "big") % 11)
+
 
 ANOMALY_TYPES = ["gravity_well","temporal_rift","bio_signal","energy_surge","precursor_signal","void_echo"]
 ANOMALY_PREFIXES = ["Anomalous","Deep","Void","Phantom","Resonant","Shifting","Silent","Ancient","Pulsing","Crimson"]
@@ -16,20 +28,31 @@ async def run_tick(session_id: int | None = None) -> dict:
         # Progress active science missions
         missions = await Database.fetch("SELECT id, mission_type, progress, target_progress, research_reward FROM maya_rp.science_missions WHERE session_id=$1 AND status='active'", session_id)
         completed = 0
+        unpaid = 0
         for m in missions:
-            gain = random.randint(5, 15)
+            gain = _pace(session_id, m["id"], m["progress"])
             new_progress = min(m["target_progress"], m["progress"] + gain)
             is_done = new_progress >= m["target_progress"]
             await Database.execute("UPDATE maya_rp.science_missions SET progress=$1, status=$2 WHERE id=$3", new_progress, "completed" if is_done else "active", m["id"])
             if is_done:
-                await Database.execute("UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2", m["research_reward"], session_id)
+                # A session with no resources row takes the reward and loses it silently: the UPDATE
+                # matches nothing and reports no error. Session 5 is in exactly that state, so the
+                # tick says what it could not pay instead of counting it as paid.
+                paid = await Database.fetchval(
+                    "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2"
+                    " RETURNING credits", m["research_reward"], session_id)
+                if paid is None:
+                    unpaid += 1
+                    warn("exoscience",
+                         f"mission {m['id']} completed but session {session_id} has no resources row;"
+                         f" {m['research_reward']} credits were not paid")
                 completed += 1
 
         # Collect data from anomalies
         anomalies = await Database.fetch("SELECT id, name, data_collected, data_threshold FROM maya_rp.anomalies_catalog WHERE session_id=$1 AND studied=false", session_id)
         studied = 0
         for a in anomalies:
-            collected = a["data_collected"] + random.randint(5, 15)
+            collected = a["data_collected"] + _pace(session_id, a["id"], a["data_collected"])
             if collected >= a["data_threshold"]:
                 await Database.execute("UPDATE maya_rp.anomalies_catalog SET studied=true, data_collected=$1 WHERE id=$2", collected, a["id"])
                 studied += 1
@@ -37,7 +60,10 @@ async def run_tick(session_id: int | None = None) -> dict:
                 await Database.execute("UPDATE maya_rp.anomalies_catalog SET data_collected=$1 WHERE id=$2", collected, a["id"])
 
         info("exoscience", f"Tick: {completed} missions, {studied} anomalies studied")
-        return {"missions_completed": completed, "anomalies_studied": studied}
+        out = {"missions_completed": completed, "anomalies_studied": studied}
+        if unpaid:
+            out["rewards_unpaid"] = unpaid
+        return out
     except Exception as e:
         info("exoscience", f"Error: {e}")
         return {"error": str(e)}

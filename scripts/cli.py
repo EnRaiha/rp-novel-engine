@@ -93,6 +93,99 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_op():
+    """op {darkops | run <operation> "<target>" | log | espionage <faction> <mission-type> <agent> |
+    espionage-log}
+
+    Five entry points across two modules had no caller: the dark operation runner and its log, and the
+    espionage mission runner and its log. The engine could plan operations and stage none.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py op darkops | log\n'
+             '       cli.py op run <operation> "<target>"\n'
+             '       cli.py op espionage <faction> <mission-type> <agent> | espionage-log')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "darkops"
+    from modules import darkops, espionage
+    if action == "run":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await darkops.run_op(sys.argv[3], sys.argv[4], sid)
+    elif action == "espionage":
+        if len(sys.argv) < 6:
+            print(usage); await Database.close(); return
+        out = await espionage.run_espionage(sys.argv[3], sys.argv[4], sys.argv[5], sid)
+    elif action == "espionage-log":
+        rows = await espionage.list_espionage_log(sid)
+        out = {"entries": len(rows)}
+        for row in rows[:8]:
+            print(f"  {row}")
+    elif action == "log":
+        rows = await darkops.list_darkops(sid)
+        out = {"operations": len(rows)}
+        for row in rows[:8]:
+            print(f"  {row}")
+    else:
+        rows = await darkops.list_darkops(sid)
+        out = {"operations": len(rows)}
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
+        print("  no result")
+    else:
+        print(f"  result: {out}")
+    await Database.close()
+
+
+async def cmd_craft():
+    """craft {recipes | transmute "<recipe>" [qty] | blueprints | sell <project-id> "<buyer>" [markdown] |
+    enroll <crew-id> <program-id> <campus-id>}
+
+    Five entry points across three modules had no caller: the recipe list and the transmutation in
+    alchemy.py, the saleable blueprint list and its sale in corporations.py, and the academy enrolment.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py craft recipes | transmute "<recipe>" [qty]\n'
+             '       cli.py craft blueprints | sell <project-id> "<buyer>" [markdown-pct]\n'
+             '       cli.py craft enroll <crew-id> <program-id> <campus-id>')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "recipes"
+    from modules import academy, alchemy, corporations
+    if action == "transmute":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        qty = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+        out = await alchemy.transmute(sys.argv[3], qty, sid)
+    elif action == "blueprints":
+        rows = await corporations.list_saleable_blueprints(sid)
+        out = {"blueprints": len(rows)}
+        for row in rows[:8]:
+            print(f"  {row}")
+    elif action == "sell":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        markdown = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+        out = await corporations.sell_blueprint(sid, int(sys.argv[3]), sys.argv[4], markdown)
+    elif action == "enroll":
+        if len(sys.argv) < 6:
+            print(usage); await Database.close(); return
+        out = await academy.enroll_crew(int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sid)
+    else:
+        rows = await alchemy.list_recipes()
+        out = {"recipes": len(rows)}
+        for row in rows[:8]:
+            print(f"  {row}")
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
+        print("  no result")
+    else:
+        print(f"  result: {out}")
+    await Database.close()
+
+
 async def cmd_world():
     """world {where <character-id> "<location>" | goto "<location>" ["ship"] | seeds | plant <type>
     "<content>" | foreshadow <seed-id> | sites [count] | excavate <site-id> | secret | discover "<context>"}
@@ -3397,6 +3490,10 @@ if __name__ == "__main__":
         asyncio.run(cmd_inner())
     elif cmd in ("burn", "fleet-economy", "caravan"):
         asyncio.run(cmd_burn())
+    elif cmd in ("op", "darkops", "espionage"):
+        asyncio.run(cmd_op())
+    elif cmd in ("craft", "alchemy", "corp", "corporation", "academy"):
+        asyncio.run(cmd_craft())
     elif cmd in ("encounter", "encounters", "events"):
         asyncio.run(cmd_encounter())
     else:

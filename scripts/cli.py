@@ -93,6 +93,50 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_shipyard():
+    """shipyard {shortage | build <class> <tier> <type> "<name>" "<location>" |
+    capacity <required-crew> | assign <ship-id> <required-crew>}
+
+    Four entry points of `modules/ship_building.py` had no caller: the builder, the capacity check, the
+    crew assignment and the shortage report. A hull could not be laid down, so the fleet had nothing to
+    assign crew to.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py shipyard shortage\n'
+             '       cli.py shipyard build <class> <tier> <type> "<name>" "<location>"\n'
+             '       cli.py shipyard capacity <required-crew>\n'
+             '       cli.py shipyard assign <ship-id> <required-crew>')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "shortage"
+    from modules import ship_building
+    if action == "build":
+        if len(sys.argv) < 8:
+            print(usage); await Database.close(); return
+        out = await ship_building.build_ship(sys.argv[3], int(sys.argv[4]), sys.argv[5], sys.argv[6],
+                                             sys.argv[7], sid)
+    elif action == "capacity":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await ship_building.check_crew_capacity(sid, int(sys.argv[3]))
+    elif action == "assign":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await ship_building.assign_crew_to_ship(sid, int(sys.argv[3]), int(sys.argv[4]))
+    else:
+        out = await ship_building.crew_shortage_report(sid)
+    # A function that answers with a bool, a number or a list had its answer swallowed here: `or {}`
+    # turned False into an empty dict and the script printed "no result", which reads as "nothing
+    # happened" when the answer was actually no.
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
+        print("  no result")
+    else:
+        print(f"  result: {out}")
+    await Database.close()
+
+
 async def cmd_fleet():
     """fleet {list | create "<name>" [formation] | assign "<ship>" "<fleet>" [position] |
     battle "<fleet>" ["tactic"] [threat]}
@@ -131,10 +175,16 @@ async def cmd_fleet():
         out = {"fleets": len(rows)}
         for row in rows[:10]:
             print(f"  {row}")
-    if not out:
+    # A function that answers with a bool, a number or a list had its answer swallowed here: `or {}`
+    # turned False into an empty dict and the script printed "no result", which reads as "nothing
+    # happened" when the answer was actually no.
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
         print("  no result")
-    for key, value in (out or {}).items():
-        print(f"  {key}: {value}")
+    else:
+        print(f"  result: {out}")
     await Database.close()
 
 
@@ -168,10 +218,16 @@ async def cmd_career():
         out = await crew_career.award(int(sys.argv[3]), int(sys.argv[4]), source, sid)
     else:
         out = await crew_career.talent_shortage(sid)
-    if not out:
+    # A function that answers with a bool, a number or a list had its answer swallowed here: `or {}`
+    # turned False into an empty dict and the script printed "no result", which reads as "nothing
+    # happened" when the answer was actually no.
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
         print("  no result")
-    for key, value in (out or {}).items():
-        print(f"  {key}: {value}")
+    else:
+        print(f"  result: {out}")
     await Database.close()
 
 
@@ -211,10 +267,16 @@ async def cmd_spy():
         out = {"cloaks": len(rows)}
         for row in rows[:10]:
             print(f"  {row}")
-    if not out:
+    # A function that answers with a bool, a number or a list had its answer swallowed here: `or {}`
+    # turned False into an empty dict and the script printed "no result", which reads as "nothing
+    # happened" when the answer was actually no.
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
         print("  no result")
-    for key, value in (out or {}).items():
-        print(f"  {key}: {value}")
+    else:
+        print(f"  result: {out}")
     await Database.close()
 
 
@@ -255,10 +317,16 @@ async def cmd_tech():
         out = {"technologies": len(rows)}
         for row in (rows or [])[:8]:
             print(f"  {row}")
-    if not out:
+    # A function that answers with a bool, a number or a list had its answer swallowed here: `or {}`
+    # turned False into an empty dict and the script printed "no result", which reads as "nothing
+    # happened" when the answer was actually no.
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
         print("  no result")
-    for key, value in (out or {}).items():
-        print(f"  {key}: {value}")
+    else:
+        print(f"  result: {out}")
     await Database.close()
 
 
@@ -309,10 +377,16 @@ async def cmd_forge():
     else:
         rows = await wd.list_weapons()
         out = {"weapons": len(rows)}
-    if not out:
+    # A function that answers with a bool, a number or a list had its answer swallowed here: `or {}`
+    # turned False into an empty dict and the script printed "no result", which reads as "nothing
+    # happened" when the answer was actually no.
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
         print("  no result")
-    for key, value in (out or {}).items():
-        print(f"  {key}: {value}")
+    else:
+        print(f"  result: {out}")
     await Database.close()
 
 
@@ -385,10 +459,16 @@ async def cmd_council():
         out = {"seats": len(seats), "valid": council.validate_cabinet(seats)}
         for seat in seats[:12]:
             print(f"  {seat.get('seat_name') or seat.get('seat')}: {seat.get('holder_name') or seat.get('holder')}")
-    if not out:
+    # A function that answers with a bool, a number or a list had its answer swallowed here: `or {}`
+    # turned False into an empty dict and the script printed "no result", which reads as "nothing
+    # happened" when the answer was actually no.
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
         print("  no result")
-    for key, value in (out or {}).items():
-        print(f"  {key}: {value}")
+    else:
+        print(f"  result: {out}")
     await Database.close()
 
 
@@ -521,10 +601,16 @@ async def cmd_prison():
         out = await prison.record_death(int(sys.argv[3]), sys.argv[4], sid)
     else:
         out = await prison.get_fleet_capacity(sid)
-    if not out:
+    # A function that answers with a bool, a number or a list had its answer swallowed here: `or {}`
+    # turned False into an empty dict and the script printed "no result", which reads as "nothing
+    # happened" when the answer was actually no.
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
         print("  no result")
-    for key, value in (out or {}).items():
-        print(f"  {key}: {value}")
+    else:
+        print(f"  result: {out}")
     await Database.close()
 
 
@@ -567,10 +653,16 @@ async def cmd_social():
         out = await social.shift_bond(sid, int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]))
     else:
         out = await social.run_tick(sid)
-    if not out:
+    # A function that answers with a bool, a number or a list had its answer swallowed here: `or {}`
+    # turned False into an empty dict and the script printed "no result", which reads as "nothing
+    # happened" when the answer was actually no.
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
         print("  no result")
-    for key, value in (out or {}).items():
-        print(f"  {key}: {value}")
+    else:
+        print(f"  result: {out}")
     await Database.close()
 
 
@@ -654,10 +746,16 @@ async def cmd_horror():
         out = {"threats": len(rows)}
         for row in rows:
             print(f"  #{row.get('id')} {row.get('name')} · {row.get('status')}")
-    if not out:
+    # A function that answers with a bool, a number or a list had its answer swallowed here: `or {}`
+    # turned False into an empty dict and the script printed "no result", which reads as "nothing
+    # happened" when the answer was actually no.
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
         print("  no result")
-    for key, value in (out or {}).items():
-        print(f"  {key}: {value}")
+    else:
+        print(f"  result: {out}")
     await Database.close()
 
 
@@ -754,10 +852,16 @@ async def cmd_build():
         for row in rows:
             print(f"  #{row['id']} {row.get('name')} · {row.get('type_name')}"
                   f" · level {row.get('level')} · {row.get('territory_name') or row.get('sector_id')}")
-    if not out:
+    # A function that answers with a bool, a number or a list had its answer swallowed here: `or {}`
+    # turned False into an empty dict and the script printed "no result", which reads as "nothing
+    # happened" when the answer was actually no.
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
         print("  no result")
-    for key, value in (out or {}).items():
-        print(f"  {key}: {value}")
+    else:
+        print(f"  result: {out}")
     await Database.close()
 
 
@@ -2918,6 +3022,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_fleet())
     elif cmd in ("career", "crew-career"):
         asyncio.run(cmd_career())
+    elif cmd in ("shipyard", "ship-building", "build-ship"):
+        asyncio.run(cmd_shipyard())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

@@ -18,9 +18,12 @@ from core.db import Database  # noqa: E402
 from modules import weapon_design as wd  # noqa: E402
 
 
-async def _credits(session_id: int) -> bool:
-    return await Database.fetchval(
-        "SELECT 1 FROM maya_rp.resources WHERE session_id=$1", session_id) is not None
+async def _enough_credits(session_id: int, need: int = 50_000_000) -> bool:
+    """A row existing is not enough: another test in the same run may have left it at zero credits, and
+    `design_blueprint` refuses rather than topping it up. This checks the balance, not the presence."""
+    found = await Database.fetchval(
+        "SELECT credits FROM maya_rp.resources WHERE session_id=$1", session_id)
+    return found is not None and float(found) >= need
 
 
 class TestTheArmouryIsShared:
@@ -31,10 +34,13 @@ class TestTheArmouryIsShared:
         await Database.init()
         made_resources = False
         try:
-            if not await _credits(5):
-                await Database.execute(
-                    "INSERT INTO maya_rp.resources (session_id, credits) VALUES (5, 50000000)")
-                made_resources = True
+            made_resources = not await _enough_credits(5)
+            # ON CONFLICT matters: the row may exist with a balance this test needs raised, and the
+            # first version of this test only inserted when the row was absent.
+            await Database.execute(
+                "INSERT INTO maya_rp.resources (session_id, credits) VALUES (5, 50000000)"
+                " ON CONFLICT (session_id) DO UPDATE SET credits = GREATEST(maya_rp.resources.credits,"
+                " 50000000)")
             first = await wd.design_blueprint("red proof twice", "Special", 0, 1, "L", 1, 5)
             assert first.get("error") is None, first
             second = await wd.design_blueprint("red proof twice", "Special", 0, 1, "L", 1, 5)

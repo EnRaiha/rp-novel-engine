@@ -102,13 +102,17 @@ async def recent_events(session_id: int, limit: int = 6) -> list[dict[str, Any]]
 async def companions_of_note(session_id: int, limit: int = 5) -> list[dict[str, Any]]:
     """The companions the scene is most likely about, by bond then id."""
     rows = await Database.fetch(
-        "SELECT c.id, c.name, c.bond, c.romance_stage, c.is_spouse, c.role,"
+        "SELECT c.id, c.name, c.bond, c.affection, c.romance_stage, c.is_spouse, c.role,"
         " (SELECT s.suspicion FROM maya_rp.ooc_suspicion s"
         "  WHERE s.session_id = c.session_id AND s.observer_id = c.id) AS suspicion"
         " FROM maya_rp.characters c"
         " WHERE c.session_id=$1 AND c.status IS DISTINCT FROM 'dead'"
-        "   AND (c.romance_flag IS TRUE OR c.is_spouse IS TRUE OR COALESCE(c.bond, 0) > 0)"
-        " ORDER BY COALESCE(c.bond, 0) DESC, c.id LIMIT $2",
+        # `affection` is in the filter on purpose: a woman may be warm toward Izzat long before
+        # any marriage, and the King's carryover sets exactly that. Reading only `bond` hid all 35
+        # wives from this block, which is how a carryover can be invisible for hours.
+        "   AND (c.romance_flag IS TRUE OR c.is_spouse IS TRUE"
+        "        OR COALESCE(c.bond, 0) > 0 OR COALESCE(c.affection, 0) > 0)"
+        " ORDER BY COALESCE(c.bond, 0) DESC, COALESCE(c.affection, 0) DESC, c.id LIMIT $2",
         int(session_id),
         int(limit),
     )
@@ -200,8 +204,11 @@ def render_blocks(blocks: dict[str, Any]) -> str:
         for companion in companions:
             band = suspicion_band(companion.get("suspicion"))
             stage = companion.get("romance_stage") or ("spouse" if companion.get("is_spouse") else "—")
+            affection = companion.get("affection") or 0
+            warmth = f"affection {affection} · " if affection else ""
             lines.append(
-                f"- {companion['name']} — bond {companion.get('bond') or 0} · {stage} · suspicion {band}"
+                f"- {companion['name']} — bond {companion.get('bond') or 0} · {warmth}{stage}"
+                f" · suspicion {band}"
             )
 
     goals = blocks.get("goals") or []

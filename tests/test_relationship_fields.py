@@ -81,3 +81,30 @@ class TestNoInvisibleRelationship:
         """
         bonded = _rows("SELECT count(*) FROM maya_rp.characters WHERE session_id = 5 AND COALESCE(bond, 0) > 0")
         assert bonded[0][0] == 0
+
+
+class TestAffectionIsVisible:
+    """A field nobody reads is a field nobody has.
+
+    `affection` was added to carry the King's first carryover part, and a column audit then found
+    it named nowhere in the code. The engine's RELATIONSHIPS block is where such a value matters,
+    so the query and the printed line both had to learn it.
+    """
+
+    def test_the_companion_query_selects_affection(self):
+        source = CONTEXT.read_text(encoding="utf-8")
+        assert "c.affection" in source
+        assert "COALESCE(c.affection, 0) > 0" in source, "affection must be part of the filter"
+
+    def test_the_printed_line_carries_affection_when_it_is_set(self):
+        source = CONTEXT.read_text(encoding="utf-8")
+        assert "affection {affection} · " in source
+
+    async def test_a_warm_companion_appears_with_no_marriage_bond(self):
+        """The King's model: affection can exist while bond_level and bond stay at zero."""
+        from core.context import companions_of_note
+
+        rows = await companions_of_note(5, limit=3)
+        assert rows, "session 5 has 35 wives at affection 4; the block must list them"
+        assert all((row["bond"] or 0) == 0 for row in rows), "nobody is married yet"
+        assert any((row["affection"] or 0) > 0 for row in rows)

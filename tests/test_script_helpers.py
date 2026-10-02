@@ -208,3 +208,35 @@ class TestSharedKeyPruning:
         """`Pirate Queen` maps to 21 characters, and the resolver refuses it. That is correct."""
         pruned = face_manifest.prune_shared_keys(["Alpha Pirate Queen", "Beta Pirate Queen"])
         assert any("Pirate Queen" in key for key in pruned["Alpha Pirate Queen"])
+
+
+class TestEmotionTokensExist:
+    """Every emotion the decorator can choose must be one the manifest can carry.
+
+    The token table is a list of literal words mapped to frame names. A typo in a frame name would
+    do nothing at all: the turn would look for a path that no character has, fall back to neutral,
+    and the mistake would be invisible. This reads both sides and refuses a name that does not exist.
+    """
+
+    def _token_emotions(self) -> set[str]:
+        import re
+
+        source = (pathlib.Path(__file__).resolve().parents[1] / "scripts" / "portrait_chat_js.py").read_text()
+        return set(re.findall(r", '([a-z]+)'\]", source))
+
+    def test_every_chosen_emotion_exists_in_the_manifest(self):
+        import json
+
+        manifest = pathlib.Path(__file__).resolve().parents[2] / "adventures/tkg-arc1-restart/prototype/faces/manifest.json"
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        carried = {row["key"] for row in payload["rows"] if row.get("kind") == "emotion"}
+        unknown = self._token_emotions() - carried
+        assert not unknown, f"the decorator chooses emotions no frame carries: {sorted(unknown)}"
+
+    def test_the_only_frame_never_chosen_is_neutral(self):
+        """Neutral is the fallback, so it is correct that no token maps to it."""
+        assert "neutral" not in self._token_emotions()
+
+    def test_the_chosen_set_covers_most_of_the_spectrum(self):
+        """Not all of it is required, but a table that lost half its rows would still pass above."""
+        assert len(self._token_emotions()) >= 12

@@ -124,14 +124,19 @@ async def encounter_animal(system_id: int, animal_id: int = None) -> dict:
     }
 
 
-async def hunt_animal(encounter_id: int, fleet_power: int = 100) -> dict:
+async def hunt_animal(encounter_id: int, fleet_power: int = 100,
+                      session_id: int | None = None) -> dict:
     """Hunt a space animal for resources."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
     enc = await Database.fetchrow(
-        "SELECT * FROM maya_rp.animal_encounters WHERE id = $1 AND status = 'active'",
-        encounter_id
+        "SELECT * FROM maya_rp.animal_encounters WHERE id = $1 AND status = 'active'"
+        " AND session_id = $2",
+        encounter_id, session_id
     )
     if not enc:
-        return {"error": "Encounter not found or already resolved."}
+        return {"error": f"Encounter {encounter_id} not found in session {session_id},"
+                         f" or already resolved."}
 
     animal = await Database.fetchrow(
         "SELECT * FROM maya_rp.space_animals WHERE id = $1", enc["animal_id"]
@@ -181,14 +186,19 @@ async def hunt_animal(encounter_id: int, fleet_power: int = 100) -> dict:
         return {"success": False, "damage": damage, "target": animal["name"]}
 
 
-async def tame_animal(encounter_id: int, trainer_skill: int = 5) -> dict:
+async def tame_animal(encounter_id: int, trainer_skill: int = 5,
+                      session_id: int | None = None) -> dict:
     """Attempt to tame a space animal as a companion/asset."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
     enc = await Database.fetchrow(
-        "SELECT * FROM maya_rp.animal_encounters WHERE id = $1 AND status = 'active'",
-        encounter_id
+        "SELECT * FROM maya_rp.animal_encounters WHERE id = $1 AND status = 'active'"
+        " AND session_id = $2",
+        encounter_id, session_id
     )
     if not enc:
-        return {"error": "Encounter not found or already resolved."}
+        return {"error": f"Encounter {encounter_id} not found in session {session_id},"
+                         f" or already resolved."}
 
     animal = await Database.fetchrow(
         "SELECT * FROM maya_rp.space_animals WHERE id = $1", enc["animal_id"]
@@ -275,14 +285,18 @@ async def discover_anomaly(system_id: int, trigger: str = "scan_low") -> dict:
     }
 
 
-async def explore_anomaly(discovery_id: int, fleet_power: int = 100) -> dict:
+async def explore_anomaly(discovery_id: int, fleet_power: int = 100,
+                          session_id: int | None = None) -> dict:
     """Explore a discovered anomaly for rewards or danger."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
     disc = await Database.fetchrow(
-        "SELECT * FROM maya_rp.discoveries WHERE id = $1 AND explored = FALSE",
-        discovery_id
+        "SELECT * FROM maya_rp.discoveries WHERE id = $1 AND explored = FALSE AND session_id = $2",
+        discovery_id, session_id
     )
     if not disc:
-        return {"error": "Discovery not found or already explored."}
+        return {"error": f"Discovery {discovery_id} not found in session {session_id},"
+                         f" or already explored."}
 
     anomaly = await Database.fetchrow(
         "SELECT * FROM maya_rp.space_anomalies WHERE id = $1", disc["target_id"]
@@ -335,12 +349,18 @@ async def explore_anomaly(discovery_id: int, fleet_power: int = 100) -> dict:
 # Wonders Overview
 # ============================================================
 
-async def get_wonders_overview() -> dict:
-    """Get an overview of all space wonders in the galaxy."""
+async def get_wonders_overview(session_id: int | None = None) -> dict:
+    """An overview of the wonders in this session's galaxy.
+
+    The planets are session-scoped; the animal and anomaly catalogues are not, because they describe
+    the galaxy rather than one campaign in it.
+    """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     planets = await Database.fetch("""
         SELECT id, name, planet_type, habitability, surveyed
-        FROM maya_rp.planets ORDER BY name
-    """)
+        FROM maya_rp.planets WHERE session_id = $1 ORDER BY name
+    """, session_id)
     animals = await Database.fetch("""
         SELECT id, name, species, aggression, rarity
         FROM maya_rp.space_animals ORDER BY rarity, name

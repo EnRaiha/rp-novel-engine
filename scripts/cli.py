@@ -93,6 +93,45 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_wonders():
+    """wonders {overview | explore <discovery-id> [fleet-power] | hunt <encounter-id> [power] |
+    tame <encounter-id> [skill]}
+
+    Four entry points of `modules/space_wonders.py` had no caller: the overview and the three actions
+    that resolve a discovery or an encounter. Nothing could hunt, tame or explore before this.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py wonders overview\n'
+             '       cli.py wonders explore <discovery-id> [fleet-power]\n'
+             '       cli.py wonders hunt <encounter-id> [fleet-power]\n'
+             '       cli.py wonders tame <encounter-id> [trainer-skill]')
+    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
+    action = sys.argv[2] if len(sys.argv) > 2 else "overview"
+    from modules import space_wonders as sw
+    if action == "explore":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        power = int(sys.argv[4]) if len(sys.argv) > 4 else 100
+        out = await sw.explore_anomaly(int(sys.argv[3]), power, sid)
+    elif action == "hunt":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        power = int(sys.argv[4]) if len(sys.argv) > 4 else 100
+        out = await sw.hunt_animal(int(sys.argv[3]), power, sid)
+    elif action == "tame":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        skill = int(sys.argv[4]) if len(sys.argv) > 4 else 5
+        out = await sw.tame_animal(int(sys.argv[3]), skill, sid)
+    else:
+        out = await sw.get_wonders_overview(sid)
+    if not out:
+        print("  no result")
+    for key, value in (out or {}).items():
+        print(f"  {key}: {len(value) if isinstance(value, list) else value}")
+    await Database.close()
+
+
 async def cmd_horror():
     """horror {measures | assets | threats | detail <id> | contain <id> <measure> | eradicate <id> [strategy]}
 
@@ -2378,6 +2417,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_mega())
     elif cmd in ("horror", "infestation", "swarm"):
         asyncio.run(cmd_horror())
+    elif cmd in ("wonders", "wonder"):
+        asyncio.run(cmd_wonders())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

@@ -60,3 +60,38 @@ async def _noop():
 
 async def _value(value):
     return value
+
+
+class TestSessionMismatch:
+    """A save restored into the wrong session wipes the target and does not put it back.
+
+    The rows keep their own session_id on the way in, so the mismatch is not a rename: it is a wipe
+    followed by either a primary-key conflict or another session's rows appearing as themselves.
+    """
+
+    async def test_a_mismatched_session_is_refused(self, tmp_path, monkeypatch):
+        payload = {"header": {"format": savegame.FORMAT, "version": savegame.SAV_VERSION,
+                              "session_id": 3}, "tables": {}}
+        path = tmp_path / "three.sav"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        monkeypatch.setattr(savegame.Database, "init", lambda: _noop())
+        with pytest.raises(savegame.SessionMismatch) as caught:
+            await savegame.import_sav(str(path), session_id=5, wipe=True)
+        assert "session 3" in str(caught.value) and "session 5" in str(caught.value)
+
+    async def test_the_same_session_is_not_refused(self, tmp_path, monkeypatch):
+        payload = {"header": {"format": savegame.FORMAT, "version": savegame.SAV_VERSION,
+                              "session_id": 5}, "tables": {}}
+        path = tmp_path / "five.sav"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        result = await savegame.import_sav(str(path), session_id=5, wipe=False)
+        assert result.get("session_id") == 5
+
+    async def test_a_forced_mismatch_proceeds(self, tmp_path, monkeypatch):
+        payload = {"header": {"format": savegame.FORMAT, "version": savegame.SAV_VERSION,
+                              "session_id": 3}, "tables": {}}
+        path = tmp_path / "three.sav"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        result = await savegame.import_sav(str(path), session_id=5, wipe=False,
+                                           allow_session_mismatch=True)
+        assert result.get("session_id") == 5

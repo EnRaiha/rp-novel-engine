@@ -97,13 +97,14 @@ async def cmd_load():
     """load <file.sav> [--keep-session] — restore PG from a .sav snapshot."""
     await Database.init()
     if len(sys.argv) < 3:
-        print("Usage: cli.py load <file.sav> [--keep-session]")
+        print("Usage: cli.py load <file.sav> [--keep-session] [--allow-session-mismatch]")
         await Database.close()
         return
     from core.savegame import import_sav
 
     wipe = "--keep-session" not in sys.argv
-    r = await import_sav(sys.argv[2], wipe=wipe)
+    forced = "--allow-session-mismatch" in sys.argv
+    r = await import_sav(sys.argv[2], wipe=wipe, allow_session_mismatch=forced)
     if not r.get("ok"):
         print(f"LOAD FAILED: {r.get('error')}")
     else:

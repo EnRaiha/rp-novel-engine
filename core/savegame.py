@@ -402,7 +402,26 @@ def _verify_checksum(data: dict) -> bool:
     return calc == saved
 
 
-async def import_sav(path: str, session_id: int | None = None, wipe: bool = True) -> dict:
+class SessionMismatch(RuntimeError):
+    """A save file belongs to a different session than the one asked to restore it.
+
+    The restore wipes the target session before it loads, and the rows it inserts keep their own
+    `session_id`. So restoring session 3's file into session 5 deletes session 5 and then either
+    conflicts on every primary key or writes session 3's rows back as themselves. Either way the
+    caller asked for something other than what happens, and the difference is silent.
+    """
+
+    def __init__(self, file_session: int, requested: int):
+        self.file_session = file_session
+        self.requested = requested
+        super().__init__(
+            f"this save belongs to session {file_session}, but the restore targets session "
+            f"{requested}. Pass allow_session_mismatch=True (CLI: --allow-session-mismatch) if that "
+            f"is really what you want.")
+
+
+async def import_sav(path: str, session_id: int | None = None, wipe: bool = True,
+                     allow_session_mismatch: bool = False) -> dict:
     """Restore PG from a .sav file. wipe=True resets ALL current session/catalog
     tables to the snapshot (FK-safe ordered DELETE, no TRUNCATE CASCADE).
 
@@ -422,6 +441,11 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
     if not checksum_ok:
         info("savegame", f"WARNING: checksum mismatch on {p.name} — proceeding anyway")
 
+    file_session = data["header"].get("session_id")
+    if session_id is not None and file_session is not None and int(session_id) != int(file_session):
+        if not allow_session_mismatch:
+            raise SessionMismatch(int(file_session), int(session_id))
+        info("savegame", f"restoring session {file_session}'s file into session {session_id} on purpose")
     sid = session_id or data["header"]["session_id"]
     tables = data.get("tables", {})
     # A file written before the export learned to refuse carries `{"__error__": ...}` where a table

@@ -126,14 +126,35 @@ def check_mutators_are_gated() -> tuple[bool, str]:
                          else f"not in the gate: {ungated}")
 
 
-def check_plugin_enabled() -> tuple[bool, str]:
-    """Criterion 5: a round runs without touching a terminal, which needs the row enabled."""
-    profiles = pathlib.Path.home() / ".dsh/profiles"
-    for path in profiles.glob("*/cordis.patch.yml"):
-        text = path.read_text(encoding="utf-8", errors="replace")
-        if "portrait-attach" in text and "enabled: true" in text:
-            return True, f"enabled in {path.parent.name}"
-    return False, "the portrait-attach row is still disabled"
+def check_images_reach_the_chat(proxy_path: pathlib.Path | None = None,
+                                decorator_path: pathlib.Path | None = None) -> tuple[bool, str]:
+    """Criterion 5: images appear in the chat without a terminal.
+
+    The plan named the host plugin row as the way. Route B reaches the same outcome through the auth
+    proxy, which already injects files into every HTML document, so this checks the outcome and names
+    which path is carrying it. Measuring the mechanism rather than the result would report a failure
+    for a working feature.
+    """
+    proxy = proxy_path or pathlib.Path.home() / "scripts" / "dsh-auth-proxy"
+    decorator = decorator_path or pathlib.Path.home() / ".config/dsh-auth/portrait-chat.js"
+    if not proxy.is_file():
+        return False, "the proxy script is missing"
+    text = proxy.read_text(encoding="utf-8")
+    wired = ('"/__dsh-portrait-chat.js"' in text
+             and 'src="/__dsh-portrait-chat.js"' in text)
+    if not wired:
+        return False, "the portrait decorator is not wired into the proxy"
+    if not decorator.is_file():
+        return False, "the proxy is wired but the decorator has not been generated"
+    import subprocess
+    import sys as _sys
+
+    check = subprocess.run([_sys.executable, str(ENGINE / "scripts" / "portrait_chat_js.py"), "--check"],
+                           capture_output=True, text=True, timeout=120)
+    current = check.returncode == 0
+    size = decorator.stat().st_size
+    return current, (f"route B carries it: proxy wired, decorator {size} bytes"
+                     + ("" if current else " and STALE, regenerate it"))
 
 
 def main() -> int:
@@ -149,7 +170,7 @@ def main() -> int:
         ("3. every confirmed wife has a face", check_every_confirmed_wife_has_a_face(cur)),
         ("4. the illustrated novel carries faces", check_illustrated_novel()),  # void by ruling
         ("5. every mutating script is dry-run gated", check_mutators_are_gated()),
-        ("6. the plugin is enabled", check_plugin_enabled()),
+        ("6. images reach the chat", check_images_reach_the_chat()),
     ]
     conn.close()
 

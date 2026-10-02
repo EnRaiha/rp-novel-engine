@@ -207,11 +207,41 @@ def render(rows: list[dict], chars: int, generated_at: str, out: pathlib.Path) -
     return text
 
 
+def match_keys(name: str) -> list[str]:
+    """The strings prose may use for this character, derived from the stored name.
+
+    Deterministic, and deliberately conservative:
+
+    - the stored name itself, so `Queen Onyx Sable` matches as written;
+    - the part before any parenthetical epithet, so `Maya al-Dabaran (Anchor)` matches
+      as `Maya al-Dabaran`, which is how the novel usually names her;
+    - the epithet alone only when it is a single or two-word proper form, because the
+      novel writes `Rook Crow (Den)` and later `Den` for the same person.
+
+    A one-word key is NOT derived from a longer name. `Zara` inside `Zara-beth` is the
+    resolver's whole-word rule to catch, and a generator that emits partial first names
+    would make collisions out of every shared given name.
+    """
+    keys: list[str] = []
+    stored = " ".join(name.split())
+    if stored:
+        keys.append(stored)
+    stem = stored.split("(", 1)[0].strip()
+    if stem and stem not in keys:
+        keys.append(stem)
+    if "(" in stored and stored.endswith(")"):
+        epithet = stored[stored.index("(") + 1 : -1].strip()
+        if epithet and len(epithet.split()) <= 2 and epithet not in keys:
+            keys.append(epithet)
+    return keys
+
+
 def json_row(r: dict) -> dict:
     """The same row as `render` prints, with `exists` named for what it means."""
     return {
         "id": r["id"],
         "name": r["name"],
+        "keys": match_keys(r["name"]),
         "twin": r["twin"],
         "tier": r["tier"],
         "key": r["key"],

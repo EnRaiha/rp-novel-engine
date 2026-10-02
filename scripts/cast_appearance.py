@@ -18,6 +18,14 @@ Rules:
 - A physical clause is only claimed when it actually describes a body. The marker list is
   deliberately narrow; where the novel says nothing physical, `appearance` stays empty and
   the row is reported, because an invented clause would make the render prompt lie.
+
+A second extractor was built and then removed: one that mined every mention of a character
+anywhere in the manuscript, not just the dossier line. It was measured against the live novel and
+returned one candidate from thirty-one attempts, and that candidate was narration
+("Kemudian orang tua B-088, yang membuka matanya..."). The novel names those people; it does not
+describe their bodies. Mining was deleted rather than shipped, because a flaky extractor is worse
+than no extractor: it would put a scene sentence into a render prompt and nobody would notice
+until the portrait was wrong.
 """
 from __future__ import annotations
 

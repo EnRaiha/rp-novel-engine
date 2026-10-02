@@ -107,3 +107,28 @@ def mode_label() -> str:
         return "GM MAYA maintenance" if maintenance.active() else "play"
     except Exception:
         return "play"
+
+
+def stale_process_default(current: int | None = None) -> str | None:
+    """Report when this process's default session is no longer the engine's.
+
+    `Config.SESSION_ID` is resolved once, at import. A process that started while the arc was session
+    3 keeps writing to session 3 after the arc moves to 5, and session 3 is frozen. That is the
+    mechanism by which a write can reach a session nobody chose, so it is worth a sentence at startup
+    rather than a mystery later.
+
+    @param current - the process default to check; defaults to `Config.SESSION_ID`.
+    @returns one line naming the drift, or None when the two agree.
+    """
+    try:
+        from core.config import Config
+
+        process_default = int(Config.SESSION_ID if current is None else current)
+        resolved = resolve_session()
+    except Exception:
+        return None
+    if resolved is None or process_default == int(resolved):
+        return None
+    frozen_note = " (and it is frozen)" if process_default in frozen() else ""
+    return (f"warning: this process defaults to session {process_default}{frozen_note}, "
+            f"but the engine now resolves to session {resolved}. Pass the session explicitly.")

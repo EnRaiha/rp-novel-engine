@@ -8,17 +8,40 @@
 """
 
 from __future__ import annotations
+
+import sys
 import os
 from typing import ClassVar
 
 
+#: True when the process default came from the fallback rather than from the engine's own resolver.
+#: A silent fallback is how a write reaches a session nobody chose, so the fallback announces itself.
+SESSION_FALLBACK_USED = False
+
+
 def _default_session() -> int:
-    """Resolve the process default from the engine's single session source."""
+    """Resolve the process default from the engine's single session source.
+
+    Two things are worth knowing about this value. It is resolved **once**, at import, so a long-lived
+    process keeps the session it started with even after the arc moves. And when the resolver fails,
+    this falls back to the legacy TKG campaign, which is the **frozen reference** session — so the
+    fallback announces itself rather than letting a write arrive somewhere nobody chose.
+
+    @returns the session id this process will use when a call does not name one.
+    """
+    global SESSION_FALLBACK_USED
     try:
         from core.session import resolve_session
 
         return int(resolve_session())
-    except Exception:
+    except Exception as exc:
+        SESSION_FALLBACK_USED = True
+        print(
+            f"warning: no session resolved ({exc.__class__.__name__}); falling back to the legacy "
+            "TKG campaign, which is the FROZEN reference session. Name a session explicitly, or "
+            "write ~/.config/rp-engine/active_arc.",
+            file=sys.stderr,
+        )
         return 3  # no arc file and no override: the legacy TKG campaign
 
 

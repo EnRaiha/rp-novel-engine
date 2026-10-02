@@ -256,8 +256,28 @@ async def _fk_child_columns() -> list[tuple[str, str, str]]:
 
 # ─── Export ─────────────────────────────────────────────────────────────
 
+class SaveIncomplete(RuntimeError):
+    """A save could not read every table, so no file was written.
+
+    The old behaviour stored `{"__error__": ...}` in place of the table and wrote the file anyway. The
+    restore path wipes every table before loading, so a save that is missing one table silently
+    restores that table as empty, and nobody finds out until the data is needed. A checkpoint that
+    cannot be trusted is worse than no checkpoint.
+    """
+
+    def __init__(self, failed: dict[str, str]):
+        self.failed = dict(failed)
+        tables = ", ".join(sorted(failed)[:8])
+        more = "" if len(failed) <= 8 else f" (+{len(failed) - 8} more)"
+        super().__init__(f"{len(failed)} table(s) could not be read, so nothing was written: "
+                         f"{tables}{more}")
+
+
 async def export_sav(session_id: int = 3, out_dir: str | None = None) -> str:
-    """Dump full state → .sav JSON file. Returns file path."""
+    """Dump full state → .sav JSON file. Returns file path.
+
+    @raises SaveIncomplete - when any table fails to read. Nothing is written in that case.
+    """
     await Database.init()
 
     all_tables, has_sid, vector_tables, fks = await _schema_inventory()
@@ -267,7 +287,8 @@ async def export_sav(session_id: int = 3, out_dir: str | None = None) -> str:
     ordered = list(reversed(fk_wipe_order(set(session_scoped) | set(global_tables), fks)))
     session_set = set(session_scoped)
 
-    tables = {}
+    tables: dict[str, object] = {}
+    failed: dict[str, str] = {}
     for t in ordered:
         try:
             if t in session_set:
@@ -277,8 +298,13 @@ async def export_sav(session_id: int = 3, out_dir: str | None = None) -> str:
                 rows = await Database.fetch(f"SELECT * FROM maya_rp.{t}")
             tables[t] = [dict(r) for r in rows]
         except Exception as e:
-            tables[t] = {"__error__": str(e)}
+            failed[t] = str(e)
             error("savegame", f"export table {t} failed: {e}")
+
+    if failed:
+        # Refuse rather than write a snapshot with a hole in it.
+        await Database.close()
+        raise SaveIncomplete(failed)
 
     payload = {
         "header": {
@@ -340,6 +366,12 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
 
     sid = session_id or data["header"]["session_id"]
     tables = data.get("tables", {})
+    # A file written before the export learned to refuse carries `{"__error__": ...}` where a table
+    # should be. Restoring it would wipe that table and leave it empty, so the restore refuses too.
+    broken = {name: value.get("__error__") for name, value in tables.items()
+              if isinstance(value, dict) and "__error__" in value}
+    if broken:
+        raise SaveIncomplete({name: str(err) for name, err in broken.items()})
     restored = 0
     row_errors = 0
     skipped_tables = 0

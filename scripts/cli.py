@@ -93,6 +93,56 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_build():
+    """build {types <category> | list | show <id> | new <type-id> [name] | upgrade <id>} — facilities.
+
+    Five entry points of `modules/infrastructure.py` had no caller: the catalogue reader, the builder,
+    the viewer, the lister and the upgrader. `run_tick` produced from facilities nothing could build.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py build types "<category>"\n'
+             '       cli.py build list\n'
+             '       cli.py build show <instance-id>\n'
+             '       cli.py build new <type-id> ["name"]\n'
+             '       cli.py build upgrade <instance-id>')
+    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
+    action = sys.argv[2] if len(sys.argv) > 2 else "list"
+    from modules import infrastructure
+    if action == "types":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        rows = await infrastructure.get_types_by_category(sys.argv[3])
+        print(f"  {len(rows)} type(s) in {sys.argv[3]}")
+        for row in rows:
+            print(f"  #{row['id']} {row['name']} · tier {row.get('fantasy_tier')}"
+                  f" · {row.get('build_cost_credits')} credits")
+        await Database.close(); return
+    if action == "new":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        name = sys.argv[4] if len(sys.argv) > 4 else None
+        out = await infrastructure.build_infrastructure(sid, int(sys.argv[3]), name=name)
+    elif action == "show":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await infrastructure.get_infrastructure(int(sys.argv[3]), sid)
+    elif action == "upgrade":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await infrastructure.upgrade_infrastructure(sid, int(sys.argv[3]))
+    else:
+        rows = await infrastructure.list_infrastructure(sid)
+        out = {"facilities": len(rows)}
+        for row in rows:
+            print(f"  #{row['id']} {row.get('name')} · {row.get('type_name')}"
+                  f" · level {row.get('level')} · {row.get('territory_name') or row.get('sector_id')}")
+    if not out:
+        print("  no result")
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
 async def cmd_cargo():
     """cargo {create <item> <qty> <loc-type> <loc-id> | ship <cargo-id> <dest-type> <dest-id> <ship-id> | status}
 
@@ -2224,6 +2274,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_science())
     elif cmd == "cargo":
         asyncio.run(cmd_cargo())
+    elif cmd == "build" or cmd == "infra":
+        asyncio.run(cmd_build())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

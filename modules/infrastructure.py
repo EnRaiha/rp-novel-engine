@@ -2,6 +2,7 @@
 import random, json
 from datetime import datetime, timezone
 from core.db import Database
+from modules._economy import RESOURCE_COLUMNS, _check_afford, _deduct_resources
 from core.events import EventBus
 from core.log import error
 
@@ -39,7 +40,7 @@ async def build_infrastructure(session_id: int, type_id: int,
     ok, msg = await _check_afford(session_id, cost)
     if not ok:
         return {"error": f"Insufficient resources: {msg}"}
-    await _deduct_resources(session_id, cost)
+    charged = await _deduct_resources(session_id, cost)
 
     if not name:
         name = f"{it['name']} {random.randint(100, 999)}"
@@ -57,28 +58,40 @@ async def build_infrastructure(session_id: int, type_id: int,
                f"Constructed {it['name']} ({it['category']}).", 2)
 
     return {"infrastructure_id": iid["id"], "name": name,
-            "type": it["name"], "category": it["category"]}
+            "type": it["name"], "category": it["category"], "charged": charged}
 
-async def get_infrastructure(inst_id: int) -> dict:
-    """Get infrastructure instance details."""
+async def get_infrastructure(inst_id: int, session_id: int | None = None) -> dict:
+    """Get infrastructure instance details, from this session only.
+
+    Reviewed 2026-10-03 before wiring: neither this nor `list_infrastructure` filtered by session, so
+    playing session 5 listed and opened session 3's facilities. The same leak was fixed in battle and
+    pirate aggregates; this is the same class.
+    """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     row = await Database.fetchrow(
-        "SELECT * FROM maya_rp.infrastructure_overview WHERE id = $1", inst_id
+        "SELECT * FROM maya_rp.infrastructure_overview WHERE id = $1 AND session_id = $2",
+        inst_id, session_id
     )
     return dict(row) if row else {}
 
-async def list_infrastructure() -> list:
-    """List all infrastructure instances."""
+async def list_infrastructure(session_id: int | None = None) -> list:
+    """List this session's infrastructure instances."""
+    if session_id is None:
+        session_id = Config.SESSION_ID
     return [dict(r) for r in await Database.fetch(
-        "SELECT * FROM maya_rp.infrastructure_overview ORDER BY territory_name, type_name"
+        "SELECT * FROM maya_rp.infrastructure_overview WHERE session_id = $1"
+        " ORDER BY territory_name, type_name", session_id
     )]
 
 async def upgrade_infrastructure(session_id: int, inst_id: int) -> dict:
     """Upgrade infrastructure to next level."""
     inst = await Database.fetchrow(
-        "SELECT * FROM maya_rp.infrastructure_instances WHERE id = $1", inst_id
+        "SELECT * FROM maya_rp.infrastructure_instances WHERE id = $1 AND session_id = $2",
+        inst_id, session_id
     )
     if not inst:
-        return {"error": "Infrastructure not found."}
+        return {"error": f"Infrastructure {inst_id} not found in session {session_id}."}
 
     level = inst["level"]
     upgrade_cost = {"credits": 50000 * level}
@@ -97,10 +110,10 @@ async def upgrade_infrastructure(session_id: int, inst_id: int) -> dict:
         elif cat == "arcane":
             upgrade_cost["dream_essence"] = 2 * level
 
-    ok, _ = await _check_afford(session_id, upgrade_cost)
+    ok, why = await _check_afford(session_id, upgrade_cost)
     if not ok:
-        return {"error": "Insufficient resources for upgrade."}
-    await _deduct_resources(session_id, upgrade_cost)
+        return {"error": f"Insufficient resources for upgrade: {why}"}
+    charged = await _deduct_resources(session_id, upgrade_cost)
 
     new_level = level + 1
     bonus = 1.0 + (new_level - 1) * 0.1
@@ -114,13 +127,11 @@ async def upgrade_infrastructure(session_id: int, inst_id: int) -> dict:
                f"⬆️ Upgraded: {inst['name']}",
                f"Level {new_level} (×{bonus:.1f} production bonus).", 2)
 
-    return {"infrastructure_id": inst_id, "new_level": new_level, "bonus": bonus}
+    return {"infrastructure_id": inst_id, "new_level": new_level, "bonus": bonus, "charged": charged}
 
 # effect keys → `resources` column. The catalogue spells it "alloy_production"
 # while the ledger column is `alloys` (the mismatch silently dropped every alloy
 # payout). Only white-listed columns are ever interpolated into the UPDATE.
-RESOURCE_COLUMNS = ("credits", "alloys", "fuel", "dream_essence", "rare_earth",
-                    "starsteel", "void_crystal", "aetherium")
 RESOURCE_ALIAS = {"alloy": "alloys"}
 
 
@@ -193,29 +204,6 @@ def _j(v):
     if isinstance(v, str):
         return json.loads(v)
     return v if v else {}
-
-async def _check_afford(session_id: int, costs: dict) -> tuple:
-    r = await Database.fetchrow(
-        "SELECT credits, alloys, fuel, dream_essence, rare_earth, starsteel, void_crystal, aetherium "
-        "FROM maya_rp.resources WHERE session_id = $1", session_id
-    )
-    if not r:
-        return False, "no resources"
-    for res, qty in costs.items():
-        if res not in r:
-            return False, f"unknown resource '{res}'"
-        if (r[res] or 0) < qty:
-            return False, f"need {qty} {res}, have {r[res] or 0}"
-    return True, ""
-
-async def _deduct_resources(session_id: int, costs: dict):
-    for res, qty in costs.items():
-        if res in ("credits", "alloys", "fuel", "dream_essence",
-                   "rare_earth", "starsteel", "void_crystal", "aetherium"):
-            await Database.execute(
-                f"UPDATE maya_rp.resources SET {res} = GREATEST(0, {res} - $1) WHERE session_id = $2",
-                qty, session_id
-            )
 
 async def _log(sid, category, title, content, importance=2):
     try:

@@ -2,6 +2,7 @@
 import random, json
 from datetime import datetime, timezone
 from core.db import Database
+from modules._economy import _check_afford, _deduct_resources
 from core.events import EventBus
 from core.log import error
 
@@ -328,29 +329,6 @@ def _j(v):
     if isinstance(v, str):
         return json.loads(v)
     return v if v else {}
-
-async def _check_afford(session_id: int, costs: dict) -> tuple:
-    r = await Database.fetchrow(
-        "SELECT credits, alloys, fuel, dream_essence, rare_earth, starsteel, void_crystal, aetherium "
-        "FROM maya_rp.resources WHERE session_id = $1", session_id
-    )
-    if not r:
-        return False, "no resources"
-    for res, qty in costs.items():
-        if res not in r:
-            return False, f"unknown resource '{res}'"
-        if (r[res] or 0) < qty:
-            return False, f"need {qty} {res}, have {r[res] or 0}"
-    return True, ""
-
-async def _deduct_resources(session_id: int, costs: dict):
-    for res, qty in costs.items():
-        if res in ("credits", "alloys", "fuel", "dream_essence",
-                   "rare_earth", "starsteel", "void_crystal", "aetherium"):
-            await Database.execute(
-                f"UPDATE maya_rp.resources SET {res} = GREATEST(0, {res} - $1) WHERE session_id = $2",
-                qty, session_id
-            )
 
 async def _log(sid, category, title, content, importance=2):
     try:

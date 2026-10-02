@@ -93,6 +93,66 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_war():
+    """war {position <zone> ["terrain"] ["formation"] | exchange <a-hull> <a-tier> <d-hull> <d-tier>
+    ["weapon"] ["targeting"] | sieges | siege "<system>" | objectives | progress <kind> <amount> |
+    mutiny "<ship>"}
+
+    Eight entry points across four modules had no caller: the tactical position and the exchange
+    resolver, the siege starter and its list, the quarterly progress writer and its view, the morale
+    event rule and the mutiny scene generator.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py war position <zone> ["terrain"] ["formation"]\n'
+             '       cli.py war exchange <a-hull> <a-tier> <d-hull> <d-tier> ["weapon"] ["targeting"]\n'
+             '       cli.py war sieges | siege "<system>" | objectives | progress <kind> <amount>\n'
+             '       cli.py war mutiny "<ship-name>"')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "sieges"
+    from modules import objectives, siege, social, tactics
+    if action == "position":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        terrain = sys.argv[4] if len(sys.argv) > 4 else None
+        formation = sys.argv[5] if len(sys.argv) > 5 else None
+        out = await tactics.get_tactical_position(sid, sys.argv[3], terrain, formation)
+    elif action == "exchange":
+        if len(sys.argv) < 7:
+            print(usage); await Database.close(); return
+        weapon = sys.argv[7] if len(sys.argv) > 7 else None
+        targeting = sys.argv[8] if len(sys.argv) > 8 else None
+        out = await tactics.resolve_exchange(int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]),
+                                             int(sys.argv[6]), weapon, targeting)
+    elif action == "siege":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await siege.start_siege(sys.argv[3], sid)
+    elif action == "objectives":
+        out = await objectives.quarterly_tasks_view(sid)
+    elif action == "progress":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await objectives.update_quarterly_progress(sid, sys.argv[3], int(sys.argv[4]))
+    elif action == "mutiny":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        mutiny = await social.calculate_mutiny_risk(sid)
+        out = social.generate_mutiny_scene(sys.argv[3], mutiny.get("ringleaders", []))
+    else:
+        rows = await siege.list_sieges(sid)
+        out = {"sieges": len(rows)}
+        for row in rows[:8]:
+            print(f"  {row}")
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
+        print("  no result")
+    else:
+        print(f"  result: {out}")
+    await Database.close()
+
+
 async def cmd_op():
     """op {darkops | run <operation> "<target>" | log | espionage <faction> <mission-type> <agent> |
     espionage-log}
@@ -3494,6 +3554,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_op())
     elif cmd in ("craft", "alchemy", "corp", "corporation", "academy"):
         asyncio.run(cmd_craft())
+    elif cmd in ("war", "siege", "tactics", "objectives"):
+        asyncio.run(cmd_war())
     elif cmd in ("encounter", "encounters", "events"):
         asyncio.run(cmd_encounter())
     else:

@@ -749,6 +749,9 @@ async def cmd_career():
             print(usage); await Database.close(); return
         source = sys.argv[5] if len(sys.argv) > 5 else "manual"
         out = await crew_career.award(int(sys.argv[3]), int(sys.argv[4]), source, sid)
+    elif action == "produce":
+        from modules import crew_system
+        out = await crew_system.produce_crew(sid)
     else:
         out = await crew_career.talent_shortage(sid)
     # A function that answers with a bool, a number or a list had its answer swallowed here: `or {}`
@@ -1285,6 +1288,12 @@ async def cmd_social():
         before = await social._get_fleet_morale(sid)
         after = await social.update_morale(sid, int(sys.argv[3]), reason)
         out = {"before": before, "after": after, "delta": int(sys.argv[3]), "reason": reason}
+    elif action == "morale-event":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        multiplier = float(sys.argv[5]) if len(sys.argv) > 5 else 1.0
+        current = await social._get_fleet_morale(sid)
+        out = social.apply_morale_event(current, sys.argv[3], multiplier)
     elif action == "events":
         if len(sys.argv) < 4:
             print(usage); await Database.close(); return

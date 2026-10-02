@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncpg
 from contextlib import asynccontextmanager
 from core.config import Config
+from core.log import warn
 from core.log import info
 
 # Errors that indicate a dead/lost pool (PG restart, network blip).
@@ -37,6 +38,17 @@ class Database:
                 max_size=Config.DB_MAX_SIZE,
                 timeout=Config.DB_TIMEOUT,
             )
+            # The name generator keeps a module-level connection. `set_global_conn` was its one
+            # caller-less function: it had no init hook, so the generator it configures could never be
+            # reached without a caller passing a connection in. Imported here rather than at the top to
+            # keep the DB layer free of an import cycle.
+            try:
+                from core import name_gen
+                name_gen.set_global_conn(cls.pool)
+            except Exception as exc:  # noqa: BLE001 - the pool is what matters; the hook is best effort
+                # Logged rather than swallowed: the silent-handler gate refused the bare pass, and it is
+                # right to. A name generator without a connection is a symptom worth seeing.
+                warn("db", f"name_gen hook not installed: {exc}")
         return cls.pool
 
     @classmethod

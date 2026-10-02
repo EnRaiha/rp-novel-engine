@@ -88,9 +88,18 @@ def connect():
     )
 
 
+#: The durable marker for a confirmed wife. The King confirmed 35 on 2026-10-02.
+WIFE_TRAIT = "confirmed-wife"
+
+
 def tier_of(row: dict, wife_names: set[str]) -> str:
-    """Tier for one character row, first match wins, in TIERS order."""
-    if row["name"] in wife_names:
+    """Tier for one character row, first match wins, in TIERS order.
+
+    A wife is recognised by her trait first, because a trait travels with the row. The name join
+    into session 3 stays as the fallback for any spouse the trait has not reached yet, since
+    session 5 records no `is_spouse` of its own.
+    """
+    if WIFE_TRAIT in parse_traits(row["traits"]) or row["name"] in wife_names:
         return "wife"
     if row["id"] in VILLAINESS_IDS:
         return "villainess"

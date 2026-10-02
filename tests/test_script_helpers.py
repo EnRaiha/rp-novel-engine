@@ -138,3 +138,24 @@ class TestManifestKeys:
 
     def test_whitespace_is_normalised(self):
         assert face_manifest.match_keys("  Doyo   Kwarta  ")[0] == "Doyo Kwarta"
+
+
+class TestWifeTierResolution:
+    """A wife is recognised by her trait first, and by the name join only as a fallback.
+
+    Session 5 records no `is_spouse`, so the manifest used to resolve the wife tier through an
+    exact-name join into frozen session 3. The King confirmed the 35 on 2026-10-02 and they carry
+    `confirmed-wife`, so the trait is the durable source and the join is the safety net.
+    """
+
+    def test_the_trait_wins(self):
+        row = {"name": "not in the join", "traits": '["confirmed-wife"]', "background": "", "id": 1}
+        assert face_manifest.tier_of(row, set()) == "wife"
+
+    def test_the_name_join_still_works_as_a_fallback(self):
+        row = {"name": "Aurelia Veyra", "traits": "[]", "background": "", "id": 2}
+        assert face_manifest.tier_of(row, {"Aurelia Veyra"}) == "wife"
+
+    def test_a_stranger_is_not_a_wife(self):
+        row = {"name": "Nobody", "traits": '["imported"]', "background": "", "id": 3}
+        assert face_manifest.tier_of(row, set()) == "import"

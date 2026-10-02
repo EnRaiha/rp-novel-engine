@@ -93,6 +93,126 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_world():
+    """world {where <character-id> "<location>" | goto "<location>" ["ship"] | seeds | plant <type>
+    "<content>" | foreshadow <seed-id> | sites [count] | excavate <site-id> | secret | discover "<context>"}
+
+    Nine entry points across four small modules had no caller: presence and travel in locations.py, the
+    seed planter and its foreshadow bookkeeping in narrative_seeds.py, the site seeder and the dig in
+    archaeology.py, and the discovery rolls in secrets.py.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py world where <character-id> "<location>" | goto "<location>" ["ship"]\n'
+             '       cli.py world seeds | plant <type> "<content>" | foreshadow <seed-id>\n'
+             '       cli.py world sites [count] | excavate <site-id>\n'
+             '       cli.py world secret | discover "<context>"')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "seeds"
+    from modules import archaeology, locations, narrative_seeds, secrets
+    if action == "where":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await locations.set_character_presence(int(sys.argv[3]), sys.argv[4], sid)
+    elif action == "goto":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        ship = sys.argv[4] if len(sys.argv) > 4 else None
+        out = await locations.cmd_goto(sys.argv[3], ship, sid)
+    elif action == "plant":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await narrative_seeds.plant_seed(sys.argv[3], sys.argv[4], None, None, None, sid)
+    elif action == "foreshadow":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await narrative_seeds.mark_foreshadowed(int(sys.argv[3]), sid)
+    elif action == "sites":
+        count = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+        out = await archaeology.seed_sites(sid, count)
+    elif action == "excavate":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await archaeology.excavate(int(sys.argv[3]), sid)
+    elif action == "secret":
+        out = await secrets.seed_initial(sid)
+    elif action == "discover":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await secrets.check_discovery(sys.argv[3], sid)
+    else:
+        rows = await narrative_seeds.get_foreshadow_ops(sid)
+        out = {"foreshadow_ops": len(rows)}
+        for row in rows[:8]:
+            print(f"  {row}")
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
+        print("  no result")
+    else:
+        print(f"  result: {out}")
+    await Database.close()
+
+
+async def cmd_inner():
+    """inner {world <character-id> | surface "<character-name>" "<context>" | react "<event-type>" |
+    offscreen}
+
+    Four entry points across two small modules: the inner world read and the memory surface in
+    memories.py, and the event reaction and off-screen discovery in npc_autonomy.py.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py inner world <character-id> | surface "<name>" "<context>"\n'
+       '       cli.py inner react "<event-type>" | offscreen')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "offscreen"
+    from modules import memories, npc_autonomy
+    if action == "world":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await memories.get_inner_world(int(sys.argv[3]), sid)
+    elif action == "surface":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await memories.cmd_memory_surface(sys.argv[3], sys.argv[4], sid)
+    elif action == "react":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await npc_autonomy.react_to_event(sys.argv[3], sid)
+    else:
+        out = await npc_autonomy.discover_off_screen(sid)
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
+        print("  no result")
+    else:
+        print(f"  result: {out}")
+    await Database.close()
+
+
+async def cmd_burn():
+    """burn {summary | caravan}
+
+    Two entry points of `modules/fleet_economy.py` had no caller: the fuel burn summary and the caravan
+    generator, so the fleet paid for fuel nothing accounted for.
+    """
+    await Database.init()
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "summary"
+    from modules import fleet_economy
+    out = (await fleet_economy.generate_caravan(sid) if action == "caravan"
+           else await fleet_economy.get_burn_summary(sid))
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
+        print("  no result")
+    else:
+        print(f"  result: {out}")
+    await Database.close()
+
+
 async def cmd_artifact():
     """artifact {list | medals | award <recipient> <tier> "<backstory>" | equip <artifact-id> <target-id>}
 
@@ -3271,6 +3391,12 @@ if __name__ == "__main__":
         asyncio.run(cmd_bond())
     elif cmd in ("artifact", "artifacts", "relics"):
         asyncio.run(cmd_artifact())
+    elif cmd in ("world", "seeds", "secrets"):
+        asyncio.run(cmd_world())
+    elif cmd in ("inner", "memories", "autonomy"):
+        asyncio.run(cmd_inner())
+    elif cmd in ("burn", "fleet-economy", "caravan"):
+        asyncio.run(cmd_burn())
     elif cmd in ("encounter", "encounters", "events"):
         asyncio.run(cmd_encounter())
     else:

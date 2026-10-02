@@ -36,6 +36,7 @@ DRY_RUNS = (
     ("faction_scale.py", ["--dry-run"]),
     ("ship_tiers.py", ["--dry-run"]),
     ("ship_fleet.py", ["--dry-run"]),
+    ("restore_mythic_tiers.py", ["--dry-run"]),
 )
 
 

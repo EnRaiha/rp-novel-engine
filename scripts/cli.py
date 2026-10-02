@@ -93,6 +93,39 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_cargo():
+    """cargo {create <item> <qty> <loc-type> <loc-id> | ship <cargo-id> <dest-type> <dest-id> <ship-id> | status}
+
+    `create_cargo` and `transport` both had no caller, so `run_tick` delivered missions nothing could
+    create and the cargo table held no rows. This is the only door.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py cargo create "<item>" <qty> <location-type> <location-id>\n'
+             '       cli.py cargo ship <cargo-id> <dest-type> <dest-id> <ship-id>\n'
+             '       cli.py cargo status')
+    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
+    action = sys.argv[2] if len(sys.argv) > 2 else "status"
+    from modules import logistics
+    if action == "create":
+        if len(sys.argv) < 7:
+            print(usage); await Database.close(); return
+        out = await logistics.create_cargo(sys.argv[3], float(sys.argv[4]), sys.argv[5], int(sys.argv[6]), sid)
+    elif action == "ship":
+        if len(sys.argv) < 7:
+            print(usage); await Database.close(); return
+        out = await logistics.transport(int(sys.argv[3]), sys.argv[4], int(sys.argv[5]), int(sys.argv[6]), sid)
+    else:
+        rows = await Database.fetch(
+            "SELECT id, item_type, quantity, location_type, location_id FROM maya_rp.cargo"
+            " WHERE session_id=$1 ORDER BY id DESC LIMIT 20", sid)
+        out = {"held": len(rows)}
+        for row in rows:
+            print(f"  #{row['id']} {row['quantity']} x {row['item_type']} at {row['location_type']}:{row['location_id']}")
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
 async def cmd_science():
     """science {mission <type> | anomaly <location> | status} — the exoscience board.
 
@@ -2189,6 +2222,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_mystery())
     elif cmd == "science" or cmd == "exoscience":
         asyncio.run(cmd_science())
+    elif cmd == "cargo":
+        asyncio.run(cmd_cargo())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

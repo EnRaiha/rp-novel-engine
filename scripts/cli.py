@@ -93,6 +93,44 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_mystery():
+    """mystery {new <title> | clue <inv-id> <text> | deduce <inv-id> [note] | status} — the case file.
+
+    The whole investigation subsystem had no production caller: `create_investigation`, `add_clue`,
+    `deduce` and `generate_red_herring` were reachable from nothing, and `run_tick` ages cases that
+    never exist. This is the boundary.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py mystery new "<title>" [template] [difficulty]\n'
+             '       cli.py mystery clue <investigation-id> "<text>" [source]\n'
+             '       cli.py mystery deduce <investigation-id> ["note"]\n'
+             '       cli.py mystery status')
+    sid = take_session_flag(sys.argv)[0] or Config.SESSION_ID
+    action = sys.argv[2] if len(sys.argv) > 2 else "status"
+    from modules import mystery
+    if action == "new":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        template = sys.argv[4] if len(sys.argv) > 4 else "generic"
+        difficulty = int(sys.argv[5]) if len(sys.argv) > 5 else 5
+        out = await mystery.create_investigation(sid, sys.argv[3], template, difficulty)
+    elif action == "clue":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        source = sys.argv[5] if len(sys.argv) > 5 else "discovery"
+        out = await mystery.add_clue(sid, int(sys.argv[3]), sys.argv[4], source=source)
+    elif action == "deduce":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        note = sys.argv[4] if len(sys.argv) > 4 else ""
+        out = await mystery.deduce(sid, int(sys.argv[3]), note)
+    else:
+        out = await mystery.run_tick(sid)
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
 async def cmd_character():
     """character <name> {item|outfit|wear|profile} <json|id> — hand a character something new.
 
@@ -2119,6 +2157,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_sync_pack())
     elif cmd == "character":
         asyncio.run(cmd_character())
+    elif cmd == "mystery" or cmd == "investigation":
+        asyncio.run(cmd_mystery())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

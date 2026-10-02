@@ -30,8 +30,22 @@ async def create_investigation(session_id: int, title: str, template: str = "gen
 async def add_clue(session_id: int, investigation_id: int, text: str, source: str = "discovery",
                    revealed_by: int | None = None, connects_to: int | None = None,
                    source_type: str = "discovery") -> dict:
+    """Attach one clue to an investigation.
+
+    Reviewed 2026-10-03 before wiring. The insert never checked that the investigation belonged to
+    this session, so a clue could be filed against another campaign's case; that check is here now.
+    An unknown `source_type` still falls back to `discovery`, which is deliberate and reported in the
+    return value rather than hidden.
+    """
     if source_type not in ALLOWED_SOURCE_TYPES:
         source_type = "discovery"
+    owner = await Database.fetchval(
+        "SELECT session_id FROM maya_rp.investigations WHERE id=$1", investigation_id)
+    if owner is None:
+        return {"error": f"investigation {investigation_id} does not exist"}
+    if int(owner) != int(session_id):
+        return {"error": f"investigation {investigation_id} belongs to session {owner},"
+                         f" not {session_id}"}
     clue_id = await Database.fetchval(
         "INSERT INTO maya_rp.clues (session_id, source, source_type, text, connects_to_clue, revealed, revealed_by_character, investigation_id) "
         "VALUES ($1,$2,$3,$4,$5,true,$6,$7) RETURNING id",

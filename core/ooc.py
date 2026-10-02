@@ -31,6 +31,7 @@ from typing import Any, Sequence
 
 from core.config import Config
 from core.db import Database
+from modules.magic_cost import declared_acts, price_acts
 
 # ── Layers (§2) ─────────────────────────────────────────────────────────
 LAYER_SOMATIC = "somatic"
@@ -469,6 +470,9 @@ async def audit(
     context: dict[str, Any] | None = None,
     turn_ref: str | None = None,
     suspicion_delta: int = 0,
+    magic_acts: Sequence[str] | str | None = None,
+    magic_witnessed: bool = False,
+    magic_instrument: bool = False,
     preview: bool = False,
 ) -> dict[str, Any]:
     """Audit one text, fold it into the state, and record the decision (D3).
@@ -484,6 +488,12 @@ async def audit(
     @param context - scene facts (`scene`, `location`) an exemption condition is tested against.
     @param turn_ref - session/turn anchor for the audit row.
     @param suspicion_delta - observer suspicion this turn moves (0 until D6).
+    @param magic_acts - the magic acts the Host declares for this turn, by canon key
+        (`modules/magic_cost.ACT_TABLE`). The engine cannot detect magic in prose, so the
+        declaration is the Host's assertion; an undeclared turn prices at zero.
+    @param magic_witnessed - true when a present character could see the declared acts.
+    @param magic_instrument - true when a witness holds an instrument that measures magic.
+        A measured act raises a record the Panel can file.
     @param preview - answer what the text *would* cost without writing anything
         (the harness `ooc_audit` tool is a free preview by contract).
     @returns the audit result: findings, new deviation, stage, debuff, award,
@@ -521,6 +531,12 @@ async def audit(
     findings = [finding for finding in raw_findings if finding.rule_id not in live]
 
     delta = 0 if standing_down else sum(finding.delta for finding in findings)
+    # Magic leaves data (third mixing law). Priced only when the Host declares it, and
+    # never while maintenance stands the register down, so the stand-down stays total.
+    magic = price_acts(declared_acts(magic_acts), witnessed=magic_witnessed,
+                       instrument=magic_instrument)
+    magic_delta = 0 if standing_down else int(magic["deviation"])
+    delta += magic_delta
     decay = STAGE_THRESHOLDS.get(stage, STAGE_THRESHOLDS["lockdown"])["decay"]
     settled = 0 if standing_down or findings else decay
     deviation = max(0, min(100, int(current["deviation"]) - settled + delta))
@@ -547,14 +563,20 @@ async def audit(
             "loophole_score": score,
             "rpp_award": award,
             "disposition": "flagged" if findings else ("exempt" if exempted else "no_match"),
-            "suspicion_delta": 0,
-            "suspicion_reason": None,
+            "suspicion_delta": 0 if standing_down else int(magic["suspicion"]),
+            "suspicion_reason": "magic" if not standing_down and magic["suspicion"] else None,
+            "magic": magic,
+            "magic_delta": magic_delta,
             "audit_event_id": None,
             "beats_completed": [],
             "state": current,
         }
 
     micro, micro_reason = await _suspicion_turn(sid, findings, stage)
+    magic_suspicion = 0 if standing_down else int(magic["suspicion"])
+    if magic_suspicion:
+        micro += magic_suspicion
+        micro_reason = "magic"
     if suspicion_delta:
         micro = suspicion_delta
 
@@ -637,6 +659,8 @@ async def audit(
         "skip_reason": skip_reason,
         "exempted": [{"rule_id": f.rule_id, "action_key": live.get(f.rule_id)} for f in exempted],
         "suspicion_delta": micro,
+        "magic": magic,
+        "magic_delta": magic_delta,
         "suspicion_reason": micro_reason,
         "audit_event_id": event["id"] if event else None,
         "beats_completed": beats_completed,

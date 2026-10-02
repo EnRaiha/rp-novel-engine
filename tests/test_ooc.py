@@ -1101,6 +1101,50 @@ class TestMirror:
         assert {item["sessionId"] for item in entries} == {3, SCRATCH_SESSION}
 
 
+class TestMagicAccounting:
+    """The third mixing law at the audit seam: magic leaves data."""
+
+    async def test_an_undeclared_turn_prices_at_zero(self, scratch_session):
+        from core import ooc
+
+        await Database.execute(
+            "UPDATE maya_rp.ooc_system_state SET deviation=0, arc_stage='selective' WHERE session_id=$1",
+            SCRATCH_SESSION,
+        )
+        result = await ooc.audit("She sets the cup down and says nothing.", SCRATCH_SESSION,
+                                 traits=("general",), turn_ref="magic-none")
+        assert result["magic_delta"] == 0
+        assert result["magic"]["acts"] == []
+
+    async def test_a_declared_act_bills_the_deviation(self, scratch_session):
+        from core import ooc
+
+        await Database.execute(
+            "UPDATE maya_rp.ooc_system_state SET deviation=0, arc_stage='selective' WHERE session_id=$1",
+            SCRATCH_SESSION,
+        )
+        plain = await ooc.audit("He works in silence.", SCRATCH_SESSION,
+                                traits=("general",), turn_ref="magic-plain")
+        billed = await ooc.audit("He works in silence.", SCRATCH_SESSION, traits=("general",),
+                                 magic_acts=["well:close_wound"], turn_ref="magic-declared")
+        assert billed["magic_delta"] == 6
+        assert billed["delta"] == plain["delta"] + 6
+
+    async def test_a_preview_writes_nothing_but_still_quotes(self, scratch_session):
+        from core import ooc
+
+        before = await Database.fetch(
+            "SELECT deviation FROM maya_rp.ooc_system_state WHERE session_id=$1", SCRATCH_SESSION
+        )
+        result = await ooc.audit("He works in silence.", SCRATCH_SESSION, traits=("general",),
+                                 magic_acts=["well:immersion"], preview=True)
+        after = await Database.fetch(
+            "SELECT deviation FROM maya_rp.ooc_system_state WHERE session_id=$1", SCRATCH_SESSION
+        )
+        assert result["magic_delta"] == 10
+        assert before[0]["deviation"] == after[0]["deviation"]
+
+
 class TestMaintenanceStandDown:
     """GM MAYA armed: the turn is recorded, the number stands still."""
 
@@ -1124,9 +1168,11 @@ class TestMaintenanceStandDown:
             SCRATCH_SESSION,
         )
         result = await ooc.audit(
-            'Tears streak her cheek. "I am fine."', SCRATCH_SESSION, traits=("aloof",), turn_ref="maint"
+            'Tears streak her cheek. "I am fine."', SCRATCH_SESSION, traits=("aloof",),
+            magic_acts=["well:immersion"], turn_ref="maint"
         )
         assert result["disposition"] == "skipped"
+        assert result["magic_delta"] == 0, "maintenance must not bill magic either"
         assert result["skip_reason"] == "maintenance"
         assert result["findings"] == []
         assert result["delta"] == 0

@@ -2,6 +2,7 @@
 from core.db import Database
 from core.utils import calc_game_days, clamp
 from datetime import datetime, timezone
+from core.log import error
 
 # Progressive marginal tax brackets — PERCENTAGE rates that thin with world size.
 # Big worlds still pay more absolute tax (they are huge), but a smaller
@@ -57,8 +58,11 @@ async def gate_toll_income(session_id: int = 3) -> int:
                JOIN maya_rp.factions fa ON fa.id = ftd.faction_a_id
                JOIN maya_rp.factions fb ON fb.id = ftd.faction_b_id
                WHERE ftd.active
-                 AND ((fa.name ILIKE '%Setia%') <> (fb.name ILIKE '%Setia%'))""")
-    except Exception:
+                 AND ftd.session_id = $1
+                 AND ((fa.name ILIKE '%Setia%') <> (fb.name ILIKE '%Setia%'))""",
+            int(session_id))
+    except Exception as e:
+        error("economy", f"gate_toll_income: {e}")
         volume = 0
     return (int(volume or 0) // GATE_TOLL_VOLUME_PER_CROSSING) * GATE_TOLL_RATE
 

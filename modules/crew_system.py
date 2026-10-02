@@ -8,7 +8,6 @@ Novel: "Oops! We are short of talent" — bottleneck bukan kapal, tapi CREW.
 - Shortage → undercrewed penalty (Stakes Integrity)
 """
 from __future__ import annotations
-import random
 from core.db import Database
 from core.config import Config
 from core.log import info
@@ -45,15 +44,22 @@ async def produce_crew(session_id: int | None = None) -> dict:
         sources.append((f"university:{u['name']}", out))
 
     if total > 0:
-        await Database.execute(
+        # The campuses are a global catalogue with no session_id, so the rate is the same for every
+        # campaign. What is not global is the pool it credits, and a session with no resources row used
+        # to be told it had produced crew that went nowhere: the UPDATE matched nothing and returned no
+        # error. It says so now.
+        pool = await Database.fetchval(
             "UPDATE maya_rp.resources SET crew_pool=crew_pool+$1, crew_trained_total=crew_trained_total+$1 "
-            "WHERE session_id=$2", total, session_id)
-        pool = await Database.fetchval("SELECT crew_pool FROM maya_rp.resources WHERE session_id=$1", session_id)
+            "WHERE session_id=$2 RETURNING crew_pool", total, session_id)
+        if pool is None:
+            return {"produced": 0, "would_produce": total, "sources": sources,
+                    "unpaid": f"session {session_id} has no resources row, so nothing was credited"}
         for src, amt in sources:
             await Database.execute(
                 "INSERT INTO maya_rp.crew_production_log (session_id, game_day, source, amount, pool_after) "
                 "VALUES ($1,$2,$3,$4,$5)", session_id, gd, src, amt, pool)
-    return {"produced": total, "sources": sources}
+        return {"produced": total, "sources": sources, "pool_after": pool}
+    return {"produced": 0, "sources": sources}
 
 
 async def consume_crew(session_id: int | None, ship_id: int, required: int) -> dict:
@@ -62,7 +68,11 @@ async def consume_crew(session_id: int | None, ship_id: int, required: int) -> d
         session_id = Config.SESSION_ID
     gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
     pool = await Database.fetchval("SELECT crew_pool FROM maya_rp.resources WHERE session_id=$1", session_id) or 0
-    name = await Database.fetchval("SELECT name FROM maya_rp.ships WHERE id=$1", ship_id) or "?"
+    ship = await Database.fetchrow(
+        "SELECT name FROM maya_rp.ships WHERE id=$1 AND session_id=$2", ship_id, session_id)
+    if ship is None:
+        return {"error": f"ship {ship_id} is not in session {session_id}"}
+    name = ship["name"]
 
     if pool >= required:
         new_pool = pool - required
@@ -70,8 +80,9 @@ async def consume_crew(session_id: int | None, ship_id: int, required: int) -> d
             "UPDATE maya_rp.resources SET crew_pool=$1, crew_consumed_total=crew_consumed_total+$2 WHERE session_id=$3",
             new_pool, required, session_id)
         await Database.execute(
-            "UPDATE maya_rp.ships SET crew_current=$1, undercrewed_penalty=0, status='active' WHERE id=$2",
-            required, ship_id)
+            "UPDATE maya_rp.ships SET crew_current=$1, undercrewed_penalty=0, status='active'"
+            " WHERE id=$2 AND session_id=$3",
+            required, ship_id, session_id)
         await Database.execute(
             "INSERT INTO maya_rp.crew_consumption_log (session_id, game_day, ship_id, ship_name, amount, pool_after) "
             "VALUES ($1,$2,$3,$4,$5,$6)", session_id, gd, ship_id, name, required, new_pool)
@@ -82,7 +93,7 @@ async def consume_crew(session_id: int | None, ship_id: int, required: int) -> d
     penalty = round(deficit / max(1, required), 3)
     await Database.execute(
         "UPDATE maya_rp.ships SET crew_current=$1, crew_required=$2, undercrewed_penalty=$3, status='undercrewed' "
-        "WHERE id=$4", pool, required, penalty, ship_id)
+        "WHERE id=$4 AND session_id=$5", pool, required, penalty, ship_id, session_id)
     await Database.execute(
         "INSERT INTO maya_rp.crew_consumption_log (session_id, game_day, ship_id, ship_name, amount, pool_after) "
         "VALUES ($1,$2,$3,$4,$5,$6)", session_id, gd, ship_id, name, pool, 0)

@@ -1485,6 +1485,137 @@ async def cmd_lineage():
     await Database.close()
 
 
+async def cmd_programme():
+    """Science programmes and the long knife (Fasa 2.3 and 2.4).
+
+    Reads and writes `maya_rp.research_queue`; the arithmetic lives in
+    `modules/programme_cost.py`, so nothing here decides a number.
+
+      cli.py programme list [--session N]
+      cli.py programme quote --tier=5 [--lab=N]
+      cli.py programme tick [--session N] [--days=N] [--apply]     # dry by default
+      cli.py programme kill --target=ID --spend=1..3 [--screened] [--deniable]
+                           [--importance=N] [--apply]              # dry by default
+
+    Writes require --apply on purpose. A read-only command that silently advances the
+    world is how a test ends up changing the campaign.
+    """
+    import modules.programme_cost as cost
+
+    flags = {a[2:].split("=", 1)[0]: (a.split("=", 1)[1] if "=" in a else "")
+             for a in sys.argv[2:] if a.startswith("--")}
+    args = [a for a in sys.argv[2:] if not a.startswith("--")]
+    sub = args[0] if args else "list"
+    # `SID` is the run-resolved session: `__main__` strips --session before dispatch,
+    # so Config.SESSION_ID is only the process default and would be the wrong fallback.
+    session = int(flags.get("session") or SID)
+
+    def show(row) -> str:
+        if isinstance(row, dict):
+            return row
+        return {}
+
+    if sub == "quote":
+        tier = int(flags.get("tier") or 5)
+        lab = int(flags.get("lab") or 0)
+        days = cost.target_days(tier)
+        credits = cost.target_credits(tier)
+        print(f"tier {tier}: {days} programme-days ({cost.lost_years(days, 1):.1f} years at one rate) "
+              f"· {credits:,} C")
+        for doctrine in ("science_tech", "magic", "balance"):
+            rate = cost.progress_per_day(True, lab, doctrine)
+            print(f"  doctrine {doctrine:<13} rate {rate}/day → {days / rate:,.0f} days with a lead")
+        return
+
+    db = Database
+
+    if sub == "kill":
+        target = flags.get("target")
+        if not target:
+            print("Usage: cli.py programme kill --target=ID --spend=1..3 [--screened] [--deniable] [--apply]")
+            sys.exit(1)
+        try:
+            spend = int(flags.get("spend") or 1)
+        except ValueError:
+            print("--spend must be 1, 2 or 3")
+            sys.exit(1)
+        importance = int(flags.get("importance") or 5)
+        score = cost.kill_score(spend, bool(flags.get("deniable")), bool(flags.get("screened")), importance)
+        outcome = cost.kill_outcome(score)
+        row = await db.fetch(
+            "SELECT id, programme_days, lead_character_id, tier_target FROM maya_rp.research_queue WHERE id=$1",
+            int(target))
+        if not row:
+            print(f"no programme with id {target}")
+            sys.exit(1)
+        days = int(row[0]["programme_days"] or 0)
+        setback = cost.setback_days(days, outcome)
+        print(f"programme {target}: score {score} → {outcome} · setback {setback} programme-days "
+              f"({cost.lost_years(setback, 1):.1f} years)")
+        case = cost.investigation_score(False, False, outcome)
+        print(f"  a case would open at strength {case} (opens at {cost.INVESTIGATION_OPEN_AT}, "
+              f"names a payer at {cost.INVESTIGATION_PAYER_AT})")
+        if not "--apply" in sys.argv:
+            print("dry run: nothing written (pass --apply to write)")
+            return
+        await db.execute(
+            "UPDATE maya_rp.research_queue SET programme_days = GREATEST(0, programme_days - $1) WHERE id=$2",
+            setback, int(target))
+        print(f"  applied: programme {target} lost {setback} days")
+        return
+
+    if sub == "tick":
+        rows = await db.fetch(
+            """SELECT id, programme_days, tier_target, lead_character_id, theory_only, faction_id
+               FROM maya_rp.research_queue WHERE session_id=$1 ORDER BY id""", session)
+        if not rows:
+            print(f"session {session} has no programme row; the seed is blocked on funding")
+            return
+        days_to_run = int(flags.get("days") or 1)
+        for row in rows:
+            target_tier = row["tier_target"] or 5
+            target = cost.target_days(int(target_tier))
+            doctrine = "unaligned"
+            if row["faction_id"]:
+                doctrine_row = await db.fetch(
+                    "SELECT doctrine FROM maya_rp.factions WHERE id=$1", int(row["faction_id"]))
+                if doctrine_row:
+                    doctrine = doctrine_row[0]["doctrine"] or "unaligned"
+            rate = 0 if row["theory_only"] else cost.progress_per_day(
+                row["lead_character_id"] is not None, 0, doctrine)
+            current = int(row["programme_days"] or 0)
+            new = min(target, current + rate * days_to_run)
+            print(f"programme {row['id']}: {current} → {new} / {target} days "
+                  f"(rate {rate}/day, {'theory only' if row['theory_only'] else 'building'})")
+            if "--apply" in sys.argv and new != current:
+                await db.execute("UPDATE maya_rp.research_queue SET programme_days=$1 WHERE id=$2",
+                                 new, int(row["id"]))
+                print(f"  applied: {row['id']} now {new}")
+        if "--apply" not in sys.argv:
+            print("dry run: nothing written (pass --apply to write)")
+        return
+
+    rows = await db.fetch(
+        """SELECT r.id, r.session_id, r.status, r.tier_target, r.programme_days, r.theory_only,
+                  r.lead_character_id, f.name AS faction, c.name AS lead
+           FROM maya_rp.research_queue r
+           LEFT JOIN maya_rp.factions f ON f.id = r.faction_id
+           LEFT JOIN maya_rp.characters c ON c.id = r.lead_character_id
+           WHERE r.session_id=$1 ORDER BY r.id""", session)
+    if not rows:
+        print(f"session {session}: no programme rows. Seed is blocked on funding; "
+              f"see wiki/rp-dev/SCIENCE-ASSASSINATION-2026-10-02.md")
+        return
+    for row in rows:
+        tier = row["tier_target"]
+        target = cost.target_days(int(tier)) if tier else None
+        progress = int(row["programme_days"] or 0)
+        pct = f"{100 * progress / target:.0f}%" if target else "n/a"
+        print(f"#{row['id']} {str(row['faction'] or '—')[:22]:<22} tier {tier or '—'} "
+              f"{progress}/{target or '—'} {pct} {'theory' if row['theory_only'] else 'building'} "
+              f"lead {str(row['lead'] or '—')[:18]}")
+
+
 async def cmd_ooc():
     """OOC engine — System overseer.
 
@@ -1897,6 +2028,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_romance())
     elif cmd == "ooc":
         asyncio.run(cmd_ooc())
+    elif cmd == "programme" or cmd == "programmes":
+        asyncio.run(cmd_programme())
     elif cmd == "assembly":
         asyncio.run(cmd_assembly())
     elif cmd == "duel":

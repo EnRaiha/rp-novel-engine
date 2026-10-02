@@ -25,6 +25,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 
 TABLES = {
+    "research_queue": "SELECT count(*), md5(string_agg(id::text || coalesce(programme_days::text,'') || coalesce(status,''), '|' ORDER BY id)) FROM maya_rp.research_queue",
     "factions": "SELECT count(*), md5(string_agg(id::text || coalesce(stance,'') || coalesce(stance_score::text,'') || coalesce(stance_at::text,'') || coalesce(systems_held::text,'') || coalesce(scale_class,'') || coalesce(doctrine,'') || coalesce(origin,'') || coalesce(trust::text,''), '|' ORDER BY id)) FROM maya_rp.factions",
     "ships": "SELECT count(*), md5(string_agg(id::text || coalesce(tier::text,'') || coalesce(faction_id::text,'') || coalesce(class_id::text,''), '|' ORDER BY id)) FROM maya_rp.ships",
     "territory": "SELECT count(*), md5(string_agg(id::text || coalesce(controlling_faction,'') || coalesce(contested_by::text,'') || coalesce(updated_at::text,''), '|' ORDER BY id)) FROM maya_rp.territory",
@@ -88,3 +89,27 @@ def test_dry_run_exits_clean_and_writes_nothing(script, args, fingerprints):
     assert "dry run" in result.stdout.lower() or "nothing written" in result.stdout.lower(), (
         f"{script} did not say it wrote nothing: {result.stdout[-300:]}"
     )
+
+
+PROGRAMME_DRY = (
+    ("list", ["programme", "list"]),
+    ("quote", ["programme", "quote", "--tier=5"]),
+    ("tick", ["programme", "tick", "--session=3"]),
+    ("kill", ["programme", "kill", "--target=1", "--spend=3"]),
+)
+
+
+@pytest.mark.parametrize("label,args", PROGRAMME_DRY)
+def test_programme_commands_are_dry_by_default(label, args, fingerprints):
+    """The programme surface must not write unless it is told to.
+
+    The magic CLI wrote to the campaign during a manual check, so this gate now covers the
+    programme commands too: `list` and `quote` read, and `tick` and `kill` print a plan and
+    stop unless `--apply` is present.
+    """
+    env = {**os.environ, "DEEPSEEK_API_KEY": os.environ.get("DEEPSEEK_API_KEY", "test-key")}
+    result = subprocess.run([sys.executable, str(SCRIPTS / "cli.py"), *args],
+                            capture_output=True, text=True, cwd=str(ROOT), env=env, timeout=300)
+    assert result.returncode == 0, f"{label} failed: {result.stderr[-400:]}"
+    if label in ("tick", "kill"):
+        assert "dry run" in result.stdout or "nothing written" in result.stdout, result.stdout[-300:]

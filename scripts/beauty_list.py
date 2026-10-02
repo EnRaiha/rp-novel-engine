@@ -145,17 +145,27 @@ def main() -> int:
         conn.close()
         return 0
 
-    free = max([r["catalog"] for r in rows if r["catalog"] is not None and r["catalog"] < CATALOG_CEILING] or [54]) + 1
+    # An existing catalog id is never reassigned. The first version of this script overwrote all
+    # 248 candidates and moved every id, which broke the binding between the readable catalog and
+    # the engine: the doc said Queen Onyx Sable was katalog 52 and the database said 334. Ids are
+    # restored from a save when that happens, and the rule lives here so it cannot happen twice.
+    free = max([r["catalog"] for r in rows
+                if r["catalog"] is not None and r["catalog"] < CATALOG_CEILING] or [54]) + 1
     changed = 0
     for row in candidates:
-        if row["standard"] and row["catalog"] is not None and basis == "kept":
+        if row["catalog"] is not None:
+            if not row["standard"]:
+                cur.execute("UPDATE maya_rp.characters SET beauty_standard = true WHERE id = %s",
+                            (row["id"],))
+                changed += 1
             continue
         cur.execute("UPDATE maya_rp.characters SET beauty_standard = true, beauty_catalog_id = %s WHERE id = %s",
                     (free, row["id"]))
         free += 1
         changed += 1
     conn.commit()
-    print(f"applied: {changed} rows now carry beauty_standard and a catalog id")
+    print(f"applied: {changed} rows changed; kept ids for "
+          f"{sum(1 for r in candidates if r['catalog'] is not None)} rows that already had one")
     conn.close()
     return 0
 

@@ -159,3 +159,25 @@ class TestWifeTierResolution:
     def test_a_stranger_is_not_a_wife(self):
         row = {"name": "Nobody", "traits": '["imported"]', "background": "", "id": 3}
         assert face_manifest.tier_of(row, set()) == "import"
+
+
+class TestBeautyListKeepsExistingIds:
+    """The catalog id binds the readable catalog to the engine, so it is never reassigned.
+
+    The first apply overwrote all 248 candidates: the doc said Queen Onyx Sable was katalog 52 and
+    the database said 334. The rule that prevents it is checked here, because the damage is silent
+    until someone compares the two.
+    """
+
+    def test_the_apply_path_only_assigns_when_the_id_is_missing(self):
+        import inspect
+
+        source = inspect.getsource(beauty_list.main)
+        assert 'if row["catalog"] is not None:' in source, 'existing ids must be kept'
+        assert "beauty_catalog_id = %s WHERE id = %s" in source
+
+    def test_the_free_id_starts_above_every_id_in_use(self):
+        import inspect
+
+        source = inspect.getsource(beauty_list.main)
+        assert "CATALOG_CEILING" in source, "the start point must ignore the synthetic ceiling"

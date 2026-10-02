@@ -52,7 +52,7 @@ Formulas, written out so a test can check them:
     well_recover(reserve, days)     = min(WELL_RESERVE_DROPS,
                                           reserve + WELL_RECOVERY_DROPS_PER_DAY * days)
                                       monotonic in days, capped at the reserve,
-                                      unchanged for days <= 0
+                                      refused for days < 0, unchanged for days = 0
 
     well_charge_bodies(drops)       = drops // WELL_COST_DROPS['immersion']
                                       336 drops restores 25 bodies

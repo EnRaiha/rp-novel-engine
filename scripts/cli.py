@@ -93,6 +93,93 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_spy():
+    """spy {build "<type>" "<name>" | deploy "<name>" "<lane>" | hack "<name>" <operation> <target> |
+    cloaks | anticloak "<system>" <level>}
+
+    Five entry points of `modules/stealth.py` had no caller: the two cloak actions, the spy builder, the
+    deployment and the hack. The tick ran against spies nothing could build.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py spy build "<unit-type>" "<name>"\n'
+             '       cli.py spy deploy "<name>" "<lane>"\n'
+             '       cli.py spy hack "<name>" <operation> <target>\n'
+             '       cli.py spy cloaks | anticloak "<system>" <level>')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "cloaks"
+    from modules import stealth
+    if action == "build":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await stealth.build_spy(sys.argv[3], sys.argv[4], sid)
+    elif action == "deploy":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await stealth.deploy_spy(sys.argv[3], sys.argv[4], sid)
+    elif action == "hack":
+        if len(sys.argv) < 6:
+            print(usage); await Database.close(); return
+        out = await stealth.hack(sys.argv[3], sys.argv[4], sys.argv[5], sid)
+    elif action == "anticloak":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await stealth.build_anticloak(sys.argv[3], int(sys.argv[4]), sid)
+    else:
+        rows = await stealth.list_anticloak(sid)
+        out = {"cloaks": len(rows)}
+        for row in rows[:10]:
+            print(f"  {row}")
+    if not out:
+        print("  no result")
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
+async def cmd_tech():
+    """tech {view | info "<tech>" | labs | build-lab <colony> "<name>" "<field>" |
+    assign <character> <lab-id> "<specialty>"}
+
+    Four entry points of `modules/tech_tree.py` had no caller, and they are the research surface: the
+    tree, one technology, the labs and the scientist assignment.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py tech view | labs\n'
+             '       cli.py tech info "<tech-name>"\n'
+             '       cli.py tech build-lab <colony-id> "<name>" "<field>"\n'
+             '       cli.py tech assign <character-id> <lab-id> "<specialty>"')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "view"
+    from modules import tech_tree
+    if action == "info":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await tech_tree.tech_info(sys.argv[3], sid)
+    elif action == "build-lab":
+        if len(sys.argv) < 6:
+            print(usage); await Database.close(); return
+        out = await tech_tree.build_lab(int(sys.argv[3]), sys.argv[4], sys.argv[5], sid)
+    elif action == "assign":
+        if len(sys.argv) < 6:
+            print(usage); await Database.close(); return
+        out = await tech_tree.assign_scientist(int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sid)
+    elif action == "labs":
+        rows = await tech_tree.list_labs(sid)
+        out = {"labs": len(rows)}
+        for row in rows[:10]:
+            print(f"  {row}")
+    else:
+        rows = await tech_tree.view_tech(sid)
+        out = {"technologies": len(rows)}
+        for row in (rows or [])[:8]:
+            print(f"  {row}")
+    if not out:
+        print("  no result")
+    for key, value in (out or {}).items():
+        print(f"  {key}: {value}")
+    await Database.close()
+
+
 async def cmd_forge():
     """forge {weapons | blueprints | design <name> <category> <damage> <range> <slot> <tier> |
     produce <blueprint> [qty] | upgrades <weapon-id> | fit <weapon-id> "<upgrade>"}
@@ -2741,6 +2828,10 @@ if __name__ == "__main__":
         asyncio.run(cmd_council())
     elif cmd in ("forge", "weapon", "weapons"):
         asyncio.run(cmd_forge())
+    elif cmd in ("spy", "spies", "stealth", "espionage"):
+        asyncio.run(cmd_spy())
+    elif cmd in ("tech", "tech-tree", "labs"):
+        asyncio.run(cmd_tech())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

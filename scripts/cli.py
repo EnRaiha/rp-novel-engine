@@ -93,6 +93,84 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_artifact():
+    """artifact {list | medals | award <recipient> <tier> "<backstory>" | equip <artifact-id> <target-id>}
+
+    Three entry points of `modules/artifacts.py` had no caller: the relic list, the medal award and the
+    medal list. The module could discover and equip, and nothing could look at what it had found.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py artifact list | medals\n'
+             '       cli.py artifact award "<recipient>" <tier> "<backstory>"\n'
+             '       cli.py artifact equip <artifact-id> <target-id>')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "list"
+    from modules import artifacts
+    if action == "award":
+        if len(sys.argv) < 6:
+            print(usage); await Database.close(); return
+        out = await artifacts.award_medal(sid, sys.argv[3], int(sys.argv[4]), sys.argv[5])
+    elif action == "medals":
+        rows = await artifacts.list_medals(sid)
+        out = {"medals": len(rows)}
+        for row in rows[:10]:
+            print(f"  {row}")
+    elif action == "equip":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await artifacts.equip(int(sys.argv[3]), int(sys.argv[4]), sid)
+    else:
+        rows = await artifacts.list_artifacts(sid)
+        out = {"artifacts": len(rows)}
+        for row in rows[:10]:
+            print(f"  {row}")
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
+        print("  no result")
+    else:
+        print(f"  result: {out}")
+    await Database.close()
+
+
+async def cmd_encounter():
+    """encounter {templates | generate <category> [difficulty] | log <type> "<title>" "<description>"}
+
+    Three entry points of `modules/encounters.py` had no caller: the template list, the generator and the
+    event log. The tick ran against events nothing could create or record.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py encounter templates\n'
+             '       cli.py encounter generate <category> [difficulty]\n'
+             '       cli.py encounter log "<event-type>" "<title>" "<description>"')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "templates"
+    from modules import encounters
+    if action == "generate":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        difficulty = int(sys.argv[4]) if len(sys.argv) > 4 else 5
+        out = await encounters.generate_event(sid, sys.argv[3], difficulty)
+    elif action == "log":
+        if len(sys.argv) < 6:
+            print(usage); await Database.close(); return
+        out = await encounters.log_event(sid, sys.argv[3], sys.argv[4], sys.argv[5])
+    else:
+        templates = encounters.get_encounter_templates()
+        out = {"templates": len(templates)}
+        for name in list(templates)[:8]:
+            print(f"  {name}")
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
+        print("  no result")
+    else:
+        print(f"  result: {out}")
+    await Database.close()
+
+
 async def cmd_bond():
     """bond {ranking | shift <action> [quality] | heal <character-id> "<activity>" |
     release <character-id> | aftercare <target-id> <initiator-id>}
@@ -3191,6 +3269,10 @@ if __name__ == "__main__":
         asyncio.run(cmd_shipyard())
     elif cmd in ("bond", "romance"):
         asyncio.run(cmd_bond())
+    elif cmd in ("artifact", "artifacts", "relics"):
+        asyncio.run(cmd_artifact())
+    elif cmd in ("encounter", "encounters", "events"):
+        asyncio.run(cmd_encounter())
     else:
         print(
             f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"

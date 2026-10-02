@@ -1491,6 +1491,7 @@ async def cmd_ooc():
     Usage:
       cli.py ooc status [--session N]
       cli.py ooc audit "<text>" [--layer=dialogue|somatic|tool] [--trait=aloof,mentor]
+                                     [--magic=well:close_wound,sight:read] [--witnessed] [--instrument]
                                 [--evidence] [--turn=REF]
       cli.py ooc persona [--slug=…]                    # voice/lore/intro/play-guide summary
       cli.py ooc portrait <name> [occasion]            # preset image lookup or queue
@@ -1553,6 +1554,7 @@ async def cmd_ooc():
             print('Usage: cli.py ooc audit "<text>" [--layer=…] [--trait=…] [--evidence]')
             sys.exit(1)
         try:
+            magic = [a for a in flag("magic", "").split(",") if a.strip()]
             result = await ooc.audit(
                 " ".join(args[1:]),
                 session,
@@ -1561,6 +1563,9 @@ async def cmd_ooc():
                 action_evidence="--evidence" in flags,
                 context=context,
                 turn_ref=flag("turn"),
+                magic_acts=magic,
+                magic_witnessed="--witnessed" in flags,
+                magic_instrument="--instrument" in flags,
             )
         except ooc.FrozenSession as exc:
             print(f"refused: {exc}", file=sys.stderr)
@@ -1569,6 +1574,12 @@ async def cmd_ooc():
               + (f" ({result['skip_reason']})" if result["skip_reason"] else ""))
         for finding in result["findings"]:
             print(f"  ✖ [{finding['rule_id']}] {finding['kind']}/{finding['layer']} +{finding['delta']}  «{finding['match']}»")
+        if result.get("magic_delta"):
+            priced = ", ".join(f"{act} +{cost}" for act, (cost, _) in result["magic"]["priced"].items())
+            print(f"  magic +{result['magic_delta']}  {priced}"
+                  + ("  record raised" if result["magic"]["record"] else ""))
+        for unknown in result.get("magic", {}).get("unknown", []):
+            print(f"  ✖ unknown magic act {unknown!r}; add it to modules/magic_cost.ACT_TABLE")
         print(f"  delta {result['delta']} → deviation {result['deviation']} (decay {result['decay']})"
               f" · debuff {result['debuff'] or '—'} · loophole {result['loophole_score']} · rpp +{result['rpp_award']}")
         for exempt in result["exempted"]:

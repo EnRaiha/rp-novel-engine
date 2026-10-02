@@ -94,15 +94,17 @@ async def cmd_save(label=""):
 
 
 async def cmd_council():
-    """council {seats | cohesion | plots [quality] | assign <crew-id> <role> | thwart <id> <method> |
-    titles | revoke "<system>" "<reason>"}
+    """council {seats | status | cohesion | route "<task>" | authority [hours] | plots [quality] |
+    assign <crew-id> <role> | thwart <id> <method> | titles | revoke "<system>" "<reason>"}
 
     The council is a cabinet politics engine with twenty-five unreachable functions. This wires the six
     that touch the database; the nineteen pure ones (votes, plots, crises, influence) need their own
     driver and their own round.
     """
     await Database.init()
-    usage = ('Usage: cli.py council seats | cohesion | plots [network-quality] | titles\n'
+    usage = ('Usage: cli.py council seats | status | cohesion | titles\n'
+             '       cli.py council route "<task>" | authority [hours]\n'
+             '       cli.py council plots [network-quality]\n'
              '       cli.py council assign <crew-id> <watcher|networker|interrogator>\n'
              '       cli.py council thwart <conspiracy-id> [method]\n'
              '       cli.py council revoke "<system-name>" "<reason>"')
@@ -134,6 +136,27 @@ async def cmd_council():
         if len(sys.argv) < 5:
             print(usage); await Database.close(); return
         out = await council.revoke_title(sid, sys.argv[3], sys.argv[4])
+    elif action == "status":
+        seats = await council.get_cabinet_seats(sid)
+        print(council.status_report(seats))
+        out = {"cohesion": council.get_cohesion(seats)}
+    elif action == "route":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = council.route_task(await council.get_cabinet_seats(sid), sys.argv[3])
+    elif action == "authority":
+        hours = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+        seats = await council.get_cabinet_seats(sid)
+        found = council.get_emergency_authority(seats, hours)
+        if found:
+            out = found
+        elif hours < 24:
+            out = {"authority": f"none: {hours}h of absence, and the chain needs 24"}
+        else:
+            # 24 hours passed and still nobody, so the reason is the cabinet, not the clock. Saying the
+            # clock would send the reader to look in the wrong place.
+            out = {"authority": f"none: {hours}h passed but no active seat in the emergency chain",
+                   "chain": list(council.EMERGENCY_CHAIN)}
     else:
         seats = await council.get_cabinet_seats(sid)
         out = {"seats": len(seats), "valid": council.validate_cabinet(seats)}

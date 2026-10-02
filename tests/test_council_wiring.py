@@ -81,3 +81,38 @@ class TestThePureHelpersTheCliUses:
             finally:
                 await Database.close()
         assert "Invalid role" in asyncio.run(check()).get("error", "")
+
+
+class TestTheThreeThatReadTheSeats:
+    """status_report, route_task and get_emergency_authority take the seat list, so the caller fetches
+    it and they stay pure. They were unreachable, not broken."""
+
+    def test_the_status_report_names_the_cabinet_and_its_cohesion(self):
+        seats = [
+            {"title": "Grand Consul", "holder": "Maya", "portfolio": "overall", "tier": 0,
+             "active": True},
+            {"title": "Commander", "holder": "Rika", "portfolio": "military", "tier": 1,
+             "active": True},
+        ]
+        report = council.status_report(seats)
+        assert "CABINET STATUS" in report
+        assert "Grand Consul: Maya" in report
+        assert "Cohesion:" in report
+
+    def test_a_task_routes_to_the_seat_that_owns_the_portfolio(self):
+        seats = [{"id": 7, "title": "Commander", "holder": "Rika", "portfolio": "defense",
+                  "tier": 1, "active": True}]
+        out = council.route_task(seats, "reinforce the military patrol")
+        assert out["routed"] is True, out
+        assert out["seat"] == 7, out
+
+    def test_emergency_authority_needs_absence_before_it_needs_a_seat(self):
+        seats = [{"title": "Commander", "holder": "Rika", "portfolio": "military", "tier": 1,
+                  "active": True}]
+        assert council.get_emergency_authority(seats, 2) is None, "2 hours cannot hand over command"
+        found = council.get_emergency_authority(seats, 30)
+        assert found and found["seat"]["title"] == "Commander", found
+
+    def test_the_empty_cabinet_is_reported_as_empty_not_as_a_clock(self):
+        assert council.get_emergency_authority([], 30) is None
+        assert council.status_report([]).endswith("Active: 0"), council.status_report([])

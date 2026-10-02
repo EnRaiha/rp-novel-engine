@@ -18,13 +18,23 @@ VAULT = pathlib.Path(__file__).resolve().parents[2]
 MANIFEST = VAULT / "adventures/tkg-arc1-restart/prototype/faces/manifest.json"
 OUT = VAULT / "adventures/tkg/character-sheets/portrait-gallery.md"
 PATH_PREFIX = "adventures/tkg/characters/"
+
+#: Why a group has no face. A gap with a stated reason is a decision; a gap without one is an
+#: oversight, and the difference matters when this sheet is read as a work list.
+NO_FACE_REASON = {
+    "arc1-cast": "the manuscript gives them no body text, so only the author can fill the basis",
+    "import": "imported characters, out of scope under the faces-only ruling",
+    "prisoner": "sealed by design: no portrait until the seal opens",
+    "other": "no appearance basis recorded",
+}
 RELATIVE = "../characters/"
 
 
-def collect() -> tuple[list[dict], list[dict]]:
-    """The characters with a face, split into the confirmed wives and everyone else.
+def collect() -> tuple[list[dict], list[dict], list[dict]]:
+    """Who has a face, and who does not.
 
-    @returns (wives, others), each sorted by name and each carrying {name, id, faces}.
+    @returns (wives, others, missing), the first two sorted by name with {name, id, faces}, and the
+        third every character the manifest carries with no frame ready, as {name, id, tier, gaps}.
     """
     payload = json.loads(MANIFEST.read_text(encoding="utf-8"))
     faces: dict[int, dict] = {}
@@ -43,12 +53,26 @@ def collect() -> tuple[list[dict], list[dict]]:
         # repeating the rule here.
         if row.get("tier") == "wife":
             entry["wife"] = True
+    missing: dict[int, dict] = {}
+    for row in payload["rows"]:
+        if row.get("kind") != "emotion":
+            continue
+        if int(row["id"]) in faces:
+            continue
+        entry = missing.setdefault(int(row["id"]), {
+            "id": int(row["id"]), "name": str(row["name"]), "tier": str(row.get("tier") or "other"),
+            "gaps": 0,
+        })
+        if row.get("status") != "ready":
+            entry["gaps"] += 1
     ordered = sorted(faces.values(), key=lambda row: row["name"])
-    return [row for row in ordered if row["wife"]], [row for row in ordered if not row["wife"]]
+    return ([row for row in ordered if row["wife"]],
+            [row for row in ordered if not row["wife"]],
+            sorted(missing.values(), key=lambda row: (row["tier"], row["name"])))
 
 
 def render() -> str:
-    wives, others = collect()
+    wives, others, missing = collect()
     lines = [
         "# Portrait gallery",
         "",
@@ -72,6 +96,20 @@ def render() -> str:
             for key in ordered:
                 lines.append(f"![{row['name']} — {key}]({RELATIVE}{row['faces'][key]})")
             lines.append("")
+    if missing:
+        by_tier: dict[str, list[dict]] = {}
+        for row in missing:
+            by_tier.setdefault(row["tier"], []).append(row)
+        lines += [f"## Characters without a face ({len(missing)})", "",
+                  "These are the gaps. A character moves out of this section when one frame is",
+                  "rendered, and the tier says who they are to the story.", ""]
+        for tier in sorted(by_tier):
+            group = by_tier[tier]
+            reason = NO_FACE_REASON.get(tier, "no reason recorded")
+            lines.append(f"**{tier}** ({len(group)}), {reason}: "
+                         + ", ".join(f"{row['name']} (id {row['id']})" for row in group[:40])
+                         + (" …" if len(group) > 40 else ""))
+            lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -87,8 +125,9 @@ def main() -> int:
         return 0 if same else 1
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(body, encoding="utf-8")
-    wives, others = collect()
-    print(f"wrote {OUT} ({len(wives)} wives, {len(others)} others, {len(body)} bytes)")
+    wives, others, missing = collect()
+    print(f"wrote {OUT} ({len(wives)} wives, {len(others)} others with a face, "
+          f"{len(missing)} without, {len(body)} bytes)")
     return 0
 
 

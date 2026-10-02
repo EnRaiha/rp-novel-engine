@@ -62,3 +62,27 @@ class TestGallery:
     def test_the_wives_are_named_as_such(self):
         text = GALLERY.read_text(encoding="utf-8")
         assert "## Confirmed wives (35)" in text, "the King confirmed 35 wives; the sheet must say so"
+
+
+class TestGaps:
+    """The gaps section is a work list, so each group must carry a stated reason.
+
+    A gap with a reason is a decision. A gap without one is an oversight, and this sheet is read to
+    decide what to render next.
+    """
+
+    def test_the_gaps_are_listed_with_counts(self):
+        text = GALLERY.read_text(encoding="utf-8")
+        assert "## Characters without a face" in text
+
+    def test_every_group_carries_a_reason(self):
+        text = GALLERY.read_text(encoding="utf-8")
+        section = text[text.index("## Characters without a face"):]
+        for line in section.splitlines():
+            if line.startswith("**"):
+                assert "), " in line, f"a gap group has no reason: {line[:60]}"
+                assert "no reason recorded" not in line, f"a gap group is unexplained: {line[:60]}"
+
+    def test_the_sealed_prisoners_are_named_as_sealed(self):
+        text = GALLERY.read_text(encoding="utf-8")
+        assert "sealed by design" in text

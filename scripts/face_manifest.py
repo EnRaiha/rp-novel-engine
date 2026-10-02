@@ -12,6 +12,9 @@ in `twin`. A merge that gives session 5 a real wife flag is the eventual fix.
 
     cd rp-engine-py && python3 scripts/face_manifest.py --stats
 
+`--format json` writes `faces/manifest.json` instead, the same rows in the shape the
+attachment plugin loads (`file` is a boolean there); markdown stays the default.
+
 Deterministic: the same tree plus the same database row set gives the same rows
 in the same order; only the generated-at header line carries a clock. Read-only:
 this script issues SELECT statements and nothing else.
@@ -19,6 +22,7 @@ this script issues SELECT statements and nothing else.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import sys
@@ -29,9 +33,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from core.portraits import EMOTIONS, OCCASIONS, character_dir, parse_traits  # noqa: E402
 
 VAULT_ROOT = pathlib.Path.home() / "Bumi-Hijau"
+FACES_DIR = VAULT_ROOT / "adventures" / "tkg-arc1-restart" / "prototype" / "faces"
 DEFAULT_OUT = pathlib.Path(
-    os.environ.get("TKG_FACE_MANIFEST_OUT")
-    or str(VAULT_ROOT / "adventures" / "tkg-arc1-restart" / "prototype" / "faces" / "MANIFEST.md")
+    os.environ.get("TKG_FACE_MANIFEST_OUT") or str(FACES_DIR / "MANIFEST.md")
+)
+DEFAULT_JSON_OUT = pathlib.Path(
+    os.environ.get("TKG_FACE_MANIFEST_JSON_OUT") or str(FACES_DIR / "manifest.json")
 )
 ACTIVE_SESSION = 5
 TWIN_SESSION = 3
@@ -200,11 +207,48 @@ def render(rows: list[dict], chars: int, generated_at: str, out: pathlib.Path) -
     return text
 
 
+def json_row(r: dict) -> dict:
+    """The same row as `render` prints, with `exists` named for what it means."""
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "twin": r["twin"],
+        "tier": r["tier"],
+        "key": r["key"],
+        "kind": r["kind"],
+        "path": r["path"],
+        "file": r["exists"] == "yes",
+        "status": r["status"],
+    }
+
+
+def render_json(rows: list[dict], chars: int, generated_at: str, out: pathlib.Path) -> str:
+    """The same rows as `render`, as JSON for the attachment plugin."""
+    payload = {
+        "generated_at": generated_at,
+        "session": ACTIVE_SESSION,
+        "characters": chars,
+        "keys": len(KEYS),
+        "rows": [json_row(r) for r in rows],
+    }
+    text = json.dumps(payload, indent=1) + "\n"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text, encoding="utf-8")
+    return text
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate the TKG face manifest (read-only).")
-    parser.add_argument("--out", type=pathlib.Path, default=DEFAULT_OUT)
+    parser.add_argument(
+        "--format",
+        choices=("md", "json"),
+        default="md",
+        help="md (default) renders MANIFEST.md; json writes the plugin's manifest.json",
+    )
+    parser.add_argument("--out", type=pathlib.Path, default=None)
     parser.add_argument("--stats", action="store_true", help="print counts per tier and per key")
     args = parser.parse_args()
+    out = args.out or (DEFAULT_JSON_OUT if args.format == "json" else DEFAULT_OUT)
 
     conn = connect()
     try:
@@ -227,7 +271,10 @@ def main() -> int:
     rows = build(characters, assets)
     chars = sum(1 for r in characters if r["session_id"] == ACTIVE_SESSION)
     generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    render(rows, chars, generated_at, args.out)
+    if args.format == "json":
+        render_json(rows, chars, generated_at, out)
+    else:
+        render(rows, chars, generated_at, out)
 
     if args.stats:
         tiers, keys, _ = tally(rows)
@@ -238,7 +285,7 @@ def main() -> int:
             body = ", ".join(f"{s}={counts[s]}" for s in STATUS_ORDER if counts[s])
             print(f"key {key} kind={kind} rows={sum(counts.values())} {body}".rstrip())
     files = sum(1 for r in rows if r["exists"] == "yes")
-    print(f"manifest: {chars} characters, {len(rows)} rows, {files} files on disk -> {args.out}")
+    print(f"manifest: {chars} characters, {len(rows)} rows, {files} files on disk -> {out}")
     return 0
 
 

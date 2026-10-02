@@ -93,6 +93,81 @@ async def cmd_save(label=""):
     await Database.close()
 
 
+async def cmd_misc():
+    """misc {herring <investigation-id> | influence <faction> | salvage "<ship-class>" | redacted |
+    guard "<action>" | link <decision-id> <event-id> | news-read <article-id> "<headline>"}
+
+    The last scattered entry points. Each of these is the only caller-less function left in its module:
+    the red herring in mystery, the influence score in council, ship salvage in pirates, the action
+    guardrail, the decision-to-event link, the news read marker, and the register delta in
+    core/text_processor.
+    """
+    await Database.init()
+    usage = ('Usage: cli.py misc herring <investigation-id> | influence "<faction>"\n'
+             '       cli.py misc salvage "<ship-class>" | guard "<action>"\n'
+             '       cli.py misc link <decision-id> <event-id> | news-read <article-id> "<headline>"\n'
+             '       cli.py misc register "<text>"')
+    sid = SID
+    action = sys.argv[2] if len(sys.argv) > 2 else "guard"
+    from core import decision
+    from modules import council, mystery, news, pirates
+    if action == "herring":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await mystery.generate_red_herring(sid, int(sys.argv[3]))
+    elif action == "influence":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        territories = await Database.fetch(
+            "SELECT system_name, status, controlling_faction, governor_name, fleet_presence"
+            " FROM maya_rp.territory WHERE session_id=$1 LIMIT 200", sid)
+        ships = await Database.fetch(
+            "SELECT id, name FROM maya_rp.ships WHERE session_id=$1 LIMIT 200", sid)
+        # The faction argument is a record, not a name: the function reads fields off it, and a string
+        # raised AttributeError on the first run.
+        faction = await Database.fetchrow(
+            "SELECT * FROM maya_rp.factions WHERE name ILIKE $1 LIMIT 1", f"%{sys.argv[3]}%")
+        if faction is None:
+            out = {"error": f"no faction matching '{sys.argv[3]}'"}
+        else:
+            out = council.calculate_influence(dict(faction), [dict(r) for r in territories],
+                                              [dict(r) for r in ships])
+    elif action == "salvage":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await pirates.salvage_ship(sys.argv[3])
+    elif action == "guard":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        from modules import guardrails
+        out = await guardrails.check_action(sys.argv[3], {"session_id": sid})
+    elif action == "link":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await decision.link_event(sid, int(sys.argv[3]), int(sys.argv[4]))
+    elif action == "news-read":
+        if len(sys.argv) < 5:
+            print(usage); await Database.close(); return
+        out = await news.mark_read(sid, int(sys.argv[3]), sys.argv[4])
+    elif action == "register":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        from core.text_processor import ds_register_delta, enforce_ds_register
+        text = sys.argv[3]
+        out = {"delta": ds_register_delta(text, enforce_ds_register(text)),
+               "processed": enforce_ds_register(text)}
+    else:
+        out = {"usage": usage}
+    if isinstance(out, dict):
+        for key, value in out.items():
+            print(f"  {key}: {value}")
+    elif out is None:
+        print("  no result")
+    else:
+        print(f"  result: {out}")
+    await Database.close()
+
+
 async def cmd_war():
     """war {position <zone> ["terrain"] ["formation"] | exchange <a-hull> <a-tier> <d-hull> <d-tier>
     ["weapon"] ["targeting"] | sieges | siege "<system>" | objectives | progress <kind> <amount> |
@@ -3556,6 +3631,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_craft())
     elif cmd in ("war", "siege", "tactics", "objectives"):
         asyncio.run(cmd_war())
+    elif cmd in ("misc", "odds"):
+        asyncio.run(cmd_misc())
     elif cmd in ("encounter", "encounters", "events"):
         asyncio.run(cmd_encounter())
     else:

@@ -113,3 +113,48 @@ class TestCrossSessionReads:
         await Database.init()
         assert await gate_toll_income(5) == 0, "session 5 has no trade network"
         await Database.close()
+
+
+class TestCrossSessionAggregates:
+    """An aggregate over a two-campaign table without a session filter answers with both.
+
+    `faction_ships` carries 8,223 session-3 hulls and none for session 5. Two queries summed or counted
+    it without a filter. Measured: the unfiltered sum for session 5 is 846,639,437 against a filtered 0,
+    so a battle in the live arc would have credited the enemy with the frozen campaign's entire fleet,
+    and the pirate den regen counted session 3's hulls toward session 5's cap, so no den ever rebuilt.
+    """
+
+    def test_battle_filters_the_enemy_power_by_session(self):
+        import inspect
+
+        from modules import battle
+
+        source = inspect.getsource(battle)
+        marker = "SELECT COALESCE(SUM(power_rating),0) FROM maya_rp.faction_ships"
+        assert marker in source, "the enemy power query moved"
+        # Read a window around the statement: the same file has another faction_ships query, and
+        # slicing to the first bracket picked that one instead.
+        window = source[source.index(marker):source.index(marker) + 260]
+        assert "session_id=$2" in window, "an unfiltered sum is both campaigns added together"
+
+    def test_the_pirate_cap_counts_only_this_session(self):
+        import inspect
+
+        from modules import pirates
+
+        source = inspect.getsource(pirates)
+        marker = "SELECT COUNT(*) FROM maya_rp.faction_ships"
+        assert marker in source, "the cap query moved"
+        window = source[source.index(marker):source.index(marker) + 200]
+        assert "session_id=$2" in window
+
+    async def test_the_filtered_sum_differs_by_session(self):
+        from core.db import Database
+
+        await Database.init()
+        total = await Database.fetchval(
+            "SELECT COALESCE(SUM(power_rating),0) FROM maya_rp.faction_ships")
+        live = await Database.fetchval(
+            "SELECT COALESCE(SUM(power_rating),0) FROM maya_rp.faction_ships WHERE session_id=5")
+        assert int(live or 0) < int(total or 0), "if they are equal there is nothing to filter"
+        await Database.close()

@@ -315,8 +315,11 @@ async def run_tick(session_id: int = None):
                 "SELECT COALESCE(SUM(power_rating),0) FROM maya_rp.ships "
                 "WHERE session_id=$1 AND status IN ('active','standby_alert')", session_id) or 0
             enemy_power = await Database.fetchval(
+                # Filtered by session: faction_ships carries both campaigns, so an unfiltered sum
+                # would add the frozen campaign's fleets to this one's opponent.
                 "SELECT COALESCE(SUM(power_rating),0) FROM maya_rp.faction_ships "
-                "WHERE faction_name=$1 AND status='active'", w["opponent_faction"]) or 0
+                "WHERE faction_name=$1 AND status='active' AND session_id=$2",
+                w["opponent_faction"], session_id) or 0
             if player_power < 1000 or enemy_power < 1000:
                 continue  # don't burn paper fleets
             formation = _r.choice(["wedge", "wall", "screen", "pincer"])

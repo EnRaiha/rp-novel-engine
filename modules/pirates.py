@@ -41,7 +41,9 @@ async def _den_regen(session_id: int):
             fname = await Database.fetchval(
                 "SELECT name FROM maya_rp.factions WHERE id=$1", b["faction_id"])
             current = await Database.fetchval(
-                "SELECT COUNT(*) FROM maya_rp.faction_ships WHERE faction_name=$1", fname) or 0
+                # Same reason as battle.py: only this campaign's hulls count toward the cap.
+                "SELECT COUNT(*) FROM maya_rp.faction_ships WHERE faction_name=$1 AND session_id=$2",
+                fname, session_id) or 0
             cap = b["fleet_cap"] or 300
             add = min(int(b["regen_per_tick"] or 0), max(0, cap - current))
             for i in range(add):

@@ -109,14 +109,20 @@ def main() -> int:
     cur = conn.cursor()
     cur.execute("""SELECT id, session_id, name, standing, trust, fear_of_player, reputation,
                           trade_aggressiveness, pirate_aggressiveness, is_pirate, doctrine, origin
-                   FROM maya_rp.factions ORDER BY session_id, id""")
+                   FROM maya_rp.factions ORDER BY session_id, id""".replace('\n', ' '))
     columns = ("id", "session_id", "name", "standing", "trust", "fear_of_player", "reputation",
-               "trade_aggressiveness", "pirate_aggressiveness", "is_pirate", "doctrine", "origin")
+               "trade_aggressiveness", "pirate_aggressiveness", "is_pirate", "doctrine", "origin",
+               "status")
     rows = [dict(zip(columns, row)) for row in cur.fetchall()]
-    results = [(row, stance(row)) for row in rows]
+    # A faction that does not exist yet has no stance to compute.
+    results = [(row, None) if row.get("status") == "not_yet_established" else (row, stance(row))
+               for row in rows]
 
     if args.show:
         for row, verdict in results[: args.show]:
+            if verdict is None:
+                print(f"{row['name'][:30]:<30} {'not yet':<9}    -     doc={row['doctrine']}")
+                continue
             print(f"{row['name'][:30]:<30} {verdict['band']:<9} {verdict['score']:+.3f}  "
                   f"doc={row['doctrine']} origin={row['origin']}")
     if args.dry_run:
@@ -125,11 +131,18 @@ def main() -> int:
 
     now = datetime.now(timezone.utc)
     for row, verdict in results:
+        if verdict is None:
+            cur.execute("UPDATE maya_rp.factions SET stance=NULL, stance_score=NULL, stance_at=%s WHERE id=%s",
+                        (now, row["id"]))
+            continue
         cur.execute("""UPDATE maya_rp.factions SET stance=%s, stance_score=%s, stance_at=%s
                        WHERE id=%s""", (verdict["band"], verdict["score"], now, row["id"]))
     conn.commit()
     bands: dict[str, int] = {}
     for _, verdict in results:
+        if verdict is None:
+            bands["not_yet_established"] = bands.get("not_yet_established", 0) + 1
+            continue
         bands[verdict["band"]] = bands.get(verdict["band"], 0) + 1
     print(f"stance written for {len(results)} factions: " + json.dumps(bands))
     conn.close()

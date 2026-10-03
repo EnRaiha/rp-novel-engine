@@ -706,7 +706,11 @@ class TestPortraits:
 
         image = tmp_path / "flustered.png"
         image.write_bytes(b"\x89PNG\r\n\x1a\n")
-        await portraits.mark_ready(queued["asset_id"], str(image), model="test", seed=None, width=8, height=8)
+        # session_id is required: the writer proves the asset row belongs to the session it was told to
+        # work on, because it used to update `WHERE id=$1` alone and a render queued for one campaign could
+        # have written its path onto another campaign's row.
+        await portraits.mark_ready(queued["asset_id"], str(image), session_id=SCRATCH_SESSION,
+                                   model="test", seed=None, width=8, height=8)
         hit = await portraits.lookup(SCRATCH_SESSION, "Scratch Observer", "romance")
         assert hit is not None
         assert hit["asset"]["image_path"] == str(image)

@@ -190,9 +190,18 @@ def test_contract_the_tier_multiplier_compounds_with_tier():
 
 
 def test_contract_a_roll_stays_inside_its_variance_band():
+    """The band is closed on a value `round()` can move, so it carries half a unit of tolerance.
+
+    Measured before this was written: 29 escapes in 20,000 rolls, about 0.145 percent, which is a 7 percent
+    chance of a red run per 50 rolls. `tier_mult(3, 1.15)` equals `1.15 ** 2` exactly, so the band was
+    computed correctly; the escapes were rolls landing in the half-unit rounding cell that straddles each
+    edge. A test that fails at random teaches a team to ignore red, which costs more than the tolerance.
+    """
+    lo = 1000 * 1.15 ** 2 * 0.9 - 0.5
+    hi = 1000 * 1.15 ** 2 * 1.1 + 0.5
     for _ in range(50):
         value = gen.roll_stat(1000, 3, 1.15, 0.10)
-        assert 1000 * 1.15 ** 2 * 0.9 <= value <= 1000 * 1.15 ** 2 * 1.1
+        assert lo <= value <= hi
 
 
 def test_contract_weapons_fill_every_mount_they_can(monkeypatch):

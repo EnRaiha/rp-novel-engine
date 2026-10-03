@@ -11,7 +11,12 @@ SEVERITY = {"minor":{"heal":3,"scar":0.1},"moderate":{"heal":10,"scar":0.4},"sev
 
 async def apply(character_id: int, desc: str, severity: str = "moderate", body: str = "unspecified", cause: str = "combat", session_id: int = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
-    cfg = SEVERITY.get(severity,SEVERITY["moderate"])
+    if severity not in SEVERITY:
+        # An unknown word used to read as "moderate" while the row stored the word
+        # the caller passed, so the wound healed on a schedule nobody chose.
+        return {"error": f"Unknown severity {severity!r}: use one of "
+                         f"{', '.join(SEVERITY)}"}
+    cfg = SEVERITY[severity]
     gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)
     scar = random.random()<cfg["scar"]
     iid = await Database.fetchval("INSERT INTO maya_rp.character_injuries(session_id,character_id,description,severity,body_part,cause,received_game_day,heal_by_game_day,became_scar,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'active') RETURNING id", session_id,character_id,desc,severity,body,cause,gd,gd+cfg["heal"],scar)
@@ -36,5 +41,10 @@ async def get_state(character_id: int, session_id: int = None) -> dict:
 async def run_tick(session_id: int = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
     gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)
-    r = await Database.execute("UPDATE maya_rp.character_injuries SET status=CASE WHEN became_scar THEN 'scar' ELSE 'healed' END WHERE session_id=$1 AND status='active' AND heal_by_game_day<=$2", session_id,gd)
-    return {"processed":r}
+    # execute() returns PostgreSQL's status tag ("UPDATE 12"), which the tick used to
+    # report as a count. RETURNING gives the rows themselves.
+    rows = await Database.fetch(
+        "UPDATE maya_rp.character_injuries SET status=CASE WHEN became_scar THEN 'scar' ELSE 'healed' END "
+        "WHERE session_id=$1 AND status='active' AND heal_by_game_day<=$2 RETURNING id",
+        session_id, gd)
+    return {"processed": len(rows)}

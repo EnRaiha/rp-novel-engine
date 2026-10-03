@@ -27,7 +27,8 @@ async def run_tick(session_id: int = None) -> dict:
         events = await Database.fetch("SELECT event_type, title, description FROM maya_rp.events WHERE session_id=$1 ORDER BY id DESC LIMIT 3", session_id)
         narratives = [await narrate_event(e["event_type"], e["title"], e["description"] or "") for e in events]
         info("narrator", f"Narrated {len(narratives)} events")
-        return {"narrated": len(narratives)}
+        # The prose used to be built and thrown away: the tick returned only a count.
+        return {"narrated": len(narratives), "narratives": narratives}
     except Exception as e:
         info("narrator", f"Error: {e}")
         return {"error": str(e)}

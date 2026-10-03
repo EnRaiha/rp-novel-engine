@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import info, error
 from modules.ship_generation import generate_ship
 
 TIER_MATERIALS = {
@@ -18,6 +18,11 @@ TIER_MATERIALS = {
 async def build_ship(class_name: str, tier: int, ship_type: str, name: str, location: str = "Stasiun TKG",
                       session_id: int | None = None) -> dict[str, Any]:
     if session_id is None: session_id = Config.SESSION_ID
+    if tier not in TIER_MATERIALS:
+        # `.get(tier, TIER_MATERIALS[1])` built a T9 hull out of tier-1 materials
+        # and said nothing about it.
+        return {"error": f"Unknown tier {tier}: buildable tiers are "
+                         f"{', '.join(str(t) for t in sorted(TIER_MATERIALS))}"}
 
     ship = await generate_ship(class_name, tier, ship_type, name, session_id)
     if "error" in ship:
@@ -62,6 +67,15 @@ async def build_ship(class_name: str, tier: int, ship_type: str, name: str, loca
             await Database.execute("UPDATE maya_rp.material_stockpiles SET quantity = quantity - $1 WHERE id = $2",
                                    take, sp["id"])
             remaining -= take
+        if remaining > 0:
+            # The stockpile check above this loop and the take inside it read the
+            # same rows twice. Anything that moved in between leaves the build
+            # short, and the shortfall used to be swallowed by the loop.
+            error("ship_building",
+                  f"{mat_name}: {remaining} short of {qty} after consumption; "
+                  f"alloys and credits for {ship['name']} are already spent")
+            return {"error": f"{mat_name} short by {remaining} after deduction; "
+                             f"alloys and credits are spent, ship not built"}
 
     # Insert ship
     ship_id = await Database.fetchval(
@@ -143,13 +157,25 @@ async def assign_crew_to_ship(session_id: int, ship_id: int, required_crew: int)
     ) or 0
 
     deficit = max(0, required_crew - available)
+    # The crew that does exist goes aboard in both branches. The undercrewed branch
+    # used to write crew_current = available and never link a single crew row, so
+    # the same people stayed available for the next ship to claim.
+    take = available if deficit > 0 else required_crew
+    if take > 0:
+        await Database.execute(
+            """UPDATE maya_rp.crew_roster SET ship_id=$1
+               WHERE id IN (SELECT id FROM maya_rp.crew_roster
+                            WHERE session_id=$2 AND ship_id IS NULL AND status='active'
+                            ORDER BY id LIMIT $3)""",
+            ship_id, session_id, take,
+        )
     if deficit > 0:
         # Stakes Integrity: undercrewed ship = liability
         penalty = round(deficit / max(1, required_crew), 3)
         await Database.execute(
             "UPDATE maya_rp.ships SET crew_current=$1, crew_required=$2, undercrewed_penalty=$3, "
-            "status='undercrewed' WHERE id=$4",
-            available, required_crew, penalty, ship_id,
+            "status='undercrewed' WHERE id=$4 AND session_id=$5",
+            available, required_crew, penalty, ship_id, session_id,
         )
         await Database.execute(
             "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance) "
@@ -159,18 +185,13 @@ async def assign_crew_to_ship(session_id: int, ship_id: int, required_crew: int)
             f"Novel bab 171: 'Oops! We are short of talent.'",
         )
         return {"warning": True, "deficit": deficit, "penalty": penalty,
-                "status": "undercrewed"}
+                "status": "undercrewed", "crew_assigned": take}
 
-    # Crew cukup — assign
+    # Crew cukup — assign (already done above, with the ship's session in the subquery)
     await Database.execute(
-        """UPDATE maya_rp.crew_roster SET ship_id=$1
-           WHERE id IN (SELECT id FROM maya_rp.crew_roster
-                        WHERE session_id=$2 AND ship_id IS NULL AND status='active' LIMIT $3)""",
-        ship_id, session_id, required_crew,
-    )
-    await Database.execute(
-        "UPDATE maya_rp.ships SET crew_current=$1, crew_required=$2, undercrewed_penalty=0, status='active' WHERE id=$3",
-        required_crew, required_crew, ship_id,
+        "UPDATE maya_rp.ships SET crew_current=$1, crew_required=$2, undercrewed_penalty=0, "
+        "status='active' WHERE id=$3 AND session_id=$4",
+        required_crew, required_crew, ship_id, session_id,
     )
     return {"warning": False, "crew": required_crew, "status": "active"}
 

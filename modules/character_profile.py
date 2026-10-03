@@ -35,14 +35,61 @@ def _as_list(value: str | None, field: str) -> list:
     raise ValueError(f"{field} holds a {type(decoded).__name__} with contents, not a list")
 
 
+def _as_dict(value: str | None, field: str) -> dict:
+    """Decode a jsonb column that must hold an object.
+
+    The mirror of `_as_list` for `profile_jsonb` and `current_outfit`, which the
+    card and the auto-dresser read. An empty list is coerced for the same reason
+    `{}` is coerced there: a seeding pass wrote the wrong empty shape once.
+    """
+    if not value:
+        return {}
+    decoded = json.loads(value) if isinstance(value, str) else value
+    if isinstance(decoded, dict):
+        return decoded
+    if isinstance(decoded, list) and not decoded:
+        return {}
+    raise ValueError(f"{field} holds a {type(decoded).__name__} with contents, not an object")
+
+
+def _object_entries(entries: list, field: str) -> list[dict]:
+    """The entries of a jsonb list that are objects.
+
+    Live rows carry plain strings inside `inventory_jsonb`: character 2071 in
+    session 5 holds `["knife", "knife"]`. `.get` on one of those raised
+    AttributeError, so the card, the dresser and `set_outfit` all failed on a row
+    that exists. A string is not an item, so it is dropped and counted, and the
+    count is logged rather than swallowed.
+    """
+    kept = [e for e in entries if isinstance(e, dict)]
+    if len(kept) != len(entries):
+        info("profile", f"{field}: {len(entries) - len(kept)} entry(ies) are not objects, skipped")
+    return kept
+
+
+def _require_character(row, character_id: int, session_id: int):
+    """A character row, or a refusal that names the id and the session.
+
+    Every write below used to run an UPDATE that matched nothing and report
+    success, so `grant` answered "added knife" for a character that does not exist.
+    """
+    if not row:
+        raise ValueError(f"character {character_id} not found in session {session_id}")
+    return row
+
+
 async def update_profile(character_id: int, profile_data: dict, session_id: int = None):
     """Set the static physical profile of a character (face, body, voice)."""
     if session_id is None:
         session_id = Config.SESSION_ID
-    await Database.execute(
-        "UPDATE maya_rp.characters SET profile_jsonb = $1 WHERE id = $2 AND session_id = $3",
+    if not isinstance(profile_data, dict):
+        raise ValueError("profile_data must be a mapping")
+    row = await Database.fetchrow(
+        "UPDATE maya_rp.characters SET profile_jsonb = $1 WHERE id = $2 AND session_id = $3 "
+        "RETURNING id",
         json.dumps(profile_data), character_id, session_id,
     )
+    _require_character(row, character_id, session_id)
     info("profile", f"Profile updated for character {character_id}")
 
 
@@ -50,11 +97,14 @@ async def add_to_wardrobe(character_id: int, outfit: dict, session_id: int = Non
     """Add a new outfit to a character's closet."""
     if session_id is None:
         session_id = Config.SESSION_ID
-    current = await Database.fetchval(
+    if not isinstance(outfit, dict):
+        raise ValueError("outfit must be a mapping")
+    row = await Database.fetchrow(
         "SELECT wardrobe_jsonb FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
         character_id, session_id,
     )
-    wardrobe = _as_list(current, "wardrobe_jsonb")
+    _require_character(row, character_id, session_id)
+    wardrobe = _as_list(row["wardrobe_jsonb"], "wardrobe_jsonb")
     wardrobe.append(outfit)
     await Database.execute(
         "UPDATE maya_rp.characters SET wardrobe_jsonb = $1 WHERE id = $2 AND session_id = $3",
@@ -62,33 +112,41 @@ async def add_to_wardrobe(character_id: int, outfit: dict, session_id: int = Non
     )
 
 
-async def set_outfit(character_id: int, outfit_id: str, session_id: int = None):
-    """Manually force a character to wear a specific outfit from their wardrobe."""
+async def set_outfit(character_id: int, outfit_id: str, session_id: int = None) -> bool:
+    """Put a wardrobe outfit on a character. Returns whether it was found."""
     if session_id is None:
         session_id = Config.SESSION_ID
-    wardrobe_raw = await Database.fetchval(
+    row = await Database.fetchrow(
         "SELECT wardrobe_jsonb FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
         character_id, session_id,
     )
-    wardrobe = _as_list(wardrobe_raw, "wardrobe_jsonb")
+    _require_character(row, character_id, session_id)
+    wardrobe = _object_entries(_as_list(row["wardrobe_jsonb"], "wardrobe_jsonb"),
+                               "wardrobe_jsonb")
     outfit = next((o for o in wardrobe if o.get("id") == outfit_id), None)
-    if outfit:
-        await Database.execute(
-            "UPDATE maya_rp.characters SET current_outfit = $1 WHERE id = $2 AND session_id = $3",
-            json.dumps(outfit), character_id, session_id,
-        )
-        info("profile", f"{outfit.get('name', 'Unknown')} equipped for character {character_id}")
+    if not outfit:
+        info("profile", f"Outfit {outfit_id!r} is not in character {character_id}'s wardrobe")
+        return False
+    await Database.execute(
+        "UPDATE maya_rp.characters SET current_outfit = $1 WHERE id = $2 AND session_id = $3",
+        json.dumps(outfit), character_id, session_id,
+    )
+    info("profile", f"{outfit.get('name', 'Unknown')} equipped for character {character_id}")
+    return True
 
 
 async def add_item(character_id: int, item: dict, session_id: int = None):
     """Add an item to a character's inventory."""
     if session_id is None:
         session_id = Config.SESSION_ID
-    current = await Database.fetchval(
+    if not isinstance(item, dict):
+        raise ValueError("item must be a mapping")
+    row = await Database.fetchrow(
         "SELECT inventory_jsonb FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
         character_id, session_id,
     )
-    inv = _as_list(current, "inventory_jsonb")
+    _require_character(row, character_id, session_id)
+    inv = _as_list(row["inventory_jsonb"], "inventory_jsonb")
     inv.append(item)
     await Database.execute(
         "UPDATE maya_rp.characters SET inventory_jsonb = $1 WHERE id = $2 AND session_id = $3",
@@ -123,7 +181,11 @@ async def grant(character_id: int, *, item: dict | None = None, outfit: dict | N
         await add_item(character_id, item, session_id)
         applied["inventory"] = f"added {item.get('name') or item.get('id') or 'item'}"
     if wear is not None:
-        await set_outfit(character_id, wear, session_id)
+        if not await set_outfit(character_id, wear, session_id):
+            raise ValueError(
+                f"outfit {wear!r} is not in character {character_id}'s wardrobe in session "
+                f"{session_id if session_id is not None else Config.SESSION_ID}"
+            )
         applied["wearing"] = wear
     if not applied:
         raise ValueError("grant needs at least one of item, outfit, profile or wear")
@@ -158,7 +220,7 @@ async def auto_dress_for_mode(character_id: int, mode: str, session_id: int = No
         "SELECT wardrobe_jsonb FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
         character_id, session_id,
     )
-    wardrobe = json.loads(wardrobe_raw) if wardrobe_raw else []
+    wardrobe = _object_entries(_as_list(wardrobe_raw, "wardrobe_jsonb"), "wardrobe_jsonb")
     if not wardrobe:
         return False  # No wardrobe = nothing to dress in
 
@@ -177,7 +239,7 @@ async def auto_dress_for_mode(character_id: int, mode: str, session_id: int = No
         "SELECT current_outfit FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
         character_id, session_id,
     )
-    current = json.loads(current_raw) if current_raw else {}
+    current = _as_dict(current_raw, "current_outfit")
 
     if chosen.get("id") != current.get("id"):
         await Database.execute(
@@ -238,9 +300,9 @@ async def get_character_card(character_id: int, session_id: int = None) -> str:
     if not row:
         return "Character not found."
 
-    profile = json.loads(row["profile_jsonb"]) if row["profile_jsonb"] else {}
-    outfit = json.loads(row["current_outfit"]) if row["current_outfit"] else {}
-    inventory = json.loads(row["inventory_jsonb"]) if row["inventory_jsonb"] else []
+    profile = _as_dict(row["profile_jsonb"], "profile_jsonb")
+    outfit = _as_dict(row["current_outfit"], "current_outfit")
+    inventory = _as_list(row["inventory_jsonb"], "inventory_jsonb")
 
     lines = [
         f"── {row['name'].upper()} ──",
@@ -279,7 +341,7 @@ async def get_character_card(character_id: int, session_id: int = None) -> str:
     # Visible inventory
     visible_items = [
         i.get("name", "")
-        for i in inventory
+        for i in _object_entries(inventory, "inventory_jsonb")
         if i.get("slot") in ("held", "holstered", "worn", "visible")
     ]
     if visible_items:

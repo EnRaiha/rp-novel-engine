@@ -38,12 +38,16 @@ async def render_one(asset: dict, *, steps: int, dry_run: bool) -> bool:
     name = asset["name"]
     emotion = portraits.OCCASIONS.get(asset["occasion"], (asset["occasion"], ()))[0]
     target = portraits.emotion_path(name, emotion)
-    version, version_file = portraits.stage_version(name, emotion)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    # The dry-run check sits before anything touches the disk. It used to sit after stage_version and
+    # mkdir, both of which write: `--dry-run` created emotions/versions/ and copied the current image into
+    # it, so a flag whose whole purpose is to change nothing changed two things. The version number is a
+    # product of the write, so the dry run prints the live target instead.
     if dry_run:
-        print(f"DRY  {name} [{asset['occasion']}] -> {version_file}")
+        print(f"DRY  {name} [{asset['occasion']}] -> {target}")
         print(f"     prompt: {asset['prompt'][:160]}…")
         return False
+    version, version_file = portraits.stage_version(name, emotion)
+    target.parent.mkdir(parents=True, exist_ok=True)
     # The negative prompt lives in the ComfyUI workflow's node 7; the CLI takes
     # the positive text only.
     prompt = asset["prompt"] or ""

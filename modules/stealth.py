@@ -8,7 +8,19 @@ from core.log import info
 
 async def build_spy(unit_type: str, name: str, session_id: int | None = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
-    ut = await Database.fetchrow("SELECT id, name, base_cost_alloys, cloak_level, max_lanes FROM maya_rp.stealth_unit_types WHERE LOWER(name) LIKE LOWER($1) LIMIT 1", f"%{unit_type}%")
+    # 'probe' matches both Shadow Probe and Pool Observation Probe on live rows,
+    # and fetchrow took whichever the plan returned first. Refuse the ambiguity.
+    pattern = f"%{unit_type}%"
+    matches = await Database.fetchval(
+        "SELECT count(*) FROM maya_rp.stealth_unit_types WHERE LOWER(name) LIKE LOWER($1)",
+        pattern) or 0
+    if matches > 1:
+        kinds = await Database.fetch(
+            "SELECT name FROM maya_rp.stealth_unit_types WHERE LOWER(name) LIKE LOWER($1) ORDER BY id",
+            pattern)
+        return {"error": f"{unit_type!r} matches {matches} unit types: "
+                         + ", ".join(r["name"] for r in kinds)}
+    ut = await Database.fetchrow("SELECT id, name, base_cost_alloys, cloak_level, max_lanes FROM maya_rp.stealth_unit_types WHERE LOWER(name) LIKE LOWER($1) ORDER BY id LIMIT 1", pattern)
     if not ut: return {"error": f"Unknown unit type: {unit_type}"}
     res = await Database.fetchrow("SELECT alloys FROM maya_rp.resources WHERE session_id=$1", session_id)
     if not res or res["alloys"] < ut["base_cost_alloys"]:
@@ -33,9 +45,19 @@ async def hack(name: str, operation: str, target: str, session_id: int | None = 
     roll = random.randint(1, 100)
     outcome = "success" if roll <= chance else "detected" if roll <= chance + 20 else "failure"
     intel = random.randint(20, 80) if outcome == "success" else random.randint(0, 10)
+    lanes_touched = 0
     if intel > 0:
-        await Database.execute("UPDATE maya_rp.space_lanes SET intel_level=LEAST(COALESCE(intel_level,0)+$1,100) WHERE session_id=$2 AND (origin=$3 OR destination=$3)", intel, session_id, target)
-    return {"spy": su["name"], "operation": operation, "target": target, "outcome": outcome, "intel_gained": intel}
+        row = await Database.fetchrow(
+            "UPDATE maya_rp.space_lanes SET intel_level=LEAST(COALESCE(intel_level,0)+$1,100) "
+            "WHERE session_id=$2 AND (origin=$3 OR destination=$3) RETURNING id",
+            intel, session_id, target)
+        lanes_touched = 1 if row else 0
+        if not lanes_touched:
+            # A target name that matches no lane used to report the intel anyway.
+            info("stealth", f"Hack on {target!r}: no lane in session {session_id} carries that name, "
+                            f"{intel} intel not banked")
+    return {"spy": su["name"], "operation": operation, "target": target, "outcome": outcome,
+            "intel_gained": intel, "lanes_touched": lanes_touched}
 
 async def build_anticloak(system: str, level: int = 1, session_id: int | None = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID

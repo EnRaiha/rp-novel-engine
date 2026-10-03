@@ -179,6 +179,17 @@ AEGIS_UNREADABLE = ("facade", "single_layer")
 # A working facade reads as one clean layer, which is exactly what an honest
 # person reads as. The sight returns a body, never a verdict.
 
+#: `AEGIS_NOT_READ` names the construct, the corpse and the facade the way the page
+#: does, with an article ("a_construct", "a_dead_body", "a_working_facade");
+#: `AEGIS_BLOCKED_BY` and `AEGIS_UNREADABLE` name the same three bare. A caller who
+#: reached for the vocabulary in this module's own refusals list got a full read of
+#: a body that is not there. Both spellings resolve to the same barrier.
+AEGIS_BLOCKED_ALIASES = {
+    "a_construct": "construct",
+    "a_dead_body": "dead_body",
+    "a_working_facade": "facade",
+}
+
 MARK_EXACT_M = 1000
 MARK_BAND_M = 100000
 MARK_CROSSES_SYSTEM = False
@@ -303,7 +314,8 @@ def aegis_read(
     if subjects < 0:
         raise ValueError("subjects cannot be negative")
 
-    if blocked_by in AEGIS_BLOCKED_BY:
+    barrier = AEGIS_BLOCKED_ALIASES.get(blocked_by, blocked_by)
+    if barrier in AEGIS_BLOCKED_BY:
         return {
             "band": "none",
             "subjects": 0,
@@ -321,7 +333,7 @@ def aegis_read(
         }
 
     resolved, field = aegis_subjects(subjects)
-    if blocked_by in AEGIS_UNREADABLE:
+    if barrier in AEGIS_UNREADABLE:
         return {
             "band": band,
             "subjects": resolved,

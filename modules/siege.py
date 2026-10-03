@@ -5,7 +5,7 @@ import random
 import json
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info
 
 async def start_siege(system: str, session_id: int | None = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
@@ -26,7 +26,7 @@ async def start_siege(system: str, session_id: int | None = None) -> dict:
 
 async def advance_siege(siege_id: int, session_id: int | None = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
-    s = await Database.fetchrow("SELECT id, target_system, target_faction, attacker_power, defender_power, phase, max_phases, damage_dealt, casualties_taken FROM maya_rp.sieges WHERE id=$1 AND status='active'", siege_id)
+    s = await Database.fetchrow("SELECT id, target_system, target_faction, attacker_power, defender_power, phase, max_phases, damage_dealt, casualties_taken FROM maya_rp.sieges WHERE id=$1 AND session_id=$2 AND status='active'", siege_id, session_id)
     if not s: return {"error": f"Siege {siege_id} not found or resolved"}
     atk_roll = s["attacker_power"] + random.randint(0, s["attacker_power"] // 4) - s["defender_power"] // 4
     def_roll = s["defender_power"] + random.randint(0, s["defender_power"] // 3) - s["attacker_power"] // 5
@@ -44,7 +44,11 @@ async def advance_siege(siege_id: int, session_id: int | None = None) -> dict:
     result = {"siege_id": siege_id, "system": s["target_system"], "phase": new_phase, "max_phases": s["max_phases"], "status": status, "description": desc, "damage_dealt": dmg, "casualties": cas}
 
     if status == "victory":
-        await Database.execute("UPDATE maya_rp.territory SET controlling_faction='Setia Empire', status='controlled' WHERE system_name=$1", s["target_system"])
+        # The capture was written by system name alone, so a victory here flipped the same-named
+        # territory in every campaign that has one.
+        await Database.execute(
+            "UPDATE maya_rp.territory SET controlling_faction='Setia Empire', status='controlled' "
+            "WHERE session_id=$1 AND system_name=$2", session_id, s["target_system"])
         loot = random.randint(1000, 5000)
         await Database.execute("UPDATE maya_rp.resources SET alloys=alloys+$1 WHERE session_id=$2", loot, session_id)
         await Database.execute("UPDATE maya_rp.ships SET experience=COALESCE(experience,0)+100 WHERE session_id=$1", session_id)
@@ -76,6 +80,6 @@ async def run_tick(session_id: int = None) -> dict:
                     json.dumps(["siege", res.get("system", ""), res.get("status", "")]))
             advanced += 1
         except Exception as e:
-            info("siege", f"advance error: {e}")
+            error("siege", f"advance failed for siege {r['id']}: {e}")
     info("siege", f"Tick: {advanced} sieges advanced")
     return {"sieges_advanced": advanced}

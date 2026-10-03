@@ -420,7 +420,7 @@ async def handle(action: str, params: dict = None) -> dict:
             """Walk a decision's causal chain, or find decisions touching a fact.
             params: {decision_id: int} | {fact: str, value?: any}
             """
-            from core.provenance import why_cli
+            from core.provenance import why_cli, resolve
             from core.decision import chain, by_fact
 
             did = params.get("decision_id")
@@ -433,7 +433,13 @@ async def handle(action: str, params: dict = None) -> dict:
                 value = params.get("value")
                 if fact:
                     text = await why_cli(fact, sid)
-                    rows = await by_fact(sid, fact.lower().strip(), value)
+                    # Resolve the alias before asking. cabinet_decrees keys on the canonical name,
+                    # and FACT_REGISTRY maps `credits` to `treasury`, so asking by the raw request
+                    # answered a summary while the decisions list beside it came back empty. The line
+                    # above resolves for the summary; this one did not, and the two disagreed in the
+                    # same response.
+                    entry = await resolve(fact)
+                    rows = await by_fact(sid, entry["fact"] if entry else fact.lower().strip(), value)
                     result["data"] = {"fact": fact, "summary": text,
                                       "decisions": rows}
                 else:

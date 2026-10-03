@@ -23,7 +23,7 @@ from typing import Any
 
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info
 
 
 # ─── Constants ───────────────────────────────────────────────────
@@ -115,15 +115,9 @@ VOICE_PROFILES = {
     },
 }
 
-LOCATION_MOODS = {
-    "bridge":       {"lighting": "dim command lighting, starfield through viewport", "mood": "intimate-isolation"},
-    "quarters":     {"lighting": "warm personal quarters, soft ambient",             "mood": "private-sanctuary"},
-    "observation":  {"lighting": "nebula glow through observation glass",            "mood": "cosmic-romance"},
-    "garden":       {"lighting": "bioluminescent Eden dome, night cycle",            "mood": "nature-embrace"},
-    "forge":        {"lighting": "forge-fire glow, amber heat",                      "mood": "raw-power"},
-    "wreckage":     {"lighting": "emergency lights, debris silence",                 "mood": "dangerous-proximity"},
-    "void":         {"lighting": "total darkness except each other",                 "mood": "nothing-but-us"},
-}
+# `LOCATION_MOODS` is defined once, below the Erotic Playbook block, because that is the copy the
+# module actually read. A second seven-key copy used to sit here under the same name and was shadowed
+# at import, so an edit to this one changed nothing at all.
 
 BOND_SHIFT_MATRIX = {
     "perfect":    {"delta": 2, "condition": "Player action perfectly matches companion's unspoken need"},
@@ -400,8 +394,15 @@ def _jealousy_narrative(active_name: str, rival_name: str, intensity: str) -> st
 # ─── Scene Generation — ported from SceneGenerator ──────────────
 
 def get_voice_profile(name: str) -> dict[str, Any]:
-    """Get voice profile for a companion. Ported from SceneGenerator.getVoiceProfile()."""
-    return VOICE_PROFILES.get(name, VOICE_PROFILES["Nethara"])
+    """Get voice profile for a companion. Ported from SceneGenerator.getVoiceProfile().
+
+    An unknown name was answered with Nethara's profile, so a companion with no voice of her own
+    spoke in Nethara's cadence and every downstream beat described the wrong woman. The caller now
+    gets a refusal it can act on.
+    """
+    if name not in VOICE_PROFILES:
+        return {"error": f"no voice profile for '{name}'", "available": sorted(VOICE_PROFILES)}
+    return VOICE_PROFILES[name]
 
 
 def generate_scene(context: dict, tier: str, companion_name: str, player_action: str) -> dict[str, Any]:
@@ -412,6 +413,8 @@ def generate_scene(context: dict, tier: str, companion_name: str, player_action:
     context keys: companion, bond, intimacy, stage, location, last_scene
     """
     voice = get_voice_profile(companion_name)
+    if "error" in voice:
+        return voice
     location = context.get("location", "bridge")
     loc_mood = LOCATION_MOODS.get(location, LOCATION_MOODS["bridge"])
     bond = context.get("bond", 0)
@@ -449,6 +452,10 @@ def calculate_bond_shift(action: str, response_quality: str = "neutral") -> dict
     """
     Calculate bond shift based on player action quality.
     Ported from SceneGenerator.calculateBondShift().
+
+    `action` is accepted and read by nothing: the shift comes from `response_quality` alone. It stays
+    in the signature because the CLI and the ported call sites pass it positionally, and a parameter
+    that looks like it scopes the answer but does not is how three defects in this engine started.
     """
     quality = response_quality.lower()
     for key, matrix in BOND_SHIFT_MATRIX.items():
@@ -459,7 +466,10 @@ def calculate_bond_shift(action: str, response_quality: str = "neutral") -> dict
 
 def get_crossed_thresholds(old_bond: int, new_bond: int) -> list[int]:
     """Check which bond thresholds were crossed. Ported from SceneGenerator.getCrossedThresholds()."""
-    return [t for t in [5, 7, 9] if old_bond < t <= new_bond]
+    # The three thresholds are the tiers' own bond requirements, so raising a tier's requirement
+    # raises the crossing with it instead of leaving a second list to drift.
+    return [t for t in sorted(tier["bond_threshold"] for tier in TIERS.values())
+            if old_bond < t <= new_bond]
 
 
 def get_arc_trigger(companion_name: str, threshold: int) -> str | None:
@@ -467,16 +477,16 @@ def get_arc_trigger(companion_name: str, threshold: int) -> str | None:
     return ARC_TRIGGERS.get(companion_name, {}).get(threshold, None)
 
 
+_MILESTONE_NAMES = {5: "flirt_unlocked", 7: "kiss_unlocked", 9: "intimacy_unlocked"}
+
+
 def get_milestones(old_bond: int, new_bond: int) -> list[str]:
-    """Get milestone names for crossed thresholds. Ported from RomanceState.getMilestones()."""
-    milestones = []
-    if old_bond < 5 <= new_bond:
-        milestones.append("flirt_unlocked")
-    if old_bond < 7 <= new_bond:
-        milestones.append("kiss_unlocked")
-    if old_bond < 9 <= new_bond:
-        milestones.append("intimacy_unlocked")
-    return milestones
+    """Get milestone names for crossed thresholds. Ported from RomanceState.getMilestones().
+
+    Reads the crossings from `get_crossed_thresholds` rather than repeating the three comparisons.
+    """
+    return [_MILESTONE_NAMES[t] for t in get_crossed_thresholds(old_bond, new_bond)
+            if t in _MILESTONE_NAMES]
 
 
 # ─── Indulgence / Saturation — ported from IndulgenceTracker ─────
@@ -737,12 +747,6 @@ async def process_healing(
     new_sat = max(0, current_sat - decay)
     state_info = calculate_saturation_state(new_sat)
 
-    stage = "glutted"
-    if new_sat <= 20:
-        stage = "balanced"
-    elif new_sat <= 50:
-        stage = "overfed"
-
     # Update saturation
     await Database.execute(
         "UPDATE maya_rp.romance_arcs SET saturation_pct = $1, updated_at = NOW() "
@@ -757,7 +761,10 @@ async def process_healing(
         "saturation_after": new_sat,
         "state": state_info["state"],
         "healed": new_sat <= 20,
-        "progress": "HEALED" if new_sat <= 20 else f"Stage: {stage}",
+        # One banding rule, not two. `progress` read a local three-band ladder (20/50) while `state`
+        # read SATURATION_THRESHOLDS (20/60/80), so a character at 30 reported "Stage: overfed" and
+        # "balanced" in the same answer.
+        "progress": "HEALED" if new_sat <= 20 else f"Stage: {state_info['state']}",
     }
 
     # If healed — grant Trial by Fire bond boost
@@ -793,6 +800,10 @@ async def release_and_heal(
     )
     if not char:
         return {"error": "Character not found"}
+    # The update below targets an arc row. A character with no arc has nothing to reset, and the
+    # function reported `released: True, healing_needed: 5` on a write that touched no row at all.
+    if not await _get_romance_arc(character_id, session_id):
+        return {"error": f"no romance arc for character {character_id} in session {session_id}"}
 
     # Reset arc to high saturation (glutted state)
     await Database.execute(
@@ -939,7 +950,7 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
         return {"arcs": len(arcs), "decayed": decayed, "jealousy": len(jealousy)}
 
     except Exception as e:
-        info("romance", f"Error: {e}")
+        error("romance", f"tick failed for session {session_id}: {e}")
         return {"error": str(e)}
 
 
@@ -1118,6 +1129,15 @@ async def execute_rolling_scene(
     if session_id is None:
         session_id = Config.SESSION_ID
 
+    pos_key = position.lower().replace(" ", "_")
+    if pos_key not in POSITIONS:
+        # Any unknown name used to become `peck`, so a typo ran the mildest scene at the mildest
+        # modifier and reported the caller's own word back as the position. Checked before the
+        # lookups, so a bad position is refused without touching the campaign.
+        return {"success": False, "error": f"unknown position '{position}'",
+                "available": sorted(POSITIONS)}
+    pos_data = POSITIONS[pos_key]
+
     target = await Database.fetchrow(
         "SELECT name, bond, traits, romance_stage FROM maya_rp.characters WHERE id=$1 AND session_id=$2",
         target_id, session_id)
@@ -1127,8 +1147,6 @@ async def execute_rolling_scene(
     if not target or not initiator:
         return {"success": False, "error": "Character not found"}
 
-    pos_key = position.lower().replace(" ", "_")
-    pos_data = POSITIONS.get(pos_key, POSITIONS["peck"])
     required_bond = TIERS[pos_data["tier"]]["bond_threshold"]
     target_bond = target["bond"] or 0
     init_bond = initiator["bond"] or 0

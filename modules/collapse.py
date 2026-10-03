@@ -135,9 +135,14 @@ async def check_for_collapse(session_id: int = None) -> dict | None:
            ORDER BY hull DESC LIMIT 1""",
         session_id,
     )
+    # Both columns are nullable, and `hull_current <=` raises TypeError on a NULL rather than
+    # answering. NULL is skipped, not read as critical: the schema permits it and no value in it
+    # says the ship is dying. `hull > 0` also keeps the division meaningful.
     if (
         flagship
-        and flagship["hull"]
+        and flagship["hull"] is not None
+        and flagship["hull"] > 0
+        and flagship["hull_current"] is not None
         and flagship["hull_current"] <= (flagship["hull"] * 0.1)
     ):
         return await _trigger_collapse("hull_critical", session_id)
@@ -182,16 +187,19 @@ async def _trigger_collapse(collapse_type: str, session_id: int) -> dict:
             config["recovery"],
         )
 
-    # 3. Log the collapse event
-    await Database.execute(
-        """INSERT INTO maya_rp.events
-           (session_id, happened_at, event_type, title, description, tags, importance)
-           VALUES ($1, NOW(), 'collapse', $2, $3, $4, 5)""",
-        session_id,
-        config["title"],
-        f"CRITICAL: {config['trigger']}. {config['effects'][0]}",
-        json.dumps(["collapse", collapse_type, config["new_arc_theme"]]),
-    )
+        # 3. Log the collapse event, once, when the arc is created. The condition that starts a
+        # collapse is a state, not an incident: it stays true on every following tick, and the
+        # caller runs on every tick, so logging outside this branch wrote one `importance 5`
+        # event per tick for as long as the treasury stayed empty.
+        await Database.execute(
+            """INSERT INTO maya_rp.events
+               (session_id, happened_at, event_type, title, description, tags, importance)
+               VALUES ($1, NOW(), 'collapse', $2, $3, $4, 5)""",
+            session_id,
+            config["title"],
+            f"CRITICAL: {config['trigger']}. {config['effects'][0]}",
+            json.dumps(["collapse", collapse_type, config["new_arc_theme"]]),
+        )
 
     return {
         "collapsed": True,

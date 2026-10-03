@@ -21,6 +21,7 @@ from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import error, info
+from modules._economy import _check_afford, _deduct_resources
 
 # ─── Constants ───────────────────────────────────────────────────
 
@@ -158,6 +159,16 @@ SECURITY_MULTIPLIERS = {
 
 
 # ─── Helpers ─────────────────────────────────────────────────────
+
+def _num(value, default):
+    """A zero is a value, not a missing one.
+
+    `value or default` read every legitimate 0 as absent. A prisoner at resistance 0 was measured at
+    50 and so never qualified for the `broken` conversion path, a risk driven to 0 by countermeasures
+    read back as 15, and an escape risk already at 0 was charged a `time_bonus` on a base of 0.15.
+    """
+    return default if value is None else value
+
 
 def _random_name() -> str:
     first = random.choice(NAME_PREFIXES)
@@ -322,11 +333,19 @@ async def interrogate(
     if not row:
         return {"success": False, "error": "Prisoner not found"}
 
-    t = INTERROGATION_TIERS.get(tier, INTERROGATION_TIERS["standard"])
+    # An unknown tier used to fall through to `standard`, so `soft` ran as standard and the caller
+    # had no way to tell a typo from a real tier. `get_interrogation_tier_info` already answers this
+    # way; the live path now agrees with it.
+    if tier not in INTERROGATION_TIERS:
+        return {"success": False,
+                "error": f"unknown interrogation tier '{tier}'",
+                "available": sorted(INTERROGATION_TIERS)}
+
+    t = INTERROGATION_TIERS[tier]
     prisoner = dict(row)
 
     # Intel yield
-    resistance_penalty = (prisoner.get("resistance") or 50) / 100.0
+    resistance_penalty = _num(prisoner.get("resistance"), 50) / 100.0
     prev_interrogations = (prisoner.get("interrogations_count") or 0) * 0.1
     base_intel = (prisoner.get("intel_value") or 1) * t["intel_multiplier"]
     intel_yield = max(1, round(base_intel * (1 - resistance_penalty - prev_interrogations)))
@@ -362,8 +381,8 @@ async def interrogate(
     new_status = "broken" if broken else "interrogated"
     await Database.execute(
         "UPDATE maya_rp.prisoners SET interrogations_count = $1, "
-        "last_interrogation_method = $2, status = $3 WHERE id = $4",
-        new_count, tier, new_status, prisoner_id,
+        "last_interrogation_method = $2, status = $3 WHERE id = $4 AND session_id = $5",
+        new_count, tier, new_status, prisoner_id, session_id,
     )
 
     # Log interrogation
@@ -446,7 +465,7 @@ async def check_conversion(
             }
 
         if (path_name == "persuasion"
-                and (p.get("resistance") or 100) <= req["max_resistance"]
+                and _num(p.get("resistance"), 100) <= req["max_resistance"]
                 and (p.get("interrogations_count") or 0) >= req["min_interrogations"]
                 and (not req.get("no_brutal") or p.get("last_interrogation_method") != "brutal")):
             return {
@@ -457,7 +476,7 @@ async def check_conversion(
             }
 
         if (path_name == "broken"
-                and (p.get("resistance") or 100) == req["resistance"]
+                and _num(p.get("resistance"), 100) == req["resistance"]
                 and (p.get("interrogations_count") or 0) >= req["min_interrogations"]
                 and p.get("last_interrogation_method") == req["last_method"]):
             return {
@@ -486,18 +505,22 @@ async def execute_conversion(
     if not cfg:
         return {"converted": False, "reason": "invalid_path"}
 
-    roll = random.random()
-    chance = cfg["base_chance"]
-    # Apply low_rank modifier if applicable
+    # The row must resolve before the roll. `p` was bound only inside `if row`, so a prisoner id that
+    # belongs to no campaign reached `p.get(...)` whenever the roll succeeded and raised
+    # UnboundLocalError, which the CLI prints as a traceback. A missing prisoner is a plain answer.
     row = await Database.fetchrow(
         "SELECT name, faction, rank, cell_ship_id AS ship_id FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2",
         prisoner_id, session_id
     )
-    if row:
-        p = dict(row)
-        if p.get("rank") in ("Private", "Corporal"):
-            chance += cfg["modifiers"].get("low_rank", 0)
+    if not row:
+        return {"converted": False, "reason": "prisoner_not_found", "path": path}
+    p = dict(row)
 
+    chance = cfg["base_chance"]
+    if p.get("rank") in ("Private", "Corporal"):
+        chance += cfg["modifiers"].get("low_rank", 0)
+
+    roll = random.random()
     if roll >= chance:
         return {"converted": False, "reason": "resisted_conversion", "path": path}
 
@@ -513,8 +536,8 @@ async def execute_conversion(
     # Update prisoner
     await Database.execute(
         "UPDATE maya_rp.prisoners SET conversion_path = $1, conversion_progress = 100, "
-        "status = 'recruited' WHERE id = $2",
-        path, prisoner_id,
+        "status = 'recruited' WHERE id = $2 AND session_id = $3",
+        path, prisoner_id, session_id,
     )
 
     info("prison", f"Converted prisoner {p['name']} via {path} (loyalty cap: {cfg['loyalty_cap']})")
@@ -534,17 +557,23 @@ async def record_death(
     Record a prisoner death.
     Ported from PrisonerConversion.recordDeath().
     Causes: execution, escape_killed, brutal_interrogation, accident
+    Returns None, and writes nothing, when the prisoner does not exist in that campaign.
     """
     if session_id is None:
         session_id = Config.SESSION_ID
-    await Database.execute(
-        "UPDATE maya_rp.prisoners SET status = 'dead', death_cause = $1, death_session = $2 WHERE id = $3",
-        cause, session_id, prisoner_id,
+    row = await Database.fetchrow(
+        "SELECT name, faction FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2",
+        prisoner_id, session_id,
     )
-    row = await Database.fetchrow("SELECT name, faction FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2", prisoner_id, session_id)
-    if row:
-        info("prison", f"Prisoner {row['name']} died: {cause}")
-    return dict(row) if row else None
+    if not row:
+        return None
+    await Database.execute(
+        "UPDATE maya_rp.prisoners SET status = 'dead', death_cause = $1, death_session = $2 "
+        "WHERE id = $3 AND session_id = $4",
+        cause, session_id, prisoner_id, session_id,
+    )
+    info("prison", f"Prisoner {row['name']} died: {cause}")
+    return dict(row)
 
 
 async def feed_intel_to_investigation(
@@ -613,7 +642,7 @@ async def get_available_intimacy_paths(
     )
     if not row:
         return []
-    resistance = row["resistance"] or 50
+    resistance = _num(row["resistance"], 50)
 
     paths = []
     if brutality >= 30:
@@ -642,7 +671,17 @@ async def initiate_intimacy(
 
     cfg = INTIMACY_PATHS.get(path)
     if not cfg:
-        return {"success": False, "reason": "Path not available for this prisoner."}
+        # "Path not available for this prisoner" was the answer for a path that does not exist at
+        # all, which reads as a rule of the prisoner rather than as a typo in the caller.
+        return {"success": False,
+                "reason": f"unknown intimacy path '{path}'",
+                "available": sorted(INTIMACY_PATHS),
+                "path": path}
+
+    if not await Database.fetchval(
+            "SELECT id FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2",
+            prisoner_id, session_id):
+        return {"success": False, "reason": "prisoner_not_found", "path": path}
 
     # Risk roll
     risks = cfg["risk"]
@@ -682,8 +721,8 @@ async def initiate_intimacy(
     # Update prisoner
     await Database.execute(
         "UPDATE maya_rp.prisoners SET intimacy_flag = true, intimacy_path = $1, "
-        "held_sessions = COALESCE(held_sessions, 0) + 1 WHERE id = $2",
-        path, prisoner_id,
+        "held_sessions = COALESCE(held_sessions, 0) + 1 WHERE id = $2 AND session_id = $3",
+        path, prisoner_id, session_id,
     )
 
     # If escape attempt, handle it
@@ -720,7 +759,9 @@ async def _handle_intimacy_risk(
         row = await Database.fetchrow("SELECT name, faction FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2", prisoner_id, session_id)
         name = row["name"] if row else "Unknown"
         faction = row["faction"] if row else "unknown"
-    except Exception:
+    except Exception as e:
+        # A swallowed handler with no trace: the caller got "Unknown" and nothing said why.
+        error("prison", f"intimacy risk lookup failed for prisoner {prisoner_id}: {e}")
         name = "Unknown"
         faction = "unknown"
 
@@ -755,8 +796,6 @@ async def get_fleet_capacity(
     session_id: int | None = None,
 ) -> dict[str, Any]:
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
     Get fleet-wide cell capacity stats.
     Ported from PrisonState.getFleetCapacity().
     """
@@ -808,6 +847,10 @@ async def assign_cell(
     """
     Assign prisoner to a ship with available cells.
     Ported from PrisonState.assignCell().
+
+    Capacity is read, not assumed. The old body took the first ship with `cell_capacity > 0` and
+    ignored how many prisoners that cell block already held, so `assignCell` reported a successful
+    assignment onto a full ship and `getFleetCapacity` disagreed with it in the same tick.
     """
     if session_id is None:
         session_id = Config.SESSION_ID
@@ -817,15 +860,25 @@ async def assign_cell(
         "WHERE session_id = $1 AND cell_capacity > 0 ORDER BY cell_capacity DESC",
         session_id,
     )
+    occupied = await Database.fetch(
+        "SELECT cell_ship_id, COUNT(*) AS used FROM maya_rp.prisoners "
+        "WHERE session_id = $1 AND status IN ('captured','holding','interrogated') "
+        "AND cell_ship_id IS NOT NULL GROUP BY cell_ship_id",
+        session_id,
+    )
+    used = {r["cell_ship_id"]: r["used"] for r in occupied}
 
     for s in ships:
         cap = s["cell_capacity"]
-        if cap > 0:
+        free = cap - used.get(s["id"], 0)
+        if free > 0:
             await Database.execute(
-                "UPDATE maya_rp.prisoners SET cell_ship_id = $1, cell_security = 'standard' WHERE id = $2",
-                s["id"], prisoner_id,
+                "UPDATE maya_rp.prisoners SET cell_ship_id = $1, cell_security = 'standard' "
+                "WHERE id = $2 AND session_id = $3",
+                s["id"], prisoner_id, session_id,
             )
-            return {"assigned": True, "ship_id": s["id"], "ship_name": s["name"], "cell_capacity": cap}
+            return {"assigned": True, "ship_id": s["id"], "ship_name": s["name"],
+                    "cell_capacity": cap, "cells_free": free - 1}
 
     return {"assigned": False, "ship_id": None, "ship_name": None,
             "message": "No cell capacity available. Build or acquire prison ships."}
@@ -835,10 +888,15 @@ async def calculate_escape_risk(
     prisoner_id: int,
     sessions_since_capture: int = 0,
     session_id: int | None = None,
+    roll: float | None = None,
 ) -> dict[str, Any]:
     """
     Calculate escape probability for a prisoner.
     Ported from PrisonState.calculateEscapeRisk().
+
+    `roll` lets a caller supply the draw. Without it the function rolls its own, so two calls on the
+    same unchanged state answer differently and no test can pin the boundary. A caller that needs the
+    same state to give the same answer passes the draw it already took.
     """
     if session_id is None:
         session_id = Config.SESSION_ID
@@ -851,13 +909,14 @@ async def calculate_escape_risk(
     p = dict(row)
 
     sec_mult = SECURITY_MULTIPLIERS.get(p.get("cell_security", "standard"), 0.5)
-    base_risk = (p.get("escape_risk_pct") or 15) / 100.0
+    base_risk = _num(p.get("escape_risk_pct"), 15) / 100.0
     time_bonus = sessions_since_capture * 0.02
     risk = min(0.95, base_risk * sec_mult + time_bonus)
 
+    draw = random.random() if roll is None else roll
     return {
         "probability": round(risk * 100),
-        "will_escape": random.random() < risk,
+        "will_escape": draw < risk,
         "security_level": p.get("cell_security"),
         "resistance": p.get("resistance"),
     }
@@ -880,11 +939,17 @@ async def process_escapes(
         session_id,
     )
 
-    results = {"escaped": [], "foiled": [], "manhunt": False}
+    results = {"escaped": [], "foiled": [], "errors": [], "manhunt": False}
 
     for row in prisoners:
         p = dict(row)
-        risk = await calculate_escape_risk(p["id"])
+        # The session has to reach the risk call. Without it the lookup fell back to
+        # Config.SESSION_ID, so an arc on another session resolved nothing, `will_escape` was None,
+        # and every prisoner was booked as "foiled" without an escape roll ever being made.
+        risk = await calculate_escape_risk(p["id"], session_id=session_id)
+        if "error" in risk:
+            results["errors"].append({"id": p["id"], "error": risk["error"]})
+            continue
 
         if risk.get("will_escape"):
             secrets_raw = p.get("secrets_jsonb")
@@ -896,8 +961,10 @@ async def process_escapes(
                     pass
 
             await Database.execute(
-                "UPDATE maya_rp.prisoners SET status = 'escaped', escape_attempts = COALESCE(escape_attempts, 0) + 1 WHERE id = $1",
-                p["id"],
+                "UPDATE maya_rp.prisoners SET status = 'escaped', "
+                "escape_attempts = COALESCE(escape_attempts, 0) + 1 "
+                "WHERE id = $1 AND session_id = $2",
+                p["id"], session_id,
             )
             results["escaped"].append({
                 "name": p["name"],
@@ -926,9 +993,11 @@ async def upgrade_security(
     """
     if session_id is None:
         session_id = Config.SESSION_ID
-    valid = ["minimal", "standard", "maximum", "isolated"]
-    if new_level not in valid:
-        new_level = "standard"
+    # A level this module does not know used to become `standard`. On a prisoner held at `isolated`
+    # that *lowers* security while the return value reports success.
+    valid = sorted(SECURITY_MULTIPLIERS)
+    if new_level not in SECURITY_MULTIPLIERS:
+        return {"error": f"unknown security level '{new_level}'", "available": valid}
 
     row = await Database.fetchrow(
         "SELECT resistance FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2", prisoner_id, session_id
@@ -937,11 +1006,12 @@ async def upgrade_security(
         return {"error": "Prisoner not found"}
 
     mult = SECURITY_MULTIPLIERS[new_level]
-    new_risk = round((row["resistance"] or 50) * mult)
+    new_risk = round(_num(row["resistance"], 50) * mult)
 
     await Database.execute(
-        "UPDATE maya_rp.prisoners SET cell_security = $1, escape_risk_pct = $2 WHERE id = $3",
-        new_level, new_risk, prisoner_id,
+        "UPDATE maya_rp.prisoners SET cell_security = $1, escape_risk_pct = $2 "
+        "WHERE id = $3 AND session_id = $4",
+        new_level, new_risk, prisoner_id, session_id,
     )
 
     # Log countermeasure
@@ -949,7 +1019,7 @@ async def upgrade_security(
         "INSERT INTO maya_rp.escape_countermeasures "
         "(session_id, prisoner_id, measure_type, cost_credits, risk_reduction) "
         "VALUES ($1, $2, 'security_upgrade', $3, $4)",
-        Config.SESSION_ID, prisoner_id, guards * 50, 1 - mult,
+        session_id, prisoner_id, guards * 50, 1 - mult,
     )
 
     return {
@@ -968,25 +1038,42 @@ async def apply_countermeasure(
     """
     Apply an escape countermeasure.
     Ported from EscapeCountermeasures.applyCountermeasure().
+
+    The measure carried a cost that was written to `escape_countermeasures.cost_credits` and never
+    charged, so the ledger said a session paid for a countermeasure it still held the credits for.
+    The cost now leaves the session's resources, and a session that cannot pay is told so.
     """
     if session_id is None:
         session_id = Config.SESSION_ID
 
     measure = next((m for m in ESCAPE_COUNTERMEASURES if m["name"] == measure_name), None)
     if not measure:
-        return None
+        # None was the answer for both an unknown measure and an unknown prisoner, so a typo in the
+        # measure table read the same as a prisoner that does not exist.
+        return {"applied": None, "error": f"unknown countermeasure '{measure_name}'",
+                "available": [m["name"] for m in ESCAPE_COUNTERMEASURES]}
 
     row = await Database.fetchrow(
         "SELECT escape_risk_pct FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2", prisoner_id, session_id
     )
     if not row:
-        return None
+        return {"applied": None, "error": f"prisoner {prisoner_id} not found in session {session_id}"}
 
-    new_risk = max(0, (row["escape_risk_pct"] or 50) - round(measure["risk_reduction"] * 100))
+    cost = {"credits": measure["cost"]} if measure["cost"] else {}
+    if cost:
+        ok, why = await _check_afford(session_id, cost)
+        if not ok:
+            return {"applied": None, "error": f"cannot pay {measure['cost']} credits for {measure_name}: {why}",
+                    "cost": measure["cost"], "charged": {}}
+        charged = await _deduct_resources(session_id, cost)
+    else:
+        charged = {}
+
+    new_risk = max(0, _num(row["escape_risk_pct"], 50) - round(measure["risk_reduction"] * 100))
 
     await Database.execute(
-        "UPDATE maya_rp.prisoners SET escape_risk_pct = $1 WHERE id = $2",
-        new_risk, prisoner_id,
+        "UPDATE maya_rp.prisoners SET escape_risk_pct = $1 WHERE id = $2 AND session_id = $3",
+        new_risk, prisoner_id, session_id,
     )
 
     await Database.execute(
@@ -996,7 +1083,8 @@ async def apply_countermeasure(
         session_id, prisoner_id, measure_name, measure["cost"], measure["risk_reduction"],
     )
 
-    return {"applied": measure_name, "cost": measure["cost"], "new_risk": new_risk, "description": measure["desc"]}
+    return {"applied": measure_name, "cost": measure["cost"], "cost_credits": measure["cost"],
+            "charged": charged, "new_risk": new_risk, "description": measure["desc"]}
 
 
 # ─── Tick ────────────────────────────────────────────────────────
@@ -1029,7 +1117,7 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
     )
     eligible = []
     for p in prisoners:
-        conv = await check_conversion(p["id"])
+        conv = await check_conversion(p["id"], session_id)
         if conv:
             eligible.append(conv)
     results["conversion_eligible"] = eligible

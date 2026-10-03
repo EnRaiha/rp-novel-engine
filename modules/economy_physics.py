@@ -50,6 +50,9 @@ Formulas, written out so a test can check them:
         Measured: every destroyed or lost hull carries crew_current = 0.
     crew_recovered(c) = floor(0.7 c)        SURVIVABILITY, fleet_refill.py
     crew_replaced(c)  = c - crew_recovered(c)
+        The 0.7 is shared with `scripts/fleet_refill.py`; the ROUNDING is not.
+        That script writes `round(c * 0.7)`, which differs from this floor for
+        26 crew sizes below 60 (5 aboard: 3 here, 4 there). The ledger floors.
 
     lane_hours(lane_type, delta)
         = 24.0 delta   standard, hazardous, unstable
@@ -122,7 +125,10 @@ DEFAULT_HULL_COST = (1_500_000, 800, 3)
 CREW_SURVIVABILITY_NUM = 7
 CREW_SURVIVABILITY_DEN = 10
 # 0.7. Battle of Gate 7 canon: 30% of the crew perish, the rest eject and return
-# to the pool. `scripts/fleet_refill.py` SURVIVABILITY holds the same number.
+# to the pool. `scripts/fleet_refill.py` SURVIVABILITY holds the same fraction.
+# The two copies round it differently: that script uses round(), this module
+# floors. On a 5-crew hull that is 4 survivors there and 3 here. The number is
+# deliberately shared; the divergence is real and is reported, not hidden.
 
 # ─── 4.3 Transit ────────────────────────────────────────────────────
 HOURS_PER_UNIT = 24.0

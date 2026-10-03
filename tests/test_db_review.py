@@ -68,12 +68,25 @@ class FakeTx:
 class FakePool:
     def __init__(self, conn=None):
         self.conn = conn or FakeConn()
+        self.released: list = []
 
     def acquire(self):
         return _Acquire(self.conn)
 
+    async def release(self, conn):
+        self.released.append(conn)
+
+
+class ClosedPool(FakePool):
+    """Pool object still set on the class, but its connections are gone."""
+
+    def acquire(self):
+        raise asyncpg.exceptions.InterfaceError("pool is closed")
+
 
 class _Acquire:
+    """Mirrors asyncpg's PoolAcquireContext: awaitable and an async context manager."""
+
     def __init__(self, conn):
         self.conn = conn
 
@@ -82,6 +95,12 @@ class _Acquire:
 
     async def __aexit__(self, *exc):
         return False
+
+    def __await__(self):
+        async def _get():
+            return self.conn
+
+        return _get().__await__()
 
 
 @pytest.fixture
@@ -152,3 +171,30 @@ async def test_fetch_readonly_uses_a_read_only_transaction(pool):
     assert rows == [{"id": 1}]
     assert fake.conn.readonly_seen == [True]
     assert fake.conn.fetched == ["SELECT 1 FROM maya_rp.sessions"]
+
+
+async def test_transaction_reconnects_when_the_pool_is_closed(pool, monkeypatch):
+    """Lead's L2. The docstring claimed reconnect-at-acquire; the acquire sat
+    outside the try, so a pool that was non-None but closed raised instead."""
+    fake, calls = pool
+    closed = ClosedPool()
+
+    async def ensure_closed():
+        return closed
+
+    monkeypatch.setattr(db.Database, "_ensure_pool", staticmethod(ensure_closed))
+    body: list = []
+    async with db.Database.transaction() as conn:
+        body.append(conn)
+
+    assert body, "the transaction body never ran"
+    assert calls == {"init": 1, "close": 1}, calls
+    assert fake.released, "the connection was never released back to the pool"
+
+
+async def test_transaction_releases_and_rolls_back_on_a_failing_body(pool):
+    fake, _ = pool
+    with pytest.raises(ValueError):
+        async with db.Database.transaction():
+            raise ValueError("body failed")
+    assert fake.released, "a rolled-back transaction leaked its connection"

@@ -119,14 +119,19 @@ class Database:
     @asynccontextmanager
     async def transaction(cls):
         """Transaction context manager — auto-rollback on exception.
-        Reconnects once if the pool is dead at acquire time."""
+        Reconnects once if the pool is dead at acquire time, which is what this
+        docstring always claimed: `_ensure_pool` only covers the pool being None,
+        so a pool that is non-None but closed failed at `pool.acquire()` without
+        the reconnect `_run` performs."""
         try:
             pool = await cls._ensure_pool()
-        except _RECONNECT_ERRORS:
-            info("db", "Pool lost at transaction start — reconnecting once")
+            conn = await pool.acquire()
+        except _RECONNECT_ERRORS as e:
+            info("db", f"Pool lost at transaction start ({type(e).__name__}) — reconnecting once")
             await cls.close()
             pool = await cls.init()
-        async with pool.acquire() as conn:
+            conn = await pool.acquire()
+        try:
             tx = conn.transaction()
             await tx.start()
             try:
@@ -135,6 +140,8 @@ class Database:
             except Exception:
                 await tx.rollback()
                 raise
+        finally:
+            await pool.release(conn)
 
     @classmethod
     async def status(cls) -> dict:

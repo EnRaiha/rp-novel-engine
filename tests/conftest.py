@@ -96,7 +96,7 @@ async def scratch_session() -> int:
 
     try:
         tables = await Database.fetch(
-            "SELECT table_name FROM information_schema.columns"
+            "SELECT c.table_name FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE'"
             " WHERE table_schema = 'maya_rp' AND column_name = 'session_id'")
     except Exception:
         return

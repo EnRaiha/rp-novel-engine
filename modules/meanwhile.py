@@ -16,18 +16,25 @@ async def generate(session_id: int = None) -> dict | None:
     # NOVEL ULTIMATE #3 — DUAL POV INTEL: undetected incoming raids = actionable threat
     # Novel kerap tukar POV ke musuh (Lilith, Marshal, Pirates) untuk dramatic irony.
     raid = await Database.fetchrow(
-        "SELECT faction_name, target_system, enemy_power, ticks_remaining FROM maya_rp.incoming_raids "
+        "SELECT id, faction_name, target_system, enemy_power, ticks_remaining FROM maya_rp.incoming_raids "
         "WHERE session_id=$1 AND detected=false AND ticks_remaining <= 5 "
         "ORDER BY ticks_remaining ASC LIMIT 1", session_id)
     if raid:
+        # Mark the row that was read. Matching on faction and target marked every
+        # raid of the same faction at the same system: three live undetected
+        # Gale Runner raids at 433-472 collapsed into one POV cut, and the other
+        # two could never be reported.
         await Database.execute(
-            "UPDATE maya_rp.incoming_raids SET detected=true WHERE session_id=$1 AND faction_name=$2 AND target_system=$3",
-            session_id, raid["faction_name"], raid["target_system"])
+            "UPDATE maya_rp.incoming_raids SET detected=true WHERE session_id=$1 AND id=$2",
+            session_id, raid["id"])
+        # enemy_power and ticks_remaining are nullable columns; `{None:,}` raises.
+        power = int(raid["enemy_power"] or 0)
+        ticks = int(raid["ticks_remaining"] or 0)
         return {"type":"enemy_pov","location":f"{raid['faction_name']} Command",
                 "characters":[f"{raid['faction_name']} admiral"],
                 "narrative":f"Meanwhile, in the void... {raid['faction_name']} fleet drops out of FTL. "
-                            f"Target: {raid['target_system']}. Power: {raid['enemy_power']:,}. "
-                            f"Impact in {raid['ticks_remaining']} ticks.",
+                            f"Target: {raid['target_system']}. Power: {power:,}. "
+                            f"Impact in {ticks} ticks.",
                 "relevance":"Intel revealed. Defensive deployment required."}
 
     from modules.secrets import get_dramatic_irony

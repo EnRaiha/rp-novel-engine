@@ -19,23 +19,85 @@ TERRAINS = ["open_space","asteroid_field","nebula","debris_field","atmosphere","
 FORMATIONS = ["line","wedge","sphere","screen","spearhead","scatter"]
 
 async def calculate_fleet_power(session_id: int, fleet_name: str | None = None) -> dict:
-    ships = await Database.fetch("SELECT tier, hull, hull_current, speed FROM maya_rp.ships WHERE session_id=$1", session_id)
-    power = sum(max(1, s["tier"] * 10 + (s["hull_current"] or s["hull"]) // 10) for s in ships) if ships else 0
+    """Combat power of a campaign's ships, or of one named fleet inside it.
+
+    `fleet_name` was accepted and never read, so asking for one fleet answered with the whole
+    campaign's order of battle (44,269 hulls for session 3 against 9 for the fleet that was named).
+    The name now resolves through `fleets`, scoped to the session, and its `fleet_members`; a name the
+    session does not hold raises instead of answering with everything.
+
+    A hull at zero is a wreck, not a full-strength ship: `hull_current or hull` read the real zero as
+    missing and counted a destroyed hull at its original hull value.
+    """
+    if fleet_name is None:
+        ships = await Database.fetch(
+            "SELECT tier, hull, hull_current, speed FROM maya_rp.ships WHERE session_id=$1", session_id)
+    else:
+        fleet = await Database.fetchrow(
+            "SELECT id FROM maya_rp.fleets WHERE session_id=$1 AND name=$2", session_id, fleet_name)
+        if fleet is None:
+            raise ValueError(f"Unknown fleet {fleet_name!r} in session {session_id}")
+        ships = await Database.fetch(
+            "SELECT s.tier, s.hull, s.hull_current, s.speed FROM maya_rp.ships s"
+            " JOIN maya_rp.fleet_members fm ON fm.ship_id=s.id WHERE fm.fleet_id=$1", fleet["id"])
+    power = 0
+    for s in ships:
+        tier = s["tier"] if s["tier"] is not None else 1
+        hull_now = s["hull_current"] if s["hull_current"] is not None else s["hull"]
+        if hull_now is None: hull_now = 0
+        power += max(1, tier * 10 + hull_now // 10)
     return {"fleet_power": power, "ship_count": len(ships)}
 
 async def resolve_exchange(attacker_hull: int, attacker_tier: int, defender_hull: int, defender_tier: int,
                            weapon: str = "kinetic", targeting_system: str | None = None) -> dict:
-    dt = DAMAGE_TYPES.get(weapon, DAMAGE_TYPES["kinetic"])
+    """Damage from one exchange.
+
+    An unknown weapon name used to resolve as kinetic, so a typo fought at kinetic odds with nothing
+    said about it. It raises now, the way `BattleEngine._tactic_mult` refuses an unknown tactic.
+    `None` stays the caller's "not specified" and means kinetic, which the CLI and the exchange test
+    both pass.
+
+    `targeting_system` is checked against the module's own SYSTEM_TARGETS and echoed back, because the
+    resolver has no defender subsystem state to aim at: only the attacker's tier and the weapon's
+    multiplier move the damage today.
+    """
+    if weapon is None:
+        weapon = "kinetic"
+    dt = DAMAGE_TYPES.get(weapon)
+    if dt is None:
+        raise ValueError(f"Unknown damage type {weapon!r}. Known types: {', '.join(sorted(DAMAGE_TYPES))}")
+    if targeting_system is not None and targeting_system not in SYSTEM_TARGETS:
+        raise ValueError(f"Unknown targeting system {targeting_system!r}. Known: {', '.join(SYSTEM_TARGETS)}")
     base_dmg = max(1, attacker_tier * 15)
     dmg = round(base_dmg * dt["mult"])
-    return {"damage": dmg, "defender_hull_remaining": max(0, defender_hull - dmg), "weapon": weapon}
+    return {"damage": dmg, "defender_hull_remaining": max(0, defender_hull - dmg), "weapon": weapon,
+            "targeting_system": targeting_system}
 
 async def get_tactical_position(session_id: int, zone: str = "forward", terrain: str = "open_space",
                                  formation: str = "spearhead") -> dict:
+    """Position multipliers, naming every input the module does not recognise.
+
+    An unknown zone, terrain or formation took a default multiplier in silence: the same answer for a
+    typo as for a real zone, which is how the CLI's `war position flank` reported the unflanked 0.8
+    with nothing said. The unrecognised values are listed in `warnings` now. `None` stays the caller's
+    "not specified": the CLI passes None for terrain and formation, and the module's own defaults are
+    the ones that apply.
+    """
+    warnings = []
+    if zone not in ZONES:
+        warnings.append(f"unknown zone {zone!r}. Known zones: {', '.join(ZONES)}")
+    if terrain is not None and terrain not in TERRAINS:
+        warnings.append(f"unknown terrain {terrain!r}. Known terrains: {', '.join(TERRAINS)}")
+    if formation is not None and formation.lower() not in FORMATIONS:
+        warnings.append(f"unknown formation {formation!r}. Known formations: {', '.join(FORMATIONS)}")
     flank_bonus = 1.0 if zone in ("aft","ventral") else 0.8
     terrain_bonus = 1.0 if terrain == "asteroid_field" else 0.9 if terrain == "nebula" else 0.8
     form_bonus = 1.2 if formation == "spearhead" else 1.0 if formation == "wedge" else 0.9
-    return {"effective_power": round(flank_bonus * terrain_bonus * form_bonus, 2), "zone": zone, "terrain": terrain, "formation": formation}
+    out = {"effective_power": round(flank_bonus * terrain_bonus * form_bonus, 2), "zone": zone,
+           "terrain": terrain, "formation": formation}
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 MILITARY_OPS = {
     "blitz": {"desc": "Fast overwhelming assault", "difficulty": 6, "duration": 3},

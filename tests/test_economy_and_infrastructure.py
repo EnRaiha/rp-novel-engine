@@ -20,11 +20,15 @@ from modules._economy import _deduct_resources  # noqa: E402
 
 
 class TestTheSharedLedger:
-    async def test_an_unlisted_resource_is_skipped_and_named(self):
+    async def test_an_unlisted_resource_is_refused_and_named(self):
+        """Skipping was the old contract: it charged nothing for `unicorns` and
+        said so under a `#skipped` string key inside a dict of amounts, which is
+        a mixed-type payload and a building paid for with nothing."""
+        import pytest as _pytest
+
         await Database.init()
-        charged = await _deduct_resources(3, {"credits": 0, "unicorns": 5})
-        assert charged.get("#skipped") == ["unicorns"], charged
-        assert "unicorns" not in charged, charged
+        with _pytest.raises(ValueError, match="unicorns"):
+            await _deduct_resources(3, {"credits": 0, "unicorns": 5})
         await Database.close()
 
     async def test_a_charge_is_reported_rather_than_silent(self):

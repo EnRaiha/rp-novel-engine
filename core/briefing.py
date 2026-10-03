@@ -19,7 +19,10 @@ async def generate_briefing(session_id: int = None) -> dict[str, Any]:
     # 1. Session state
     s = await Database.fetchrow(
         "SELECT name, status, game_day FROM maya_rp.sessions WHERE id=$1", session_id)
-    game_day = s["game_day"] or 1
+    if s is None:
+        raise ValueError(f"no session {session_id}: maya_rp.sessions has no such row")
+    # A NULL game_day is an unset clock; a game_day of 0 is day zero, not day one.
+    game_day = s["game_day"] if s["game_day"] is not None else 1
     briefing["session"] = f"Day {game_day}, {s['status']} — {s['name']}"
 
     # 2. Active crises (max 5)
@@ -52,7 +55,7 @@ async def generate_briefing(session_id: int = None) -> dict[str, Any]:
         dict(r) for r in await Database.fetch(
             "SELECT c.name, ra.arc_stage, ra.saturation_pct, ra.pursuit_stage "
             "FROM maya_rp.romance_arcs ra JOIN maya_rp.characters c ON c.id=ra.character_id "
-            "WHERE ra.session_id=$1 AND c.bond >= 5 ORDER BY c.bond DESC LIMIT 8",
+            "WHERE ra.session_id=$1 AND c.session_id=$1 AND c.bond >= 5 ORDER BY c.bond DESC LIMIT 8",
             session_id)]
 
     # 5. Resource pressure
@@ -60,9 +63,16 @@ async def generate_briefing(session_id: int = None) -> dict[str, Any]:
         "SELECT credits, alloys, fuel FROM maya_rp.resources WHERE session_id=$1", session_id)
     briefing["resource_pressure"] = []
     if r:
-        if r["fuel"] < 500_000: briefing["resource_pressure"].append("FUEL LOW")
-        if r["credits"] < 200_000: briefing["resource_pressure"].append("CREDITS LOW")
-        if r["alloys"] < 100_000: briefing["resource_pressure"].append("ALLOYS LOW")
+        # A NULL figure is a figure the ledger does not hold, so the briefing does
+        # not claim the treasury is low on it.
+        for column, threshold, alert in (
+            ("fuel", 500_000, "FUEL LOW"),
+            ("credits", 200_000, "CREDITS LOW"),
+            ("alloys", 100_000, "ALLOYS LOW"),
+        ):
+            value = r[column]
+            if value is not None and value < threshold:
+                briefing["resource_pressure"].append(alert)
 
     # 6. Last 3 narrative beats
     briefing["recent_beats"] = [
@@ -82,7 +92,7 @@ async def generate_briefing(session_id: int = None) -> dict[str, Any]:
         dict(r) for r in await Database.fetch(
             "SELECT cm.character_id, c.name, cm.memory_type, cm.content "
             "FROM maya_rp.character_memories cm JOIN maya_rp.characters c ON c.id=cm.character_id "
-            "WHERE cm.session_id=$1 AND cm.recalled_count=0 AND cm.emotional_weight >= 7 "
+            "WHERE cm.session_id=$1 AND c.session_id=$1 AND cm.recalled_count=0 AND cm.emotional_weight >= 7 "
             "ORDER BY cm.emotional_weight DESC LIMIT 3",
             session_id)]
 
@@ -108,20 +118,21 @@ def briefing_to_prompt(briefing: dict) -> str:
     if briefing.get("crises"):
         lines.append("\n### ACTIVE CRISES")
         for c in briefing["crises"][:5]:
-            lines.append(f"- {c.get('title','?')}: {c.get('description','?')[:80]}")
+            lines.append(f"- {c.get('title') or '?'}: {(c.get('description') or '?')[:80]}")
 
     lines.append(f"\n### LOCATION: {briefing.get('location','bridge')}")
 
     if briefing.get("present"):
         lines.append("\n### PRESENT")
         for p in briefing["present"]:
-            icon = "\u2665" if p.get("bond", 0) >= 7 else "\u25cb" if p.get("bond", 0) >= 3 else "\u00b7"
-            lines.append(f"- {icon} {p['name']} ({p.get('role','?')})")
+            bond = p.get("bond") or 0
+            icon = "\u2665" if bond >= 7 else "\u25cb" if bond >= 3 else "\u00b7"
+            lines.append(f"- {icon} {p['name']} ({p.get('role') or '?'})")
 
     if briefing.get("companion_states"):
         lines.append("\n### COMPANION STATES")
         for cs in briefing["companion_states"]:
-            lines.append(f"- {cs['name']}: {cs.get('arc_stage','?')}, sat {cs.get('saturation_pct',0)}%")
+            lines.append(f"- {cs.get('name') or '?'}: {cs.get('arc_stage') or '?'}, sat {cs.get('saturation_pct') or 0}%")
 
     if briefing.get("resource_pressure"):
         lines.append(f"\n### \u26a0 RESOURCE ALERTS: {', '.join(briefing['resource_pressure'])}")
@@ -129,7 +140,7 @@ def briefing_to_prompt(briefing: dict) -> str:
     if briefing.get("pending_choices"):
         lines.append("\n### PENDING DECISIONS")
         for ch in briefing["pending_choices"]:
-            lines.append(f"- [ ] {ch.get('title','?')}")
+            lines.append(f"- [ ] {ch.get('title') or '?'}")
 
     if briefing.get("overdue_memories"):
         lines.append("\n### UNRESOLVED MEMORIES")
@@ -139,7 +150,7 @@ def briefing_to_prompt(briefing: dict) -> str:
     if briefing.get("wars"):
         lines.append("\n### ACTIVE WARS")
         for w in briefing["wars"]:
-            lines.append(f"- {w['opponent_faction']} ({w['phase']})")
+            lines.append(f"- {w['opponent_faction'] or '?'} ({w['phase'] or '?'})")
 
     lines.append(f"\n### FLAGS: leave_mode={briefing.get('leave_mode','NONE')}, tone={briefing.get('rp_tone','English')}")
     return "\n".join(lines)

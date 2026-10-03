@@ -8,18 +8,24 @@ established literary register.
 import re
 
 # Clinical/Mechanical -> Literary/Metaphorical (DS Register)
+#: Every pattern here has to catch the forms a model actually writes. Five of the entries handled
+#: their inflections (`moan(ed|ing|s)?`, `thrust(s|ing|ed)?`, `climax(ed|ing|es)?`,
+#: `ejaculat(ed|ing|es)?`) and four did not, so the pass replaced `orgasm` and left `orgasms`,
+#: replaced `breasts` and left `breast`, and let the noun `ejaculation` through entirely — the exact
+#: clinical vocabulary the block exists to remove. The pass runs on the prose boundary
+#: (`core/stream_interceptor.py:171`), which is what makes the gap reachable.
 REPLACEMENT_LEXICON = {
     # Anatomy -> Metaphor
     r"\bpenis\b": ["the dragon", "the core of him", "his heat"],
     r"\bvagina\b": ["the valley", "the lock", "her core"],
-    r"\bbreasts\b": ["the swell of her chest", "golden curves", "softness"],
-    r"\bnipples\b": ["peaks", "buds", "the rigid proof of her want"],
+    r"\bbreast(s)?\b": ["the swell of her chest", "golden curves", "softness"],
+    r"\bnipple(s)?\b": ["peaks", "buds", "the rigid proof of her want"],
 
     # Acts -> Sensory descriptions
     r"\bintercourse\b": ["the joining", "the merging of souls", "the torrent"],
     r"\bsex\b": ["the union", "the heat", "the dance"],
-    r"\borgasm\b": ["the breaking point", "the torrent", "the collapse", "the summit"],
-    r"\bejaculat(ed|ing|es)?\b": ["spilled his heat", "gave way to the torrent", "found his release"],
+    r"\borgasm(s)?\b": ["the breaking point", "the torrent", "the collapse", "the summit"],
+    r"\bejaculat(ed|ing|es|ion)?\b": ["spilled his heat", "gave way to the torrent", "found his release"],
 
     # Modifiers -> Playbook language
     r"\bthrust(s|ing|ed)?\b": ["moved with purpose", "drove the rhythm", "pressed deep"],

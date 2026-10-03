@@ -19,7 +19,15 @@ from core.db import Database
 from core.config import Config
 from core.log import info
 
-SID = Config.SESSION_ID
+
+def _sid(session_id: int | None) -> int:
+    """The session for this call, resolved at call time.
+
+    This module used to hold `SID = Config.SESSION_ID` at import. A module-level copy freezes on the
+    session that was current when the module was first imported, so every default path read and wrote
+    that campaign for the life of the process.
+    """
+    return Config.SESSION_ID if session_id is None else session_id
 
 # Weighted drivers (all clamped -100..100 / 0..100)
 W_MORALE  = 0.30
@@ -36,8 +44,7 @@ def _clamp(v: float, lo: int = -100, hi: int = 100) -> int:
 
 async def init_for_territory(session_id: int | None = None) -> int:
     """Ensure every territory has baseline rows (governor faction + Setia Empire)."""
-    if session_id is None:
-        session_id = SID
+    session_id = _sid(session_id)
     n = 0
     for t in await Database.fetch(
             "SELECT id, controlling_faction FROM maya_rp.territory WHERE session_id=$1", session_id):
@@ -60,8 +67,7 @@ async def init_for_territory(session_id: int | None = None) -> int:
 
 async def refresh(session_id: int | None = None, territory_id: int | None = None) -> dict:
     """Recompute sentiment for all rows (or one territory). Returns updated count."""
-    if session_id is None:
-        session_id = SID
+    session_id = _sid(session_id)
     rows = await Database.fetch(
         """SELECT ps.id, ps.territory_id, ps.faction_name,
                   t.morale, t.tax_rate, t.crisis_level, t.slave_revolt_risk,
@@ -109,8 +115,7 @@ async def refresh(session_id: int | None = None, territory_id: int | None = None
 async def shift(session_id: int | None, territory_id: int, faction_name: str,
                 delta: int, reason: str) -> dict:
     """Manual/narrative shift (news, events, decrees). Clamped."""
-    if session_id is None:
-        session_id = SID
+    session_id = _sid(session_id)
     row = await Database.fetchrow(
         """SELECT id, sentiment FROM maya_rp.population_sentiment
            WHERE session_id=$1::int AND territory_id=$2::int AND faction_name=$3::text""",
@@ -128,8 +133,7 @@ async def shift(session_id: int | None, territory_id: int, faction_name: str,
 
 async def apply_news_bias(session_id: int | None = None, limit: int = 50) -> int:
     """Pull recent news faction_bias into sentiment shifts."""
-    if session_id is None:
-        session_id = SID
+    session_id = _sid(session_id)
     news = await Database.fetch(
         """SELECT id, headline, faction_bias, game_day FROM maya_rp.news_articles
            WHERE session_id=$1 ORDER BY id DESC LIMIT $2""",
@@ -167,8 +171,7 @@ async def apply_news_bias(session_id: int | None = None, limit: int = 50) -> int
 
 async def run_tick(session_id: int | None = None) -> dict:
     """Tick hook: refresh all + apply news bias."""
-    if session_id is None:
-        session_id = SID
+    session_id = _sid(session_id)
     await init_for_territory(session_id)  # ensure rows
     ref = await refresh(session_id)
     nb = await apply_news_bias(session_id)
@@ -178,8 +181,7 @@ async def run_tick(session_id: int | None = None) -> dict:
 
 async def status(session_id: int | None = None, territory_id: int | None = None,
                  faction_name: str | None = None) -> list[dict]:
-    if session_id is None:
-        session_id = SID
+    session_id = _sid(session_id)
     q = """SELECT ps.territory_id, t.system_name, ps.faction_name, ps.sentiment,
                   ps.approval, ps.fear, ps.trust, ps.bias, ps.last_shift_reason, ps.updated_at
            FROM maya_rp.population_sentiment ps
@@ -187,10 +189,14 @@ async def status(session_id: int | None = None, territory_id: int | None = None,
            WHERE ps.session_id=$1"""
     args: list[Any] = [session_id]
     if territory_id is not None:
-        q += " AND ps.territory_id=$2"
         args.append(territory_id)
+        q += f" AND ps.territory_id=${len(args)}"
     if faction_name:
-        q += " AND ps.faction_name ILIKE $3" if territory_id is None else " AND ps.faction_name ILIKE $3"
+        # The placeholder was written as $3 in both branches of a ternary whose branches were
+        # identical, so a faction filter without a territory bound one argument and left the other
+        # unnamed: `status(session, faction_name=...)`, which is what `cli.py sentiment` calls by
+        # default, died with "could not determine data type of parameter $2".
         args.append(f"%{faction_name}%")
+        q += f" AND ps.faction_name ILIKE ${len(args)}"
     q += " ORDER BY ps.sentiment DESC"
     return await Database.fetch(q, *args)

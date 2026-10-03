@@ -8,10 +8,12 @@ from core.log import info
 
 async def generate_prompt(session_id: int | None = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
-    ships = await Database.fetchrow("SELECT name, tier, hull FROM maya_rp.ships WHERE session_id=$1 ORDER BY RANDOM() LIMIT 1", session_id)
+    # `hull` was selected here and never used: it is a numeric hull value, not a
+    # class name, so it could not go into a prompt.
+    ships = await Database.fetchrow("SELECT name, tier FROM maya_rp.ships WHERE session_id=$1 ORDER BY RANDOM() LIMIT 1", session_id)
     chars = await Database.fetchrow("SELECT name, role FROM maya_rp.characters WHERE session_id=$1 ORDER BY RANDOM() LIMIT 1", session_id)
     systems = await Database.fetchrow("SELECT system_name FROM maya_rp.territory WHERE session_id=$1 ORDER BY RANDOM() LIMIT 1", session_id)
-    prompt = f"Space scene: "
+    prompt = "Space scene: "
     if chars: prompt += f"{chars['name']} ({chars['role']}) "
     if ships: prompt += f"onboard T{ships['tier']} vessel in the {systems['system_name'] if systems else 'void'} system. "
     prompt += "Sci-fi cinematic lighting, detailed starship interior, epic scale."

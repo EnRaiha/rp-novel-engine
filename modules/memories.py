@@ -4,7 +4,17 @@ from __future__ import annotations
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import info, error
+
+
+def _like_escape(word: str) -> str:
+    """Escape LIKE metacharacters in a context word.
+
+    Unescaped, a word containing `%` or `_` becomes a wildcard pattern: a
+    context with "50%" matched far more than it should, and a lone "%" matched
+    every memory the character owns.
+    """
+    return word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 async def store(character_id: int, memory_type: str, content: str,
@@ -34,7 +44,7 @@ async def recall(character_id: int, context_text: str,
     game_day = await Database.fetchval(
         "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
 
-    words = [f"%{w}%" for w in context_text.lower().split()[:20]]
+    words = [f"%{_like_escape(w)}%" for w in (context_text or "").lower().split()[:20]]
     if not words:
         words = ["%"]
 
@@ -51,8 +61,8 @@ async def recall(character_id: int, context_text: str,
     for m in rows:
         await Database.execute(
             "UPDATE maya_rp.character_memories SET recalled_count=recalled_count+1, "
-            "last_recalled_at_game_day=$1 WHERE id=$2",
-            game_day, m["id"])
+            "last_recalled_at_game_day=$1 WHERE id=$2 AND session_id=$3",
+            game_day, m["id"], session_id)
     return [dict(r) for r in rows]
 
 
@@ -109,13 +119,16 @@ async def run_tick(session_id: int = None) -> dict:
     try:
         game_day = await Database.fetchval(
             "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
-        expired = await Database.execute(
+        tag = await Database.execute(
             "UPDATE maya_rp.character_memories SET expires_at_game_day=0 "
             "WHERE session_id=$1 AND expires_at_game_day IS NOT NULL AND expires_at_game_day < $2",
             session_id, game_day)
+        # `Database.execute` returns the status tag, so this key used to hold the
+        # string "UPDATE 3" where a count belongs.
+        expired = int(tag.split()[-1]) if isinstance(tag, str) and tag.startswith("UPDATE") else 0
         return {"memories_expired": expired}
     except Exception as e:
-        info("memories", f"Error: {e}")
+        error("memories", f"tick error: {e}")
         return {"error": str(e)}
 
 
@@ -162,6 +175,13 @@ async def consolidate_memories(session_id: int = None, character_id: int | None 
     """
     if session_id is None:
         session_id = Config.SESSION_ID
+    # This path DELETES the originals, so a nonsense window would take the whole
+    # history: a negative age_days moved the cutoff into the future and matched
+    # every memory the character owned.
+    if age_days < 0:
+        raise ValueError(f"age_days cannot be negative, got {age_days}")
+    if min_count < 1:
+        raise ValueError(f"min_count must be at least 1, got {min_count}")
     try:
         game_day = await Database.fetchval(
             "SELECT COALESCE(game_day, 1) FROM maya_rp.sessions WHERE id=$1", session_id) or 1

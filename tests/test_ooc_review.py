@@ -307,3 +307,143 @@ class TestEveryWriterRefusesAFrozenCampaign:
         await ooc.state(scratch_session)
         row = await ooc.set_stage(scratch_session, "selective")
         assert row["arc_stage"] == "selective"
+
+
+class TestOneUnknownStageIsOneAnswer:
+    """Four reads of a stage, three answers to an unknown name.
+
+    `debuff_for` and the decay lookup in `audit` used the lockdown ladder, `stage_allows` allowed
+    every rule, and `stage_readiness` raised a bare `list.index` ValueError that named nothing. A
+    typo in a rule's `min_stage` changed which rules ran, and no line said so.
+    """
+
+    @staticmethod
+    def _rule(**window) -> ooc.OocRule:
+        return ooc.OocRule(id="review-window", kind="prose", pattern="x", delta=1, **window)
+
+    def test_the_debuff_ladder_refuses_an_unknown_stage(self):
+        with pytest.raises(ValueError, match="unknown arc stage 'lockdwon' in the stage debuff_for"):
+            ooc.debuff_for(80, "lockdwon")
+
+    def test_the_rule_window_refuses_an_unknown_stage(self):
+        with pytest.raises(ValueError, match="unknown arc stage 'lockdwon' in the current stage"):
+            ooc.stage_allows(self._rule(), "lockdwon")
+
+    def test_a_rule_window_that_is_wrong_names_the_rule_and_the_field(self):
+        with pytest.raises(ValueError, match="rule 'review-window' min_stage"):
+            ooc.stage_allows(self._rule(min_stage="selectiv"), "lockdown")
+
+    def test_a_known_window_still_opens_and_closes(self):
+        opens = self._rule(min_stage="selective")
+        assert ooc.stage_allows(opens, "lockdown") is False
+        assert ooc.stage_allows(opens, "selective") is True
+        assert ooc.stage_allows(opens, "confrontation") is True
+        closes = self._rule(max_stage="lockdown")
+        assert ooc.stage_allows(closes, "lockdown") is True
+        assert ooc.stage_allows(closes, "selective") is False
+
+    def test_the_ladder_still_reads_each_stage_differently(self):
+        assert ooc.debuff_for(30, "lockdown")[0] == "Neural Tremor"
+        assert ooc.debuff_for(30, "selective") is None
+        assert ooc.debuff_for(80, "confrontation")[0] == "Meridian Lock"
+        assert ooc.debuff_for(100, "confrontation")[0] == "System Reclamation"
+
+    def test_the_stage_tables_name_the_same_three_stages(self):
+        """One source of truth for the names; the refusal reads STAGE_ORDER."""
+        assert set(ooc.STAGE_ORDER) == set(ooc.STAGE_THRESHOLDS) == set(ooc.STAGE_RANK)
+        assert set(ooc.STAGE_GATES) <= set(ooc.STAGE_ORDER)
+
+    async def test_the_readiness_reader_refuses_a_bad_stage_by_name(self, scratch_session, monkeypatch):
+        async def bad_state(_sid):
+            return {"arc_stage": "lockdwon", "deviation": 0}
+
+        monkeypatch.setattr(ooc, "state", bad_state)
+        with pytest.raises(ValueError, match="unknown arc stage 'lockdwon' in the session's arc_stage"):
+            await ooc.stage_readiness(scratch_session)
+
+    async def test_the_audit_refuses_a_bad_stage_before_it_writes(self, scratch_session, monkeypatch):
+        """With no rules to window, the decay lookup is the stage read under test here."""
+        async def bad_state(_sid):
+            return {"arc_stage": "lockdwon", "deviation": 0, "roleplay_points": 0}
+
+        async def no_rules(*_args, **_kwargs):
+            return []
+
+        monkeypatch.setattr(ooc, "state", bad_state)
+        monkeypatch.setattr(ooc, "effective_rules", no_rules)
+        with pytest.raises(ValueError, match="unknown arc stage 'lockdwon'.*use one of lockdown, selective, confrontation"):
+            await ooc.audit("prose to audit", scratch_session, turn_ref="review")
+        assert await Database.fetchval(
+            "SELECT count(*) FROM maya_rp.ooc_audit_events WHERE session_id=$1", scratch_session) == 0
+
+
+class TestTheLedgerNamesEveryRuleThatFired:
+    """One row per turn is the design. Naming one of that turn's three rules is not.
+
+    `ooc_audit_events.rule_id` carries a foreign key into `ooc_rules`, so the column can hold one
+    rule id or NULL. The row therefore names a rule only when the turn fired exactly one, and the
+    count of what fired stays where it already was: the deviation delta and `state.findings`.
+    """
+
+    @staticmethod
+    def _finding(rule_id: str) -> ooc.OocFinding:
+        return ooc.OocFinding(rule_id=rule_id, kind="prose", layer=ooc.LAYER_DIALOGUE,
+                              match="matched prose", delta=1)
+
+    @staticmethod
+    async def _real_rules(limit: int) -> list[str]:
+        """Ids that exist in `ooc_rules`: `rule_id` is a foreign key, so a made-up id cannot be stored."""
+        rows = await Database.fetch(
+            "SELECT id FROM maya_rp.ooc_rules WHERE enabled ORDER BY id LIMIT $1", limit)
+        ids = [row["id"] for row in rows]
+        assert len(ids) == limit, f"this test needs {limit} enabled rules, found {ids}"
+        return ids
+
+    @staticmethod
+    def _last_row(session_id: int):
+        return Database.fetchval(
+            "SELECT rule_id FROM maya_rp.ooc_audit_events WHERE session_id=$1 ORDER BY id DESC LIMIT 1",
+            session_id)
+
+    async def test_a_turn_with_three_findings_counts_three_and_names_none(self, scratch_session, monkeypatch):
+        fired = [self._finding(f"review-rule-{n}") for n in (1, 2, 3)]
+        monkeypatch.setattr(ooc, "audit_text", lambda text, rules, layer: fired)
+        result = await ooc.audit("prose to audit", scratch_session, turn_ref="review")
+        assert [f["rule_id"] for f in result["findings"]] == [
+            "review-rule-1", "review-rule-2", "review-rule-3"]
+        assert result["deviation"] == 3, "all three findings were billed"
+        assert result["state"]["findings"] == 3, "all three were counted"
+        assert await self._last_row(scratch_session) is None, (
+            "the row cannot name one of three rules as if it were the only one")
+
+    async def test_a_single_finding_still_names_one_rule(self, scratch_session, monkeypatch):
+        one = (await self._real_rules(1))[0]
+        monkeypatch.setattr(ooc, "audit_text", lambda text, rules, layer: [self._finding(one)])
+        await ooc.audit("prose to audit", scratch_session, turn_ref="review")
+        assert await self._last_row(scratch_session) == one
+
+    async def test_a_clean_turn_names_no_rule(self, scratch_session, monkeypatch):
+        monkeypatch.setattr(ooc, "audit_text", lambda text, rules, layer: [])
+        await ooc.audit("prose to audit", scratch_session, turn_ref="review")
+        assert await self._last_row(scratch_session) is None
+
+    async def test_one_rule_corrected_on_the_next_turn_still_reads_as_a_correction(
+        self, scratch_session, monkeypatch
+    ):
+        first, second = await self._real_rules(2)
+        monkeypatch.setattr(ooc, "audit_text", lambda text, rules, layer: [self._finding(first)])
+        await ooc.audit("prose to audit", scratch_session, turn_ref="review")
+        monkeypatch.setattr(ooc, "audit_text", lambda text, rules, layer: [self._finding(second)])
+        returned = await ooc.audit("prose to audit", scratch_session, turn_ref="review")
+        assert returned["suspicion_delta"] == ooc.SUSPICION_MU
+        assert returned["suspicion_reason"] == f"micro_consistency:{first}"
+
+    async def test_a_turn_with_several_rules_cannot_claim_a_correction(self, scratch_session, monkeypatch):
+        """Before, the row named the first rule, so the second one re-firing still read as a fix."""
+        first, second, third = await self._real_rules(3)
+        monkeypatch.setattr(ooc, "audit_text",
+                            lambda text, rules, layer: [self._finding(first), self._finding(second)])
+        await ooc.audit("prose to audit", scratch_session, turn_ref="review")
+        monkeypatch.setattr(ooc, "audit_text", lambda text, rules, layer: [self._finding(third)])
+        returned = await ooc.audit("prose to audit", scratch_session, turn_ref="review")
+        assert returned["suspicion_delta"] == 0, "the row named no rule, so nothing was shown corrected"

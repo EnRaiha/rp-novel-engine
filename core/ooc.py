@@ -361,7 +361,7 @@ def debuff_for(deviation: int, stage: str = "lockdown") -> tuple[str, str] | Non
     @param stage - arc stage key.
     @returns `(name, effect)`, or None below the warning boundary.
     """
-    bounds = STAGE_THRESHOLDS.get(stage, STAGE_THRESHOLDS["lockdown"])
+    bounds = STAGE_THRESHOLDS[_stage_key(stage, "the stage debuff_for was asked for")]
     for level, name, effect in DEBUFF_LADDER:
         if deviation >= bounds[level]:
             return name, effect
@@ -552,7 +552,7 @@ async def audit(
                        instrument=magic_instrument)
     magic_delta = 0 if standing_down else int(magic["deviation"])
     delta += magic_delta
-    decay = STAGE_THRESHOLDS.get(stage, STAGE_THRESHOLDS["lockdown"])["decay"]
+    decay = STAGE_THRESHOLDS[_stage_key(stage, "the session's arc_stage")]["decay"]
     settled = 0 if standing_down or findings else decay
     deviation = max(0, min(100, int(current["deviation"]) - settled + delta))
     award, score = rpp_award(text, findings, action_evidence=action_evidence)
@@ -626,7 +626,9 @@ async def audit(
             " match_sha256, match_len, delta, deviation_after, suspicion_delta, turn_ref)"
             " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id, created_at",
             sid,
-            findings[0].rule_id if findings else None,
+            # `rule_id` carries a foreign key into `ooc_rules`, so one row names one rule or none.
+            # A turn that fired several rules names none of them rather than claiming the first.
+            findings[0].rule_id if len(findings) == 1 else None,
             layer,
             disposition,
             skip_reason,
@@ -1154,20 +1156,21 @@ STAGE_RANK = {"lockdown": 0, "selective": 1, "confrontation": 2}
 
 
 def stage_allows(rule: OocRule, stage: str) -> bool:
-    """Whether a rule's arc window includes the current stage (M27)."""
-    rank = STAGE_RANK.get(stage)
-    if rank is None:
-        return True
-    low = STAGE_RANK.get(rule.min_stage or "")
-    high = STAGE_RANK.get(rule.max_stage or "")
-    if rule.min_stage and low is None:
-        return True
-    if rule.max_stage and high is None:
-        return True
-    if rule.min_stage and rank < low:
-        return False
-    if rule.max_stage and rank > high:
-        return False
+    """Whether a rule's arc window includes the current stage (M27).
+
+    An unknown stage is refused here too, and the rule's own window is named in the refusal. The
+    fallback this replaces allowed every rule, so a typo in `min_stage` opened the window rather
+    than closing it.
+    """
+    rank = STAGE_RANK[_stage_key(stage, "the current stage")]
+    if rule.min_stage:
+        low = STAGE_RANK[_stage_key(rule.min_stage, f"rule {rule.id!r} min_stage")]
+        if rank < low:
+            return False
+    if rule.max_stage:
+        high = STAGE_RANK[_stage_key(rule.max_stage, f"rule {rule.id!r} max_stage")]
+        if rank > high:
+            return False
     return True
 
 
@@ -1305,6 +1308,9 @@ async def _suspicion_turn(
         session_id,
     )
     flagged = {finding.rule_id for finding in findings}
+    # A row names a rule only when the turn fired exactly one, so a NULL row cannot say which rule
+    # was corrected and awards nothing. Claiming a correction for a turn with several rules would
+    # read the one rule named as if it were the only one that fired.
     if (
         previous is not None
         and previous["rule_id"]
@@ -1367,6 +1373,21 @@ STAGE_GATES: dict[str, dict[str, int]] = {
 STAGE_ORDER = ("lockdown", "selective", "confrontation")
 
 
+def _stage_key(stage: str, where: str = "the arc stage") -> str:
+    """One arc stage name, or a refusal that names it.
+
+    Four reads of a stage answered an unknown name three different ways: `debuff_for` and the
+    decay lookup in `audit` used the lockdown ladder, `stage_allows` allowed every rule, and
+    `stage_readiness` raised a bare `list.index` ValueError that named nothing. A typo in a rule's
+    `min_stage` therefore decided which rules ran, silently. All four come here.
+    """
+    key = str(stage or "").strip()
+    if key not in STAGE_ORDER:
+        raise ValueError(
+            f"unknown arc stage {stage!r} in {where}; use one of {', '.join(STAGE_ORDER)}")
+    return key
+
+
 async def stage_readiness(
     session_id: int | None = None, traits: Sequence[str] = ("general",)
 ) -> dict[str, Any]:
@@ -1379,7 +1400,7 @@ async def stage_readiness(
     sid = _session_key(session_id)
     current = await state(sid)
     stage = current["arc_stage"]
-    index = STAGE_ORDER.index(stage)
+    index = STAGE_ORDER.index(_stage_key(stage, "the session's arc_stage"))
     if index >= len(STAGE_ORDER) - 1:
         return {"ok": True, "stage": stage, "next": None, "ready": False, "gates": {}}
 

@@ -33,7 +33,7 @@ async def design_blueprint(name: str, category: str, damage: int, range_m: int, 
     cost_research = damage * 100 + range_m * 25 + tier * 300
 
     res = await Database.fetchrow("SELECT credits FROM maya_rp.resources WHERE session_id=$1", session_id)
-    if not res or res["credits"] < cost_credits:
+    if not res or (res["credits"] or 0) < cost_credits:
         return {"error": f"Need {cost_credits} credits"}
 
     await Database.execute("UPDATE maya_rp.resources SET credits=credits-$1 WHERE session_id=$2",
@@ -58,7 +58,11 @@ async def produce_weapons(blueprint: str, qty: int = 1, session_id: int | None =
     alloy_cost = (bp["alloy_cost"] or 0) * qty
     credit_cost = (bp["credit_cost"] or 0) * qty
     res = await Database.fetchrow("SELECT alloys, credits FROM maya_rp.resources WHERE session_id=$1", session_id)
-    if res["alloys"] < alloy_cost or res["credits"] < credit_cost:
+    # The sibling paths already refuse this case; this one raised TypeError on a
+    # session with no resources row, which is every session that has not been seeded.
+    if res is None:
+        return {"error": f"no resources row for session {session_id}"}
+    if (res["alloys"] or 0) < alloy_cost or (res["credits"] or 0) < credit_cost:
         return {"error": f"Need {alloy_cost}a/{credit_cost}c"}
 
     await Database.execute("UPDATE maya_rp.resources SET alloys=alloys-$1, credits=credits-$2 WHERE session_id=$3",

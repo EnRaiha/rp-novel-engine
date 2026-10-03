@@ -33,7 +33,12 @@ from core.ooc import (  # noqa: E402
 SOMATIC_RULE = OocRule("somatic-cry", "somatic_lock", "re:(tears|crying)", 8, LAYER_SOMATIC)
 DIALOGUE_RULE = OocRule("modern-slip", "modern_phrasing", "re:(okay|ok|hey)", 4, LAYER_DIALOGUE)
 BOTH_RULE = OocRule("any-slip", "modern_phrasing", "wanna", 2, LAYER_BOTH)
-SCRATCH_SESSION = 999
+# A scratch session, but not one fixed number. This file's cleanup deletes every row for its session,
+# and three reviewers were running the suite at the same time: each run deleted the row another run was
+# mid-test on, so `audit` read back a state row that had just been removed and the failure count moved
+# between runs (3, 14, 16). Deriving the session from the process id gives every concurrent run its own
+# scratch space without changing what the tests assert.
+SCRATCH_SESSION = 900 + (os.getpid() % 100)
 
 
 class TestLayerSplit:

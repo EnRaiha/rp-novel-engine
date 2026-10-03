@@ -33,7 +33,9 @@ async def upgrade(install_id: int, session_id: int | None = None) -> dict:
     if not res or res["alloys"] < cost: return {"error": f"Need {cost} alloys"}
     await Database.execute("UPDATE maya_rp.resources SET alloys=alloys-$1 WHERE session_id=$2", cost, session_id)
     nl, nr = d["level"] + 1, round(d["defense_rating"] * 1.4)
-    await Database.execute("UPDATE maya_rp.defense_installations SET level=$1, defense_rating=$2 WHERE id=$3", nl, nr, d["id"])
+    await Database.execute(
+        "UPDATE maya_rp.defense_installations SET level=$1, defense_rating=$2 "
+        "WHERE id=$3 AND session_id=$4", nl, nr, d["id"], session_id)
     return {"type": d["installation_type"], "level": nl, "rating": nr, "cost": cost}
 
 async def status(session_id: int | None = None) -> list[dict]:

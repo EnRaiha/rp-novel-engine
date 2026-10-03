@@ -1,10 +1,11 @@
 """Global state manager — session, save/load, checkpoint orchestration."""
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Dict
 from pathlib import Path
 from .db import Database
 from .config import Config
 from core.log import warn
+from core.utils import comma
 
 
 def _resolve_session(session_id: int | None) -> int:
@@ -20,13 +21,6 @@ def _resolve_session(session_id: int | None) -> int:
     if resolved is None:
         raise ValueError("no session named and the engine is in maintenance mode")
     return int(resolved)
-
-
-def _num(value: Any, spec: str = ",") -> str:
-    """A number for the snapshot, with a missing figure named instead of raising."""
-    if value is None:
-        return "n/a"
-    return format(value, spec)
 
 
 class StateManager:
@@ -77,12 +71,12 @@ class StateManager:
         lines.append(f"**Generated:** {datetime.now(timezone.utc).isoformat()}\n")
         if state.get("resources"):
             r = state["resources"]
-            lines.append(f"## Resources\nCredits: {_num(r['credits'])} | Alloys: {_num(r['alloys'])} | Fuel: {_num(r['fuel'])}\n")
+            lines.append(f"## Resources\nCredits: {comma(r['credits'])} | Alloys: {comma(r['alloys'])} | Fuel: {comma(r['fuel'])}\n")
         if state.get("territories"):
             lines.append("## Territories")
             for t in state["territories"]:
                 tax = f"{float(t['tax_rate'])*100:.0f}%" if t["tax_rate"] is not None else "n/a"
-                lines.append(f"- {t['system_name']}: Pop {_num(t['population'])}, Tax {tax}, Dev {t['development_level']}, Crisis {t['crisis_level']}")
+                lines.append(f"- {t['system_name']}: Pop {comma(t['population'])}, Tax {tax}, Dev {t['development_level']}, Crisis {t['crisis_level']}")
             lines.append("")
         if state.get("factions"):
             lines.append("## Factions")

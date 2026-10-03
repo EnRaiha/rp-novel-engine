@@ -10,7 +10,7 @@ Tracks mothers per session against game day. Each tick:
 from __future__ import annotations
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import info, error
 
 TRIMESTER_DAYS = [90, 180, 270]          # ends of trimester 1, 2, 3
 DUE_SOON_WINDOW = 30                      # days before due → status 'due_soon'
@@ -31,6 +31,10 @@ async def register(session_id: int, mother_name: str, mother_id: int | None = No
                    father_name: str = "King Izzat", notes: str = "") -> int:
     """Register a new pregnancy. Returns pregnancy id."""
     if session_id is None: session_id = Config.SESSION_ID
+    if not str(mother_name or "").strip():
+        raise ValueError(f"mother_name must be a non-empty string, got {mother_name!r}")
+    if gestation_days < 1:
+        raise ValueError(f"gestation_days must be at least 1, got {gestation_days}")
     gd = await _game_day(session_id)
     if conceived_game_day is None:
         conceived_game_day = gd
@@ -49,7 +53,13 @@ async def register(session_id: int, mother_name: str, mother_id: int | None = No
 
 
 async def status(session_id: int | None = None) -> list[dict]:
-    """Full tracker report — all pregnancies for the session, newest first."""
+    """Full tracker report — every pregnancy for the session.
+
+    Active and due_soon rows come first, then the births, each in due-day order.
+    The progress fields used to be attached to `active` rows only, so a
+    pregnancy lost its day count, ETA and percentage at exactly the moment it
+    became `due_soon`.
+    """
     if session_id is None: session_id = Config.SESSION_ID
     gd = await _game_day(session_id)
     rows = await Database.fetch(
@@ -63,7 +73,7 @@ async def status(session_id: int | None = None) -> list[dict]:
     out = []
     for r in rows:
         d = dict(r)
-        if r["status"] == "active":
+        if r["status"] in ("active", "due_soon"):
             days_pregnant = max(0, gd - r["conceived_game_day"])
             d["days_pregnant"] = days_pregnant
             d["days_to_due"] = max(0, r["due_game_day"] - gd)
@@ -86,8 +96,8 @@ async def _roll_birth(session_id: int, gd: int, preg_id: int, mother_name: str) 
     await Database.execute(
         """UPDATE maya_rp.pregnancies
            SET status='birthed', baby_gender=$1, baby_name=$2, birthed_game_day=$3
-           WHERE id=$4""",
-        gender, name, gd, preg_id,
+           WHERE id=$4 AND session_id=$5""",
+        gender, name, gd, preg_id, session_id,
     )
     await Database.execute(
         """INSERT INTO maya_rp.events (session_id, event_type, title, description, happened_at)
@@ -137,5 +147,5 @@ async def run_tick(session_id: int = None) -> dict:
         info("pregnancy", f"Advanced: {result['checked']} tracked, {len(result['births'])} births")
         return result
     except Exception as e:
-        info("pregnancy", f"Error: {e}")
+        error("pregnancy", f"tick error: {e}")
         return {"error": str(e)}

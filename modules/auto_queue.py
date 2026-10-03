@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info
 
 MEDICAL_SUPPLY_COMMODITY = "Medical Supplies"
 MEDICAL_TRANSFER_PER_TICK = 5000  # stockpile → market per pharma corp per tick
@@ -27,6 +27,9 @@ async def run_tick(session_id: int | None = None) -> dict:
         try:
             results[name] = await fn(session_id)
         except Exception as e:  # keep the rest of the tick alive
+            # The answer says what broke, and the log now says it too: a tick that half-ran used to
+            # be visible only to whoever read the returned dict.
+            error("auto_queue", f"{name} failed for session {session_id}: {e}")
             results[name] = {"error": str(e)}
     info("auto_queue", f"yard={results.get('yard')} pharma={results.get('pharma')}")
     return results
@@ -52,9 +55,11 @@ async def _yard_auto_queue(session_id: int) -> dict:
         if need <= 0:
             continue
         existing = await Database.fetchval(
+            # The name count ran with no session filter, so it counted every campaign's hulls with
+            # this prefix and one campaign's standing orders numbered themselves against another's.
             "SELECT COUNT(*) FROM maya_rp.production_queue "
-            "WHERE ship_name LIKE $1",
-            f"{o['ship_name_prefix']}%",
+            "WHERE session_id=$1 AND ship_name LIKE $2",
+            session_id, f"{o['ship_name_prefix']}%",
         ) or 0
         for i in range(1, need + 1):
             n = existing + i
@@ -83,12 +88,19 @@ async def _yard_auto_queue(session_id: int) -> dict:
 # ─── Corporate tick: Setia Pharma ───────────────────────────────────────
 
 async def _pharma_tick(session_id: int) -> dict:
+    # `corporations` carries a session_id and this read had no filter on it, so every campaign's
+    # pharmaceutical corps booked income during another campaign's tick.
     corps = await Database.fetch(
         "SELECT id, name, treasury FROM maya_rp.corporations "
-        "WHERE industry='pharmaceutical'",
+        "WHERE industry='pharmaceutical' AND session_id=$1",
+        session_id,
     )
     if not corps:
-        return {"corps": 0, "note": "no pharmaceutical corporations"}
+        # Same keys as the full answer: a caller that reads `treasury_income` got a KeyError on
+        # exactly the session that has no corporations, which is the one most likely to be asked why
+        # nothing moved.
+        return {"corps": 0, "treasury_income": 0, "hub_throughput": 0,
+                "medical_supply_added": 0, "note": "no pharmaceutical corporations"}
 
     # Per-corp income: each corp books income from ITS OWN assets only.
     total_income = 0
@@ -111,27 +123,37 @@ async def _pharma_tick(session_id: int) -> dict:
         "SELECT COALESCE(SUM(ca.income_per_day),0) "
         "FROM maya_rp.corporate_assets ca "
         "JOIN maya_rp.corporations c ON c.id=ca.corporation_id "
-        "WHERE c.industry='pharmaceutical' AND ca.status='active' "
+        "WHERE c.industry='pharmaceutical' AND c.session_id=$1 AND ca.status='active' "
         "AND ca.asset_type='medical_distribution_hub'",
+        session_id,
     ) or 0
 
     supply_moved = 0
     # Stockpile → market transfer once per tick (not per corp).
-    avail = await Database.fetchval(
-        "SELECT COALESCE(SUM(quantity-reserved),0) "
-        "FROM maya_rp.material_stockpiles "
-        "WHERE session_id=$1 AND material_name=$2",
+    # The old body moved `min(SUM(quantity - reserved), 5000)` out of the single lowest-id row, so a
+    # pile of 100 with a 5000 budget went to -4900 and the market was credited 5000. The budget is
+    # spent across the session's piles instead, and a pile is never asked for more than it holds.
+    piles = await Database.fetch(
+        "SELECT id, quantity, COALESCE(reserved, 0) AS reserved FROM maya_rp.material_stockpiles "
+        "WHERE session_id=$1 AND material_name=$2 AND quantity > COALESCE(reserved, 0) "
+        "ORDER BY id",
         session_id, MEDICAL_SUPPLY_COMMODITY,
-    ) or 0
-    transfer = min(avail, MEDICAL_TRANSFER_PER_TICK)
-    if transfer > 0:
+    )
+    budget = MEDICAL_TRANSFER_PER_TICK
+    transfer = 0
+    for pile in piles:
+        if budget <= 0:
+            break
+        take = min(budget, pile["quantity"] - pile["reserved"])
+        if take <= 0:
+            continue
         await Database.execute(
-            "UPDATE maya_rp.material_stockpiles SET quantity=quantity-$1 WHERE id=("
-            "SELECT id FROM maya_rp.material_stockpiles "
-            "WHERE session_id=$2 AND material_name=$3 AND quantity>0 "
-            "ORDER BY id LIMIT 1)",
-            transfer, session_id, MEDICAL_SUPPLY_COMMODITY,
+            "UPDATE maya_rp.material_stockpiles SET quantity = quantity - $1 WHERE id = $2",
+            take, pile["id"],
         )
+        budget -= take
+        transfer += take
+    if transfer > 0:
         await Database.execute(
             "UPDATE maya_rp.commodities SET supply=supply+$1 "
             "WHERE session_id=$2 AND name=$3",

@@ -24,6 +24,7 @@ The live arc and the frozen reference are never written.
 """
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import sys
@@ -194,3 +195,60 @@ class TestARuleThatCannotRunIsReported:
         rule = ooc.OocRule(id="review-ok", kind="forbidden_lexicon", pattern="okay", delta=4)
         findings = ooc.audit_text('He said "okay" to that.', [rule])
         assert [f.rule_id for f in findings] == ["review-ok"]
+
+
+class TestTheMirrorDoesNotTakeTheLedgerDown:
+    """The mirror is a cache in front of the truth, and it runs after the commit.
+
+    `entries.sort(key=lambda entry: int(entry.get("sessionId") or 0))` raised
+    ValueError on any non-numeric key, in a file the engine does not own, while
+    writing the mirror. `audit()` calls this after its transaction has committed, so
+    the audit row was in the ledger and the caller was told the turn failed: the two
+    planes disagree from then on, permanently.
+    """
+
+    @pytest.fixture()
+    def mirror(self, tmp_path, monkeypatch):
+        path = tmp_path / "ooc" / "tkg-state.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("OOC_STATE_FILE", str(path))
+        return path
+
+    async def test_a_non_numeric_session_key_does_not_break_the_write(self, scratch_session, mirror):
+        mirror.write_text(json.dumps([
+            {"sessionId": "tkg-play", "deviation": 1},
+            {"sessionId": 5, "deviation": 2},
+        ]))
+        written = await ooc.mirror_state_file(scratch_session)
+        assert written is not None, "a stray key must not take the mirror down"
+        entries = json.loads(mirror.read_text())
+        keys = [entry["sessionId"] for entry in entries]
+        assert scratch_session in keys, keys
+        assert keys == sorted(keys, key=lambda k: (1, str(k)) if isinstance(k, str) else (0, k)), keys
+
+    async def test_a_corrupt_mirror_is_rebuilt_and_reported(self, scratch_session, mirror, monkeypatch):
+        said = []
+        monkeypatch.setattr(ooc, "error", lambda module, msg: said.append(msg))
+        mirror.write_text("{not json at all")
+        written = await ooc.mirror_state_file(scratch_session)
+        assert written is not None
+        assert any("not JSON" in message for message in said), said
+        assert [entry["sessionId"] for entry in json.loads(mirror.read_text())] == [scratch_session]
+
+    async def test_an_unwritable_mirror_is_reported_not_raised(self, scratch_session, tmp_path, monkeypatch):
+        """The engine's own rows are committed by now, so this must not raise."""
+        said = []
+        monkeypatch.setattr(ooc, "error", lambda module, msg: said.append(msg))
+        # A directory where the file should be: every write path fails.
+        blocked = tmp_path / "blocked"
+        blocked.mkdir()
+        monkeypatch.setenv("OOC_STATE_FILE", str(blocked))
+        assert await ooc.mirror_state_file(scratch_session) is None
+        assert said, "a failed mirror must say so"
+
+    async def test_a_successful_mirror_still_writes_the_entry(self, scratch_session, mirror):
+        written = await ooc.mirror_state_file(scratch_session)
+        assert written == str(mirror)
+        entries = json.loads(mirror.read_text())
+        assert entries[0]["sessionId"] == scratch_session
+        assert entries[0]["stage"] == "lockdown"

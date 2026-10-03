@@ -1426,49 +1426,81 @@ async def advance_stage(
     return {"ok": True, "stage": row["arc_stage"], "from": readiness["stage"], "gates": readiness["gates"]}
 
 
+def _mirror_sort_key(entry: dict[str, Any]) -> tuple[int, str]:
+    """Order mirror entries by session, without assuming the key is a number.
+
+    `int(entry.get("sessionId") or 0)` raised ValueError on a non-numeric key, and
+    this sort runs while writing the mirror, which runs after the audit transaction
+    has committed: a stray key in a file the engine does not own turned a completed
+    audit into an exception. Numeric ids sort first and in numeric order; anything
+    else follows, in text order, instead of taking the write down.
+
+    @param entry - one mirror entry.
+    @returns a key that never raises.
+    """
+    raw = entry.get("sessionId")
+    try:
+        return (0, f"{int(raw):020d}")
+    except (TypeError, ValueError):
+        return (1, str(raw))
+
+
 def state_file_path() -> Path:
     """Where the harness plugin reads state from (`OOC_STATE_FILE` overrides)."""
     return Path(os.getenv("OOC_STATE_FILE", "~/.dsh/ooc/tkg-state.json")).expanduser()
 
 
-async def mirror_state_file(session_id: int | None = None) -> str:
+async def mirror_state_file(session_id: int | None = None) -> str | None:
     """Write this session's state into the harness JSON store (D7 phase 1).
 
     The engine is the single writer; the plugin keeps reading its file so the
     two planes cannot lose an update between them while phase 2 (plugin reads
     the engine directly) is not wired.
 
+    A failure here is reported, never raised. The engine's own rows are committed by
+    the time this runs, so raising leaves a half-write: the audit is in the ledger
+    and the caller is told the turn failed. The mirror is a cache in front of the
+    truth, and the next successful call rewrites it.
+
     @param session_id - session key.
-    @returns the path written.
+    @returns the path written, or None when the write failed.
     """
     sid = _session_key(session_id)
-    current = await state(sid)
-    path = state_file_path()
-    entries: list[dict[str, Any]] = []
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text())
-            if isinstance(loaded, list):
-                entries = [entry for entry in loaded if isinstance(entry, dict)]
-        except json.JSONDecodeError:
-            entries = []
-    mirror = {
-        "sessionId": sid,
-        "deviation": int(current["deviation"]),
-        "roleplayPoints": int(current["roleplay_points"]),
-        "audits": int(current["audits"]),
-        "findings": int(current["findings"]),
-        "debuff": current["debuff"],
-        "stage": current["arc_stage"],
-        "updatedAt": _iso(current["updated_at"]),
-    }
-    entries = [entry for entry in entries if entry.get("sessionId") != sid] + [mirror]
-    entries.sort(key=lambda entry: int(entry.get("sessionId") or 0))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(entries, indent=2) + "\n")
-    os.replace(tmp, path)
-    return str(path)
+    try:
+        current = await state(sid)
+        path = state_file_path()
+        entries: list[dict[str, Any]] = []
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text())
+                if isinstance(loaded, list):
+                    entries = [entry for entry in loaded if isinstance(entry, dict)]
+            except json.JSONDecodeError as exc:
+                # Rebuilt rather than left alone: a file the plugin reads cannot stay
+                # unparsable, and saying so is the difference between a repair and a
+                # silent wipe of the other sessions' entries.
+                error("ooc", f"mirror {path} is not JSON ({exc}); rebuilding it for session {sid}")
+                entries = []
+        mirror = {
+            "sessionId": sid,
+            "deviation": int(current["deviation"]),
+            "roleplayPoints": int(current["roleplay_points"]),
+            "audits": int(current["audits"]),
+            "findings": int(current["findings"]),
+            "debuff": current["debuff"],
+            "stage": current["arc_stage"],
+            "updatedAt": _iso(current["updated_at"]),
+        }
+        entries = [entry for entry in entries if entry.get("sessionId") != sid] + [mirror]
+        entries.sort(key=_mirror_sort_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(entries, indent=2) + "\n")
+        os.replace(tmp, path)
+        return str(path)
+    except Exception as exc:  # noqa: BLE001 - see the docstring: the ledger already committed
+        error("ooc", f"mirror for session {sid} not written: {exc}")
+        return None
 
 
 def _iso(value: Any) -> str:

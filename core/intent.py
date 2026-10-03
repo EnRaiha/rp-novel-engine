@@ -149,9 +149,19 @@ async def resolve_intent_dispatch(session_id: int, intent: PlayerIntent) -> dict
     if intent.action_type == "attack":
         try:
             from modules.battle import resolve_intent
-            result = await resolve_intent(session_id, intent.target or "", intent.item_used or "")
+            # `resolve_intent(session_id, action, target, fleet_name="")`. This call used to pass
+            # (target, item_used), so the target landed in `action`, which the resolver ignores, and
+            # the item landed in `target`, which is the string the narrative and the defeat branch
+            # name. The resolver's own docstring records the disagreement with the other caller.
+            result = await resolve_intent(session_id, intent.action_type, intent.target or "",
+                                          intent.item_used or "")
             return {"success": True, "event": "combat_resolved", **result}
         except Exception as e:
+            # Logged before it is turned into a player-facing failure: this handler catches the
+            # resolver's own bugs too, and without a line here a defect reads as a failed action.
+            from core.log import error
+
+            error("intent", f"combat resolution failed for {intent.target or 'no target'}: {e}")
             return {"success": False, "error": f"Combat resolver error: {e}"}
 
     if intent.action_type == "roll":
@@ -159,8 +169,15 @@ async def resolve_intent_dispatch(session_id: int, intent: PlayerIntent) -> dict
         # roll is handled by CLI; here we just acknowledge
         return {"success": True, "event": "roll_requested", "expr": expr}
 
-    return {"success": True, "event": f"{intent.action_type}_queued",
-            "resolver": ctx.get("resolver"), "note": "Module resolver invoked via workflow."}
+    # Everything else names a resolver in RESOLVERS that this entry point never imports or calls.
+    # It used to answer `success: True` with `event: <action>_queued` and a note about a workflow,
+    # so the CLI printed a successful event to the player for an action nothing had run. The
+    # registry is a map of names, not of callables: the dispatch refuses instead of claiming one.
+    resolver = ctx.get("resolver")
+    return {"success": False, "event": f"{intent.action_type}_not_dispatched",
+            "resolver": resolver,
+            "error": f"{intent.action_type} is registered to {resolver} and this entry point does"
+                     f" not invoke it"}
 
 
 # ─── Parse helper: LLM output → strict PlayerIntent ──────────────────────

@@ -77,6 +77,10 @@ WESTERN_LAST = ["Baker", "Chen", "Costa", "Drake", "Ellis", "Ford", "Grant", "Hi
 # Culture distribution for "mixed" (Malaysian demographics: ~70% Malay, 20% Chinese, 10% Indian)
 MIXED_CULTURES = ["malay"] * 7 + ["chinese"] * 2 + ["indian"] * 1
 
+#: Cultures `_compose` and `unique_name` accept. Anything else raises: the old
+#: fallback returned a Malay name, so "chinse" produced plausible output and no error.
+VALID_CULTURES = ("mixed", "malay", "chinese", "indian", "east", "western")
+
 
 class NameGenerator:
     """Async name generator with DB uniqueness guarantee."""
@@ -89,30 +93,41 @@ class NameGenerator:
         self.conn = conn
 
     @staticmethod
+    def _malay_given(rng):
+        """The one place that knows how a Malay given name is drawn.
+
+        Shared by `_compose` and `_compose_malay_first` so the two copies of the
+        Malay rule cannot drift apart again.
+        """
+        is_male = rng.random() < 0.5
+        return rng.choice(MELAYU_FIRST_M if is_male else MELAYU_FIRST_F)
+
+    @staticmethod
     def _compose(culture="mixed", seed=None, family_rate=0.85):
         """Compose a culturally-correct Malaysian name.
 
-        - malay:  NO family name: "Ahmad bin Abdullah" / "Siti binti Omar" (patronymic)
-        - mixed:  MALAY name + family name — "Ahmad Abdullah" (Malay-first, best for Malaysian)
+        - malay:  NO patronymic (cancelled, Day 1481): "Ahmad Abdullah" or "Ahmad"
+        - mixed:  one draw from MIXED_CULTURES (~70% Malay, 20% Chinese, 10% Indian)
         - chinese: surname FIRST: "Lim Wei Ming" (family name — correct for Cina)
         - indian:  "Ravi Kumar" / "Kavita Kaur" (family name)
         - east:    "Kenji Tanaka" (family name)
         - western: "Elena Baker" (family name)
+
+        An unknown culture raises ValueError rather than returning a Malay name.
         """
         rng = random.Random(seed)
         if culture == "mixed":
             culture = rng.choice(MIXED_CULTURES)
+        if culture not in VALID_CULTURES:
+            raise ValueError(f"unknown culture {culture!r}; expected one of {VALID_CULTURES}")
 
         if culture == "malay":
-            # MELAYU: tiada family name. Nama + bin/binti + nama bapa (patronimik).
-            is_male = rng.random() < 0.5
-            first = rng.choice(MELAYU_FIRST_M if is_male else MELAYU_FIRST_F)
+            # MELAYU: tiada patronimik bin/binti (Izzat, Day 1481). The rule lives
+            # in _compose_malay_first; this branch only decides whether the family
+            # name is carried at all.
             if rng.random() < family_rate:
-                # patronymic — "Ahmad bin Abdullah" / "Siti binti Omar"
-                father = rng.choice(PATRONYM_FATHERS)
-                patron = "bin" if is_male else "binti"
-                return f"{first} {patron} {father}"
-            return first  # single name (common for Melayu)
+                return NameGenerator._compose_malay_first(seed=rng.randint(0, 2**31))
+            return NameGenerator._malay_given(rng)  # single name (common for Melayu)
         elif culture == "chinese":
             # Cina Malaysia: surname FIRST — "Lim Wei Ming"
             family = rng.choice(CHINESE_FAMILY)
@@ -126,26 +141,31 @@ class NameGenerator:
             return f"{rng.choice(EAST_GIVEN)} {rng.choice(EAST_FAMILY)}"
         elif culture == "western":
             return f"{rng.choice(WESTERN_FIRST)} {rng.choice(WESTERN_LAST)}"
-        # fallback: mixed again
-        return f"{rng.choice(MELAYU_FIRST_M + MELAYU_FIRST_F)}"
+        raise ValueError(f"unknown culture {culture!r}; expected one of {VALID_CULTURES}")
 
     @staticmethod
-    def _compose_malay_first(seed=None, with_bin=True):
+    def _compose_malay_first(seed=None, with_bin=False):
         """Malay name + family name, Malaysian style.
 
         NO patronymic (bin/binti) — Izzat cancelled it (Day 1481).
         "Ahmad Abdullah" — given name + family name, plain.
+
+        `with_bin=True` asks for the cancelled rule, so it raises instead of
+        returning a plain name the caller did not ask for.
         """
+        if with_bin:
+            raise ValueError("patronymic bin/binti cancelled (Day 1481); compose given + family name")
         rng = random.Random(seed)
-        is_male = rng.random() < 0.5
-        first = rng.choice(MELAYU_FIRST_M if is_male else MELAYU_FIRST_F)
+        first = NameGenerator._malay_given(rng)
         family = rng.choice(PATRONYM_FATHERS)
         return f"{first} {family}"
 
     async def _exists(self, name: str) -> bool:
-        """Check name against characters + crew_roster + slaves."""
+        """Check name against characters + crew_roster + slaves, and this generator's own output."""
+        if name in self._seen:
+            return True
         if self.conn is None:
-            return name in self._seen
+            return False
         row = await self.conn.fetchrow(
             """SELECT 1 FROM (
                  SELECT name FROM maya_rp.characters WHERE name ILIKE $1
@@ -178,48 +198,63 @@ class NameGenerator:
         family_names (list): pilihan family name — ['Voss','al-Dabaran'].
         father_name: bila diberi, guna SEBAGAI family name terus
                      (no bin/binti): "Nabil Izzat" bukan "Nabil bin Izzat"
+        culture: "mixed" (default, one draw from MIXED_CULTURES), or one of
+                 "malay", "chinese", "indian", "east", "western". An unknown
+                 culture raises ValueError. When family_names or father_name is
+                 given the family is the supplied one, so the given name comes
+                 from the Malay pool and culture is not consulted.
+        family_rate: probability a Malay name carries a family name at all.
         Culture collisions are ALSO checked (Mira vs Mira (Ghost...) etc.).
         """
-        rng = random.Random()
-        for attempt in range(max_attempts):
-            first = rng.choice(MELAYU_FIRST_M + MELAYU_FIRST_F)
+        if family_names and father_name:
+            raise ValueError("pass family_names or father_name, not both: they are two family-name rules")
+        if not culture:
+            culture = "mixed"
+        if culture not in VALID_CULTURES:
+            raise ValueError(f"unknown culture {culture!r}; expected one of {VALID_CULTURES}")
+
+        def _base(numeral: str = "") -> str:
+            """One candidate. Suffix is carried by the caller's numeral, if any."""
+            tail = f" {numeral}" if numeral else ""
             if family_names:
                 if decided_by == "mother":
                     # Ibu pilih: nama keluarga ibu (Voss)
-                    base = f"{first} {family_names[0]}"
-                elif decided_by == "father":
+                    given = self._malay_given(rng)
+                    return f"{given} {family_names[0]}{tail}"
+                if decided_by == "father":
                     # Bapa pilih: nama rumah bapa (al-Dabaran — last in list)
-                    base = f"{first} {family_names[-1]}"
-                else:
-                    # Tiada penentu — rawak (fallback)
-                    base = f"{first} {rng.choice(family_names)}"
-            elif father_name:
+                    given = self._malay_given(rng)
+                    return f"{given} {family_names[-1]}{tail}"
+                # Tiada penentu — rawak (fallback)
+                return f"{self._malay_given(rng)} {rng.choice(family_names)}{tail}"
+            if father_name:
                 # family name = father's name, no patronymic marker
-                base = f"{first} {father_name}"
-            else:
-                base = self._compose_malay_first(seed=rng.randint(0, 2**31), with_bin=False)
-            full = f"{prefix} {base}".strip() if prefix else base
+                return f"{self._malay_given(rng)} {father_name}{tail}"
+            composed = self._compose(culture=culture, seed=rng.randint(0, 2**31),
+                                     family_rate=family_rate)
+            return f"{composed}{tail}"
+
+        def _full(base: str) -> str:
+            return f"{prefix} {base}".strip() if prefix else base
+
+        rng = random.Random()
+        for attempt in range(max_attempts):
+            full = _full(_base())
             if not await self._exists(full):
                 self._seen.add(full)
                 return full
-        # Exhausted: append roman numeral to guarantee uniqueness
+        # Exhausted: append a roman numeral. Every numeral is CHECKED — the old
+        # fallback returned its first pick unverified and called that a guarantee.
         roman = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"]
-        idx = rng.randint(0, len(roman) - 1)
-        first = rng.choice(MELAYU_FIRST_M + MELAYU_FIRST_F)
-        if family_names:
-            if decided_by == "mother":
-                base = f"{first} {family_names[0]} {roman[idx]}"
-            elif decided_by == "father":
-                base = f"{first} {family_names[-1]} {roman[idx]}"
-            else:
-                base = f"{first} {rng.choice(family_names)} {roman[idx]}"
-        elif father_name:
-            base = f"{first} {father_name} {roman[idx]}"
-        else:
-            base = self._compose_malay_first(seed=rng.randint(0, 2**31), with_bin=False)
-        full = f"{prefix} {base}".strip() if prefix else base
-        self._seen.add(full)
-        return full
+        rng.shuffle(roman)
+        for numeral in roman:
+            full = _full(_base(numeral))
+            if not await self._exists(full):
+                self._seen.add(full)
+                return full
+        raise RuntimeError(
+            f"name_gen exhausted {max_attempts} attempts and {len(roman)} roman suffixes"
+            f" (prefix={prefix!r}, culture={culture!r})")
 
     async def unique_crew_name(self, prefix=""):
         """Crew-specific: C1-C4 generic, no title prefix by default."""

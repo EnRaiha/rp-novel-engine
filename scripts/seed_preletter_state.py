@@ -63,7 +63,9 @@ async def main() -> int:
                     help=f"default {POPULATION_FROM_RECORD}, from the record's beat 14")
     ap.add_argument("--credits", type=int, required=True, help="no default: the record does not state it")
     ap.add_argument("--fuel", type=int, required=True, help="no default: the record does not state it")
-    ap.add_argument("--alloys", type=int, required=True, help="no default: the record does not state it")
+    ap.add_argument("--alloys", type=int, default=None,
+                    help="optional. alloys is NOT a collapse condition, so the script leaves it alone \
+unless you pass it")
     ap.add_argument("--apply", action="store_true", help="write. Without it, nothing changes")
     ap.add_argument("--dry-run", action="store_true", help="print what would change and stop")
     ap.add_argument("--force", action="store_true",
@@ -86,7 +88,12 @@ async def main() -> int:
             print(f"REFUSED: session {SESSION} has no resources row. Nothing to correct.")
             return 2
 
-        target = {"credits": a.credits, "alloys": a.alloys, "fuel": a.fuel, "population": a.population}
+        # Only the columns given are touched. credits, fuel and population are the three collapse
+        # conditions this row fails today; alloys is not one, so leaving it alone is better than
+        # requiring a number the record does not state for a column nothing checks.
+        target = {"credits": a.credits, "fuel": a.fuel, "population": a.population}
+        if a.alloys is not None:
+            target["alloys"] = a.alloys
 
         print(f"\nSESSION {SESSION} — resources")
         print(f"{'column':14} {'now':>14} {'after':>14}")
@@ -123,10 +130,12 @@ async def main() -> int:
             return 1
         print(f"\narchived the current row -> {backup} ({size} bytes)")
 
+        # Column names come from the fixed dict above, never from argv, so the f-string cannot carry an
+        # injected identifier; the values are bound.
+        assignments = ", ".join(f"{col}=${i + 1}" for i, col in enumerate(target))
         await Database.execute(
-            "UPDATE maya_rp.resources SET credits=$1, alloys=$2, fuel=$3, population=$4"
-            " WHERE session_id=$5",
-            a.credits, a.alloys, a.fuel, a.population, SESSION)
+            f"UPDATE maya_rp.resources SET {assignments} WHERE session_id=${len(target) + 1}",
+            *target.values(), SESSION)
 
         read_back = await Database.fetchrow(
             "SELECT credits, alloys, fuel, population FROM maya_rp.resources WHERE session_id=$1", SESSION)

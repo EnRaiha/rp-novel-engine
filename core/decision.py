@@ -12,9 +12,11 @@ Sources of truth:
   - maya_rp.events            (evidence, linked via event_ids)
 """
 from __future__ import annotations
+import json
 from typing import Any, Optional
 from core.db import Database
 from core.config import Config
+from core.log import warn
 
 
 async def record(
@@ -36,17 +38,23 @@ async def record(
     """Append a decision to the provenance chain. Returns decision id.
 
     If decree_id is given, updates that existing cabinet_decree row with the
-    provenance columns instead of inserting (single source of truth).
+    provenance columns instead of inserting (single source of truth). Returns
+    None when that row does not exist in this session, so a miss is not reported
+    as a write.
     """
-    sid = session_id or Config.SESSION_ID
+    sid = session_id if session_id is not None else Config.SESSION_ID
     if decree_id is not None:
-        await Database.execute(
+        tag = await Database.execute(
             "UPDATE maya_rp.cabinet_decrees SET parent_id=$1, game_day=$2, "
             "event_ids=$3::int[], state_before=$4::jsonb, "
             "state_after=$5::jsonb WHERE id=$6 AND session_id=$7",
             parent_id, game_day, event_ids or [], state_before or {},
             state_delta or {}, decree_id, sid,
         )
+        if tag.rsplit(" ", 1)[-1] == "0":
+            warn("decision", f"decree {decree_id} not found in session {sid}; "
+                             "provenance not written")
+            return None
         return decree_id
     row = await Database.fetchrow(
         "INSERT INTO maya_rp.cabinet_decrees "
@@ -99,6 +107,8 @@ async def by_fact(session_id: int, fact_key: str, fact_value: Any = None,
             session_id, fact_key, limit,
         )
     else:
+        # json.dumps, not f'"{value}"': a number carried as a JSON string never
+        # equals the number in the column, so every numeric lookup returned nothing.
         rows = await Database.fetch(
             "SELECT id, game_day, issued_by AS actor, decree_type AS decision_type, "
             "       title, status, impact_deltas, state_after, event_ids "
@@ -106,30 +116,46 @@ async def by_fact(session_id: int, fact_key: str, fact_value: Any = None,
             "WHERE session_id=$1 AND (state_after->$2 = $3::jsonb "
             "   OR impact_deltas->$2 = $3::jsonb) "
             "ORDER BY COALESCE(game_day, 0) DESC, id DESC LIMIT $4",
-            session_id, fact_key, f'"{fact_value}"', limit,
+            session_id, fact_key, json.dumps(fact_value), limit,
         )
     return [dict(r) for r in rows]
 
 
 async def link_event(session_id: int, decision_id: int, event_id: int) -> None:
-    """Attach an evidence event to a decision (idempotent)."""
-    await Database.execute(
+    """Attach an evidence event to a decision (idempotent).
+
+    Raises nothing and returns nothing by contract, so a miss is logged: the
+    update is scoped to the decision's own session and a mismatched id used to
+    complete in silence.
+    """
+    tag = await Database.execute(
         "UPDATE maya_rp.cabinet_decrees SET event_ids = "
         "ARRAY(SELECT DISTINCT unnest(event_ids || ARRAY[$1::int])) "
         "WHERE id=$2 AND session_id=$3",
         event_id, decision_id, session_id,
     )
+    if tag.rsplit(" ", 1)[-1] == "0":
+        warn("decision", f"event {event_id} not linked: decision {decision_id} "
+                         f"is not in session {session_id}")
 
 
 async def decisions(session_id: int, *, day: Optional[int] = None,
                     kind: Optional[str] = None, status: Optional[str] = None,
                     limit: int = 20) -> list[dict]:
-    """Unified decision list (decrees + plan) with optional filters."""
+    """Unified decision list (decrees + plan) with optional filters.
+
+    The `decision_stream` view select-lists both branches without their
+    `session_id`, so filtering has to ask the base tables which row belongs to
+    this session. Without it the call returned every campaign's decisions.
+    """
     sql = ["SELECT kind, decision_id, parent_id, game_day, actor, decision_type, "
            "       title, status, priority, secrecy_level, impact_deltas, "
            "       event_ids, occurred_at FROM maya_rp.decision_stream "
-           "WHERE 1=1"]
-    args: list = []
+           "WHERE (kind = 'decree' AND decision_id IN "
+           "         (SELECT id FROM maya_rp.cabinet_decrees WHERE session_id = $1)) "
+           "   OR (kind = 'plan' AND decision_id IN "
+           "         (SELECT id FROM maya_rp.grand_plan WHERE session_id = $1))"]
+    args: list = [session_id]
     if day is not None:
         args.append(day)
         sql.append(f"AND game_day = ${len(args)}")
@@ -146,7 +172,6 @@ async def decisions(session_id: int, *, day: Optional[int] = None,
 
 async def add_cli(argv: list[str]) -> dict:
     """CLI front for record() — parses --key value pairs."""
-    from core.utils import parse_kv_flags  # small helper below if missing
     kv = _parse_flags(argv)
     actor = kv.get("actor", "Izzat")
     dtype = kv.get("type", "directive")

@@ -10,11 +10,15 @@ Usage:
   result = await execute_time_skip(180, focus="economy", session_id=3)
 """
 from __future__ import annotations
-import math, random
 from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import info
+from modules.calendar_tkg import DAYS_PER_MONTH
+
+# The four focuses this engine knows. An unknown name used to fall through every
+# branch and read exactly like "balanced", so a typo changed nothing and said nothing.
+FOCUSES = ("balanced", "economy", "military", "research")
 
 
 # ─── Base income/expense rates (per day) ────────────────────────────────
@@ -50,6 +54,9 @@ async def execute_time_skip(
         # Hard cap per single skip. Use narration_sync / chunked rolls for long skips,
         # OR set ALLOW_LONG_SKIP = 1080+ for structural corrections (children comp).
         raise ValueError(f"Max 365 days per skip (got {days}) — split into chunks")
+    if focus not in FOCUSES:
+        return {"days_skipped": 0, "error": f"Unknown focus {focus!r}: use one of {', '.join(FOCUSES)}",
+                "montage_prompt": ""}
 
     results = {
         "days_skipped": days,
@@ -58,7 +65,7 @@ async def execute_time_skip(
         "world_events": [],
     }
 
-    months = days / 30.0
+    months = days / DAYS_PER_MONTH
 
     # ═══════════════════════════════════════════════════════════════
     # 1. Snapshot before
@@ -67,6 +74,13 @@ async def execute_time_skip(
         "SELECT credits, alloys, fuel, aggregate_morale FROM maya_rp.resources WHERE session_id=$1",
         session_id,
     )
+    if not before:
+        # The economy step below reads before["credits"], so a session with no
+        # resources row raised TypeError after the guard on credits_before said the
+        # row may be missing. No session, no skip: refuse before anything moves.
+        return {"days_skipped": 0, "focus": focus,
+                "error": f"No resources row for session {session_id}: time skip refused",
+                "montage_prompt": ""}
     credits_before = before["credits"] if before else 0
 
     # ═══════════════════════════════════════════════════════════════
@@ -159,7 +173,7 @@ async def execute_time_skip(
     # ═══════════════════════════════════════════════════════════════
     # 5. Advance Geopolitics (world moves while you wait)
     # ═══════════════════════════════════════════════════════════════
-    faction_turns = max(1, days // 30)  # ~1 faction turn per month
+    faction_turns = max(1, days // DAYS_PER_MONTH)  # ~1 faction turn per month
     from modules.geopolitics import run_tick as geopolitics_tick
 
     world_events = []
@@ -235,8 +249,8 @@ async def execute_time_skip(
 
 def _build_montage_prompt(results: dict) -> str:
     """Generate a narrative instruction for Deepseek to write the time-skip montage."""
-    months = results["days_skipped"] // 30
-    days_remainder = results["days_skipped"] % 30
+    months = results["days_skipped"] // DAYS_PER_MONTH
+    days_remainder = results["days_skipped"] % DAYS_PER_MONTH
     time_str = f"{months} month{'s' if months != 1 else ''}"
     if days_remainder:
         time_str += f" and {days_remainder} day{'s' if days_remainder != 1 else ''}"

@@ -232,3 +232,15 @@ def test_every_tier_the_roller_can_return_has_an_icon_and_flavor():
             for domain in domains:
                 assert rt.flavor(domain, tier, total) != ""
     assert seen == {"fumble", "fail", "partial", "success", "crit"}
+
+
+def test_tier_precedence_pins_todays_behaviour_pending_a_ruling():
+    """tier_of tests the -40 rule before the >=96 rule.
+
+    A natural 100 against dc 140 therefore reads as fumble. The precedence is
+    deliberate for now and pending the King's ruling, because moving it would
+    re-read rolls the campaign has already played. This test pins what the
+    roller does today, so a silent change fails here first.
+    """
+    assert rt.tier_of(100, 140) == "fumble"   # -40 rule wins over natural crit
+    assert rt.tier_of(100, 139) == "crit"     # dc-40 = 99, so the crit stands

@@ -8,13 +8,27 @@ from core.log import info
 
 async def introduce(elem_type: str, desc: str, importance: str = "medium", payoff_window: int = 15, session_id: int = None) -> int:
     if session_id is None: session_id = Config.SESSION_ID
+    if payoff_window < 0:
+        raise ValueError(f"payoff_window cannot be negative, got {payoff_window}")
     gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)
     return await Database.fetchval("INSERT INTO maya_rp.chekhov_elements(session_id,element_type,description,importance,introduced_game_day,payoff_deadline,status) VALUES($1,$2,$3,$4,$5,$6,'unpaid') RETURNING id", session_id,elem_type,desc,importance,gd,gd+payoff_window)
 
-async def payoff(element_id: int, method: str, session_id: int = None):
+async def payoff(element_id: int, method: str, session_id: int = None) -> bool:
+    """Mark one element paid off. Returns whether the element was found.
+
+    Scoped by session: `WHERE id=$3` alone let a payoff land on another
+    campaign's element, and the caller was told nothing either way.
+    """
     if session_id is None: session_id = Config.SESSION_ID
     gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)
-    await Database.execute("UPDATE maya_rp.chekhov_elements SET status='paid',payoff_method=$1,paid_game_day=$2 WHERE id=$3", method,gd,element_id)
+    tag = await Database.execute(
+        "UPDATE maya_rp.chekhov_elements SET status='paid',payoff_method=$1,paid_game_day=$2 "
+        "WHERE id=$3 AND session_id=$4",
+        method, gd, element_id, session_id)
+    paid = not (isinstance(tag, str) and tag.split()[-1:] == ["0"])
+    if not paid:
+        info("chekhov", f"element {element_id} is not in session {session_id} — nothing paid off")
+    return paid
 
 async def get_overdue(session_id: int = None) -> list[dict]:
     if session_id is None: session_id = Config.SESSION_ID

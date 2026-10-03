@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Location & Scene Management — tracks where characters are, who's present."""
 from __future__ import annotations
-import json
 from datetime import datetime
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import info, warn
 
 SHIP_LOCATIONS = [
     "bridge", "quarters", "observation_deck", "garden", "forge",
@@ -20,7 +19,6 @@ COLONY_LOCATIONS = [
 
 async def set_player_location(session_id: int, location: str, ship: str = None):
     """Update where Izzat is."""
-    val = json.dumps({"location": location, "ship": ship, "updated": datetime.now().isoformat()})
     await Database.execute(
         "INSERT INTO maya_rp.player_context (session_id, current_focus, mood, updated_at) "
         "VALUES ($1, $2, 'normal', NOW()) "
@@ -40,13 +38,27 @@ async def get_player_location(session_id: int) -> dict:
 
 
 async def set_character_presence(character_id: int, location: str, session_id: int = None):
-    """Place a character at a location."""
+    """Place a character at a location.
+
+    The presence log is a global audit trail with no session column, so the log
+    row is written unscoped by design. `characters.scene_location` is the column
+    the engine actually reads back (char_query, char_locations, context), and it
+    was never written here: the CLI could place a character for a year and no
+    reader would see it move.
+    """
     if session_id is None:
         session_id = Config.SESSION_ID
     await Database.execute(
         "INSERT INTO maya_rp.character_presence_log (character_table, character_id, new_presence, reason) "
         "VALUES ('characters', $1, $2, 'location_update')",
         character_id, location)
+    tag = await Database.execute(
+        "UPDATE maya_rp.characters SET scene_location=$1 WHERE id=$2 AND session_id=$3",
+        location, character_id, session_id)
+    if tag.rsplit(" ", 1)[-1] == "0":
+        warn("locations", f"character #{character_id} is not in session {session_id}; "
+                          "appearance unchanged")
+    return None
 
 
 async def get_characters_at_location(session_id: int, location: str) -> list[dict]:

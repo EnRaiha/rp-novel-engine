@@ -1,0 +1,109 @@
+"""Module review tests for modules/locations.py.
+
+Defects covered:
+
+1. `set_character_presence` wrote only `character_presence_log`, a global audit
+   trail. `characters.scene_location` is the column the engine reads back
+   (char_query, char_locations, core/context), and nothing in the module ever
+   wrote it, so the CLI could place a character for a year and no reader would
+   see it move. `cli.py:404` calls it.
+2. The new write is session-scoped, so a character id from the other campaign
+   matches nothing; that miss used to be invisible in the same way.
+3. `set_player_location` built a `val` dict with the location, ship and timestamp
+   and never used it.
+
+Reported rather than patched, because the fix changes what the GM sees and the
+two vocabularies do not match:
+`get_characters_at_location(session_id, location)` returns every active
+character in the session and never uses `location`. Measured: characters hold
+free-form scene names ("MASTIKA — Royal Palace (household)"), the player's
+location is a slug ("bridge"), and session 5's 440 characters all have a NULL
+scene_location. An equality filter would empty the scene for the live arc. A
+test pins the current behaviour so it cannot drift while the decision is open.
+
+Checked and correct: `character_presence_log` and `location_catalog` have no
+`session_id` column, measured against information_schema, so their unscoped
+statements are right; `get_characters_at_location` does scope by session.
+
+No database: every test drives a fake connection.
+"""
+from __future__ import annotations
+
+import pytest
+
+from modules import locations
+
+
+class FakeDB:
+    def __init__(self, tags=("UPDATE 1",)):
+        self.tags = list(tags)
+        self.executes: list[tuple[str, tuple]] = []
+        self.rows: list[dict] = []
+
+    async def execute(self, sql, *args):
+        self.executes.append((" ".join(sql.split()), args))
+        return self.tags.pop(0) if self.tags else "UPDATE 1"
+
+    async def fetch(self, sql, *args):
+        return self.rows
+
+    async def fetchrow(self, sql, *args):
+        return self.rows[0] if self.rows else None
+
+
+@pytest.fixture
+def db(monkeypatch):
+    fake = FakeDB()
+    logs = {"info": [], "warn": []}
+    monkeypatch.setattr(locations, "info", lambda m, msg: logs["info"].append(msg))
+    monkeypatch.setattr(locations, "warn", lambda m, msg: logs["warn"].append(msg))
+    monkeypatch.setattr(locations.Database, "execute", staticmethod(fake.execute))
+    monkeypatch.setattr(locations.Database, "fetch", staticmethod(fake.fetch))
+    monkeypatch.setattr(locations.Database, "fetchrow", staticmethod(fake.fetchrow))
+    return fake, logs
+
+
+async def test_placing_a_character_moves_it_where_readers_look(db):
+    """(1) The log row alone left every reader showing the old location."""
+    fake, _ = db
+    await locations.set_character_presence(42, "medbay", session_id=5)
+    moves = [e for e in fake.executes if e[0].startswith("UPDATE maya_rp.characters")]
+    assert len(moves) == 1, fake.executes
+    assert moves[0][1] == ("medbay", 42, 5), moves[0][1]
+    assert any(e[0].startswith("INSERT INTO maya_rp.character_presence_log") for e in fake.executes)
+
+
+async def test_placing_another_campaigns_character_says_so(db):
+    """(2) The update is scoped, so the miss has to be reported."""
+    fake, logs = db
+    fake.tags = ["INSERT 0 1", "UPDATE 0"]
+    await locations.set_character_presence(999, "medbay", session_id=5)
+    assert logs["warn"], "a placement that moved nothing was silent"
+
+
+async def test_set_player_location_writes_the_line_its_reader_parses(db):
+    fake, _ = db
+    await locations.set_player_location(5, "observation_deck", "Flagship")
+    _, args = fake.executes[0]
+    assert args == (5, "Location: observation_deck on Flagship"), args
+
+
+async def test_get_characters_at_location_ignores_the_location_PINNED(db, monkeypatch):
+    """Reported, not fixed: an equality filter would empty session 5's scene.
+
+    Every character location in session 5 is NULL and session 3's are free-form
+    scene names, while the player's location is a slug. The test pins what the
+    function does today so a later change is deliberate.
+    """
+    fake, _ = db
+    seen: list[tuple] = []
+
+    async def capture(sql, *args):
+        seen.append((sql, args))
+        return []
+
+    monkeypatch.setattr(locations.Database, "fetch", staticmethod(capture))
+    await locations.get_characters_at_location(5, "medbay")
+    assert seen == [(
+        "SELECT c.name, c.bond, c.role FROM maya_rp.characters c "
+        "WHERE c.session_id=$1 AND c.status='active' ORDER BY c.bond DESC", (5,))], seen

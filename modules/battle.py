@@ -41,8 +41,8 @@ class BattleEngine:
     async def init(cls, session_id: int, player_ships: List[int],
                    enemy_faction: str, terrain_id: int = None) -> BattleState:
         """Initialize a new battle."""
-        pf = await cls._make_fleet(player_ships, "Setia Empire")
-        ef = await cls._make_enemy_fleet(enemy_faction)
+        pf = await cls._make_fleet(player_ships, "Setia Empire", session_id)
+        ef = await cls._make_enemy_fleet(enemy_faction, session_id=session_id)
         # One argument list per query: passing terrain_id into the "random()"
         # variant raised InterfaceError (server expects 0 arguments) every time
         # init() was called without an explicit terrain.
@@ -58,7 +58,8 @@ class BattleEngine:
         state = BattleState(battle_id=bid["id"], player=pf, enemy=ef, terrain=terrain,
                             session_id=session_id)
         await cls._save(state, None)
-        await EventBus.emit("battle_started", {"battle_id": state.battle_id})
+        await EventBus.emit("battle_started", {"battle_id": state.battle_id,
+                                               "session_id": session_id})
         return state
 
     @classmethod
@@ -86,25 +87,46 @@ class BattleEngine:
         return state
 
     @classmethod
-    async def _make_fleet(cls, ship_ids: List[int], faction: str) -> BattleFleet:
+    async def _make_fleet(cls, ship_ids: List[int], faction: str,
+                          session_id: int | None = None) -> BattleFleet:
+        """Load the named hulls for THIS session.
+
+        `ships.id` is unique across both campaigns, so an id-only WHERE let a
+        stale id from the frozen campaign fight in the live one. Ids that match
+        nothing are named in the log instead of shrinking the fleet in silence.
+        """
         if not ship_ids:
             return BattleFleet(faction=faction)
         rows = await Database.fetch(
             "SELECT s.*, sr.base_stats FROM ships s "
             "LEFT JOIN ship_roles sr ON LOWER(sr.name)=LOWER(s.role) "
-            "WHERE s.id = ANY($1::int[])", ship_ids)
+            "WHERE s.id = ANY($1::int[]) AND s.session_id=$2", ship_ids, session_id)
+        found = {r["id"] for r in rows}
+        missing = [sid for sid in ship_ids if sid not in found]
+        if missing:
+            info("battle", f"{len(missing)} ship id(s) not in session {session_id}: {missing}")
         return BattleFleet(faction=faction, ships=[cls._to_ship(r) for r in rows])
 
     @classmethod
-    async def _make_enemy_fleet(cls, faction: str, limit: int = 60) -> BattleFleet:
+    async def _make_enemy_fleet(cls, faction: str, limit: int = 60,
+                                session_id: int | None = None) -> BattleFleet:
         """Enemy order of battle comes from `faction_ships` — `ships` only holds
-        Setia hulls, so an enemy built from it was always an empty fleet."""
+        Setia hulls, so an enemy built from it was always an empty fleet.
+
+        Filtered by session: faction_ships carries both campaigns (8,223 hulls
+        for session 3 against 246 for session 5), so an unfiltered read handed
+        this campaign the frozen campaign's entire order of battle.
+        """
+        if session_id is None:
+            session_id = Config.SESSION_ID
         rows = await Database.fetch(
             "SELECT id, ship_name, ship_type, hull, speed, power_rating FROM maya_rp.faction_ships "
-            "WHERE faction_name=$1 AND status='active' ORDER BY power_rating DESC LIMIT $2",
-            faction, limit)
+            "WHERE faction_name=$1 AND status='active' AND session_id=$2 "
+            "ORDER BY power_rating DESC LIMIT $3",
+            faction, session_id, limit)
         if not rows:
-            info("battle", f"Faction '{faction}' has no active hulls — empty order of battle")
+            info("battle", f"Faction '{faction}' has no active hulls in session "
+                           f"{session_id} — empty order of battle")
         return BattleFleet(faction=faction, ships=[cls._to_ship(r) for r in rows])
 
     @staticmethod
@@ -126,8 +148,16 @@ class BattleEngine:
 
     @classmethod
     async def _tactic_mult(cls, tactic: str) -> float:
+        """Catalogue multiplier for a tactic.
+
+        An unknown name raises. Returning 1.0 for a typo silently turned the
+        battle into a "Direct Assault" (1.0) without telling the caller that
+        the tactic it named (Disengage 0.5, Pincer 1.4) never applied.
+        """
         r = await Database.fetchrow("SELECT effect_multiplier FROM tactics_catalog WHERE name=$1", tactic)
-        return float(r["effect_multiplier"]) if r else 1.0
+        if r is None:
+            raise ValueError(f"Unknown tactic {tactic!r} — see maya_rp.tactics_catalog")
+        return float(r["effect_multiplier"])
 
     @classmethod
     async def _ai_tactic(cls, state: BattleState) -> str:
@@ -173,8 +203,9 @@ class BattleEngine:
             # NOVEL ULTIMATE #5 — Rank naik + procedural scars untuk near-death survivor
             for ship_id in ship_ids:
                 row = await Database.fetchrow(
-                    "SELECT name, veteran_kills, hull, hull_current, scars_jsonb, ship_rank FROM maya_rp.ships WHERE id=$1",
-                    ship_id)
+                    "SELECT name, veteran_kills, hull, hull_current, scars_jsonb, ship_rank "
+                    "FROM maya_rp.ships WHERE id=$1 AND session_id=$2",
+                    ship_id, state.session_id)
                 if not row:
                     continue
                 kills = row["veteran_kills"] or 0
@@ -186,7 +217,8 @@ class BattleEngine:
                     new_rank = "Veteran"
                 if new_rank != rank:
                     await Database.execute(
-                        "UPDATE maya_rp.ships SET ship_rank=$1 WHERE id=$2", new_rank, ship_id)
+                        "UPDATE maya_rp.ships SET ship_rank=$1 WHERE id=$2 AND session_id=$3",
+                        new_rank, ship_id, state.session_id)
                     await Database.execute(
                         "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance) "
                         "VALUES ($1, 'honor', $2, $3, 4)",
@@ -201,23 +233,41 @@ class BattleEngine:
                             "story": f"Survived with {hc}/{hull} hull ({(hc/hull)*100:.0f}%)"}
                     await Database.execute(
                         "UPDATE maya_rp.ships SET scars_jsonb = scars_jsonb || $1::jsonb, "
-                        "hull = GREATEST(1, hull * 0.95) WHERE id=$2",
-                        json.dumps(scar), ship_id)
-        await EventBus.emit("battle_completed", {"battle_id": state.battle_id, "outcome": outcome})
+                        "hull = GREATEST(1, hull * 0.95) WHERE id=$2 AND session_id=$3",
+                        json.dumps(scar), ship_id, state.session_id)
+        # session_id in the payload: EventBus falls back to session 3 when it is
+        # absent, so a live-arc battle event was filed in the frozen campaign.
+        await EventBus.emit("battle_completed", {"battle_id": state.battle_id, "outcome": outcome,
+                                                 "session_id": state.session_id})
         return state
 
     @classmethod
-    async def set_formation(cls, battle_id: int, formation: str):
-        # fleet_formations is capitalised ('Wedge', 'Defensive Circle'); the
-        # campaign tick hands out lowercase names, so match case-insensitively
-        # and persist the catalogue's own spelling.
+    async def set_formation(cls, battle_id: int, formation: str) -> str:
+        """Set the battle's formation and return the catalogue's own spelling.
+
+        fleet_formations is capitalised ('Wedge', 'Defensive Circle'); the
+        campaign tick hands out lowercase names, so match case-insensitively
+        and persist the catalogue's spelling.
+
+        A name outside the catalogue raises. It used to write nothing and
+        return None, so a typo left the battle at its previous formation with
+        the caller told nothing.
+        """
         r = await Database.fetchrow(
             "SELECT name FROM maya_rp.fleet_formations WHERE LOWER(name)=LOWER($1)", formation)
-        if r:
-            await Database.execute("UPDATE combat_results SET player_formation=$1 WHERE id=$2", r["name"], battle_id)
+        if r is None:
+            raise ValueError(f"Unknown formation {formation!r} — see maya_rp.fleet_formations")
+        await Database.execute("UPDATE combat_results SET player_formation=$1 WHERE id=$2", r["name"], battle_id)
+        return r["name"]
 
     @classmethod
     async def attempt_retreat(cls, battle_id: int) -> Dict:
+        """Roll an escape from a battle; damage only lands when it FAILS.
+
+        `dmg` scales with (1 - chance): the worse the odds, the harder the
+        pursuit. The row was written with `dmg if success`, the inverse of what
+        the caller was told, so the battle record disagreed with the return.
+        """
         state = await cls._load_state(battle_id)
         if not state: return {"success": False, "error": "Not found"}
         spd = sum(s.speed for s in state.player.ships) / max(1, len(state.player.ships))
@@ -225,13 +275,15 @@ class BattleEngine:
         chance = max(0.1, min(0.95, 0.5 + (spd - 5) * 0.05 + eva * 0.5))
         success = random.random() < chance
         dmg = int(random.randint(0, 20) * (1 - chance))
+        pursuit_damage = 0 if success else dmg
         await Database.execute(
             "UPDATE combat_results SET retreat_attempted=true, retreat_successful=$1, "
             "pursuit_damage=$2, status='completed', ended_at=NOW(), "
             "outcome=COALESCE(outcome,'player_retreat') WHERE id=$3",
-            success, dmg if success else 0, battle_id)
-        await EventBus.emit("battle_retreated", {"battle_id": battle_id, "success": success})
-        return {"success": success, "damage": dmg if not success else 0}
+            success, pursuit_damage, battle_id)
+        await EventBus.emit("battle_retreated", {"battle_id": battle_id, "success": success,
+                                                 "session_id": state.session_id})
+        return {"success": success, "damage": pursuit_damage}
 
     @classmethod
     def _narr(cls, state: BattleState, wins: bool) -> str:
@@ -407,6 +459,16 @@ async def resolve_intent(session_id: int, action: str, target: str, fleet_name: 
     Resolve a combat intent from the Action Parser.
     Returns {winner, ships_lost, damage_taken, narrative_hook} for Deepseek narration.
     Called by kilo_bridge.py action_intent domain=combat.
+
+    @param action - what the parser said the player is doing. The resolution
+        ignores it: the maths reads the live ship count and the debuff ladder.
+    @param target - who the action names. This is the string the narrative uses.
+    @param fleet_name - the fleet the caller named. Unused by the maths.
+
+    Caller contract, read before touching the signature: core/intent.py calls
+    (session_id, target, item_used), so `action` receives the target and `target`
+    receives the item; kilo_bridge.py calls (session_id, action, target, fleet).
+    The two callers disagree about which string lands in `target`.
     """
     # Simple combat resolution: TKG forces vs target
     from core import campaign
@@ -437,7 +499,9 @@ async def resolve_intent(session_id: int, action: str, target: str, fleet_name: 
         narrative += f" [{effects['debuff']}: {effects['note']}; command penalty -{effects['battle_penalty']}]"
 
     # Reduce ship count from DB
-    remaining = max(1, player_power - ships_lost)
+    # max(0, …): a one-ship fleet that lost its ship has 0 remaining, and the
+    # caller was told "1" because the floor was 1.
+    remaining = max(0, player_power - ships_lost)
     await Database.execute(
         "UPDATE maya_rp.ships SET status='lost' WHERE session_id=$1 AND status='active' "
         "AND ctid IN (SELECT ctid FROM maya_rp.ships WHERE session_id=$1 AND status='active' LIMIT $2)",

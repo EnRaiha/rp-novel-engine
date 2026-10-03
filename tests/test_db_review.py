@@ -126,18 +126,25 @@ async def _same(pool):
     return pool
 
 
-async def test_run_reconnects_once_and_retries(pool):
+async def test_run_reconnects_once_and_does_not_replay_a_sent_statement(pool):
+    """The retry is for a dead pool, not for a statement whose fate is unknown.
+
+    `ConnectionDoesNotExistError` has one raise site in asyncpg 0.31.0, the protocol's
+    `connection_lost` handler, and it fires after the statement was written to the socket.
+    Re-issuing it applies a relative write twice. The pool is still rebuilt and the error reaches
+    the caller.
+    """
     fake, calls = pool
     attempts = []
 
     async def fn(conn, *args):
         attempts.append(conn)
-        if len(attempts) == 1:
-            raise asyncpg.exceptions.ConnectionDoesNotExistError("pool is closed")
-        return "ok"
+        raise asyncpg.exceptions.ConnectionDoesNotExistError(
+            "connection was closed in the middle of operation")
 
-    assert await db.Database._run(fn) == "ok"
-    assert len(attempts) == 2, attempts
+    with pytest.raises(asyncpg.exceptions.ConnectionDoesNotExistError):
+        await db.Database._run(fn)
+    assert len(attempts) == 1, attempts
     assert calls == {"init": 1, "close": 1}
 
 

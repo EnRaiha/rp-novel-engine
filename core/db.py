@@ -23,6 +23,20 @@ _RECONNECT_ERRORS = (
     asyncpg.exceptions.PostgresConnectionError,
 )
 
+#: The only reconnect errors that prove nothing reached the socket.
+#:
+#: `Connection._check_open()` and the pool's own guards raise `InterfaceError` before a statement is
+#: sent, so re-issuing the call cannot apply a write twice.
+#:
+#: The other two are not replayable. `ConnectionDoesNotExistError` has exactly one raise site in
+#: asyncpg 0.31.0, `protocol/protocol.pyx:691`, the `connection_lost` handler, which fires after the
+#: statement was written to the socket. Whether the server applied it is unknown to the client, and
+#: `PostgresConnectionError` is that error's parent. Replaying either runs the write a second time
+#: whenever the first one landed. Nothing is lost by refusing: measured against the live database, a
+#: holder whose connection died is reconnected by the next `acquire()`, so the common case never
+#: reaches this handler.
+_PRE_FLIGHT_ERRORS = (asyncpg.exceptions.InterfaceError,)
+
 
 class Database:
     """One pool, one DSN, reconnection + transaction support."""
@@ -71,7 +85,13 @@ class Database:
 
     @classmethod
     async def _run(cls, fn, *args):
-        """Run fn(conn, *args) with ONE reconnect retry on dead-pool errors."""
+        """Run fn(conn, *args) with ONE reconnect retry on dead-pool errors.
+
+        The retry re-issues the call only when the failure happened before anything reached the
+        socket. A statement that was already written is never replayed: the client cannot tell
+        whether the server applied it, and a second execution of a relative write
+        (`SET credits = credits - $1`) charges the session twice with no way to detect it.
+        """
         try:
             pool = await cls._ensure_pool()
             async with pool.acquire() as conn:
@@ -80,6 +100,8 @@ class Database:
             info("db", f"Pool connection lost ({type(e).__name__}) — reconnecting once")
             await cls.close()
             pool = await cls.init()
+            if not isinstance(e, _PRE_FLIGHT_ERRORS):
+                raise
             async with pool.acquire() as conn:
                 return await fn(conn, *args)
 

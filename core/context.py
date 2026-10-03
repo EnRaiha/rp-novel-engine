@@ -62,7 +62,12 @@ async def _story_row(session_id: int) -> dict[str, Any] | None:
     try:
         return await Database.fetchrow(
             "SELECT story_path FROM maya_rp.sessions WHERE id=$1", int(session_id))
-    except Exception:
+    except Exception as exc:
+        # Logged, because an absent column and a failed read both land here and only one of them is
+        # the documented case: without the line a broken read silently served the default brief.
+        from core.log import warn
+
+        warn("context", f"story_path unreadable for session {session_id}, using the default brief: {exc}")
         return None
 
 
@@ -221,9 +226,9 @@ def render_blocks(blocks: dict[str, Any]) -> str:
 
     lore = blocks.get("lore") or []
     if lore:
-        lines.append("[LORE]")
-        for entry in lore[:4]:
-            lines.append(f"- {entry['title']}: {str(entry['content'])[:320]}")
+        # One renderer for this block. `campaign.render_lore` writes the same heading and the same
+        # truncation, and it had no production caller while this copy existed.
+        lines.extend(campaign.render_lore(lore).splitlines())
 
     system = blocks.get("system") or []
     if system:

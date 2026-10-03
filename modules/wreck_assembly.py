@@ -26,6 +26,18 @@ async def list_wrecks(session_id: int) -> list:
 async def add_wreck(session_id: int, name: str, tier: int, hull: int, power_rating: int,
                     sub_class: str, source_ship_id: int | None = None) -> dict:
     """Tambah wreck ke inventory (dari salvage/debris)."""
+    if not (name or "").strip():
+        return {"error": "Wreck needs a name."}
+    try:
+        tier, hull, power_rating = int(tier), int(hull), int(power_rating)
+    except (TypeError, ValueError):
+        return {"error": f"tier/hull/power must be whole numbers, got {tier}/{hull}/{power_rating}"}
+    if tier < 1:
+        return {"error": f"Wreck tier must be at least 1, got {tier}"}
+    if hull < 0 or power_rating < 0:
+        # A negative hull became a ship with negative hull and negative hull_current,
+        # because assemble() derives the new hull from the wreck's.
+        return {"error": f"Wreck hull and power cannot be negative, got {hull}/{power_rating}"}
     wid = await Database.fetchval(
         """INSERT INTO maya_rp.wreck_inventory (session_id, source_ship_id, name, tier, hull, power_rating, sub_class)
            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id""",
@@ -40,6 +52,12 @@ async def assemble(session_id: int, name: str, wreck_ids: list[int],
     """Pasang kapal baru dari 2-5 wrecks. Gagal = power -50% (Stakes Integrity)."""
     if not (2 <= len(wreck_ids) <= 5):
         return {"error": "Memerlukan 2-5 wrecks untuk assemble."}
+    try:
+        engineering_skill = int(engineering_skill)
+    except (TypeError, ValueError):
+        return {"error": f"engineering skill must be a whole number, got {engineering_skill!r}"}
+    if engineering_skill < 0:
+        return {"error": f"engineering skill cannot be negative, got {engineering_skill}"}
 
     wrecks = await Database.fetch(
         "SELECT * FROM maya_rp.wreck_inventory WHERE id = ANY($1::int[]) AND session_id=$2 AND status='available'",
@@ -82,8 +100,9 @@ async def assemble(session_id: int, name: str, wreck_ids: list[int],
 
     # Tandakan wreck sebagai used
     await Database.execute(
-        "UPDATE maya_rp.wreck_inventory SET status='used' WHERE id = ANY($1::int[])",
-        wreck_ids,
+        "UPDATE maya_rp.wreck_inventory SET status='used' WHERE id = ANY($1::int[]) "
+        "AND session_id=$2",
+        wreck_ids, session_id,
     )
 
     # Event log (spec clarity: nombor nyata)

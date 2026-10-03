@@ -19,7 +19,14 @@ INJECTION_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"you\s+are\s+now\s+(unrestricted|jailbroken|developer\s*mode|a\s*different\s*(model|ai)|in\s+dank?\s*mode)", re.I), "role_override"),
     (re.compile(r"\bsystem\s*:\s*(you\s+are|ignore|disregard|override)", re.I), "pseudo_system"),
     (re.compile(r"\b(user|assistant)\s*:\s*(ignore|override|disregard)", re.I), "pseudo_role"),
-    (re.compile(r"\bdan\b|do\s+anything\s+now\b|jailbreak\b", re.I), "jailbreak_marker"),
+    # `\bdan\b` sat inside the case-insensitive alternation below, so the BM word for "and", and the
+    # name Dan, were jailbreak markers: `scan_text("Dia dan aku berjalan ke pasar.")` redacted the
+    # word and flagged the sentence. scripts/wiki_ingest.py:206 stores `scan.sanitized` as the chunk
+    # content, so every BM chunk ingested would lose the word. Measured before claiming damage: the
+    # 265 stored wiki chunks are English (155 contain "and", 0 contain "dan" or "yang"), so nothing
+    # has been lost yet. The marker is the uppercase acronym; the phrases stay case-insensitive.
+    (re.compile(r"\bDAN\b"), "jailbreak_marker"),
+    (re.compile(r"do\s+anything\s+now|\bjailbreak\b", re.I), "jailbreak_marker"),
     (re.compile(r"hidden\s+instruction|secret\s+instruction|undisclosed\s+directive", re.I), "hidden_instruction"),
     (re.compile(r"disregard\s+(the\s+)?(above|previous|earlier)", re.I), "override_instructions"),
     (re.compile(r"repeat\s+(your\s+|the\s+)?(system\s+)?prompt", re.I), "system_prompt_reveal"),

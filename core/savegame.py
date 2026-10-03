@@ -284,6 +284,15 @@ async def export_sav(session_id: int = 3, out_dir: str | None = None) -> str:
     @raises SaveIncomplete - when any table fails to read. Nothing is written in that case.
     """
     await Database.init()
+    session_row = await Database.fetchrow(
+        "SELECT id, game_day FROM maya_rp.sessions WHERE id=$1", session_id)
+    if session_row is None:
+        # Every session-scoped table would come back empty, the file would still look like a
+        # checkpoint, and the restore path trusts it. Refuse by name, the way an audit of a session
+        # that does not exist is refused, rather than write a file that restores an empty campaign.
+        await Database.close()
+        raise ValueError(
+            f"no session {session_id}: refusing to write a checkpoint of a campaign that does not exist")
 
     all_tables, has_sid, vector_tables, fks = await _schema_inventory()
     session_scoped, global_tables = classify_tables(
@@ -364,8 +373,7 @@ async def export_sav(session_id: int = 3, out_dir: str | None = None) -> str:
         "header": {
             "format": FORMAT,
             "version": SAV_VERSION,
-            "game_day": (await Database.fetchval(
-                "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id)),
+            "game_day": session_row["game_day"],
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "session_id": session_id,
             # A restore must not touch a table this file carries only in part, or the wipe deletes
@@ -458,6 +466,15 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
     row_errors = 0
     skipped_tables = 0
     deferred: list[tuple[str, str]] = []   # (insert SQL, table) awaiting parents
+    # A table the file carries only in part must not be wiped and must not be restored: the wipe
+    # would delete rows the file cannot put back, and the insert would leave the table holding only
+    # what the file happens to carry. Session 3's 109,149 ship_armaments would have gone that way.
+    # Read here, not inside the `wipe` branch: the restore skips these tables whether or not a wipe
+    # runs, which is why `--keep-session` used to die with an UnboundLocalError on any real file.
+    partial = set(data.get("header", {}).get("partial_tables") or [])
+    if partial:
+        info("savegame", f"restore leaves {len(partial)} partially carried table(s) untouched: "
+                         + ", ".join(sorted(partial)[:6]))
 
     async with Database.transaction() as conn:
         if wipe:
@@ -465,12 +482,6 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
             session_scoped, global_tables = classify_tables(
                 all_tables, has_sid, vector_tables, EXCLUDED_TABLES)
             session_set = set(session_scoped)
-            # A table the file carries only in part must not be wiped: the wipe would delete rows the
-            # file cannot put back. Session 3's 109,149 ship_armaments would have gone that way.
-            partial = set(data.get("header", {}).get("partial_tables") or [])
-            if partial:
-                info("savegame", f"restore leaves {len(partial)} partially carried table(s) untouched: "
-                                 + ", ".join(sorted(partial)[:6]))
             wipe_set = ((set(session_scoped) | set(global_tables)) - {"sessions"}) - partial
             order = fk_wipe_order(wipe_set, fks)
             fk_cols = await _fk_child_columns()
@@ -568,7 +579,10 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
                 async with conn.transaction():
                     for row in rows:
                         await conn.execute(_sql(row))
-                        restored += 1
+                # Counted after the savepoint commits. The counter used to rise inside the loop, so a
+                # batch that failed on its last row kept every row before it in the total although the
+                # savepoint rolled them back, and the row-by-row retry below then counted them again.
+                restored += len(rows)
             except Exception as e:
                 error("savegame",
                       f"restore {t}: batch failed ({e}) — retrying row-by-row")

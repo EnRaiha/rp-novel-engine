@@ -249,7 +249,9 @@ async def memorialize(
             timeout=15.0,
         )
         story = (story or "").strip()
-    except Exception:
+    except Exception as e:
+        # local GPU is optional; the template below is the documented fallback.
+        info("roll_theater", f"Local flavor line unavailable ({e}), using template")
         story = ""
     if not story:
         story = (
@@ -335,6 +337,16 @@ def pool_odds(crit_rate: float) -> str:
 
 
 async def open_pool(session_id: int, name: str, dc: int) -> dict:
+    """Open a betting pool on the next vs-roll.
+
+    `dc` is the target the pool is opened for. The pool table carries no dc
+    column, so resolution is driven by the caller's `king_won`; dc is checked
+    here because a pool opened against a nonsense target is a caller error.
+    """
+    if not (name or "").strip():
+        raise ValueError("open_pool: pool name is empty")
+    if int(dc) <= 0:
+        raise ValueError(f"open_pool: dc must be positive, got {dc}")
     gd = (
         await Database.fetchval(
             "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id
@@ -392,6 +404,13 @@ async def open_pool(session_id: int, name: str, dc: int) -> dict:
 
 
 async def resolve_pool(session_id: int, king_won: bool) -> dict:
+    """Close the newest open pool and report the money.
+
+    `house_keeps` is the net the house retains: the pool minus what it paid out.
+    An upset pool pays 1.8x on more than it holds, so the net can be negative,
+    and the report says so instead of clamping the loss to zero. `crown_credited`
+    says whether the crown fee reached a resources row; a fee of 0 is never paid.
+    """
     pool = await Database.fetchrow(
         "SELECT id, pool_name, credits_in_pool FROM maya_rp.roll_pools "
         "WHERE session_id=$1 AND status='open' ORDER BY id DESC LIMIT 1",
@@ -403,7 +422,7 @@ async def resolve_pool(session_id: int, king_won: bool) -> dict:
         "SELECT id, bettor_name, bet_credits, bet_side FROM maya_rp.pool_bets WHERE pool_id=$1",
         pool["id"],
     )
-    house_keeps = 0
+    house_keeps = 0  # stakes kept off the losers
     paid = 0
     for b in bets:
         won = (b["bet_side"] == "king") == king_won
@@ -414,18 +433,29 @@ async def resolve_pool(session_id: int, king_won: bool) -> dict:
             await Database.execute(
                 "UPDATE maya_rp.pool_bets SET payout=$1 WHERE id=$2", payout, b["id"]
             )
-    house_keeps += max(0, (pool["credits_in_pool"] or 0) - paid - house_keeps)
+    # Net, not gross: paying 1.8 on the winners can put an upset pool underwater.
+    house_keeps = (pool["credits_in_pool"] or 0) - paid
     await Database.execute(
         "UPDATE maya_rp.roll_pools SET result=$1, status='closed' WHERE id=$2",
         "king" if king_won else "house",
         pool["id"],
     )
-    if king_won:
-        await Database.execute(
-            "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2",
-            max(0, house_keeps // 2),
+    crown_fee = max(0, house_keeps // 2)
+    crown_credited = False
+    if king_won and crown_fee:
+        row = await Database.fetchrow(
+            "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2 "
+            "RETURNING credits",
+            crown_fee,
             session_id,
-        )  # house fee to Crown
+        )
+        crown_credited = row is not None
+        if not crown_credited:
+            info(
+                "roll_theater",
+                f"Pool {pool['id']}: no resources row for session {session_id}, "
+                f"crown fee {crown_fee}C not paid",
+            )
     await Database.execute(
         "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
         "VALUES ($1, NOW(), 'pool', $2, $3, $4, 2)",
@@ -439,6 +469,8 @@ async def resolve_pool(session_id: int, king_won: bool) -> dict:
         "pool": pool["pool_name"],
         "paid": paid,
         "house_keeps": house_keeps,
+        "crown_fee": crown_fee,
+        "crown_credited": crown_credited,
         "winner": "king" if king_won else "house",
     }
 
@@ -447,7 +479,13 @@ async def resolve_pool(session_id: int, king_won: bool) -> dict:
 
 
 async def plant_ripple(session_id: int, domain: str, tier: str, dc: int) -> None:
-    """Partial/fumble rolls plant consequence seeds (wired to consequences.py)."""
+    """Partial/fumble rolls plant consequence seeds (wired to consequences.py).
+
+    A success or an unrecognised tier plants nothing and says so on the log.
+    """
+    if tier not in ("partial", "fumble"):
+        info("roll_theater", f"Ripple skipped: tier '{tier}' plants nothing")
+        return
     try:
         from core.consequences import plant
 
@@ -460,8 +498,14 @@ async def plant_ripple(session_id: int, domain: str, tier: str, dc: int) -> None
                 "effects": [
                     {
                         "type": "stat",
-                        "target": "morale" if domain != "economy" else "credits",
+                        # `morale` is not a column of maya_rp.resources. The live
+                        # column is aggregate_morale; naming `morale` leaned on
+                        # core/consequences.py's unknown-column fallback.
+                        "target": "aggregate_morale" if domain != "economy" else "credits",
                         "delta": -weight,
+                        # process_due reads a missing delay_ticks as 999 ticks,
+                        # so an effect without this one stays planted for good.
+                        "delay_ticks": 2,
                     }
                 ],
                 "can_be_prevented": False,
@@ -479,10 +523,11 @@ def parse_telegram_dice(value: int) -> int:
     """Map a Telegram 🎲 result (1-6) to a d100 band.
 
     1 → 1-5 (fumble territory) · 2 → 6-40 · 3 → 41-60 · 4 → 61-80 ·
-    5 → 81-95 · 6 → 96-100 (crit territory). Deterministic and documented —
-    the dice emoji itself stays the true random source.
+    5 → 81-95 · 6 → 96-100 (crit territory). The dice emoji is the entropy, so
+    the band is fixed and the same emoji always maps to the same d100. The value
+    returned is the band midpoint: 3, 23, 50, 70, 88, 98.
     """
     v = max(1, min(6, int(value)))
     bands = {1: (1, 5), 2: (6, 40), 3: (41, 60), 4: (61, 80), 5: (81, 95), 6: (96, 100)}
     lo, hi = bands[v]
-    return random.randint(lo, hi)
+    return (lo + hi) // 2

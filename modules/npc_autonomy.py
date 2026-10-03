@@ -23,6 +23,12 @@ async def react_to_event(event_type: str, session_id: int = None) -> list[dict]:
     shifts = EVENT_REACTIONS.get(event_type)
     if not shifts: return []
     npcs = await Database.fetch("SELECT c.id,c.name,c.archetype,nis.personal_morale,nis.personal_fear,nis.personal_loyalty,nis.current_mood FROM maya_rp.characters c LEFT JOIN maya_rp.npc_internal_state nis ON nis.character_id=c.id AND nis.session_id=$1 WHERE c.session_id=$1 AND c.status='active' AND c.role NOT IN ('wife','player')", session_id)
+    unknown = {str(n.get("archetype")) for n in npcs} - set(ARCHETYPES)
+    if unknown:
+        # The live column carries pirate, leader, royal_child, immortal and NULL for
+        # most rows, so every one of those NPCs reacted as a stoic without a word.
+        info("npc_autonomy", f"archetype(s) {sorted(unknown)} are not in ARCHETYPES; "
+                             f"{len(npcs)} NPCs react as stoic")
     notable = []
     for npc in npcs:
         a = ARCHETYPES.get(str(npc.get("archetype")), ARCHETYPES["stoic"])
@@ -30,9 +36,12 @@ async def react_to_event(event_type: str, session_id: int = None) -> list[dict]:
         md = int(shifts["m"]*mult); fd = int(shifts["f"]*mult); ld = int(shifts["l"]*mult)
         if "cabinet" in event_type and a["ambition"]=="high": ld *= 2
         if "death" in event_type and a["fear"]=="protect_others": md *= 2; fd *= 2
-        nm = max(0,min(100,(npc.get("personal_morale")or 50)+md))
-        nf = max(0,min(100,(npc.get("personal_fear")or 0)+fd))
-        nl = max(0,min(100,(npc.get("personal_loyalty")or 50)+ld))
+        # `or 50` read a stored 0 as a missing value, the same way a bond of 0 was
+        # read in characters.resolve_intent. Only None takes the default.
+        m0 = npc.get("personal_morale"); f0 = npc.get("personal_fear"); l0 = npc.get("personal_loyalty")
+        nm = max(0,min(100,(50 if m0 is None else m0)+md))
+        nf = max(0,min(100,(0 if f0 is None else f0)+fd))
+        nl = max(0,min(100,(50 if l0 is None else l0)+ld))
         mood = "terrified" if nf>70 else "broken" if nm<20 else "demoralized" if nm<35 else "anxious" if nf>50 else "discontent" if nl<30 else "euphoric" if nm>80 and nf<20 else "content" if nm>65 else "stable" if nm>50 else "wary"
         await Database.execute("INSERT INTO maya_rp.npc_internal_state(character_id,session_id,personal_morale,personal_fear,personal_loyalty,current_mood,last_reaction_event) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(character_id,session_id)DO UPDATE SET personal_morale=$3,personal_fear=$4,personal_loyalty=$5,current_mood=$6,last_reaction_event=$7", npc["id"],session_id,nm,nf,nl,mood,event_type)
         if abs(md)>=3 or abs(ld)>=3 or nf>70 or nm<20:
@@ -69,8 +78,12 @@ async def discover_off_screen(session_id: int = None) -> dict | None:
     r = await Database.fetchrow("SELECT * FROM maya_rp.npc_offscreen_interactions WHERE session_id=$1 AND discovered=false ORDER BY game_day ASC LIMIT 1", session_id)
     if not r: return None
     await Database.execute("UPDATE maya_rp.npc_offscreen_interactions SET discovered=true WHERE id=$1", r["id"])
-    an = await Database.fetchval("SELECT name FROM maya_rp.characters WHERE id=$1", r["character_a"])
-    bn = await Database.fetchval("SELECT name FROM maya_rp.characters WHERE id=$1", r["character_b"])
+    an = await Database.fetchval(
+        "SELECT name FROM maya_rp.characters WHERE id=$1 AND session_id=$2",
+        r["character_a"], session_id)
+    bn = await Database.fetchval(
+        "SELECT name FROM maya_rp.characters WHERE id=$1 AND session_id=$2",
+        r["character_b"], session_id)
     return {"type":r["interaction_type"],"description":r["description"],"discovery":random.choice([f"You overhear {an} and {bn} talking in low voices.",f"You notice {an} and {bn} exchanging a look.",f"A crewman mentions {an} and {bn} have been spending time together."]),"characters":[an,bn]}
 
 async def run_tick(session_id: int = None) -> dict:

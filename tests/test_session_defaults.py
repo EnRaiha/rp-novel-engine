@@ -56,6 +56,14 @@ class TestFallbackAnnouncesItself:
         assert session == 3, "the fallback is the legacy campaign"
         assert "FROZEN" in captured.err, "a silent fallback is a write to a session nobody chose"
         assert config.SESSION_FALLBACK_USED is True
+        # Undo the patches BEFORE the reload, and the order is the whole point. The
+        # reload re-runs the class body, which computes Config.SESSION_ID again. With
+        # `active_arc` still patched to None it computes the fallback, and that value
+        # stays on the class for the rest of the process: monkeypatch.undo() restores
+        # the patched function, never the attribute the reload just wrote. Every test
+        # after this one then reads the frozen campaign through Config.SESSION_ID,
+        # which is the hazard this file exists to describe.
+        monkeypatch.undo()
         importlib.reload(config)
 
 

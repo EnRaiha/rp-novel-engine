@@ -1,6 +1,7 @@
 """Infrastructure — mining, refineries, stations, factories, farms, defense, logistics, arcane."""
 import random, json
 from datetime import datetime, timezone
+from core.config import Config
 from core.db import Database
 from modules._economy import RESOURCE_COLUMNS, _check_afford, _deduct_resources
 from core.events import EventBus
@@ -23,7 +24,24 @@ async def build_infrastructure(session_id: int, type_id: int,
     if not it:
         return {"error": "Infrastructure type not found."}
 
-    # Check research gate
+    # Placement is checked before anything is charged: the foreign keys reach
+    # `territory` and `sectors`, which both carry a session, so a build in this
+    # campaign could hang off the frozen campaign's world or sector.
+    if territory_id is not None:
+        owned = await Database.fetchval(
+            "SELECT 1 FROM maya_rp.territory WHERE id = $1 AND session_id = $2",
+            territory_id, session_id)
+        if not owned:
+            return {"error": f"Territory {territory_id} is not in session {session_id}."}
+    if sector_id is not None:
+        owned = await Database.fetchval(
+            "SELECT 1 FROM maya_rp.sectors WHERE id = $1 AND session_id = $2",
+            sector_id, session_id)
+        if not owned:
+            return {"error": f"Sector {sector_id} is not in session {session_id}."}
+
+    # Check research gate. `research_projects` carries no session of its own — it
+    # is the global tech catalogue, so an unfiltered name lookup is correct here.
     if it.get("required_tech"):
         researched = await Database.fetchrow(
             "SELECT unlocked FROM maya_rp.research_projects WHERE name = $1",
@@ -120,8 +138,8 @@ async def upgrade_infrastructure(session_id: int, inst_id: int) -> dict:
     await Database.execute("""
         UPDATE maya_rp.infrastructure_instances
         SET level = $1, last_upgrade = NOW(), production_bonus = $2
-        WHERE id = $3
-    """, new_level, bonus, inst_id)
+        WHERE id = $3 AND session_id = $4
+    """, new_level, bonus, inst_id, session_id)
 
     await _log(session_id, "infrastructure",
                f"⬆️ Upgraded: {inst['name']}",
@@ -147,46 +165,69 @@ async def run_production_tick(session_id: int, game_days: float = 0.5) -> dict:
     Scoped to the session that owns the instance: the query used to select every
     session's active infrastructure and credit the totals to the session_id
     argument, so a second session's facilities paid into this one's treasury.
+
+    A payout is counted only when it landed: a session with no `resources` row
+    (session 5 has none) used to log production into `infrastructure_production`
+    that never reached a treasury. One malformed `effects` row is skipped and
+    named rather than aborting the whole tick.
     """
     produced = {}
+    unlanded = {}
+    skipped = []
     for inst in await Database.fetch("""
         SELECT ii.*, it.effects, it.category
         FROM maya_rp.infrastructure_instances ii
         JOIN maya_rp.infrastructure_types it ON it.id = ii.infrastructure_type_id
         WHERE ii.status = 'active' AND ii.session_id = $1
     """, session_id):
-        effects = _j(inst.get("effects"))
-        # numeric columns and jsonb numerics arrive as Decimal → float() before
-        # multiplying (Decimal * float raised TypeError, so the tick never
-        # produced anything: infrastructure_production was empty).
-        bonus = float(inst.get("production_bonus") or 1.0)
-        production = {}
+        try:
+            effects = _j(inst.get("effects"))
+            # numeric columns and jsonb numerics arrive as Decimal → float() before
+            # multiplying (Decimal * float raised TypeError, so the tick never
+            # produced anything: infrastructure_production was empty).
+            bonus = float(inst.get("production_bonus") or 1.0)
+            production = {}
 
-        for key, val in effects.items():
-            if key.endswith("_production"):
-                col = _resource_column(key)
-                if not col:
-                    continue
-                amount = int(float(val) * bonus * game_days)
-                if amount > 0:
-                    production[col] = production.get(col, 0) + amount
+            for key, val in effects.items():
+                if key.endswith("_production"):
+                    col = _resource_column(key)
+                    if not col:
+                        continue
+                    amount = int(float(val) * bonus * game_days)
+                    if amount > 0:
+                        production[col] = production.get(col, 0) + amount
 
-        for res, amount in production.items():
-            await Database.execute(
-                f"UPDATE maya_rp.resources SET {res} = {res} + $1 WHERE session_id = $2",
-                amount, session_id
-            )
-            await Database.execute("""
-                INSERT INTO maya_rp.infrastructure_production
-                    (infrastructure_id, resource_type, amount_produced, produced_at)
-                VALUES ($1, $2, $3, NOW())
-            """, inst["id"], res, amount)
-            produced[res] = produced.get(res, 0) + amount
-    return {"produced": produced}
+            for res, amount in production.items():
+                tag = await Database.execute(
+                    f"UPDATE maya_rp.resources SET {res} = {res} + $1 WHERE session_id = $2",
+                    amount, session_id
+                )
+                if isinstance(tag, str) and tag.split()[-1:] == ["0"]:
+                    unlanded[res] = unlanded.get(res, 0) + amount
+                    continue          # no production row for a payout nobody received
+                await Database.execute("""
+                    INSERT INTO maya_rp.infrastructure_production
+                        (infrastructure_id, resource_type, amount_produced, produced_at)
+                    VALUES ($1, $2, $3, NOW())
+                """, inst["id"], res, amount)
+                produced[res] = produced.get(res, 0) + amount
+        except Exception as e:  # noqa: BLE001 - one bad row must not stop the fleet
+            skipped.append(inst.get("id"))
+            error("infrastructure", f"instance {inst.get('id')} skipped: {e}")
+    if unlanded:
+        error("infrastructure", f"session {session_id} has no resources row — "
+                                f"{unlanded} produced but NOT credited")
+    return {"produced": produced, "unlanded": unlanded, "skipped": skipped}
 
-async def run_tick(session_id: int = 3):
-    """Infrastructure tick — run production."""
+async def run_tick(session_id: int = None):
+    """Infrastructure tick — run production.
+
+    Defaults to the engine's session (Config.SESSION_ID), not the literal 3: that
+    id is the frozen reference campaign, so a bare tick produced there.
+    """
     from core.log import info, error
+    if session_id is None:
+        session_id = Config.SESSION_ID
     try:
         out = await run_production_tick(session_id)
         info("infrastructure", f"Tick: produced {out['produced'] or 'nothing'}")

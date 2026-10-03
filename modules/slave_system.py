@@ -2,7 +2,9 @@
 import random, json
 from datetime import datetime, timezone
 from core.db import Database
+from core.config import Config
 from core.events import EventBus
+from core.log import error, info
 
 NAMES = ['Kael','Mira','Theron','Seph','Elara','Dorian','Lysander','Valia','Rourke','Jax',
          'Mara','Vex','Grieves','Sam','Razor','Shadow','Crimson','Raven','Wolf','Storm']
@@ -21,29 +23,41 @@ CREW_POOLS = {
 HIDDEN_TALENTS = ["gunnery", "tactics", "navigation", "engineering", "charisma", "logistics",
                   "espionage", "morale", "boarding", "research"]
 
-async def run_tick(session_id: int = 3):
-    """Slave system tick — training, health, loyalty, revolts, market."""
+async def run_tick(session_id: int = None):
+    """Slave system tick — training, health, loyalty, revolts, market.
+
+    Every read below is scoped to the tick's campaign. `slave_training` and
+    `slave_births` carry no session_id, so their scope comes through the join to
+    `slaves`. The default used to be the frozen reference campaign.
+    """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     try:
         gd = 0.5  # simplified game days
         # Advance training
         for r in await Database.fetch(
-            "SELECT st.*, s.loyalty FROM slave_training st JOIN slaves s ON s.id=st.slave_id WHERE st.progress<100"):
+            "SELECT st.*, s.loyalty FROM slave_training st JOIN slaves s ON s.id=st.slave_id "
+            "WHERE st.progress<100 AND s.session_id=$1", session_id):
             p = min(100, r["progress"] + 2 * gd * (1 + (r["loyalty"] or 50) / 100))
             await Database.execute("UPDATE slave_training SET progress=$1 WHERE id=$2", p, r["id"])
             if p >= 100:
                 await Database.execute("UPDATE slave_training SET completed_at=NOW() WHERE id=$1", r["id"])
                 await Database.execute("UPDATE slaves SET role=$1 WHERE id=$2", r["training_type"], r["slave_id"])
         # Update health/loyalty
-        for s in await Database.fetch("SELECT id, health, loyalty, assigned_to, assigned_id FROM slaves WHERE status='active'"):
+        for s in await Database.fetch(
+                "SELECT id, health, loyalty, assigned_to, assigned_id FROM slaves "
+                "WHERE status='active' AND session_id=$1", session_id):
             h = max(0, s["health"] - random.uniform(0, 0.5) * gd)
             l = s["loyalty"]
             if s["assigned_to"] == "territory":
-                t = await Database.fetchrow("SELECT morale FROM territory WHERE id=$1", s["assigned_id"])
+                t = await Database.fetchrow(
+                    "SELECT morale FROM territory WHERE id=$1 AND session_id=$2",
+                    s["assigned_id"], session_id)
                 if t: l += (-0.5 if t["morale"] < 40 else 0.3 if t["morale"] > 70 else 0) * gd
             await Database.execute("UPDATE slaves SET health=$1, loyalty=$2 WHERE id=$3", h, max(0, min(100, l)), s["id"])
         # Revolt checks
         for t in await Database.fetch("SELECT id, slave_population FROM territory WHERE slave_population>0 AND session_id=$1", session_id):
-            risk = await _revolt_risk(t["id"])
+            risk = await _revolt_risk(t["id"], session_id)
             if risk > 70 and random.random() < 0.1 * gd:
                 await _trigger_revolt(session_id, t["id"])
         # Market refresh
@@ -51,24 +65,34 @@ async def run_tick(session_id: int = 3):
             t = await Database.fetchrow("SELECT id FROM territory WHERE session_id=$1 AND controlling_faction='Setia Empire' ORDER BY random() LIMIT 1", session_id)
             if t: await _generate_market(session_id, t["id"], random.randint(1, 3))
     except Exception as e:
-        print(f"  Slaves: {e}")
+        # A bare print() left the orchestrator scoring a crash as success.
+        error("slaves", f"Tick error: {e}")
+        return {"error": str(e)}
+    return {"training_advanced": True, "session_id": session_id}
 
-async def _revolt_risk(tid: int) -> int:
-    t = await Database.fetchrow("SELECT slave_population, population, slave_revolt_risk FROM territory WHERE id=$1", tid)
+async def _revolt_risk(tid: int, session_id: int | None = None) -> int:
+    t = await Database.fetchrow(
+        "SELECT slave_population, population, slave_revolt_risk FROM territory "
+        "WHERE id=$1 AND ($2::int IS NULL OR session_id=$2)", tid, session_id)
     if not t or not t["slave_population"]: return 0
     sr = t["slave_population"] / max(1, t["population"]) * 30
-    al = await Database.fetchrow("SELECT AVG(loyalty) AS a FROM slaves WHERE assigned_to='territory' AND assigned_id=$1 AND status='active'", tid)
+    al = await Database.fetchrow(
+        "SELECT AVG(loyalty) AS a FROM slaves WHERE assigned_to='territory' AND assigned_id=$1 "
+        "AND status='active' AND ($2::int IS NULL OR session_id=$2)", tid, session_id)
     if al and al["a"]: sr += max(0, (50 - al["a"]) / 2)
     sr = min(100, sr)
     await Database.execute("UPDATE territory SET slave_revolt_risk=$1 WHERE id=$2", sr, tid)
     return sr
 
 async def _trigger_revolt(sid: int, tid: int):
-    t = await Database.fetchrow("SELECT system_name, slave_population FROM territory WHERE id=$1", tid)
+    t = await Database.fetchrow(
+        "SELECT system_name, slave_population FROM territory WHERE id=$1 AND session_id=$2", tid, sid)
     sz = int(t["slave_population"] * random.uniform(0.2, 0.8))
-    sev = min(10, int(await _revolt_risk(tid) / 10) + 1)
+    sev = min(10, int(await _revolt_risk(tid, sid) / 10) + 1)
     await Database.execute("INSERT INTO slave_revolts (session_id,territory_id,size,severity,outcome,narrative) VALUES ($1,$2,$3,$4,'ongoing',$5)", sid, tid, sz, sev, f"Revolt in {t['system_name']}: {sz} slaves risen.")
-    await Database.execute("UPDATE territory SET slave_population=GREATEST(0,slave_population-$1) WHERE id=$2", sz, tid)
+    await Database.execute(
+        "UPDATE territory SET slave_population=GREATEST(0,slave_population-$1) "
+        "WHERE id=$2 AND session_id=$3", sz, tid, sid)
     # PostgreSQL has no UPDATE … ORDER BY … LIMIT — use a subquery to pick the
     # exact rows (this statement used to abort the whole revolt phase).
     await Database.execute(
@@ -112,18 +136,28 @@ async def _log(sid: int, cat: str, title: str, content: str, imp: int = 1):
 
 async def cmd(sid: int, action: str, params: dict) -> dict:
     if action == "list":
-        return {"slaves": [dict(r) for r in await Database.fetch("SELECT * FROM slave_overview")]}
+        # slave_overview has no session_id of its own, so the scope comes through
+        # the base table. The view used to list every campaign's slaves.
+        return {"slaves": [dict(r) for r in await Database.fetch(
+            "SELECT so.* FROM slave_overview so JOIN slaves s ON s.id = so.id "
+            "WHERE s.session_id = $1", sid)]}
     if action == "assign":
         s = params["slave_id"]; tt = params["target_type"]; ti = params["target_id"]; role = params.get("role", "laborer")
-        sl = await Database.fetchrow("SELECT * FROM slaves WHERE id=$1", s)
+        sl = await Database.fetchrow("SELECT * FROM slaves WHERE id=$1 AND session_id=$2", s, sid)
         if not sl: return {"error": "Not found"}
-        if tt == "territory" and not await Database.fetchrow("SELECT id FROM territory WHERE id=$1", ti): return {"error": "Territory not found"}
+        if tt == "territory" and not await Database.fetchrow(
+                "SELECT id FROM territory WHERE id=$1 AND session_id=$2", ti, sid):
+            return {"error": "Territory not found"}
         await Database.execute("UPDATE slaves SET assigned_to=$1, assigned_id=$2, role=$3 WHERE id=$4", tt, ti, role, s)
         if tt == "territory":
             bonus = (sl["strength"] + sl["intelligence"]) / 20
             await Database.execute("UPDATE territory SET slave_productivity_mult=slave_productivity_mult+$1, slave_population=slave_population+1 WHERE id=$2", bonus, ti)
         return {"success": True}
     if action == "train":
+        # slave_training has no session_id: the slave has to be yours first.
+        if not await Database.fetchrow(
+                "SELECT id FROM slaves WHERE id=$1 AND session_id=$2", params["slave_id"], sid):
+            return {"error": "Slave not found"}
         e = await Database.fetchrow("SELECT id FROM slave_training WHERE slave_id=$1 AND progress<100", params["slave_id"])
         if e: return {"error": "Already training"}
         await Database.execute("INSERT INTO slave_training (slave_id,training_type) VALUES ($1,$2)", params["slave_id"], params.get("training_type", "laborer"))
@@ -145,7 +179,9 @@ async def cmd(sid: int, action: str, params: dict) -> dict:
         return {"pools": list(CREW_POOLS.keys()), "territory_id": t["id"],
                 "market": [dict(r) for r in market]}
     if action == "buy":
-        m = await Database.fetchrow("SELECT * FROM slave_market WHERE id=$1 AND availability=true", params["market_id"])
+        m = await Database.fetchrow(
+            "SELECT * FROM slave_market WHERE id=$1 AND availability=true AND session_id=$2",
+            params["market_id"], sid)
         if not m: return {"error": "Not available"}
         cr = await Database.fetchrow("SELECT credits FROM resources WHERE session_id=$1", sid)
         if not cr or cr["credits"] < m["price"]: return {"error": "Insufficient credits"}
@@ -172,16 +208,21 @@ async def cmd(sid: int, action: str, params: dict) -> dict:
         return {"slave_id": sl_id, "price": m["price"], "tier": m.get("price_tier"), "talent": m.get("hidden_talent"),
                 "clearance": clr, "role": role}
     if action == "revolt_risk":
-        return {"risk": await _revolt_risk(params["territory_id"])}
+        return {"risk": await _revolt_risk(params["territory_id"], sid)}
     if action == "suppress":
-        r = await Database.fetchrow("SELECT * FROM slave_revolts WHERE id=$1 AND outcome='ongoing'", params["revolt_id"])
+        r = await Database.fetchrow(
+            "SELECT * FROM slave_revolts WHERE id=$1 AND outcome='ongoing' AND session_id=$2",
+            params["revolt_id"], sid)
         if not r: return {"error": "Not found"}
         force = params.get("force", True)
         success = random.random() < (0.7 if force else 0.4)
         cas = int(r["size"] * random.uniform(0.1, 0.5)) if success else 0
         if success:
             await Database.execute("UPDATE slave_revolts SET end_time=NOW(), outcome='suppressed', casualties=$1 WHERE id=$2", cas, r["id"])
-            await Database.execute("UPDATE slaves SET status='active', loyalty=GREATEST(0,loyalty+10) WHERE status='rebellious' AND assigned_id=$1", r["territory_id"])
+            await Database.execute(
+                "UPDATE slaves SET status='active', loyalty=GREATEST(0,loyalty+10) "
+                "WHERE status='rebellious' AND assigned_id=$1 AND session_id=$2",
+                r["territory_id"], sid)
             await _log(sid, "crisis", f"Revolt Suppressed", f"Casualties: {cas}", 3)
         else:
             sv = min(10, r["severity"] + 1)
@@ -195,17 +236,22 @@ async def cmd(sid: int, action: str, params: dict) -> dict:
             return {"success": False, "severity": sv, "escaped": esc}
         return {"success": success, "casualties": cas}
     if action == "breed":
-        a = await Database.fetchrow("SELECT * FROM slaves WHERE id=$1", params["parent_a"])
-        b = await Database.fetchrow("SELECT * FROM slaves WHERE id=$1", params["parent_b"])
+        a = await Database.fetchrow("SELECT * FROM slaves WHERE id=$1 AND session_id=$2", params["parent_a"], sid)
+        b = await Database.fetchrow("SELECT * FROM slaves WHERE id=$1 AND session_id=$2", params["parent_b"], sid)
         if not a or not b: return {"error": "Parent not found"}
         s = max(1, min(10, int((a["strength"] + b["strength"]) / 2) + random.randint(-2, 2)))
         i = max(1, min(10, int((a["intelligence"] + b["intelligence"]) / 2) + random.randint(-2, 2)))
+        # One child, one name. Two birth rows used to name two children that were
+        # never created, and neither name matched the child in `slaves`.
+        child_name = _name()
         cid = (await Database.fetchrow("INSERT INTO slaves (session_id,name,species,gender,strength,intelligence,loyalty,health) VALUES ($1,$2,$3,$4,$5,$6,50,90) RETURNING id",
-            sid, _name(), random.choice([a["species"], b["species"]]), random.choice(["M","F"]), s, i))["id"]
-        await Database.execute("INSERT INTO slave_births (parent_slave_id,child_name) VALUES ($1,$2)", a["id"], _name())
-        await Database.execute("INSERT INTO slave_births (parent_slave_id,child_name) VALUES ($1,$2)", b["id"], _name())
-        await _log(sid, "slave", "New Slave Born", f"From {a['name']} and {b['name']}", 1)
-        return {"child_id": cid}
+            sid, child_name, random.choice([a["species"], b["species"]]), random.choice(["M","F"]), s, i))["id"]
+        for parent in (a, b):
+            await Database.execute(
+                "INSERT INTO slave_births (parent_slave_id,child_name) VALUES ($1,$2)",
+                parent["id"], child_name)
+        await _log(sid, "slave", "New Slave Born", f"From {a['name']} and {b['name']}: {child_name}", 1)
+        return {"child_id": cid, "child_name": child_name}
     if action == "stats":
         total = (await Database.fetchrow("SELECT COUNT(*) AS c FROM slaves WHERE session_id=$1 AND status='active'", sid))["c"]
         by_role = await Database.fetch("SELECT role, COUNT(*) AS c FROM slaves WHERE session_id=$1 AND status='active' GROUP BY role", sid)

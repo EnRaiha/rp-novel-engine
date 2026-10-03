@@ -18,7 +18,8 @@ async def list_modules(ship_name: str, session_id: int | None = None) -> dict[st
         "JOIN maya_rp.modules m ON sm.module_id = m.id WHERE sm.ship_id=$1 ORDER BY sm.slot_index", ship["id"])
     available = await Database.fetch(
         "SELECT name, category, cost_alloys, cost_credits FROM maya_rp.modules "
-        "WHERE tier_min <= $1 AND tier_max >= $1 ORDER BY category, name", ship["tier"])
+        "WHERE tier_min <= $1 AND (tier_max IS NULL OR tier_max >= $1) "
+        "ORDER BY category, name", ship["tier"])
     return {"ship": ship["name"], "tier": ship["tier"],
             "installed": [dict(r) for r in installed],
             "available": [dict(r) for r in available]}
@@ -33,12 +34,20 @@ async def install_module(ship_name: str, module_name: str, slot_index: int,
 
     mod = await Database.fetchrow(
         "SELECT id, name, category, cost_alloys, cost_credits FROM maya_rp.modules "
-        "WHERE LOWER(name) LIKE LOWER($1) AND tier_min <= $2 AND tier_max >= $2 LIMIT 1",
+        "WHERE LOWER(name) LIKE LOWER($1) AND tier_min <= $2 AND (tier_max IS NULL OR tier_max >= $2) "
+        "ORDER BY id LIMIT 1",
         f"%{module_name}%", ship["tier"])
     if not mod: return {"error": f"Module '{module_name}' not found or incompatible with T{ship['tier']}"}
+    if int(slot_index) < 1:
+        # Slot 0 and below are not slots; the row is keyed by (ship_id, slot_index).
+        return {"error": f"slot_index must be at least 1, got {slot_index}"}
 
     res = await Database.fetchrow(
         "SELECT alloys, credits FROM maya_rp.resources WHERE session_id=$1", session_id)
+    if not res:
+        # `res["alloys"]` raised TypeError for a session with no resources row,
+        # which is session 5 today.
+        return {"error": f"No resources row for session {session_id}: refit refused"}
     if res["alloys"] < mod["cost_alloys"] or res["credits"] < mod["cost_credits"]:
         return {"error": f"Need {mod['cost_alloys']}a/{mod['cost_credits']}c, have {res['alloys']}a/{res['credits']}c"}
 
@@ -74,14 +83,17 @@ async def upgrade_ship(ship_name: str, session_id: int | None = None) -> dict[st
 
     res = await Database.fetchrow(
         "SELECT alloys, credits FROM maya_rp.resources WHERE session_id=$1", session_id)
+    if not res:
+        return {"error": f"No resources row for session {session_id}: upgrade refused"}
     if res["alloys"] < cost_a or res["credits"] < cost_c:
         return {"error": f"Need {cost_a}a/{cost_c}c for upgrade"}
 
     await Database.execute("UPDATE maya_rp.resources SET alloys=alloys-$1, credits=credits-$2 WHERE session_id=$3",
                            cost_a, cost_c, session_id)
     await Database.execute(
-        "UPDATE maya_rp.ships SET tier=$1, hull=$2, hull_current=$3, speed=$4 WHERE id=$5",
-        new_tier, hull_gain, hull_gain, speed_gain, ship["id"])
+        "UPDATE maya_rp.ships SET tier=$1, hull=$2, hull_current=$3, speed=$4 "
+        "WHERE id=$5 AND session_id=$6",
+        new_tier, hull_gain, hull_gain, speed_gain, ship["id"], session_id)
     await Database.execute(
         "INSERT INTO maya_rp.events (session_id, event_type, title, description, tags) VALUES "
         "($1,'upgrade',$2,$3,'[\"refit\"]'::jsonb)",

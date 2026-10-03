@@ -25,7 +25,7 @@ import time
 from typing import AsyncGenerator, Any
 
 from core.db import Database
-from core.log import info
+from core.log import info, warn
 
 # Cosine-similarity threshold equivalent to the old PG cosine-distance 0.35
 SEMANTIC_MIN_COSINE = 0.65
@@ -206,13 +206,15 @@ class StreamInterceptor:
             return self._interpolate(entry["expanded_text"])
         except Exception as e:
             self._consecutive_failures += 1
+            # A fault, not a note: the same call the council review made. An embed that fails every
+            # turn is what disables tier 2 for the stream, and at info level it reads as routine.
             if self._consecutive_failures >= BREAKER_LIMIT:
                 self._semantic_disabled = True
                 self.stats["breaker_engaged"] = True
-                info("interceptor", f"Circuit breaker engaged — tier 2 disabled for stream "
+                warn("interceptor", f"Circuit breaker engaged — tier 2 disabled for stream "
                                     f"({BREAKER_LIMIT} consecutive failures: {e})")
             else:
-                info("interceptor", f"Semantic embed failed (passthrough): {e}")
+                warn("interceptor", f"Semantic embed failed (passthrough): {e}")
             return None
         finally:
             self.stats["semantic_total_ms"] += (time.perf_counter() - t0) * 1000

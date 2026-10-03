@@ -17,19 +17,25 @@ CLI:
 """
 from __future__ import annotations
 import json
-import asyncio, sys
-sys.path.insert(0, str(__file__ + "/../../"))
 from core.config import Config
 from core.db import Database
 
-SID = Config.SESSION_ID
+
+def _sid(session_id: int | None) -> int:
+    """The session for this call, resolved at call time.
+
+    This module used to hold `SID = Config.SESSION_ID` at import. A module-level copy freezes on the
+    session that was active when the module was first imported, so every default path here ran
+    against that campaign for the life of the process: a tick aimed at Arc I prompted, appointed and
+    wrote for whichever campaign happened to be current at import.
+    """
+    return Config.SESSION_ID if session_id is None else session_id
 
 ADJUTANTS = ["Maya", "Hanum Voss", "Sara Valdez", "Maria"]
 
 
 async def king_status(session_id: int | None = None) -> bool:
-    if session_id is None:
-        session_id = SID
+    session_id = _sid(session_id)
     return bool(await Database.fetchval(
         "SELECT king_present FROM maya_rp.sessions WHERE id=$1", session_id))
 
@@ -37,15 +43,13 @@ async def king_status(session_id: int | None = None) -> bool:
 async def dark_status(session_id: int | None = None) -> bool:
     """DARK MODE: King unreachable (stealth/away). Ministries run via their
     co-ministers (deputies). Prompts only for critical items + Mastika capital."""
-    if session_id is None:
-        session_id = SID
+    session_id = _sid(session_id)
     return bool(await Database.fetchval(
         "SELECT dark_mode FROM maya_rp.sessions WHERE id=$1", session_id))
 
 
 async def set_king(session_id: int | None, present: bool) -> None:
-    if session_id is None:
-        session_id = SID
+    session_id = _sid(session_id)
     await Database.execute(
         "UPDATE maya_rp.sessions SET king_present=$2, dark_mode=NOT $2 WHERE id=$1",
         session_id, present)
@@ -53,8 +57,7 @@ async def set_king(session_id: int | None, present: bool) -> None:
 
 async def set_dark(session_id: int | None, dark: bool) -> None:
     """DARK MODE toggle: dark=TRUE → king_present=FALSE; dark=FALSE → king_present=TRUE."""
-    if session_id is None:
-        session_id = SID
+    session_id = _sid(session_id)
     await Database.execute(
         "UPDATE maya_rp.sessions SET dark_mode=$2, king_present=NOT $2 WHERE id=$1",
         session_id, dark)
@@ -75,8 +78,7 @@ async def _prompt(session_id: int, ministry: str, holder: str, action: str,
 
 
 async def run_tick(session_id: int | None = None) -> dict:
-    if session_id is None:
-        session_id = SID
+    session_id = _sid(session_id)
     present = await king_status(session_id)
     dark = await dark_status(session_id)
     taken = 0      # actions ministries executed autonomously (King away / dark mode)
@@ -102,8 +104,12 @@ async def run_tick(session_id: int | None = None) -> dict:
         taken += 1
 
     # ── Mastika capital: ALWAYS prompts, King present or away ──
+    # The capital was read as the literal territory id 170, which is session 3's row: in any other
+    # campaign the query matched nothing, `crisis` stayed 0, and the one prompt the rule says is
+    # unconditional never fired. `requires_king_prompt` is the column that marks the capital.
     crisis = await Database.fetchval(
-        "SELECT crisis_level FROM maya_rp.territory WHERE session_id=$1 AND id=170", session_id) or 0
+        "SELECT crisis_level FROM maya_rp.territory "
+        "WHERE session_id=$1 AND requires_king_prompt ORDER BY id LIMIT 1", session_id) or 0
     if crisis and crisis >= 3:
         await _prompt(session_id, "Cabinet", "Aina Merpati & Azlan Perak",
                       "Mastika crisis response", "TKG Mastika",
@@ -193,8 +199,7 @@ async def run_tick(session_id: int | None = None) -> dict:
 
 
 async def pending(session_id: int | None = None) -> list[dict]:
-    if session_id is None:
-        session_id = SID
+    session_id = _sid(session_id)
     return await Database.fetch(
         """SELECT id, ministry, holder, action, target, impact, urgency, routed_via, created_at
            FROM maya_rp.adjutant_prompts
@@ -206,6 +211,13 @@ async def pending(session_id: int | None = None) -> list[dict]:
 async def resolve(session_id: int, prompt_id: int, decision: str) -> dict:
     if decision not in ("accepted", "rejected"):
         return {"error": "decision must be accepted/rejected"}
+    # The update targeted a prompt by id and session and answered with the decision either way, so a
+    # prompt id from another campaign read as a resolved prompt.
+    exists = await Database.fetchval(
+        "SELECT id FROM maya_rp.adjutant_prompts WHERE id=$1 AND session_id=$2",
+        prompt_id, session_id)
+    if not exists:
+        return {"error": f"prompt {prompt_id} not found in session {session_id}"}
     await Database.execute(
         """UPDATE maya_rp.adjutant_prompts
            SET status=$3, resolved_at=NOW() WHERE id=$1 AND session_id=$2""",

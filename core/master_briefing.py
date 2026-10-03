@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info, warn
 
 async def generate(session_id: int = None) -> str:
     if session_id is None: session_id = Config.SESSION_ID
@@ -105,13 +105,15 @@ async def generate(session_id: int = None) -> str:
                     clines.append(card)
             if len(clines) > 1:
                 blocks.append("\n".join(clines))
-    except Exception:
-        pass  # Non-fatal — profiles are a nice-to-have
+    except Exception as e:
+        warn("briefing", f"scene appearance block skipped: {e!r}")  # Non-fatal — profiles are a nice-to-have
 
     # 12. FINAL BLOCK: Dynamic Content Clearance based on Pacing Mode
     # Tells Deepseek what level of explicit content is authorized for this scene.
     # Prevents both unnecessary refusals AND tonally-inappropriate content.
-    mode = await PacingDirector.get_mode(session_id)
+    # `pm` from block 3 already holds this session's mode; a second read is the
+    # same query twice per briefing.
+    mode = pm
     current_mode = mode["mode"]
 
     clearance_map = {
@@ -153,15 +155,8 @@ async def generate(session_id: int = None) -> str:
     blocks.append(clearance)
 
     # Wrap in GM Brain XML tags for DeepSeek optimization
-    xml_blocks = []
-    for b in blocks:
-        b_stripped = b.strip()
-        if b_stripped.startswith("##") or b_stripped.startswith("["):
-            xml_blocks.append(b_stripped)
-        else:
-            xml_blocks.append(b_stripped)
-
-    content = "\n\n".join(xml_blocks)
+    # (the branch that used to sit here appended the same string on both sides)
+    content = "\n\n".join(b.strip() for b in blocks)
     # Wrap everything
     result = "<gm_brain>\n" + content + "\n</gm_brain>"
     return result
@@ -212,4 +207,8 @@ async def _generate_ui_dashboard(session_id: int) -> str:
                 lines.append(f"  ⚔ {vs['name']} ({vs['veteran_kills']} kills, {vs['ship_rank']}) | Scars: {scar_names}")
         return "\n".join(lines)
     except Exception as e:
+        # The dashboard is the only block that reads the treasury before the LLM
+        # narrates. "(unavailable)" without a reason is how a broken query stays
+        # invisible for a month.
+        error("briefing", f"system dashboard unavailable: {e!r}")
         return "【 SYSTEM DASHBOARD 】\n(unavailable)"

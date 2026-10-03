@@ -8,6 +8,10 @@ from core.log import info
 
 ENCOUNTER_TYPES = ["merchant","pirate","derelict","anomaly","distress","trade_fleet","refugee","ambush","signal","artifact"]
 
+#: The outcomes `resolve` understands. Anything else is refused rather than
+#: reported as a resolved encounter that paid nothing.
+OUTCOMES = ("success", "failure")
+
 async def generate(session_id: int | None = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
     etype = random.choice(ENCOUNTER_TYPES)
@@ -17,12 +21,30 @@ async def generate(session_id: int | None = None) -> dict:
     return {"type": etype, "system": system, "gold_reward": gold, "combat": combat, "description": f"A {etype} encounter at {system}"}
 
 async def resolve(adventure_type: str, outcome: str, session_id: int | None = None) -> dict:
+    """Pay out one encounter. The reward does NOT vary by encounter type.
+
+    @param adventure_type - the type `generate` rolled. It is echoed back so the
+        caller can narrate it; it does not price the reward, and the docstring
+        says so rather than leaving a caller to assume it does.
+    @param outcome - "success" or "failure"; anything else is refused, because a
+        misspelling used to read as a resolved encounter that paid nothing.
+    @raises ValueError - the outcome is not one this module knows.
+    """
     if session_id is None: session_id = Config.SESSION_ID
+    if outcome not in OUTCOMES:
+        raise ValueError(f"outcome must be one of {OUTCOMES}, got {outcome!r}")
     if outcome == "success":
         reward = random.randint(500, 5000)
-        await Database.execute("UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2", reward, session_id)
-        return {"reward": reward, "outcome": "success"}
-    return {"reward": 0, "outcome": outcome}
+        tag = await Database.execute(
+            "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2",
+            reward, session_id)
+        if isinstance(tag, str) and tag.split()[-1:] == ["0"]:
+            info("adventures", f"session {session_id} has no resources row — "
+                               f"{reward}C reward NOT paid")
+            return {"reward": 0, "outcome": "success", "adventure_type": adventure_type,
+                    "error": f"No treasury row for session {session_id}"}
+        return {"reward": reward, "outcome": "success", "adventure_type": adventure_type}
+    return {"reward": 0, "outcome": outcome, "adventure_type": adventure_type}
 
 async def run_tick(session_id: int = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID

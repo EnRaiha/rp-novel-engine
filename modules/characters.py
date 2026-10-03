@@ -56,6 +56,11 @@ async def resolve_intent(session_id: int, action: str, target: str, character_id
     if not char:
         return {"domain": "character", "success": False, "narrative_hook": f"Character not found: {target}"}
 
+    # `char["bond"] or 50` read a stored 0 as a missing value: 696 of the 715 live
+    # characters sit at bond 0, so every interaction reported bond_before 50 and
+    # wrote 50 + shift, raising a character nobody had spoken to.
+    bond_before = char["bond"] if char["bond"] is not None else 50
+
     bond_shift = 0
     if action in ("talk", "converse", "chat"):
         bond_shift = 1
@@ -68,11 +73,11 @@ async def resolve_intent(session_id: int, action: str, target: str, character_id
     elif action in ("reprimand", "punish"):
         bond_shift = -3
 
+    bond_after = max(0, min(100, bond_before + bond_shift))
     if bond_shift != 0:
-        new_bond = max(0, min(100, (char["bond"] or 50) + bond_shift))
         await Database.execute(
-            "UPDATE maya_rp.characters SET bond=$1 WHERE id=$2",
-            new_bond, char["id"])
+            "UPDATE maya_rp.characters SET bond=$1 WHERE id=$2 AND session_id=$3",
+            bond_after, char["id"], session_id)
 
     reactions = {
         1: f"{char['name']} acknowledges you with a nod.",
@@ -87,8 +92,8 @@ async def resolve_intent(session_id: int, action: str, target: str, character_id
         "domain": "character",
         "success": True,
         "character": char["name"],
-        "bond_before": char["bond"] or 50,
-        "bond_after": max(0, min(100, (char["bond"] or 50) + bond_shift)),
+        "bond_before": bond_before,
+        "bond_after": bond_after,
         "bond_shift": bond_shift,
         "reaction": reaction,
         "narrative_hook": f"Interaction with {char['name']}: bond shifted by {bond_shift:+d}.",

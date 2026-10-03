@@ -56,9 +56,10 @@ async def render_one(asset: dict, *, steps: int, dry_run: bool) -> bool:
     framing = asset.get("framing") or DEFAULT_FRAMING
     frame = portraits.FRAMING.get(framing, portraits.FRAMING[DEFAULT_FRAMING])
     size = f"{frame['width']}x{frame['height']}"
-    negative = portraits.style()["negative"]
-    if framing != "bust":
-        negative = f"{negative}, {portraits.FRAMING_NEGATIVE}"
+    # One rule, one place. This used to recompute what `core/portraits.py` already computes, which is
+    # the second copy of a rule and the reason a row could describe a semi prompt beside a photoreal
+    # negative: the script and the queue built the same negative independently and disagreed.
+    negative = portraits.negative_for(framing)
     result = subprocess.run(
         [sys.executable, str(GENERATOR), prompt, "-o", str(version_file), "--steps", str(steps),
          "--size", size, "--negative", negative],

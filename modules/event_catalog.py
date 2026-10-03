@@ -65,14 +65,27 @@ ENCOUNTERS = {
 
 def get_random_encounter(category: str | None = None, max_diff: int = 10) -> dict:
     if category:
-        pool = ENCOUNTERS.get(category, {})
+        if category not in ENCOUNTERS:
+            # An unknown category used to fall through to a fabricated "default_encounter" that is in
+            # no catalogue, so a misspelled category returned an encounter nobody had written.
+            return {"error": f"unknown encounter category {category!r}",
+                    "categories": sorted(ENCOUNTERS)}
+        pool = ENCOUNTERS[category]
     else:
         pool = {k: v for cat in ENCOUNTERS.values() for k, v in cat.items()}
-    if not pool: pool = {"default_encounter": {"diff": 3, "desc": "Routine space encounter."}}
+    if not pool:
+        return {"error": f"no encounters catalogued for category {category!r}"}
     filtered = {k: v for k, v in pool.items() if v["diff"] <= max_diff}
-    if not filtered: filtered = pool
-    name = random.choice(list(filtered.keys()))
-    return {"name": name, **filtered[name]}
+    if filtered:
+        name = random.choice(list(filtered.keys()))
+        return {"name": name, **filtered[name]}
+    # Nothing in the pool sits at or below the caller's ceiling. The old code answered with the whole
+    # pool anyway, so a caller asking for difficulty 1 or less could be handed a 9 and never told. The
+    # closest encounter is returned instead, and the override is named in the result.
+    name, entry = min(pool.items(), key=lambda kv: (kv[1]["diff"], kv[0]))
+    return {"name": name, **entry,
+            "warnings": [f"no encounter at or below difficulty {max_diff}."
+                         f" {name!r} is the closest at {entry['diff']}"]}
 
 async def run_tick(session_id: int = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID

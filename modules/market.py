@@ -35,10 +35,16 @@ PRICE_MIN_MULT, PRICE_MAX_MULT = 0.5, 2.0
 
 
 def market_index(pairs: list) -> float:
-    """Pure: mean(current/base) over commodity pairs. 1.0 = prices at base."""
-    if not pairs:
+    """Pure: mean(current/base) over commodity pairs. 1.0 = prices at base.
+
+    Both the sum and the count run over the pairs that have a base: the old count
+    included a zero-base pair the sum had skipped, and an all-zero input returned
+    0.0 where the contract says 1.0.
+    """
+    usable = [(base, cur) for base, cur in pairs if base]
+    if not usable:
         return 1.0
-    return sum(cur / base for base, cur in pairs if base) / max(1, len(pairs))
+    return sum(cur / base for base, cur in usable) / len(usable)
 
 
 async def get_market_index(session_id: int | None = None) -> float:

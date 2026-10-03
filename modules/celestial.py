@@ -23,7 +23,7 @@ from typing import Any
 
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info
 
 
 # ─── Visibility Levels ──────────────────────────────────────────
@@ -43,9 +43,29 @@ VIS_ORDER = ["uncharted", "scanned", "surveyed", "explored", "colonized"]
 # SYSTEM REGISTRY — ported from system-registry.js
 # ═══════════════════════════════════════════════════════════════
 
-async def query_systems(session_id: int, filters: dict | None = None) -> list[dict]:
-    """Query systems by filters. Ported from SystemRegistry.querySystems()."""
+#: The filter keys `query_systems` can answer, mapped to the column each one reads. The SELECT below
+#: returns exactly these. `sector` and `threat` are not among them, and a filter naming one of those
+#: used to match nothing at all rather than say so.
+SYSTEM_FILTER_KEYS = {
+    "system_name": "system_name",
+    "faction": "controlling_faction",
+    "controlling_faction": "controlling_faction",
+    "status": "status",
+    "fleet_presence": "fleet_presence",
+    "contested_by": "contested_by",
+}
+
+
+async def query_systems(session_id: int, filters: dict | None = None):
+    """Query systems by filters. Ported from SystemRegistry.querySystems().
+
+    @returns a list of rows, or a dict naming a filter this function cannot answer.
+    """
     if filters is None: filters = {}
+    unknown = sorted(k for k in filters if k not in SYSTEM_FILTER_KEYS)
+    if unknown:
+        return {"error": f"unsupported system filter(s): {', '.join(unknown)}",
+                "available": sorted(SYSTEM_FILTER_KEYS)}
     rows = await Database.fetch(
         "SELECT system_name, controlling_faction, status, fleet_presence, "
         "contested_by FROM maya_rp.territory WHERE session_id = $1 ORDER BY system_name",
@@ -57,9 +77,7 @@ async def query_systems(session_id: int, filters: dict | None = None) -> list[di
     for sys in systems:
         match = True
         for key, val in filters.items():
-            sys_val = sys.get(key) or sys.get({"sector": "sector", "faction": "controlling_faction",
-                                               "status": "status", "threat": "threat_level"}.get(key, key))
-            if sys_val != val:
+            if sys.get(SYSTEM_FILTER_KEYS[key]) != val:
                 match = False
                 break
         if match:
@@ -320,18 +338,34 @@ async def get_visibility(session_id: int, system_name: str) -> dict:
     return {"level": level, **VISIBILITY_LEVELS[level], "status": s}
 
 
-async def reveal_system(session_id: int, system_name: str, level: str = "scanned"):
-    """Reveal a system. Ported from FogOfWar.revealSystem()."""
+async def reveal_system(session_id: int, system_name: str, level: str = "scanned") -> dict:
+    """Reveal a system. Ported from FogOfWar.revealSystem().
+
+    @returns what the call did. It used to return nothing at all, so a caller could not tell a
+    reveal that raised the level from one that changed nothing, and the territory write below is a
+    political status, not only a visibility one.
+    """
     existing = await get_visibility(session_id, system_name)
-    old_idx = VIS_ORDER.index(existing.get("level", "uncharted"))
+    old_level = existing.get("level", "uncharted")
+    old_idx = VIS_ORDER.index(old_level)
     new_idx = VIS_ORDER.index(level) if level in VIS_ORDER else -1
-    if new_idx > old_idx:
-        # Update territory status if exists
-        await Database.execute(
-            "UPDATE maya_rp.territory SET status = $1 WHERE session_id = $2 AND system_name = $3",
-            "explored" if level in ("surveyed", "explored") else "contested" if level == "scanned" else "controlled",
-            session_id, system_name,
-        )
+    if new_idx <= old_idx:
+        return {"revealed": False, "level": old_level, "requested": level,
+                "reason": f"'{level}' is not above '{old_level}'"}
+
+    # `territory.status` is a CHECK-constrained political column (controlled, contested, besieged,
+    # lost, abandoned, neutral) and get_visibility reads the fog level back out of it. The old
+    # mapping wrote "explored", which the constraint rejects, so every reveal to `surveyed` or
+    # `explored` raised CheckViolationError. It also wrote "contested" for a plain scan, which reads
+    # back as `explored` and marks a political contest nobody asked for.
+    status = {"colonized": "controlled", "explored": "contested"}.get(level, "neutral")
+    await Database.execute(
+        "UPDATE maya_rp.territory SET status = $1 WHERE session_id = $2 AND system_name = $3",
+        status, session_id, system_name,
+    )
+    read_back = (await get_visibility(session_id, system_name)).get("level")
+    return {"revealed": True, "level": level, "previous_level": old_level, "status": status,
+            "read_back": read_back}
 
 
 async def get_visible_systems(session_id: int, min_level: str = "scanned") -> list[dict]:
@@ -456,7 +490,10 @@ async def get_system_detail(session_id: int, system_name: str) -> dict | None:
     t = dict(territory)
     planets = await get_planets_in_system(session_id, system_name)
     routes = await get_routes(session_id)
-    routes_from = [r for r in routes if r["origin"] == system_name]
+    # A lane is read as bidirectional everywhere else in this module — dijkstra_route and
+    # get_reachable_systems both build both directions — so a lane arriving here belongs here too.
+    routes_from = [r for r in routes
+                   if system_name in (r.get("origin"), r.get("destination"))]
     return {
         "name": system_name, "faction": t.get("controlling_faction"),
         "status": t.get("status"), "fleet": t.get("fleet_presence"),
@@ -477,5 +514,5 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
         info("celestial", f"Tick: {stats['systems']} systems, {stats['planets']} planets, {stats['colonies']} colonies")
         return stats
     except Exception as e:
-        info("celestial", f"Error: {e}")
+        error("celestial", f"tick failed for session {session_id}: {e}")
         return {"error": str(e)}

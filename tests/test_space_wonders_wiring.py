@@ -27,7 +27,18 @@ async def _clean_story_log():
     ceiling = await Database.fetchval(
         "SELECT COALESCE(max(id), 0) FROM maya_rp.story_log WHERE session_id=5")
     yield
-    await Database.execute("DELETE FROM maya_rp.story_log WHERE session_id=5 AND id > $1", ceiling)
+    # Delete by id, and only rows this module's code path writes. A ceiling delete is what destroyed 169
+    # rows of session-5 events in another reviewer's test today: he reused a story_log ceiling against the
+    # events table, which numbers independently. This one is scoped to one table, one session, one ceiling
+    # AND the two titles explore_anomaly produces, so it cannot reach a row it did not cause. The rule from
+    # that incident is simple: a test may only delete what it created, by id.
+    written = await Database.fetch(
+        "SELECT id FROM maya_rp.story_log WHERE session_id=5 AND id > $1"
+        " AND (title LIKE 'Anomaly%' OR category = 'anomaly')", ceiling)
+    if written:
+        await Database.execute(
+            "DELETE FROM maya_rp.story_log WHERE id = ANY($1::bigint[])",
+            [row["id"] for row in written])
     await Database.close()
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]

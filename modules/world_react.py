@@ -66,7 +66,7 @@ async def run_tick(session_id: int = None) -> dict:
     """Count the reactions whose day has come.
 
     Deliberately does NOT surface them. The consumer is
-    `core/master_briefing.get_due`, and a tick that marked them surfaced first
+    `get_due` in this module, called by `core/master_briefing`, and a tick that marked them surfaced first
     would leave the briefing with nothing to show. That the briefing never calls
     `surface` either is reported to the lead: with no caller, the same three
     reactions are due in every briefing.

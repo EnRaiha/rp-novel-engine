@@ -16,7 +16,8 @@ capped at three and ordered by the day it surfaces; and `run_tick` counts
 instead of consuming.
 
 Deliberately NOT changed, and reported to the lead: `run_tick` does not surface
-the reactions it counts. The consumer is `core/master_briefing.get_due`, so a
+the reactions it counts. The consumer is `core.master_briefing`, which imports `get_due` from this
+# module (`core/master_briefing.py:50`), so a
 tick that marked them surfaced first would leave the briefing with nothing to
 show. Nothing calls `surface` either, which is why the same three reactions are
 due in every briefing — that belongs to the briefing, not here.

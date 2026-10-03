@@ -4,7 +4,7 @@
 Narration says "we sail" — the ENGINE books the days.
 Two canonical rates, both evidence-anchored:
 
-  GRID_HOURS_PER_UNIT = 24.0   (avg travel_time_hours / distance across sector_connections)
+  GRID_HOURS_PER_UNIT = 24.0   (the lane law, owned by modules.economy_physics)
   LY_PER_DAY          = 710.0  (canon: Serein->Mastika 28,400 ly in 40 days)
 
 register(): create a voyage, automagically compute travel time + arrival day from
@@ -18,8 +18,12 @@ from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import info
+from modules.economy_physics import HOURS_PER_DAY, HOURS_PER_UNIT
 
-GRID_HOURS_PER_UNIT = 24.0        # engine-derived: sector_connections avg ~28.8h/1.2u
+# One owner for the lane law: `economy_physics` derives it from all 4,704
+# ordinary session-3 lanes and `unity.py` imports the same constant. This module
+# restated 24.0 under its own name, which is the drift `unity.py` calls a defect.
+GRID_HOURS_PER_UNIT = HOURS_PER_UNIT
 LY_PER_DAY = 710.0                # canon anchor: 28,400 ly / 40 days
 
 # ── Gate tolls (2026-08-15 Izzat canon) ──
@@ -86,7 +90,7 @@ async def wormhole_jump(name: str, session_id: int | None = None) -> dict:
     if row["status"] == "collapsed":
         raise ValueError(f"Wormhole {row['name']} has COLLAPSED — no passage.")
     dist = euclidean((row["ex"] or 0, row["ey"] or 0), (row["xx"] or 0, row["xy"] or 0))
-    travel_days = dist * _num(row["travel_multiplier"], 0.1) * GRID_HOURS_PER_UNIT / 24.0
+    travel_days = dist * _num(row["travel_multiplier"], 0.1) * GRID_HOURS_PER_UNIT / HOURS_PER_DAY
     return {"id": row["id"], "name": row["name"], "status": row["status"],
             "stability": _num(row["stability"], 1.0), "entry": row["entry_name"],
             "exit": row["exit_name"], "travel_days": travel_days,
@@ -369,7 +373,7 @@ async def compute_travel(
     if distance_ly is not None:
         if distance_ly < 0:
             raise ValueError(f"distance_ly cannot be negative, got {distance_ly}")
-        travel_hours = distance_ly / LY_PER_DAY * 24.0
+        travel_hours = distance_ly / LY_PER_DAY * HOURS_PER_DAY
         return {"travel_hours": travel_hours, "travel_days": distance_ly / LY_PER_DAY,
                 "distance_ly": distance_ly, "distance_units": None, "mode": "ly"}
 
@@ -377,7 +381,7 @@ async def compute_travel(
         if distance_units < 0:
             raise ValueError(f"distance_units cannot be negative, got {distance_units}")
         travel_hours = distance_units * GRID_HOURS_PER_UNIT
-        return {"travel_hours": travel_hours, "travel_days": travel_hours / 24.0,
+        return {"travel_hours": travel_hours, "travel_days": travel_hours / HOURS_PER_DAY,
                 "distance_ly": None, "distance_units": distance_units, "mode": "units"}
 
     # Coordinate-based euclidean (grid space) — z-aware (2026-08-14)
@@ -389,14 +393,14 @@ async def compute_travel(
         if za is not None and zb is not None and za != zb:
             gate = await gate_crossing(za, zb, session_id)
             travel_hours += gate["travel_time_hours"]
-            return {"travel_hours": travel_hours, "travel_days": travel_hours / 24.0,
+            return {"travel_hours": travel_hours, "travel_days": travel_hours / HOURS_PER_DAY,
                     "distance_ly": None, "distance_units": dist + gate["distance"],
                     "mode": "gate", "via_gate": gate["name"],
                     "hidden": gate.get("hidden", False),
                     "lane_type": gate["lane_type"],
                     "toll_credits": gate["toll_credits"],
                     "pirate_density": gate["pirate_density"]}
-        return {"travel_hours": travel_hours, "travel_days": travel_hours / 24.0,
+        return {"travel_hours": travel_hours, "travel_days": travel_hours / HOURS_PER_DAY,
                 "distance_ly": None, "distance_units": dist, "mode": "coord"}
 
     # Fallback: try sector_connections for a direct link.
@@ -427,7 +431,7 @@ async def compute_travel(
                 session_id, o_id or d_id)
         if row and row["travel_time_hours"]:
             return {"travel_hours": row["travel_time_hours"],
-                    "travel_days": row["travel_time_hours"] / 24.0,
+                    "travel_days": row["travel_time_hours"] / HOURS_PER_DAY,
                     "distance_ly": None, "distance_units": row["distance"], "mode": "link"}
 
     raise ValueError(f"Cannot compute travel between {origin!r} and {destination!r} — "
@@ -575,7 +579,7 @@ async def register(
                              "(e.g. 10,480,3 → 450,450,1) — use normal travel within a plane")
         vc = await void_crossing_cost(za, zb, fleet, session_id)
         dist_void = euclidean((a_c[0], a_c[1]), (b_c[0], b_c[1])) if a_c and b_c else (t.get("distance_units") or 0)
-        travel_days = dist_void * vc["hours_per_unit"] / 24.0
+        travel_days = dist_void * vc["hours_per_unit"] / HOURS_PER_DAY
         arrive_day = gd + int(math.ceil(travel_days))
         transit_kind = "void"
         transit_name = f"void z{za}→z{zb}"

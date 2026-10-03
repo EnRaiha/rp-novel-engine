@@ -51,8 +51,11 @@ class Config:
     # ─── Database ───────────────────────────────────────────────
     # RP_ENGINE has OWNER on maya_rp schema. Roast me for hardcoding.
     # This is a single-user private Tailscale game engine.
+    # Addressed by its Tailscale name, per the addressing convention: `100.65.243.60:5432` is the
+    # fallback and stays in this comment rather than in the DSN. Measured before the change: the
+    # name resolves through MagicDNS and the engine connects and queries through it.
     DSN: ClassVar[str] = (
-        "postgres://rp_engine:REDACTED@100.65.243.60:5432/maya_memory"
+        "postgres://rp_engine:REDACTED@postgresql.tail73711d.ts.net:5432/maya_memory"
         "?search_path=maya_rp,public"
     )
     DB_MIN_SIZE: ClassVar[int] = 1
@@ -158,11 +161,14 @@ class Config:
 
     @classmethod
     def summary(cls) -> str:
+        # The host comes from the DSN rather than a second copy of it, so a move of the database
+        # cannot leave the summary pointing at the old address.
+        host = cls.DSN.split("@", 1)[-1].split("/", 1)[0]
         lines = [
             f"╔══ RP Engine Config ════════════════════════",
             f"║ Session:     {cls.SESSION_ID} ({cls.RP_UNIVERSE})",
             f"║ RP Mode:     {'ACTIVE' if cls.RP_MODE_ACTIVE else 'OFF'} ({cls.RP_TONE})",
-            f"║ Database:    postgres://rp_engine@100.65.243.60/maya_memory",
+            f"║ Database:    postgres://rp_engine@{host}/maya_memory",
             f"║ Schema:      maya_rp (260 tables)",
             f"║ Time mult:   {cls.TIME_MULTIPLIER}x",
             f"║ Modules on:  {len(cls.active_modules())}",

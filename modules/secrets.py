@@ -17,7 +17,7 @@ async def plant(secret_type: str, holder_id: int, content: str, hidden_from: lis
     if session_id is None: session_id = Config.SESSION_ID
     gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)
     sid = await Database.fetchval("INSERT INTO maya_rp.secrets(session_id,secret_type,holder_character_id,content,hidden_from_ids,discovery_trigger,consequence_description,planted_game_day,auto_reveal_game_day,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'active') RETURNING id", session_id,secret_type,holder_id,content,(hidden_from or []),trigger,consequence,gd,auto_reveal_day)
-    info("secrets", f"Planted: {secret_type}", holder=holder_id)
+    info("secrets", f"Planted: {secret_type} for holder {holder_id}")
     return sid
 
 async def check_discovery(context: str, session_id: int = None) -> list[dict]:
@@ -32,7 +32,9 @@ async def check_discovery(context: str, session_id: int = None) -> list[dict]:
         auto = s.get("auto_reveal_game_day") and gd >= s["auto_reveal_game_day"]
         if matches >= len(trigger)*0.5 or auto:
             await Database.execute("UPDATE maya_rp.secrets SET status='revealed',revealed_game_day=$1,revelation_context=$2 WHERE id=$3", gd, context[:200], s["id"])
-            hn = await Database.fetchval("SELECT name FROM maya_rp.characters WHERE id=$1", s["holder_character_id"])
+            hn = await Database.fetchval(
+                "SELECT name FROM maya_rp.characters WHERE id=$1 AND session_id=$2",
+                s["holder_character_id"], session_id)
             discovered.append({"secret_id":s["id"],"type":s["secret_type"],"holder":hn,"content":s["content"],"consequence":s["consequence_description"]})
     return discovered
 

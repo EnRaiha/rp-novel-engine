@@ -697,6 +697,11 @@ async def set_stage(session_id: int | None, stage: str) -> dict[str, Any]:
     if stage not in STAGES:
         raise ValueError(f"unknown stage {stage!r}; expected one of {', '.join(STAGES)}")
     sid = _session_key(session_id)
+    # A frozen campaign is reference. `audit` has refused writes into one since the
+    # session work and these four did not, so a stage change, a completed beat, a
+    # bought exemption or a suspicion bump could edit the campaign that is supposed
+    # to be read-only. The guard is the same call, on every writer.
+    _refuse_frozen(sid)
     await state(sid)  # ensure the row exists
     row = await Database.fetchrow(
         "UPDATE maya_rp.ooc_system_state SET arc_stage=$2, updated_at=now() WHERE session_id=$1"
@@ -877,6 +882,11 @@ async def complete_milestone(
     if not name:
         raise ValueError("complete_milestone needs a milestone name")
     sid = _session_key(session_id)
+    # A frozen campaign is reference. `audit` has refused writes into one since the
+    # session work and these four did not, so a stage change, a completed beat, a
+    # bought exemption or a suspicion bump could edit the campaign that is supposed
+    # to be read-only. The guard is the same call, on every writer.
+    _refuse_frozen(sid)
     milestone = await Database.fetchrow(
         "SELECT id, name, trait, stage, required, rpp_reward, latch_ruleset FROM maya_rp.ooc_milestones"
         " WHERE session_id=$1 AND name=$2",
@@ -1065,6 +1075,11 @@ async def buy_exemption(
             "exemption expires the moment it is bought"
         )
     sid = _session_key(session_id)
+    # A frozen campaign is reference. `audit` has refused writes into one since the
+    # session work and these four did not, so a stage change, a completed beat, a
+    # bought exemption or a suspicion bump could edit the campaign that is supposed
+    # to be read-only. The guard is the same call, on every writer.
+    _refuse_frozen(sid)
     rule = await Database.fetchrow(
         "SELECT id, delta FROM maya_rp.ooc_rules WHERE id=$1", rule_id
     )
@@ -1238,6 +1253,11 @@ async def bump_suspicion(
     @returns the observer's new suspicion.
     """
     sid = _session_key(session_id)
+    # A frozen campaign is reference. `audit` has refused writes into one since the
+    # session work and these four did not, so a stage change, a completed beat, a
+    # bought exemption or a suspicion bump could edit the campaign that is supposed
+    # to be read-only. The guard is the same call, on every writer.
+    _refuse_frozen(sid)
     target = observer if observer is not None else await observer_id(sid)
     if target is None:
         return {"ok": False, "reason": "no_observer"}

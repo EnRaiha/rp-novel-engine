@@ -252,3 +252,58 @@ class TestTheMirrorDoesNotTakeTheLedgerDown:
         entries = json.loads(mirror.read_text())
         assert entries[0]["sessionId"] == scratch_session
         assert entries[0]["stage"] == "lockdown"
+
+
+class TestEveryWriterRefusesAFrozenCampaign:
+    """`audit` refused writes into a frozen campaign. Four other writers did not.
+
+    A frozen campaign is reference: readable at will, writable only with GM MAYA
+    maintenance armed. `_refuse_frozen` was called on one path, so a stage change, a
+    completed beat, a bought exemption and a suspicion bump could each edit the
+    campaign that is supposed to be read-only.
+
+    The freeze is simulated by patching `core.session.is_frozen`, so the real
+    `~/.config/rp-engine/frozen_sessions` is never touched: three reviewers run this
+    suite at once and none of them should see another's edit to that file.
+    """
+
+    @pytest.fixture()
+    def frozen(self, monkeypatch):
+        import core.session as session_mod
+
+        monkeypatch.setattr(session_mod, "is_frozen", lambda sid: True)
+        monkeypatch.setattr(ooc, "_maintenance_active", lambda: False)
+        return True
+
+    async def test_set_stage_is_refused(self, scratch_session, frozen):
+        await ooc.state(scratch_session)  # the row must exist for the write to matter
+        with pytest.raises(ooc.FrozenSession):
+            await ooc.set_stage(scratch_session, "selective")
+
+    async def test_complete_milestone_is_refused(self, scratch_session, frozen):
+        with pytest.raises(ooc.FrozenSession):
+            await ooc.complete_milestone(scratch_session, "any-beat")
+
+    async def test_buy_exemption_is_refused(self, scratch_session, frozen):
+        with pytest.raises(ooc.FrozenSession):
+            await ooc.buy_exemption(scratch_session, "any-rule", "any_action")
+
+    async def test_bump_suspicion_is_refused(self, scratch_session, frozen):
+        with pytest.raises(ooc.FrozenSession):
+            await ooc.bump_suspicion(scratch_session, observer=1, delta=5)
+
+    async def test_reading_a_frozen_campaign_is_still_allowed(self, scratch_session, frozen):
+        """The guard refuses writes, not reads."""
+        row = await ooc.state(scratch_session)
+        assert row["session_id"] == scratch_session
+        assert await ooc.milestones(scratch_session) == []
+
+    async def test_arming_maintenance_lets_the_write_through(self, scratch_session, monkeypatch):
+        """The refusal must not close the documented way in."""
+        import core.session as session_mod
+
+        monkeypatch.setattr(session_mod, "is_frozen", lambda sid: True)
+        monkeypatch.setattr(ooc, "_maintenance_active", lambda: True)
+        await ooc.state(scratch_session)
+        row = await ooc.set_stage(scratch_session, "selective")
+        assert row["arc_stage"] == "selective"

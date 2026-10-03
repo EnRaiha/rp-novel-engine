@@ -10,7 +10,7 @@ Replaces the old random-drift tick with core.decision_models:
 from __future__ import annotations
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info
 from core.decision_models import (detect_pirate_group, predict_pirate_policy,
                                   predict_pirate_survival, log_decision)
 
@@ -62,7 +62,7 @@ async def run_tick(session_id: int | None = None) -> dict:
         info("faction_ai", f"Tick: {decisions} pirate decisions (ML/rules)")
         return {"factions": len(factions), "decisions": decisions}
     except Exception as e:
-        info("faction_ai", f"Error: {e}")
+        error("faction_ai", f"tick failed for session {session_id}: {e}")
         return {"error": str(e)}
 
 

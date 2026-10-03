@@ -39,12 +39,15 @@ async def objectives_to_prompt(session_id: int = None) -> str:
 async def run_tick(session_id: int = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
     try:
+        # The EventBus auto-tracking existed and was never registered, so a
+        # quarterly task could only advance when a caller pushed it by hand.
+        await _register_event_listeners()
         expired = await Database.fetch("SELECT id,hook_type FROM maya_rp.narrative_hooks WHERE session_id=$1 AND status='active' AND created_at IS NOT NULL AND created_at < NOW() - INTERVAL '30 days'", session_id)
         for e in expired:
-            await Database.execute("UPDATE maya_rp.narrative_hooks SET status='expired' WHERE id=$1", e["id"])
+            await Database.execute("UPDATE maya_rp.narrative_hooks SET status='expired' WHERE id=$1 AND session_id=$2", e["id"], session_id)
         return {"expired":len(expired)}
     except Exception as e:
-        info("objectives", f"Error: {e}")
+        error("objectives", f"tick error: {e}")
         return {"error": str(e)}
 
 
@@ -65,6 +68,26 @@ QUARTERLY_TASK_POOL = [
 ]
 
 BLUEPRINT_TIERS = [1, 2, 3, 4]  # gacha draw weights: rare = high tier
+
+#: The listener kinds that are not pool kinds. A built ship advances the closest
+#: thing the pool has to a construction objective, which is Development.
+KIND_ALIASES = {"build": "dev"}
+
+#: `EventBus.on` APPENDS, so registering per tick would stack a duplicate
+#: listener every tick and multiply every bump. One flag, one registration.
+_LISTENERS_REGISTERED = False
+
+
+def task_titles_for(kind: str) -> list[str]:
+    """The pool titles a progress kind belongs to.
+
+    The objective text is localised BM, so a text probe for the English kind
+    missed: "kills" matched nothing ("Sweep X hostiles di sempadan") and
+    "build" matched nothing ("Development X sistem ke tier 3"). The pool's own
+    `kind` field is the mapping, and the title carries it into the query.
+    """
+    wanted = KIND_ALIASES.get(kind, kind)
+    return [t["title"] for t in QUARTERLY_TASK_POOL if t["kind"] == wanted]
 
 
 async def generate_quarterly_tasks(session_id: int = None) -> dict:
@@ -97,9 +120,14 @@ async def update_quarterly_progress(session_id: int = None, kind: str = None, am
     if session_id is None: session_id = Config.SESSION_ID
     if not kind:
         return {"error": "kind required (kills/survey/trade/credits/duels/wrecks/dev/crew)"}
+    if amount < 1:
+        raise ValueError(f"amount must be at least 1, got {amount}")
+    titles = task_titles_for(kind)
     tasks = await Database.fetch(
         "SELECT id, title, target_value, progress, reward_value FROM maya_rp.quarterly_tasks "
-        "WHERE session_id=$1 AND status='active' AND objective ILIKE '%'||$2||'%'", session_id, kind)
+        "WHERE session_id=$1 AND status='active' "
+        "AND (title = ANY($3::text[]) OR objective ILIKE '%'||$2||'%')",
+        session_id, kind, titles)
     completed = []
     for t in tasks:
         np_ = (t["progress"] or 0) + amount
@@ -133,8 +161,12 @@ async def quarterly_tasks_view(session_id: int = None) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 async def _register_event_listeners() -> None:
-    """Daftar listeners untuk auto-update quarterly progress."""
+    """Daftar listeners untuk auto-update quarterly progress. Registers ONCE."""
     from core.events import EventBus
+
+    global _LISTENERS_REGISTERED
+    if _LISTENERS_REGISTERED:
+        return
 
     async def _on_ship_built(data):
         ship = data.get("ship") or {}
@@ -158,24 +190,25 @@ async def _register_event_listeners() -> None:
             EventBus.on(evt, cb)
         except Exception as e:  # noqa: BLE001 - reported below
             error("objectives", f"_register_event_listeners: {e}")
+    _LISTENERS_REGISTERED = True
 
 
 async def _bump_kind(session_id: int, kind: str, amount: int = 1) -> dict:
-    """Kemaskini progress tasks ikut kind (kills/survey/trade/credits/duels/wrecks/dev/crew/build)."""
+    """Kemaskini progress tasks ikut kind (kills/survey/trade/credits/duels/wrecks/dev/crew/build).
+
+    One matcher, shared with `update_quarterly_progress`: the pool's own kind
+    mapping. The three text probes this replaced could not match a localised
+    objective, and every live task carries `task_type = 'generic'`, so the probe
+    was the only path that could ever have worked.
+    """
+    titles = task_titles_for(kind)
     tasks = await Database.fetch(
         "SELECT id, task_type, objective, title, target_value, current_progress, required_amount, reward_blueprint, progress "
-        "FROM maya_rp.quarterly_tasks WHERE session_id=$1 AND status='active'", session_id)
+        "FROM maya_rp.quarterly_tasks WHERE session_id=$1 AND status='active' "
+        "AND (title = ANY($3::text[]) OR objective ILIKE '%'||$2||'%')",
+        session_id, kind, titles)
     completed = []
     for t in tasks:
-        matches = False
-        if kind == "duels" and (t.get("task_type") == "duels" or (t.get("objective") or "").lower().find("duel") >= 0):
-            matches = True
-        elif kind == "kills" and (t.get("task_type") == "kill_pirates" or (t.get("objective") or "").lower().find("kill") >= 0):
-            matches = True
-        elif kind == "build" and (t.get("task_type") == "build_tier" or (t.get("objective") or "").lower().find("build") >= 0):
-            matches = True
-        if not matches:
-            continue
         cur = (t.get("current_progress") or t.get("progress") or 0) + amount
         req = t.get("required_amount") or t.get("target_value") or 0
         done = req > 0 and cur >= req

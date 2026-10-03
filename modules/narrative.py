@@ -2,6 +2,8 @@
 import random, json
 from datetime import datetime, timezone
 from core.db import Database
+from core.config import Config
+from core.log import info
 from core.utils import calc_game_days
 from core.events import EventBus
 
@@ -15,14 +17,24 @@ async def _story_entry(session_id: int, cat: str, title: str, content: str, imp:
         "INSERT INTO events (session_id, event_type, title, description, importance, tags) VALUES ($1,'narrative',$2,$3,$4,$5)",
         session_id, title, content, imp, json.dumps(["narrative", cat]))
 
-async def run_tick(session_id: int = 3):
+async def run_tick(session_id: int | None = None) -> dict:
+    """Ambient colour and narrative hooks for one campaign.
+
+    The default was the literal session 3, the frozen reference campaign, so a tick run without an
+    argument wrote story entries into the archive. Every path answers with counts now; the tick used
+    to return None and end with a print.
+    """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     row = await Database.fetchrow("SELECT last_tick_at FROM resources WHERE session_id=$1", session_id)
     if not row or not row.get("last_tick_at"):
-        return
+        return {"game_days": 0.0, "ambient": 0, "hooks": 0}
     gd = calc_game_days(row["last_tick_at"])
     if gd < 0.01:
-        return
+        return {"game_days": gd, "ambient": 0, "hooks": 0}
 
+    ambient = 0
+    hooks_made = 0
     # Get state
     res = await Database.fetchrow("SELECT credits FROM resources WHERE session_id=$1", session_id)
     crisis = await Database.fetchrow(
@@ -58,6 +70,7 @@ async def run_tick(session_id: int = 3):
             c = "Deep space sensors detect rhythmic pulses from an uncharted nebula."
         if t and c:
             await _story_entry(session_id, cat, t, c, 1)
+            ambient += 1
 
     # Narrative hooks
     hooks = await Database.fetch(
@@ -76,5 +89,7 @@ async def run_tick(session_id: int = 3):
             "VALUES ($1,$2,$3,'active')",
             session_id, ht, desc)
         await _story_entry(session_id, "narrative", f"Hook: {ht.title()}", desc, 2)
+        hooks_made += 1
 
-    print(f"  Narrative: ambient events + hooks")
+    info("narrative", f"Tick: {ambient} ambient, {hooks_made} new hooks, {active} already active")
+    return {"game_days": gd, "ambient": ambient, "hooks": hooks_made, "hooks_active": active}

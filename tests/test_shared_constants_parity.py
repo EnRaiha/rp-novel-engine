@@ -45,6 +45,25 @@ class TestTheLaneLaw:
         assert voyage.HOURS_PER_UNIT == economy_physics.HOURS_PER_UNIT
         assert voyage.HOURS_PER_DAY == economy_physics.HOURS_PER_DAY
 
+    def test_voyage_imports_them_rather_than_restating_them(self):
+        """Value equality passes today even if the constant is restated with the same number.
+
+        A restatement drifts the moment someone edits one copy. This reads the source and requires the
+        import, which is the structural fact the other assertion cannot see. My first report of a
+        weakness here was wrong: I quoted a line from the module docstring as if it were an assignment.
+        """
+        import inspect
+
+        from modules import voyage
+
+        source = inspect.getsource(voyage)
+        assert "from modules.economy_physics import" in source, (
+            "voyage does not import the lane constants")
+        header = next(line for line in source.split("\n")
+                      if "from modules.economy_physics import" in line)
+        for name in ("HOURS_PER_UNIT", "HOURS_PER_DAY"):
+            assert name in header, f"{name} is not imported from economy_physics: {header}"
+
 
 class TestTheCouncilAgendas:
     def test_both_names_are_one_object(self):

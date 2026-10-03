@@ -18,19 +18,35 @@ async def tick_disasters(session_id: int) -> list[dict]:
         damage = d["base_damage"] * d["severity"] * 0.3
 
         if d["category"] == "economic":
-            await Database.execute("UPDATE maya_rp.resources SET credits=GREATEST(0, credits-$1::bigint) WHERE session_id=$2", int(damage), session_id)
-            events.append({"type": "disaster", "title": "Economic Damage", "desc": f"Market drains {int(damage)} credits"})
+            row = await Database.fetchrow(
+                "UPDATE maya_rp.resources SET credits=GREATEST(0, credits-$1::bigint) "
+                "WHERE session_id=$2 RETURNING credits", int(damage), session_id)
+            events.append({"type": "disaster", "title": "Economic Damage",
+                           "desc": f"Market drains {int(damage)} credits",
+                           "applied": row is not None})
         elif d["category"] == "plague":
             # Plague hits TERRITORY population (unified model) — not colonies.
-            await Database.execute(
+            row = await Database.fetchrow(
                 "UPDATE maya_rp.territory SET population=GREATEST(0, population-$1::bigint) "
-                "WHERE session_id=$2 AND controlling_faction='Setia Empire' AND status != 'abandoned'",
+                "WHERE session_id=$2 AND controlling_faction='Setia Empire' AND status != 'abandoned' "
+                "RETURNING id",
                 int(damage * 100), session_id)
             events.append({"type": "disaster", "title": "Plague",
-                           "desc": f"Pathogen spreads — {int(damage * 100)} population lost"})
+                           "desc": f"Pathogen spreads — {int(damage * 100)} population lost",
+                           "applied": row is not None})
         else:
-            await Database.execute("UPDATE maya_rp.ships SET hull_current=GREATEST(0, hull_current-$1::int) WHERE session_id=$2 AND status='active'", int(damage), session_id)
-            events.append({"type": "disaster", "title": f"{d['category'].title()} Damage", "desc": f"{int(damage)} hull damage applied"})
+            row = await Database.fetchrow(
+                "UPDATE maya_rp.ships SET hull_current=GREATEST(0, hull_current-$1::int) "
+                "WHERE session_id=$2 AND status='active' RETURNING id",
+                int(damage), session_id)
+            events.append({"type": "disaster", "title": f"{d['category'].title()} Damage",
+                           "desc": f"{int(damage)} hull damage applied",
+                           "applied": row is not None})
+        if row is None:
+            # Three UPDATEs matched nothing when the session had no resources row,
+            # no Setia territory or no active ship, and the event still claimed it.
+            info("disasters",
+                 f"{d['name']}: no row in session {session_id} to take {d['category']} damage")
 
         if new_ticks <= 0:
             await Database.execute("UPDATE maya_rp.active_disasters SET status='resolved', ticks_remaining=0 WHERE id=$1", d["id"])

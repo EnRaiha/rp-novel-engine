@@ -1,0 +1,141 @@
+"""Module review tests for modules/disasters.py (2026-10-03).
+
+Every database call is stubbed. A disaster never touches a live row.
+"""
+from __future__ import annotations
+
+import asyncio
+import pathlib
+import sys
+
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import modules.disasters as dis  # noqa: E402
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _disaster(category, ticks=3, severity=2, damage=100):
+    return {"id": 1, "name": f"{category} event", "severity": severity,
+            "ticks_remaining": ticks, "base_damage": damage, "category": category}
+
+
+class _StubDB:
+    def __init__(self, active=(), applied=True):
+        self.active = list(active)
+        self.applied = applied
+        self.reads = []
+        self.writes = []
+
+    async def fetch(self, sql, *args):
+        self.reads.append((sql, args))
+        if "active_disasters" in sql:
+            return self.active
+        return []
+
+    async def fetchrow(self, sql, *args):
+        self.reads.append((sql, args))
+        if "UPDATE maya_rp." in sql:
+            self.writes.append((sql, args))
+            return {"id": 1} if self.applied else None
+        return None
+
+    async def execute(self, sql, *args):
+        self.writes.append((sql, args))
+        return "OK"
+
+
+def test_an_economic_disaster_drains_credits_and_says_it_did(monkeypatch):
+    stub = _StubDB(active=[_disaster("economic")])
+    monkeypatch.setattr(dis, "Database", stub)
+
+    events = _run(dis.tick_disasters(5))
+
+    assert events[0]["applied"] is True, events
+    damage = [args for sql, args in stub.writes if "credits=GREATEST" in sql]
+    assert damage and damage[0][1] == 5
+    assert damage[0][0] == 60        # 100 base * 2 severity * 0.3
+
+
+def test_a_disaster_with_nothing_to_damage_is_reported(monkeypatch):
+    """A session with no resources row booked the loss and moved nothing."""
+    stub = _StubDB(active=[_disaster("economic")], applied=False)
+    monkeypatch.setattr(dis, "Database", stub)
+    logged = []
+    monkeypatch.setattr(dis, "info", lambda *a: logged.append(a[-1]))
+
+    events = _run(dis.tick_disasters(5))
+
+    assert events[0]["applied"] is False, events
+    assert any("no row in session 5" in line for line in logged), logged
+
+
+def test_a_plague_hits_territory_population_only(monkeypatch):
+    stub = _StubDB(active=[_disaster("plague")])
+    monkeypatch.setattr(dis, "Database", stub)
+
+    _run(dis.tick_disasters(3))
+
+    plague = [(sql, args) for sql, args in stub.writes if "population=GREATEST" in sql]
+    assert plague, "the plague hit something else"
+    assert "maya_rp.territory" in plague[0][0]
+    assert plague[0][1][1] == 3
+
+
+def test_any_other_category_hits_active_hulls(monkeypatch):
+    stub = _StubDB(active=[_disaster("solar")])
+    monkeypatch.setattr(dis, "Database", stub)
+
+    events = _run(dis.tick_disasters(3))
+
+    hulls = [(sql, args) for sql, args in stub.writes if "hull_current=GREATEST" in sql]
+    assert hulls and "status='active'" in hulls[0][0]
+    assert events[0]["title"] == "Solar Damage", events
+
+
+def test_the_last_tick_resolves_the_disaster(monkeypatch):
+    stub = _StubDB(active=[_disaster("solar", ticks=1)])
+    monkeypatch.setattr(dis, "Database", stub)
+
+    _run(dis.tick_disasters(3))
+
+    resolved = [sql for sql, _ in stub.writes if "status='resolved'" in sql]
+    counted = [sql for sql, _ in stub.writes if "SET ticks_remaining=$1" in sql]
+    assert resolved and not counted
+
+
+def test_a_running_disaster_counts_down(monkeypatch):
+    stub = _StubDB(active=[_disaster("solar", ticks=4)])
+    monkeypatch.setattr(dis, "Database", stub)
+
+    _run(dis.tick_disasters(3))
+
+    counted = [args for sql, args in stub.writes if "SET ticks_remaining=$1" in sql]
+    assert counted == [(3, 1)], counted
+    assert [sql for sql, _ in stub.writes if "status='resolved'" in sql] == []
+
+
+def test_the_tick_reads_its_own_campaign_only(monkeypatch):
+    stub = _StubDB()
+    monkeypatch.setattr(dis, "Database", stub)
+    out = _run(dis.run_tick(session_id=5))
+    assert out == {"disaster_events": 0}
+    (sql, args), = stub.reads
+    assert "d.session_id=$1" in sql and args == (5,)
+
+
+def test_the_tick_reports_an_error_instead_of_raising(monkeypatch):
+    class _Boom(_StubDB):
+        async def fetch(self, sql, *args):
+            raise RuntimeError("connection reset")
+    monkeypatch.setattr(dis, "Database", _Boom())
+    logged = []
+    monkeypatch.setattr(dis, "info", lambda *a: logged.append(a[-1]))
+    out = _run(dis.run_tick(session_id=3))
+    assert "connection reset" in out["error"]
+    assert any("connection reset" in line for line in logged)

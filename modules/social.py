@@ -18,7 +18,7 @@ from typing import Any
 
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info
 from core import ooc
 
 
@@ -213,7 +213,7 @@ async def shift_bond(
         )
         return {"relationship": row, "type": rtype, "bond": bond}
     except Exception as e:
-        info("social", f"shiftBond error: {e}")
+        error("social", f"shiftBond failed for {a}/{b}: {e}")
         return None
 
 
@@ -242,7 +242,11 @@ async def get_ringleaders(session_id: int, crew_list: list[dict]) -> list[dict]:
             "loyalty": member.get("loyalty_flag", "neutral"),
         })
 
-    max_network = max((r["network_size"] for r in all_data), default=1)
+    max_network = max(1, max((r["network_size"] for r in all_data), default=1))
+    # A crew with no relationships recorded yet has a largest network of zero, and the old
+    # `max(..., default=1)` still returned 0 because the sequence was not empty. Every member then
+    # divided by zero, so `calculate_mutiny_risk` crashed on exactly the fleet that had nothing to
+    # plot: a session whose relationship table is empty.
     return [
         {"crew_id": r["crew_id"], "risk": round((r["network_size"] / max_network) * 100)}
         for r in all_data
@@ -273,19 +277,17 @@ def calculate_loyalty(
     score += (crew_member.get("morale", 50) - 50) * 0.002
     score += (fleet_morale - 50) * 0.001
 
-    traits = crew_member.get("personality_traits") or []
-    if isinstance(traits, str):
-        try:
-            traits = json.loads(traits)
-        except (json.JSONDecodeError, TypeError):
-            traits = []
+    traits = _traits_list(crew_member.get("personality_traits"))
     if "devoted" in traits: score += 0.2
     if "ambitious" in traits: score -= 0.1
     if "traumatized" in traits: score -= 0.05
     if "cynic" in traits: score -= 0.05
 
     for ev in recent_events:
-        et = ev.get("type", "")
+        # `test_crew_loyalty` feeds rows straight out of `social_events`, whose column is
+        # `event_type`, while a caller passing a JS-shaped dict uses `type`. Reading only `type`
+        # meant no event modifier ever applied to a live event.
+        et = ev.get("type") or ev.get("event_type", "")
         if et == "injustice": score -= 0.1
         if et == "hero_recognized" and ev.get("target") == crew_member.get("name"): score += 0.15
         if et == "betrayal_revealed": score -= 0.15
@@ -307,11 +309,16 @@ def _traits_list(traits):
             return []
     return []
 
+
 def classify_loyalty(score: float) -> str:
-    """Classify loyalty flag from score. Ported from LoyaltyEngine.classifyLoyalty()."""
-    if score >= 0.7: return "loyal"
-    if score >= 0.3: return "neutral"
-    if score >= 0.15: return "wavering"
+    """Classify loyalty flag from score. Ported from LoyaltyEngine.classifyLoyalty().
+
+    Read from `LOYALTY_FLAG_LEVELS` rather than restating its four thresholds, so the table and the
+    classifier cannot disagree.
+    """
+    for flag, cfg in sorted(LOYALTY_FLAG_LEVELS.items(), key=lambda kv: -kv[1]["threshold"]):
+        if score >= cfg["threshold"]:
+            return flag
     return "disloyal"
 
 
@@ -460,6 +467,9 @@ def apply_morale_event(
     """
     Apply a morale modifier event.
     Ported from MoraleTracker.applyEvent().
+
+    An unknown event used to read as a zero-point event: the caller got a full result dict, morale
+    did not move, and nothing named the typo.
     """
     base_delta = BASE_MORALE_MODIFIERS.get(event_type, 0)
     delta = round(base_delta * multiplier)
@@ -467,7 +477,7 @@ def apply_morale_event(
     new_morale = max(0, min(100, current_morale + delta))
     new_status = get_morale_status(new_morale)
 
-    return {
+    result = {
         "old_morale": current_morale,
         "new_morale": new_morale,
         "delta": delta,
@@ -477,6 +487,11 @@ def apply_morale_event(
         "descending": new_status["status"] in ("mutiny", "crisis"),
         "effects": new_status["effects"],
     }
+    if event_type not in BASE_MORALE_MODIFIERS:
+        result["applied"] = False
+        result["error"] = f"unknown morale event '{event_type}'"
+        result["available"] = sorted(BASE_MORALE_MODIFIERS)
+    return result
 
 
 def get_tension_narrative(morale: int) -> str:
@@ -497,6 +512,16 @@ def get_pending_events(morale: int) -> list[str]:
     return events
 
 
+def _morale_value(value) -> int:
+    """A crew member at morale 0 is at 0, not at the default.
+
+    `value or 50` read the bottom of the scale as a missing row. `_get_fleet_morale` then averaged
+    that member at 50, and `update_morale` *raised* them to 50 plus the delta, so the crew closest to
+    mutiny was the one the tick quietly promoted.
+    """
+    return 50 if value is None else value
+
+
 async def _get_fleet_morale(session_id: int) -> int:
     """Calculate fleet-wide average morale from crew_roster."""
     rows = await Database.fetch(
@@ -504,7 +529,7 @@ async def _get_fleet_morale(session_id: int) -> int:
     )
     if not rows:
         return 50
-    return round(sum(r["morale"] or 50 for r in rows) / len(rows))
+    return round(sum(_morale_value(r["morale"]) for r in rows) / len(rows))
 
 
 async def update_morale(
@@ -521,7 +546,7 @@ async def update_morale(
     )
     before_sum = after_sum = 0
     for r in rows:
-        before = r["morale"] or 50
+        before = _morale_value(r["morale"])
         new_morale = max(0, min(100, before + delta))
         before_sum += before
         after_sum += new_morale
@@ -574,8 +599,15 @@ def detect_event_type(
 
 
 def get_social_event_config(event_type: str) -> dict:
-    """Get event template config. Ported from SocialEvents.getEventConfig()."""
-    return SOCIAL_EVENT_TYPES.get(event_type, SOCIAL_EVENT_TYPES["banquet"])
+    """Get event template config. Ported from SocialEvents.getEventConfig().
+
+    An unknown type was answered with the banquet template, so a typo produced a banquet that called
+    itself whatever the caller had asked for.
+    """
+    if event_type not in SOCIAL_EVENT_TYPES:
+        return {"error": f"unknown social event type '{event_type}'",
+                "available": sorted(SOCIAL_EVENT_TYPES)}
+    return SOCIAL_EVENT_TYPES[event_type]
 
 
 def _observer_probe(reading: dict, participants: list[dict]) -> dict | None:
@@ -612,11 +644,17 @@ async def generate_social_event(
     if companions is None:
         companions = []
 
+    if event_type not in SOCIAL_EVENT_TYPES:
+        # The banquet template answered for any unknown name, so `feast` gathered a banquet's
+        # agenda and reported the caller's word back as the event type.
+        return {"error": f"unknown social event type '{event_type}'",
+                "available": sorted(SOCIAL_EVENT_TYPES)}
+
     crew = await Database.fetch(
         "SELECT id, name, role, loyalty_flag, personality_traits "
         "FROM maya_rp.crew_roster WHERE session_id = $1", session_id
     )
-    config = SOCIAL_EVENT_TYPES.get(event_type, SOCIAL_EVENT_TYPES["banquet"])
+    config = SOCIAL_EVENT_TYPES[event_type]
     crew_list = [dict(r) for r in crew]
     participants = []
 
@@ -626,9 +664,20 @@ async def generate_social_event(
 
     # Select NPCs
     remaining = [c for c in crew_list if c["name"] not in companions]
-    needed = max(1, config["min"] - len(participants))
 
     npc_participants = _select_event_npcs(event_type, remaining)
+    # `config["min"]` is the event's own claim about attendance. It was read into `needed` and then
+    # dropped, so a rally that asks for thirty crew gathered ten. The type-specific selection stands
+    # and the scene is topped up to the minimum from the crew nobody has picked yet.
+    if len(participants) + len(npc_participants) < config["min"]:
+        chosen = {p["name"] for p in npc_participants}
+        for c in remaining:
+            if len(participants) + len(npc_participants) >= config["min"]:
+                break
+            if c["name"] in chosen:
+                continue
+            npc_participants.append({"name": c["name"], "role": "attendee", "type": "npc"})
+            chosen.add(c["name"])
     participants.extend(npc_participants)
 
     # Companion voice line
@@ -654,10 +703,9 @@ async def generate_social_event(
         beats.append({"type": "companion_weigh_in", "speaker": c_name, "marker": marker, "line": companion_line})
 
     for npc in npc_participants[:3]:
-        traits = npc.get("personality_traits") or ["stoic"]
-        if isinstance(traits, str):
-            try: traits = json.loads(traits)
-            except: traits = ["stoic"]
+        # `_traits_list` already owns "parse the JSON, fall back to nothing", and the inline copy here
+        # used a bare `except:` that swallowed every error class including a KeyboardInterrupt.
+        traits = _traits_list(npc.get("personality_traits")) or ["stoic"]
         personality = traits[0] if traits else "stoic"
         voice = PERSONALITY_VOICES.get(personality, PERSONALITY_VOICES["stoic"])
         beats.append({"type": "dialogue", "speaker": npc["name"], "role": npc.get("role", "crew"),
@@ -770,5 +818,5 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
             "observer_suspicion": reading,
         }
     except Exception as e:
-        info("social", f"Error: {e}")
+        error("social", f"tick failed for session {session_id}: {e}")
         return {"error": str(e)}

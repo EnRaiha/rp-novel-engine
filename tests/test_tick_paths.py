@@ -69,9 +69,15 @@ def test_policy_rule_fallback_per_group():
     assert free["source"].startswith(("ml:", "rules:"))
 
 
-def test_survival_rule_fallback_per_group():
+def test_survival_rule_fallback_per_group(monkeypatch):
+    """The rule path answers with an action when no model can. The ML path answers in the model's
+    own classes (`DEATH`/`LIVE`), and this test claimed to be a rule-path test while the ML path was
+    the one running: sklearn is installed here, so it passed only because both paths happened to
+    speak the action vocabulary. The `source` assertion is what holds it to the path it names."""
+    monkeypatch.setattr("core.decision_models._has_sklearn", lambda: False)
     for g in PIRATE_GROUPS:
         r = predict_pirate_survival(g, 0, 0.5, "queen_offers_alliance")
+        assert r["source"] == f"rules:{g}"
         assert r["class"] in {"den_surrenders", "hostage_trade", "pirate_crew_captured",
                               "pirate_king_captured", "pirate_queen_captured",
                               "queen_offers_alliance", "relic_offer", "tender_of_alliance"}

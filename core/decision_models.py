@@ -65,6 +65,65 @@ def _log(module: str, msg: str):
 
 _cache: dict = {}
 
+def _group_key(group: str) -> str:
+    """One of `PIRATE_GROUPS`; an unknown name falls back to free and says so.
+
+    The model slot already fell back silently, but the bias table and the returned `source` label
+    kept the caller's string, so a typo produced the free model's answer with no bias and called it
+    `ml:hiredd`. The module never raises into the tick, so the fallback stays and the log line is
+    what changes.
+    """
+    if group in PIRATE_GROUPS:
+        return group
+    _log("decision_models", f"unknown pirate group {group!r}; using {DEFAULT_GROUP}")
+    return DEFAULT_GROUP
+
+
+def _label_map(model: dict) -> dict[str, int]:
+    """{label: output column} for one loaded model.
+
+    The classifier's own `classes_` is the authority for what its columns mean. The pickles carry a
+    separate label map (`labels`, `act_map` or `action_map`, depending on the training script of the
+    day) and the module trusted it in both directions, so the shipped survival model, which
+    classifies `['DEATH', 'LIVE']`, decoded its predictions through an `action_map` naming eight raid
+    actions: the crew's fate came back as an action name and the per-group bias multiplied an
+    outcome column with a feature index. A map is used only when the classifier's classes live
+    inside its value space; otherwise the classes are the map.
+    """
+    raw_classes = getattr(model.get("clf"), "classes_", None)
+    # `classes_` is a numpy array on a real classifier, so it is iterated rather than truth-tested.
+    classes = [label for label in raw_classes] if raw_classes is not None else []
+    for key in ("labels", "act_map", "action_map"):
+        raw = model.get(key)
+        if isinstance(raw, dict) and raw:
+            mapping = {str(label): int(index) for label, index in raw.items()}
+        elif isinstance(raw, (list, tuple)) and raw:
+            mapping = {str(label): index for index, label in enumerate(raw)}
+        else:
+            continue
+        if classes and not set(classes) <= set(mapping.values()):
+            _log("decision_models", f"{key} does not cover the model's classes {classes};"
+                                    " decoding with the classifier's own classes")
+            break
+        return mapping
+    return {str(label): index for index, label in enumerate(classes)}
+
+
+def _bias_for(bias: dict, labels: dict, columns: int) -> dict:
+    """The bias entries naming a column this prediction has, and a line about the rest.
+
+    A model trained on a subset of the label space carries the whole encoding, so a bias label can
+    be in the map and still have no column in `probs`. The old code checked the index against the
+    column count and dropped the rest in silence.
+    """
+    usable = {label: mult for label, mult in (bias or {}).items()
+              if label in labels and 0 <= labels[label] < columns}
+    dropped = sorted(set(bias or {}) - set(usable))
+    if dropped:
+        _log("decision_models", f"bias labels with no column in this model's output: {dropped}")
+    return usable
+
+
 def _load(name: str) -> dict | None:
     """Load a pickle by basename; return None on any failure."""
     if name in _cache:
@@ -91,7 +150,7 @@ def _load(name: str) -> dict | None:
 
 def _model_for(group: str, kind: str) -> dict | None:
     """kind ∈ {policy, survival}. Group-specific model → base model → None."""
-    group = group if group in PIRATE_GROUPS else DEFAULT_GROUP
+    group = _group_key(group)
     base = {"policy": "pirate_policy_tree.pkl", "survival": "pirate_survival_tree.pkl"}[kind]
     specific = f"pirate_{kind}_{group}.pkl"
     m = _load(specific) or _load(base)
@@ -177,24 +236,20 @@ def predict_event_importance(event: dict) -> float:
 
 def predict_pirate_policy(group: str, src: str, policy: str, cond: str, act: str) -> dict:
     """Predict pirate policy decision {class, probs, source}."""
+    group = _group_key(group)
     m = _model_for(group, "policy")
     if m and _has_sklearn():
         try:
             clf = m.get("clf")
             feats = [policy_features(src, policy, cond, act)]
             probs = clf.predict_proba(feats)[0]
-            bias = POLICY_BIAS.get(group, {})
-            if bias:
-                labels = list(clf.classes_)
-                am = {v: k for k, v in m.get("act_map", {}).items()}
-                for label, mult in bias.items():
-                    idx = am.get(label)
-                    if idx is not None and idx < len(probs):
-                        probs[idx] *= mult
-                probs = probs / probs.sum()
+            labels = _label_map(m)
+            by_index = {index: label for label, index in labels.items()}
+            for label, mult in _bias_for(POLICY_BIAS.get(group, {}), labels, len(probs)).items():
+                probs[labels[label]] *= mult
+            probs = probs / probs.sum()
             pred = int(probs.argmax())
-            am_inv = {v: k for k, v in m.get("act_map", {}).items()}
-            return {"class": am_inv.get(pred, str(pred)), "probs": probs.tolist(),
+            return {"class": by_index.get(pred, str(pred)), "probs": probs.tolist(),
                     "source": f"ml:{group}"}
         except Exception as e:
             _log("decision_models", f"policy predict failed: {e}")
@@ -210,22 +265,19 @@ def predict_pirate_policy(group: str, src: str, policy: str, cond: str, act: str
 
 def predict_pirate_survival(group: str, virgin: int, live_chance: float, action: str) -> dict:
     """Predict pirate survival-action outcome {class, probs, source}."""
+    group = _group_key(group)
     m = _model_for(group, "survival")
     if m and _has_sklearn():
         try:
             clf = m.get("clf")
             probs = clf.predict_proba([survival_features(virgin, live_chance, action)])[0]
-            bias = SURVIVAL_BIAS.get(group, {})
-            if bias:
-                am = {v: k for k, v in m.get("action_map", {}).items()}
-                for label, mult in bias.items():
-                    idx = am.get(label)
-                    if idx is not None and idx < len(probs):
-                        probs[idx] *= mult
-                probs = probs / probs.sum()
+            labels = _label_map(m)
+            by_index = {index: label for label, index in labels.items()}
+            for label, mult in _bias_for(SURVIVAL_BIAS.get(group, {}), labels, len(probs)).items():
+                probs[labels[label]] *= mult
+            probs = probs / probs.sum()
             pred = int(probs.argmax())
-            am_inv = {v: k for k, v in m.get("action_map", {}).items()}
-            return {"class": am_inv.get(pred, str(pred)), "probs": probs.tolist(),
+            return {"class": by_index.get(pred, str(pred)), "probs": probs.tolist(),
                     "source": f"ml:{group}"}
         except Exception as e:
             _log("decision_models", f"survival predict failed: {e}")
@@ -271,7 +323,8 @@ async def detect_pirate_group(faction_id: int, session_id: int | None = None) ->
         else:
             group = "free"
         await Database.execute(
-            "UPDATE maya_rp.factions SET pirate_group=$1 WHERE id=$2", group, faction_id)
+            "UPDATE maya_rp.factions SET pirate_group=$1 WHERE id=$2 AND session_id=$3",
+            group, faction_id, sid)
         return group
     except Exception as e:
         _log("decision_models", f"group detect failed for {faction_id}: {e}")
@@ -285,7 +338,7 @@ async def log_decision(faction_id: int, model_name: str, inputs: dict,
     sid = session_id or Config.SESSION_ID
     try:
         name = await Database.fetchval(
-            "SELECT name FROM maya_rp.factions WHERE id=$1", faction_id) or "unknown"
+            "SELECT name FROM maya_rp.factions WHERE id=$1 AND session_id=$2", faction_id, sid) or "unknown"
         tick = await Database.fetchval(
             "SELECT game_day FROM maya_rp.sessions WHERE id=$1", sid) or 0
         await Database.execute(

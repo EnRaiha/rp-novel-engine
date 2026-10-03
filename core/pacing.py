@@ -5,7 +5,7 @@ import json
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info, warn
 
 MODES = {
     "combat":     {"speed":"fast","senses":["kinesthetic","auditory"],"internal":"minimal","dialogue":"shouted_brief","para":"short","tension_floor":7,"desc":"sparse","time":"slow","example":"The hull screamed. Nethara's blade was already moving."},
@@ -57,7 +57,12 @@ class PacingDirector:
         await PacingDirector.ensure(session_id)
         row = await Database.fetchrow("SELECT * FROM maya_rp.narrative_pacing WHERE session_id=$1", session_id)
         mode = row["mode"] if row else "downtime"
-        cfg = MODES.get(mode, MODES["downtime"])
+        cfg = MODES.get(mode)
+        if cfg is None:
+            # A mode the engine does not know is a data fault. Falling back quietly
+            # handed the GM downtime prose labelled with the unknown mode.
+            warn("pacing", f"unknown pacing mode '{mode}' for session {session_id}; using downtime")
+            cfg = MODES["downtime"]
         return {"mode": mode, "config": cfg, "tension": row["tension"] if row else 0,
                 "scenes_in_mode": row["scenes_in_mode"] if row else 0}
 
@@ -77,8 +82,15 @@ class PacingDirector:
     @staticmethod
     async def transition(new_mode: str, reason: str, session_id: int = None):
         if session_id is None: session_id = Config.SESSION_ID
-        if new_mode not in MODES: return
-        gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)
+        if new_mode not in MODES:
+            warn("pacing", f"refusing unknown pacing mode '{new_mode}' for session {session_id}")
+            return
+        # COALESCE inside the SELECT never fires when the session row is absent:
+        # the query returns no row and fetchval answers None, which was written
+        # into entered_at_game_day as NULL.
+        gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id)
+        if gd is None:
+            gd = 1
         await Database.execute(
             "UPDATE maya_rp.narrative_pacing SET mode=$1, entered_at_game_day=$2, last_transition_reason=$3, scenes_in_mode=0 WHERE session_id=$4",
             new_mode, gd, reason, session_id)
@@ -100,6 +112,9 @@ class PacingDirector:
     @staticmethod
     async def adjust_tension(delta: int, reason: str = "", session_id: int = None):
         if session_id is None: session_id = Config.SESSION_ID
+        # Without the row the UPDATE matched nothing and the read below crashed on
+        # None. Every other entry point calls ensure() first.
+        await PacingDirector.ensure(session_id)
         await Database.execute(
             "UPDATE maya_rp.narrative_pacing SET tension = GREATEST(0, LEAST(10, tension + $1)) WHERE session_id=$2",
             delta, session_id)
@@ -109,6 +124,7 @@ class PacingDirector:
     @staticmethod
     async def increment(session_id: int = None):
         if session_id is None: session_id = Config.SESSION_ID
+        await PacingDirector.ensure(session_id)
         await Database.execute("UPDATE maya_rp.narrative_pacing SET scenes_in_mode = scenes_in_mode + 1 WHERE session_id=$1", session_id)
 
     @staticmethod
@@ -123,5 +139,7 @@ class PacingDirector:
                 r["mode"] = new_mode
             return {"mode": r["mode"], "tension": r["tension"]}
         except Exception as e:
-            info("pacing", f"Error: {e}")
+            # A fault in the tick is not prose detail: the orchestrator runs this
+            # every tick, so an info line hid a failing pacing engine.
+            error("pacing", f"run_tick failed: {e!r}")
             return {"error": str(e)}

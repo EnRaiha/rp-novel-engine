@@ -15,6 +15,16 @@ from core.log import info
 async def challenge(session_id: int, player_ship_id: int, opponent: dict, stakes: dict,
                     venue: str = "Open Space") -> dict:
     """Daftarkan duel formal. opponent: {name, tier, hull, power}. stakes: {type, value}."""
+    stakes_type = stakes.get("type")
+    if stakes_type not in ("credits", "favor"):
+        return {"error": f"Unknown stakes type {stakes_type!r}: use 'credits' or 'favor'"}
+    if stakes_type == "credits":
+        try:
+            value = int(stakes.get("value") or 0)
+        except (TypeError, ValueError):
+            return {"error": f"stakes value {stakes.get('value')!r} is not a whole number"}
+        if value < 0:
+            return {"error": f"stakes value cannot be negative, got {value}"}
     duel_id = await Database.fetchval(
         """INSERT INTO maya_rp.duels (session_id, player_ship_id, opponent_name, opponent_tier,
                                       opponent_hull, opponent_power, stakes_type, stakes_value, venue, status)
@@ -76,8 +86,8 @@ async def resolve(session_id: int, duel_id: int) -> dict:
     else:
         status = "active"
     await Database.execute(
-        "UPDATE maya_rp.ships SET hull_current=$1, status=$2 WHERE id=$3",
-        new_hull, status, ship["id"],
+        "UPDATE maya_rp.ships SET hull_current=$1, status=$2 WHERE id=$3 AND session_id=$4",
+        new_hull, status, ship["id"], session_id,
     )
 
     # Stakes transfer (Stakes Integrity — benar-benar pindah)
@@ -85,20 +95,27 @@ async def resolve(session_id: int, duel_id: int) -> dict:
     if d["stakes_type"] == "credits":
         amount = int(d["stakes_value"] or 0)
         if win:
-            await Database.execute(
-                "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2", amount, session_id)
+            paid = await Database.fetchrow(
+                "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2 "
+                "RETURNING credits", amount, session_id)
             stakes_msg = f"Menang {amount:,} credits."
         else:
-            await Database.execute(
-                "UPDATE maya_rp.resources SET credits=GREATEST(0, credits-$1) WHERE session_id=$2",
-                amount, session_id)
+            paid = await Database.fetchrow(
+                "UPDATE maya_rp.resources SET credits=GREATEST(0, credits-$1) WHERE session_id=$2 "
+                "RETURNING credits", amount, session_id)
             stakes_msg = f"Hilang {amount:,} credits."
+        if paid is None:
+            # A session with no resources row used to settle the stake on paper only.
+            stakes_msg += f" (no resources row for session {session_id}: nothing moved)"
+            info("duel", f"Duel {duel_id}: no resources row for session {session_id}, "
+                         f"{amount:,}C stake not transferred")
     elif d["stakes_type"] == "favor":
         stakes_msg = f"Favor {'menang' if win else 'hilang'} dalam duel."
 
     await Database.execute(
-        "UPDATE maya_rp.duels SET status='resolved', result=$1, resolved_at=NOW() WHERE id=$2",
-        result, duel_id,
+        "UPDATE maya_rp.duels SET status='resolved', result=$1, resolved_at=NOW() "
+        "WHERE id=$2 AND session_id=$3",
+        result, duel_id, session_id,
     )
 
     # Event + news (spec clarity: nombor penuh)

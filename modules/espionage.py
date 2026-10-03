@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
 """Espionage — Ported from Rust espionage.rs."""
 from __future__ import annotations
-import random
+import json, random
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import info, error
 
 async def run_espionage(faction: str, mission_type: str, agent: str, session_id: int | None = None) -> dict:
+    """Run one mission and RECORD it.
+
+    Nothing wrote to `espionage_missions` before this: `list_espionage_log`
+    could only ever show rows that predate the code, and the tick could only
+    resolve rows nothing created. The mission row is written after the roll, so
+    the log states what happened.
+    """
     if session_id is None: session_id = Config.SESSION_ID
-    fac = await Database.fetchrow("SELECT id, name, reputation FROM maya_rp.factions WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) LIMIT 1", session_id, f"%{faction}%")
+    fac = await Database.fetchrow(
+        "SELECT id, name, reputation FROM maya_rp.factions WHERE session_id=$1 "
+        "AND LOWER(name) LIKE LOWER($2) ORDER BY (LOWER(name)=LOWER($2)) DESC, id LIMIT 1",
+        session_id, f"%{faction}%")
     if not fac: return {"error": f"Faction '{faction}' not found"}
 
     base = {"steal_tech": 40, "sabotage": 35, "steal_resources": 55, "assassinate": 20, "plant_rumor": 60, "scout_fleet": 70}
     chance = base.get(mission_type)
-    if not chance: return {"error": f"Unknown mission: {mission_type}"}
+    if chance is None: return {"error": f"Unknown mission: {mission_type}"}
 
-    rep_mod = max(-10, fac["reputation"] // 10)
+    # `reputation` is a nullable column; `None // 10` raised TypeError.
+    rep_mod = max(-10, int(fac["reputation"] or 0) // 10)
     success = max(5, min(95, chance + rep_mod + random.randint(-15, 15)))
     roll = random.randint(1, 100)
     outcome = "critical_failure" if roll <= success // 5 else "success" if roll <= success else "detected" if roll <= success + 20 else "failure"
@@ -35,8 +46,23 @@ async def run_espionage(faction: str, mission_type: str, agent: str, session_id:
         narrative = f"{agent} failed the {mission_type} mission against {fac['name']}."
 
     if loot_a or loot_c:
-        await Database.execute("UPDATE maya_rp.resources SET alloys=alloys+$1, credits=credits+$2 WHERE session_id=$3", loot_a, loot_c, session_id)
+        tag = await Database.execute(
+            "UPDATE maya_rp.resources SET alloys=alloys+$1, credits=credits+$2 WHERE session_id=$3",
+            loot_a, loot_c, session_id)
+        if isinstance(tag, str) and tag.split()[-1:] == ["0"]:
+            # A session with no resources row (session 5 has none) used to be
+            # told it looted; the mission row would then lie as well.
+            info("espionage", f"session {session_id} has no resources row — "
+                              f"{loot_a} alloys / {loot_c}C NOT banked")
+            loot_a, loot_c = 0, 0
     await Database.execute("UPDATE maya_rp.factions SET reputation=GREATEST(reputation+$1, -100) WHERE id=$2", rep_delta, fac["id"])
+    await Database.execute(
+        "INSERT INTO maya_rp.espionage_missions "
+        "(session_id, faction_id, mission_type, agent_name, success_chance, outcome, "
+        " loot_json, reputation_delta, narrative, launched_at, resolved_at) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW())",
+        session_id, fac["id"], mission_type, agent, success, outcome,
+        json.dumps({"alloys": loot_a, "credits": loot_c}), rep_delta, narrative)
     info("espionage", f"{agent} → {fac['name']} ({mission_type}): {outcome}")
     return {"outcome": outcome, "agent": agent, "mission": mission_type, "faction": fac["name"], "loot_alloys": loot_a, "loot_credits": loot_c, "rep_delta": rep_delta, "narrative": narrative}
 
@@ -58,11 +84,12 @@ async def run_tick(session_id: int = None) -> dict:
         for m in stale:
             outcome = "went_dark" if m["mission_type"] in ("scout_fleet", "plant_rumor") else "compromised"
             await Database.execute(
-                "UPDATE maya_rp.espionage_missions SET outcome=$1, resolved_at=NOW() WHERE id=$2",
-                outcome, m["id"])
+                "UPDATE maya_rp.espionage_missions SET outcome=$1, resolved_at=NOW() "
+                "WHERE id=$2 AND session_id=$3",
+                outcome, m["id"], session_id)
             resolved += 1
         info("espionage", f"Tick: {resolved} stale missions resolved")
         return {"resolved_stale": resolved}
     except Exception as e:
-        info("espionage", f"Error: {e}")
+        error("espionage", f"tick error: {e}")
         return {"error": str(e)}

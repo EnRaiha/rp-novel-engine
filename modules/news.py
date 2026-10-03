@@ -72,6 +72,12 @@ NEWS_TEMPLATES = {
 MAX_DEDUP_ATTEMPTS = 8
 MAX_NEWS_AGE_DAYS = 5   # articles older than this many game days are stale — retired on roll
 
+# Categories `generate` can mint, since they are NEWS_TEMPLATES' keys. The
+# sentiment hook scored ("celebration", "trade", "science"), none of which this
+# module can produce, so every headline it minted lowered public opinion. These
+# are the real ones: good news is the economy, the fleet families and discovery.
+GOOD_NEWS_CATEGORIES = ("economy", "social", "discovery")
+
 # Normalizes "Trade volumes up 21%" -> "Trade volumes up N%"
 _NUM_RE = re.compile(r"\d+")
 
@@ -97,7 +103,12 @@ async def _existing_headlines(session_id: int) -> set[str]:
 
 async def _recent_templates(session_id: int, gd: int, window: int) -> set[str]:
     """Story skeletons used within the last `window` game days.
-    Blocks same-template repeats like 'Trade volumes up N%' re-rolling."""
+    Blocks same-template repeats like 'Trade volumes up N%' re-rolling.
+
+    An article with a NULL game_day counts as inside the window: an undated row
+    cannot prove it is stale, and this guard errs toward not repeating a
+    skeleton. Every generator writes game_day, so the branch is defensive.
+    """
     cutoff = gd - window
     rows = await Database.fetch(
         """SELECT headline FROM maya_rp.news_articles
@@ -153,7 +164,7 @@ async def generate(session_id: int | None = None) -> list[dict]:
                 "SELECT id FROM maya_rp.territory WHERE session_id=$1 AND "
                 "controlling_faction='Setia Empire' ORDER BY RANDOM() LIMIT 1", session_id)
             if terr:
-                delta = 2 if category in ("celebration", "trade", "science") else -1
+                delta = 2 if category in GOOD_NEWS_CATEGORIES else -1
                 await Database.execute(
                     "INSERT INTO maya_rp.population_sentiment "
                     "(session_id, territory_id, faction_name, sentiment, approval, fear, trust, "
@@ -169,6 +180,20 @@ async def generate(session_id: int | None = None) -> list[dict]:
     return articles
 
 
+async def _fresh_unread(session_id: int, cutoff: int, limit: int) -> list:
+    """The fresh, unread articles for one campaign, newest first.
+
+    One definition: `roll_news` re-ran this identical SELECT after each top-up
+    round, so a change to the freshness rule had two places to land.
+    """
+    return await Database.fetch(
+        "SELECT id, headline, category, importance, game_day FROM maya_rp.news_articles "
+        "WHERE session_id=$1 AND read = false AND (game_day IS NULL OR game_day >= $2) "
+        "ORDER BY game_day DESC NULLS LAST, id DESC LIMIT $3",
+        session_id, cutoff, limit,
+    )
+
+
 async def roll_news(session_id: int | None = None, limit: int = 5, top_up: bool = True) -> list[dict]:
     """Fetch fresh unread news (a 'news roll'). Stale articles (older than
     MAX_NEWS_AGE_DAYS) are retired as read — they never return. Fresh ones
@@ -178,6 +203,8 @@ async def roll_news(session_id: int | None = None, limit: int = 5, top_up: bool 
     generate new articles on the spot so there is always news to serve.
     """
     if session_id is None: session_id = Config.SESSION_ID
+    if limit < 0:
+        raise ValueError(f"limit cannot be negative, got {limit}")
     gd = await _game_day(session_id)
     cutoff = gd - MAX_NEWS_AGE_DAYS
     # Retire anything unread that is older than the freshness window.
@@ -186,26 +213,14 @@ async def roll_news(session_id: int | None = None, limit: int = 5, top_up: bool 
         "WHERE session_id=$1 AND read = false AND game_day IS NOT NULL AND game_day < $2",
         session_id, cutoff,
     )
-    rows = await Database.fetch(
-        "SELECT id, headline, category, importance, game_day FROM maya_rp.news_articles "
-        "WHERE session_id=$1 AND read = false AND (game_day IS NULL OR game_day >= $2) "
-        "ORDER BY game_day DESC NULLS LAST, id DESC LIMIT $3",
-        session_id, cutoff, limit,
-    )
+    rows = await _fresh_unread(session_id, cutoff, limit)
     if top_up and len(rows) < limit:
         # Pool is running dry — mint fresh articles so news is always available.
         for _ in range(3):  # up to 3 mint rounds per roll
             if len(rows) >= limit:
                 break
             await generate(session_id)
-            rows = await Database.fetch(
-                "SELECT id, headline, category, importance, game_day FROM maya_rp.news_articles "
-                "WHERE session_id=$1 AND read = false AND (game_day IS NULL OR game_day >= $2) "
-                "ORDER BY game_day DESC NULLS LAST, id DESC LIMIT $3",
-                session_id, cutoff, limit,
-            )
-        if not rows:
-            rows = []
+            rows = await _fresh_unread(session_id, cutoff, limit)
     if rows:
         ids = [r["id"] for r in rows]
         await Database.execute(
@@ -214,18 +229,31 @@ async def roll_news(session_id: int | None = None, limit: int = 5, top_up: bool 
     return [{"headline": r["headline"], "category": r["category"], "importance": r["importance"], "game_day": r["game_day"]} for r in rows]
 
 
+async def _retire(sql: str, *args) -> bool:
+    """Run a retire UPDATE and report whether it matched a row.
+
+    asyncpg returns the status tag ('UPDATE 1', 'UPDATE 0'), which is how a
+    mark-read for an id that does not exist stops being a silent True.
+    """
+    tag = await Database.execute(sql, *args)
+    return not (isinstance(tag, str) and tag.split()[-1:] == ["0"])
+
+
 async def mark_read(session_id: int | None = None, article_id: int | None = None, headline: str | None = None) -> bool:
-    """Mark one article as read — by id, or by headline match. Already-checked news stays retired."""
+    """Mark one article as read — by id, or by headline match. Already-checked news stays retired.
+
+    Scoped by session in both branches: `WHERE id=$1` alone retired another
+    campaign's article. Returns whether it retired anything.
+    """
     if session_id is None: session_id = Config.SESSION_ID
     if article_id is not None:
-        await Database.execute("UPDATE maya_rp.news_articles SET read = true WHERE id=$1", article_id)
-        return True
+        return await _retire(
+            "UPDATE maya_rp.news_articles SET read = true WHERE session_id=$1 AND id=$2",
+            session_id, article_id)
     if headline is not None:
-        await Database.execute(
+        return await _retire(
             "UPDATE maya_rp.news_articles SET read = true WHERE session_id=$1 AND headline=$2",
-            session_id, headline,
-        )
-        return True
+            session_id, headline)
     return False
 
 
@@ -236,5 +264,5 @@ async def run_tick(session_id: int = None) -> dict:
         info("news", f"Generated {len(articles)} articles")
         return {"articles": len(articles)}
     except Exception as e:
-        info("news", f"Error: {e}")
+        error("news", f"tick error: {e}")
         return {"error": str(e)}

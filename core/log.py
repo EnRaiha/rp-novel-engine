@@ -22,9 +22,42 @@ _log.propagate = False
 
 # File handler — logs to tick_YYYYMMDD.log
 os.makedirs(Config.LOG_DIR, exist_ok=True)
-_file_handler = logging.FileHandler(
-    os.path.join(Config.LOG_DIR, f"tick_{datetime.now():%Y%m%d}.log")
-)
+
+
+def _log_path() -> str:
+    """The file for the day the record is written on, asked for per record.
+
+    The path used to be chosen once, at import, so a process that outlived midnight kept appending
+    to yesterday's `tick_YYYYMMDD.log` and the new day's file never appeared. The ticker on the
+    other host has been running for days.
+    """
+    return os.path.join(Config.LOG_DIR, f"tick_{datetime.now():%Y%m%d}.log")
+
+
+class _DatedFileHandler(logging.FileHandler):
+    """A FileHandler that follows the date instead of freezing it at import."""
+
+    def __init__(self) -> None:
+        super().__init__(_log_path())
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if os.path.abspath(self.baseFilename) != os.path.abspath(_log_path()):
+            self._roll_to_today()
+        super().emit(record)
+
+    def _roll_to_today(self) -> None:
+        self.acquire()
+        try:
+            if self.stream:
+                self.stream.close()
+                self.stream = None
+            self.baseFilename = os.path.abspath(_log_path())
+            self.stream = self._open()
+        finally:
+            self.release()
+
+
+_file_handler = _DatedFileHandler()
 _file_handler.setFormatter(
     logging.Formatter("[%(asctime)s] %(levelname)s %(name)s %(message)s")
 )

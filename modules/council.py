@@ -23,7 +23,7 @@ from typing import Any
 
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info
 from core import ooc
 
 
@@ -133,14 +133,6 @@ MEETING_TYPES = {
     "ceremony":    {"duration": "1 scene", "frequency": "appointment", "formality": "formal"},
 }
 
-DEFAULT_AGENDAS = {
-    "regular":     ["Territory status report","Faction standing review","Active project updates","Resource allocation","Any new business"],
-    "emergency":   ["Crisis assessment","Immediate response options","Resource emergency allocation","Fleet mobilization assessment"],
-    "war_council": ["Enemy fleet assessment","Campaign objectives","Force composition","Rules of engagement","Contingency plans"],
-    "briefing":    ["Intelligence summary","Perimeter status","Anomaly reports","Agent field reports"],
-    "ceremony":    ["Opening formalities","Oath of office","Portfolio assignment","Celebration"],
-}
-
 CROSS_ENGINE_HITS = {
     "military":   {"engine": "tactics",     "method": "deployFleet"},
     "intel":      {"engine": "mystery",     "method": "openCase"},
@@ -159,6 +151,10 @@ MEETING_AGENDAS = {
     "briefing": ["Intelligence summary","Perimeter status","Anomaly reports","Agent field reports"],
     "ceremony": ["Opening formalities","Oath of office","Portfolio assignment","Celebration"],
 }
+
+#: `MEETING_AGENDAS` is the agenda table `convene_meeting` reads. `DEFAULT_AGENDAS` held a
+#: byte-identical copy of it, so two edits could drift. One source, both names kept.
+DEFAULT_AGENDAS = MEETING_AGENDAS
 
 DECREE_TO_PORTFOLIO = {
     "military": "defense", "diplomatic": "diplomacy", "economic": "economy",
@@ -495,7 +491,7 @@ async def assign_agent(session_id: int, crew_id: int, role: str) -> dict:
     """Assign counter-intel agent. Ported from CounterEspionage.assignAgent()."""
     valid = ["watcher", "networker", "interrogator"]
     if role not in valid:
-        return {"error": "Invalid role"}
+        return {"error": f"Invalid role '{role}'", "available": valid}
     try:
         quality_boost = {"networker": 5, "watcher": 3, "interrogator": 2}.get(role, 0)
         # intel_network is a per-session singleton (created on first assignment —
@@ -515,22 +511,37 @@ async def assign_agent(session_id: int, crew_id: int, role: str) -> dict:
         return {"error": str(e)}
 
 
-async def thwart_plot(conspiracy_id: int, method: str) -> dict:
-    """Thwart a detected plot. Ported from CounterEspionage.thwartPlot()."""
+async def thwart_plot(conspiracy_id: int, method: str, session_id: int | None = None) -> dict:
+    """Thwart a detected plot. Ported from CounterEspionage.thwartPlot().
+
+    The update ran by id alone, so any campaign could attempt to thwart another campaign's plot, and
+    a conspiracy id that does not exist was answered with a success roll against nothing.
+    """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     m = THWART_METHODS.get(method)
-    if not m: return {"error": "Invalid method"}
+    if not m:
+        return {"error": f"Invalid method '{method}'", "available": sorted(THWART_METHODS)}
     try:
+        row = await Database.fetchrow(
+            "SELECT id FROM maya_rp.conspiracies WHERE id = $1 AND session_id = $2",
+            conspiracy_id, session_id,
+        )
+        if not row:
+            return {"success": False,
+                    "error": f"conspiracy {conspiracy_id} not found in session {session_id}"}
         success = random.random() < m["success"]
         status = "thwarted" if success else "active"
         await Database.execute(
-            "UPDATE maya_rp.conspiracies SET status = $1, details = jsonb_set(coalesce(details, '{}'), '{thwarted_by}', $2::jsonb) WHERE id = $3",
-            status, json.dumps({"method": method}), conspiracy_id,
+            "UPDATE maya_rp.conspiracies SET status = $1, details = jsonb_set(coalesce(details, '{}'), '{thwarted_by}', $2::jsonb) WHERE id = $3 AND session_id = $4",
+            status, json.dumps({"method": method}), conspiracy_id, session_id,
         )
         return {
             "success": success, "exposure_risk": m["exposure"], "moral_cost": m["moral"],
             "narrative": f"Plot {'successfully disrupted' if success else f'failed. {method} ineffective.'}",
         }
     except Exception as e:
+        error("council", f"thwart_plot failed on conspiracy {conspiracy_id}: {e}")
         return {"success": False, "error": str(e)}
 
 
@@ -539,9 +550,16 @@ async def thwart_plot(conspiracy_id: int, method: str) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def convene_meeting(meeting_type: str = "regular", context: dict | None = None) -> dict:
-    """Generate cabinet meeting. Ported from GovernanceEvents.conveneMeeting()."""
+    """Generate cabinet meeting. Ported from GovernanceEvents.conveneMeeting().
+
+    An unknown meeting type used to be answered with a regular meeting, so a typo convened the wrong
+    agenda and the caller had no way to tell.
+    """
     if context is None: context = {}
-    t = MEETING_TYPES.get(meeting_type, MEETING_TYPES["regular"])
+    if meeting_type not in MEETING_TYPES:
+        return {"error": f"Unknown meeting type: {meeting_type}",
+                "available": sorted(MEETING_TYPES)}
+    t = MEETING_TYPES[meeting_type]
     return {
         "type": meeting_type, "duration": t["duration"], "formality": t["formality"],
         "convened_by": context.get("convened_by", "Grand Consul"),
@@ -838,7 +856,9 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
         return {"seats": len(seats), "cohesion": cohesion, "valid": valid["valid"],
                 "missing": valid["missing"], "observer_suspicion": reading, "notice": notice}
     except Exception as e:
-        info("council", f"Error: {e}")
+        # A catch-all answered with a dict and an INFO line, so a malfunctioning tick read like a
+        # quiet one. The answer stays the same shape; the fault is now logged as a fault.
+        error("council", f"tick failed for session {session_id}: {e}")
         return {"error": str(e)}
 
 
@@ -879,7 +899,10 @@ async def check_title_revocation(session_id: int | None = None) -> dict:
             perf += 1
         risk = max(0, risk - (perf // 3))
 
-        if risk != (t["revocation_risk"] or 0):
+        if risk != (t["revocation_risk"] or 0) or perf != (t["title_performance"] or 0):
+            # The gate watched `risk` alone while the update wrote `title_performance` too, so a tick
+            # that only earned performance points wrote nothing and the points were lost. A territory
+            # with a governor and no crisis could never accumulate past the first two.
             await Database.execute(
                 "UPDATE maya_rp.territory SET revocation_risk=$1, title_performance=$2 WHERE id=$3",
                 risk, perf, t["id"],

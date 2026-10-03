@@ -220,7 +220,23 @@ def _terr1000() -> list:
     return _terr1000_cache
 
 
-async def resolve_loc(query: str) -> dict:
+def _call_session() -> int:
+    """The session for this call, not the one that was current at import.
+
+    `scripts/char_query.py` is reached through kilo_bridge's loc branch, and the DSH worker imports that
+    bridge once and serves the plugin for the life of the process. Reading Config.SESSION_ID would freeze
+    the answer at worker start, which is the drift `core.session.stale_process_default` exists to name.
+    """
+    from core.session import resolve_session
+
+    return int(resolve_session(None) or Config.SESSION_ID)
+
+async def resolve_loc(query: str, session_id: int | None = None) -> dict:
+    # Scoped by session, and NULL kept visible: 625 sectors belong to session 3, session 5 has none, and
+    # 49 rows carry no session at all -- the gate and thread anchors, which are shared landmarks. Filtering
+    # strictly by session would hide them, so this keeps them and the ownership of those 49 is left as the
+    # King's decision rather than settled in a query.
+    sid = session_id if session_id is not None else _call_session()
     q = _norm(query)
     m = re.fullmatch(r"(\d+)\s*,\s*(\d+)(?:\s*,\s*(\d+))?", q)
     if m:
@@ -229,8 +245,8 @@ async def resolve_loc(query: str) -> dict:
         if z != 2:
             rows = [dict(r) for r in await Database.fetch(
                 "SELECT name, x_coord, y_coord, z_coord, star_type, controlled_by, hazard_level "
-                "FROM maya_rp.sectors WHERE z_coord=$1 "
-                "ORDER BY (x_coord-$2)^2+(y_coord-$3)^2 LIMIT 5", z, x, y)]
+                "FROM maya_rp.sectors WHERE z_coord=$1 AND (session_id=$4 OR session_id IS NULL) "
+                "ORDER BY (x_coord-$2)^2+(y_coord-$3)^2 LIMIT 5", z, x, y, sid)]
             return {"ok": True, "kind": "coords", "query": (x, y, z), "grid": f"z{z}",
                     "sectors": rows, "note": f"nearest sectors on the z={z} plane"}
         if x > 30 or y > 30:
@@ -258,7 +274,8 @@ async def resolve_loc(query: str) -> dict:
                         "note": "nearest systems on the 1000-grid"}
         rows = [dict(r) for r in await Database.fetch(
             "SELECT name, x_coord, y_coord, star_type, controlled_by, hazard_level "
-            "FROM maya_rp.sectors ORDER BY (x_coord-$1)^2+(y_coord-$2)^2 LIMIT 5", x, y)]
+            "FROM maya_rp.sectors WHERE (session_id=$3 OR session_id IS NULL)"
+            " ORDER BY (x_coord-$1)^2+(y_coord-$2)^2 LIMIT 5", x, y, sid)]
         return {"ok": True, "kind": "coords", "query": (x, y), "grid": "24",
                 "sectors": rows, "note": "nearest sectors on the 0–24 sector grid"}
     terr = [dict(r) for r in await Database.fetch(
@@ -268,7 +285,8 @@ async def resolve_loc(query: str) -> dict:
         "ORDER BY population DESC LIMIT 10", Config.SESSION_ID, f"%{q}%")]
     sect = [dict(r) for r in await Database.fetch(
         "SELECT name, x_coord, y_coord, z_coord, controlled_by, star_type, hazard_level, hidden "
-        "FROM maya_rp.sectors WHERE LOWER(name) LIKE $1 LIMIT 10", f"%{q}%")]
+        "FROM maya_rp.sectors WHERE LOWER(name) LIKE $1 AND (session_id=$2 OR session_id IS NULL)"
+        " LIMIT 10", f"%{q}%", sid)]
     if terr or sect:
         return {"ok": True, "kind": "name", "territories": terr, "sectors": sect}
     names = [r["system_name"] for r in await Database.fetch(

@@ -31,13 +31,28 @@ def get_encounter_templates() -> dict:
     return templates
 
 async def generate_event(session_id: int, category: str | None = None, difficulty: int = 5) -> dict:
+    """Roll one encounter. `session_id` is accepted for the tick's uniform call shape and read by
+    nothing: this function touches no session state, it rolls a template.
+    """
     if category is None:
         category = random.choice(list(ENCOUNTER_CATEGORIES.keys()))
-    templates = ENCOUNTER_CATEGORIES.get(category, ENCOUNTER_CATEGORIES["space_phenomena"])
+    # An unknown category is still answered with a space phenomenon, which the CLI and the existing
+    # wiring tests depend on, but the answer now says so instead of reporting the caller's own word
+    # back as the category it used.
+    fallback = category not in ENCOUNTER_CATEGORIES
+    requested = category
+    if fallback:
+        category = "space_phenomena"
+    templates = ENCOUNTER_CATEGORIES[category]
     event_type = random.choice(templates)
     scaled_difficulty = difficulty + random.randint(-2, 2)
-    return {"category": category, "event_type": event_type, "difficulty": max(1, scaled_difficulty),
-            "tier": "standard" if scaled_difficulty <= 5 else "elite" if scaled_difficulty <= 8 else "boss"}
+    result = {"category": category, "event_type": event_type,
+              "difficulty": max(1, scaled_difficulty),
+              "tier": "standard" if scaled_difficulty <= 5 else "elite" if scaled_difficulty <= 8 else "boss"}
+    if fallback:
+        result["requested_category"] = requested
+        result["available"] = sorted(ENCOUNTER_CATEGORIES)
+    return result
 
 async def log_event(session_id: int, event_type: str, title: str, description: str) -> dict:
     await Database.execute(
@@ -87,7 +102,7 @@ async def run_tick(session_id: int = None) -> dict:
         info("events", f"Tick: {len(events)} recent, fired={fired}, planted={planted}")
         return {"recent_events": len(events), "encounters_fired": fired, "consequences_planted": planted}
     except Exception as e:
-        info("events", f"Error: {e}")
+        error("events", f"tick failed for session {session_id}: {e}")
         return {"error": str(e)}
 
 import random as _r

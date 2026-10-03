@@ -23,8 +23,12 @@ async def detect(session_id: int = None) -> list[dict]:
         text = f"{event['title']} {event.get('description','')}".lower()
         tags = event["tags"]
         if isinstance(tags,str):
-            try: tags = json.loads(tags)
-            except: tags = []
+            try:
+                tags = json.loads(tags)
+            except ValueError as e:
+                # A bare `except:` here swallowed malformed tag JSON in silence.
+                info("themes", f"event tags are not JSON ({e}) — counting the event without them")
+                tags = []
         text += " "+" ".join(str(t) for t in tags)
         for theme,kws in KW.items():
             for kw in kws:

@@ -33,16 +33,27 @@ async def generate_details(location: str = "bridge", session_id: int = None) -> 
     if session_id is None: session_id = Config.SESSION_ID
     details = []
 
-    morale = await Database.fetchval("SELECT COALESCE(AVG(morale),50) FROM maya_rp.crew_roster WHERE session_id=$1", session_id) or 50
+    morale = await Database.fetchval("SELECT COALESCE(AVG(morale),50) FROM maya_rp.crew_roster WHERE session_id=$1", session_id)
+    if morale is None:
+        # The COALESCE already answers "no crew rows" with 50. `morale or 50` also answered a crew at
+        # zero with 50, so a mutinous ship was described as one that runs like clockwork.
+        morale = 50
 
     for lo, hi, tells in TELLS["morale"]:
         if lo <= morale < hi:
             details.append(random.choice(tells))
             break
 
-    recent = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.combat_results WHERE session_id=$1 AND ended_at > NOW() - INTERVAL '72 hours'", session_id)
-    if recent and recent > 0:
+    recent = await Database.fetchrow(
+        "SELECT COUNT(*) AS fights, COALESCE(SUM(crew_casualties),0) AS casualties"
+        " FROM maya_rp.combat_results WHERE session_id=$1 AND ended_at > NOW() - INTERVAL '72 hours'",
+        session_id)
+    if recent and recent["fights"] > 0:
         details.append(random.choice(TELLS["combat"][0][2]))
+        # The death tells were written and never reachable: nothing read the casualties a fight left,
+        # so "a memorial has appeared" could not appear for a fight that killed anyone.
+        if recent["casualties"] > 0:
+            details.append(random.choice(TELLS["death"][0][2]))
 
     pacing = await Database.fetchrow("SELECT tension FROM maya_rp.narrative_pacing WHERE session_id=$1", session_id)
     if pacing and pacing["tension"] >= 7:

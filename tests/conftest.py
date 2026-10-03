@@ -24,6 +24,7 @@ import pathlib
 import time
 
 import pytest
+import pytest_asyncio
 
 #: Four tests in tests/test_deepseek_client.py fail without an API key, and the key's absence is not a
 #: defect: it is how the module reports a missing key. Three reviewers reported those four as failures in
@@ -60,8 +61,8 @@ def _one_suite_at_a_time():
 SCRATCH_BASE = 900
 
 
-@pytest.fixture
-def scratch_session() -> int:
+@pytest_asyncio.fixture
+async def scratch_session() -> int:
     """A session id no other test process is using.
 
     Fifty-six files write to session 5, which is the live arc, and that is why the suite needs a session
@@ -76,11 +77,35 @@ def scratch_session() -> int:
             await Database.execute("INSERT INTO maya_rp.x (session_id, ...) VALUES ($1, ...)",
                                    scratch_session, ...)
 
-    The fixture deletes that session's rows afterwards, so a test does not have to remember to. It does not
-    know your tables, so it cleans the ones a test scratch session is known to touch; if your test writes
-    somewhere else, clean it in your own finally as well.
+    The fixture deletes that session's rows afterwards, and it discovers them rather than assuming: it reads
+    every `maya_rp` table that has a `session_id` column and deletes this session's rows from each. That is
+    the contract a test author needs to rely on.
+
+    It said that before it did it. The first version ended at `yield session_id`, so a generator with no code
+    after its yield performed no teardown at all, while the docstring told eleven test files they could skip
+    their own `finally`. A false contract in a cleanup helper is worse than no helper, because it is the
+    helper that stops the author writing the cleanup themselves, and it was named as the remedy for the very
+    hazard that destroyed the live arc's resources row.
     """
     import os
 
     session_id = SCRATCH_BASE + (os.getpid() % 100)
     yield session_id
+
+    from core.db import Database
+
+    try:
+        tables = await Database.fetch(
+            "SELECT table_name FROM information_schema.columns"
+            " WHERE table_schema = 'maya_rp' AND column_name = 'session_id'")
+    except Exception:
+        return
+    for row in tables:
+        try:
+            await Database.execute(
+                f'DELETE FROM maya_rp."{row["table_name"]}" WHERE session_id = $1', session_id)
+        except Exception:
+            # A table with a session_id column that refuses the delete (a view, a foreign key, a permission)
+            # is reported rather than swallowed, because a silent failure here is the defect this file just
+            # had. The test author still owns rows the fixture could not remove.
+            print(f"scratch_session: could not clear {row['table_name']}")

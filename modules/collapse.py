@@ -94,12 +94,19 @@ COLLAPSE_STATES: dict[str, dict] = {
 }
 
 
-async def check_for_collapse(session_id: int = None) -> dict | None:
+async def check_for_collapse(session_id: int = None, dry_run: bool = False) -> dict | None:
     """
     Check all collapse conditions. Returns the first triggered collapse,
     or None if the system is stable.
 
     Call this at the end of every tick and after every time skip.
+
+    `dry_run=True` reports what WOULD happen and writes nothing. The name says check, and the body
+    writes: it creates an `events` row, completes the session's active `story_arc`, and opens a collapse
+    arc. A status query asking this question therefore destroyed the campaign it was asked about — the
+    `collapse_status` action in `scripts/kilo_bridge.py` routed a read to it, so a GM asking how the arc
+    was doing would complete its arc. Any caller that is reporting rather than ticking must pass
+    `dry_run=True`.
     """
     if session_id is None:
         session_id = Config.SESSION_ID
@@ -114,19 +121,19 @@ async def check_for_collapse(session_id: int = None) -> dict | None:
 
     # 1. Fuel zero
     if r["fuel"] is not None and r["fuel"] <= 0:
-        return await _trigger_collapse("fuel_zero", session_id)
+        return await _trigger_collapse("fuel_zero", session_id, dry_run=dry_run)
 
     # 2. Morale collapse
     if r["aggregate_morale"] is not None and r["aggregate_morale"] <= 15:
-        return await _trigger_collapse("morale_collapse", session_id)
+        return await _trigger_collapse("morale_collapse", session_id, dry_run=dry_run)
 
     # 3. Credits zero
     if r["credits"] is not None and r["credits"] <= 0:
-        return await _trigger_collapse("credits_zero", session_id)
+        return await _trigger_collapse("credits_zero", session_id, dry_run=dry_run)
 
     # 4. Population zero
     if r["population"] is not None and r["population"] <= 0:
-        return await _trigger_collapse("population_zero", session_id)
+        return await _trigger_collapse("population_zero", session_id, dry_run=dry_run)
 
     # 5. Flagship hull critical
     flagship = await Database.fetchrow(
@@ -145,16 +152,24 @@ async def check_for_collapse(session_id: int = None) -> dict | None:
         and flagship["hull_current"] is not None
         and flagship["hull_current"] <= (flagship["hull"] * 0.1)
     ):
-        return await _trigger_collapse("hull_critical", session_id)
+        return await _trigger_collapse("hull_critical", session_id, dry_run=dry_run)
 
     return None
 
 
-async def _trigger_collapse(collapse_type: str, session_id: int) -> dict:
+async def _trigger_collapse(collapse_type: str, session_id: int, dry_run: bool = False) -> dict:
     """Execute a collapse: create a new story arc, log the event, return instructions."""
     config = COLLAPSE_STATES.get(collapse_type)
     if not config:
         return {"collapsed": False, "error": f"Unknown collapse type: {collapse_type}"}
+
+    if dry_run:
+        # Report shape only. Everything below writes: an events row, the active arc completed, a new
+        # collapse arc opened. A status query must not do any of it.
+        info("collapse", f"WOULD COLLAPSE (dry run): {config['title']} ({config['new_arc_theme']})")
+        return {"collapsed": True, "dry_run": True, "type": collapse_type, "title": config["title"],
+                "new_arc": config.get("new_arc_theme"), "effects": config.get("effects", []),
+                "recovery": config.get("recovery"), "gm_instruction": config.get("gm_instruction")}
 
     info("collapse", f"⚠️ COLLAPSE: {config['title']} ({config['new_arc_theme']})")
 

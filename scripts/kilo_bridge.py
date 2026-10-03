@@ -406,7 +406,10 @@ async def handle(action: str, params: dict = None) -> dict:
             """Check if any collapse conditions have been triggered."""
             from modules.collapse import check_for_collapse
 
-            c = await check_for_collapse(sid)
+            # dry_run: this is a status question. Without it the answer completed the session's story
+            # arc, opened a collapse arc and logged an event, so asking how the campaign was doing
+            # destroyed it. The function's name says check and its body wrote.
+            c = await check_for_collapse(sid, dry_run=True)
             if c:
                 result["data"] = c
             else:

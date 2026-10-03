@@ -35,11 +35,17 @@ async def _pool():
 
 async def test_a_test_can_leave_rows_behind(scratch_session):
     for table in PROBE_TABLES:
+        # Counted as a delta, not as an absolute: a scratch id is `900 + pid % 100`, so a run that
+        # crashed before its teardown can leave a row for the next process to inherit. The delta
+        # proves this test wrote, and the checker below still requires zero rows afterwards.
+        before = await Database.fetchval(
+            f'SELECT count(*) FROM maya_rp."{table}" WHERE session_id = $1', scratch_session)
         await Database.execute(
             f'INSERT INTO maya_rp."{table}" (session_id) VALUES ($1)', scratch_session)
-        present = await Database.fetchval(
+        after = await Database.fetchval(
             f'SELECT count(*) FROM maya_rp."{table}" WHERE session_id = $1', scratch_session)
-        assert present == 1, f"the probe wrote nothing to {table}, so the check would be vacuous"
+        assert after == before + 1, (
+            f"the probe did not leave exactly one row in {table}: {before} became {after}")
     WROTE.append(scratch_session)
 
 

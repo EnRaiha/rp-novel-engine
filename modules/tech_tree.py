@@ -5,7 +5,7 @@ import json
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info
 
 async def view_tech(session_id: int | None = None) -> list[dict]:
     if session_id is None: session_id = Config.SESSION_ID
@@ -39,8 +39,14 @@ async def assign_scientist(character: str, lab_id: int, specialty: str, session_
     if session_id is None: session_id = Config.SESSION_ID
     char = await Database.fetchrow("SELECT id, name FROM maya_rp.characters WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) LIMIT 1", session_id, f"%{character}%")
     if not char: return {"error": f"Character '{character}' not found"}
-    lab = await Database.fetchval("SELECT id FROM maya_rp.research_labs WHERE id=$1", lab_id)
-    if not lab: return {"error": f"Lab #{lab_id} not found"}
+    lab = await Database.fetchval(
+        # `research_labs` carries no session_id: ownership runs through the colony that hosts it.
+        # The bare id check let one campaign put its scientist in another campaign's lab.
+        "SELECT rl.id FROM maya_rp.research_labs rl "
+        "JOIN maya_rp.colonies col ON rl.colony_id = col.id AND col.session_id=$2 "
+        "WHERE rl.id=$1",
+        lab_id, session_id)
+    if not lab: return {"error": f"Lab #{lab_id} not found in session {session_id}"}
     await Database.execute(
         "INSERT INTO maya_rp.scientist_assignments (character_id, lab_id, specialty, bonus) VALUES ($1,$2,$3,0.25) ON CONFLICT DO NOTHING",
         char["id"], lab_id, specialty)
@@ -67,7 +73,9 @@ async def run_tick(session_id: int | None = None) -> dict:
             "ORDER BY research_progress ASC", session_id)
         res = await Database.fetchrow("SELECT alloys, credits, tech_score FROM maya_rp.resources WHERE session_id=$1", session_id)
         if not active or not res:
-            return {"active_projects": 0}
+            # Same keys as the full answer: a caller reading `completed` got a KeyError on exactly
+            # the session with nothing in progress.
+            return {"active": 0, "completed": 0, "active_projects": 0}
 
         total_rate = await Database.fetchval(
             "SELECT COALESCE(SUM(rl.research_rate + COALESCE(sa.bonus,0.0)),0.0) FROM maya_rp.research_labs rl "
@@ -92,5 +100,5 @@ async def run_tick(session_id: int | None = None) -> dict:
         info("tech_tree", f"Tick: {len(active)} active, {completed} completed")
         return {"active": len(active), "completed": completed}
     except Exception as e:
-        info("tech_tree", f"Error: {e}")
+        error("tech_tree", f"tick failed for session {session_id}: {e}")
         return {"error": str(e)}

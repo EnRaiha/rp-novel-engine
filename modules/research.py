@@ -2,9 +2,17 @@
 import json
 from datetime import datetime, timezone
 from core.db import Database
+from core.config import Config
 from core.utils import calc_game_days
 
-async def run_tick(session_id: int = 3):
+async def run_tick(session_id: int = None):
+    """Advance the research queue for one campaign.
+
+    Defaults to the engine's session (Config.SESSION_ID), not the literal 3: that
+    id is the frozen reference campaign.
+    """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     row = await Database.fetchrow("SELECT last_tick_at FROM resources WHERE session_id=$1", session_id)
     if not row or not row.get("last_tick_at"): return
     gd = calc_game_days(row["last_tick_at"])
@@ -40,7 +48,9 @@ async def run_tick(session_id: int = 3):
                         await Database.execute(
                             "UPDATE resource_inventory ri SET quantity=ri.quantity-$1 "
                             "FROM strategic_resources sr WHERE sr.name=$2 AND ri.resource_id=sr.id", qty, res_name)
-                await Database.execute("UPDATE research_queue SET status='active' WHERE id=$1", pending["qid"])
+                await Database.execute(
+                    "UPDATE research_queue SET status='active' WHERE id=$1 AND session_id=$2",
+                    pending["qid"], session_id)
                 await Database.execute("UPDATE research_projects SET started_at=$1 WHERE id=$2",
                                        datetime.now(timezone.utc), pending["id"])
                 active = await Database.fetchrow(
@@ -50,15 +60,22 @@ async def run_tick(session_id: int = 3):
     if not active:
         return
 
-    # Advance
-    inc = (gd / active["duration_days"]) * 100
-    new_progress = min(100, float(active["progress_pct"]) + inc)
+    # Advance. `progress_pct` is nullable and `duration_days` can be zero in
+    # principle: float(None) and a division by zero both killed the tick.
+    duration = active["duration_days"] or 0
+    if duration <= 0:
+        print(f"  Research: {active['name']} has no duration — cannot advance")
+        return
+    started = active["progress_pct"] if active["progress_pct"] is not None else 0
+    inc = (gd / duration) * 100
+    new_progress = min(100, float(started) + inc)
     await Database.execute("UPDATE research_projects SET progress_pct=$1 WHERE id=$2", round(new_progress, 1), active["id"])
 
     if new_progress >= 100:
         await Database.execute("UPDATE research_projects SET completed_at=$1, unlocked=true WHERE id=$2",
                                datetime.now(timezone.utc), active["id"])
-        await Database.execute("UPDATE research_queue SET status='complete' WHERE id=$1", active["qid"])
+        await Database.execute("UPDATE research_queue SET status='complete' WHERE id=$1 AND session_id=$2",
+                               active["qid"], session_id)
         et = active.get("bonus_type")
         ev = float(active.get("bonus_value") or 0) if active.get("bonus_value") else None
         if et and ev:
@@ -78,7 +95,8 @@ async def run_tick(session_id: int = 3):
         nxt = await Database.fetchrow(
             "SELECT id FROM research_queue WHERE status='pending' AND session_id=$1 ORDER BY queue_position LIMIT 1", session_id)
         if nxt:
-            await Database.execute("UPDATE research_queue SET status='active' WHERE id=$1", nxt["id"])
+            await Database.execute("UPDATE research_queue SET status='active' WHERE id=$1 AND session_id=$2",
+                                   nxt["id"], session_id)
 
         print(f"  Research complete: {active['name']}")
     else:

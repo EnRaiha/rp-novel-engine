@@ -89,17 +89,21 @@ def price_acts(acts: Iterable[str], *, witnessed: bool = False,
                instrument: bool = False) -> dict[str, object]:
     """Price a turn's declared acts.
 
-    @param acts - the act keys the Host declares for this turn.
+    @param acts - the act keys the Host declares for this turn. A bare string, a
+        sequence, or None are all accepted, through `declared_acts`: a string is
+        iterable, so `price_acts("well:touch")` used to price the characters and
+        report every one of them as unknown.
     @param witnessed - true when a present character could see the act.
     @param instrument - true when a witness holds an instrument that can measure magic.
-    @returns a dict: deviation, suspicion, record, priced (act -> (deviation, suspicion)),
-        and unknown (keys refused, priced at zero). Nothing is written by this call.
+    @returns a dict: deviation, suspicion, record, record_deviation, priced
+        (act -> (deviation, suspicion)), unknown (keys refused, priced at zero), acts.
+        Nothing is written by this call.
     """
     priced: dict[str, tuple[int, int]] = {}
     unknown: list[str] = []
     deviation = 0
     suspicion = 0
-    acts = list(acts)
+    acts = declared_acts(acts)
     for act in acts:
         try:
             act_deviation, act_suspicion = price_act(act)
@@ -109,7 +113,11 @@ def price_acts(acts: Iterable[str], *, witnessed: bool = False,
         priced[act] = (act_deviation, act_suspicion)
         deviation += act_deviation
         suspicion += act_suspicion
-    if acts and witnessed and not unknown:
+    # The audience scales what was actually priced. It used to be voided by ANY
+    # unknown key in the same turn, so a Host's typo made the turn CHEAPER than
+    # the same act spelled correctly — a discount for an incomplete declaration,
+    # which is the opposite of "refused, not guessed".
+    if priced and witnessed:
         suspicion *= WITNESS_SUSPICION_MULTIPLIER
     record = instrument and witnessed and deviation > 0
     return {

@@ -11,6 +11,7 @@ starting a later act directly.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -138,7 +139,10 @@ async def triggered_endings(session_id: int | None = None) -> list[dict[str, Any
     for entry in hits:
         if entry["triggered_at"] is None:
             await Database.execute(
-                "UPDATE maya_rp.ooc_endings SET triggered_at=now() WHERE id=$1 AND triggered_at IS NULL", entry["id"]
+                "UPDATE maya_rp.ooc_endings SET triggered_at=now()"
+                " WHERE id=$1 AND session_id=$2 AND triggered_at IS NULL",
+                entry["id"],
+                sid,
             )
     return hits
 
@@ -238,9 +242,14 @@ async def spend(session_id: int | None = None, kind: str = "", target: str | Non
             raise ValueError("no observer to calm")
         await ooc.bump_suspicion(sid, observer, -10, f"paid:{kind}")
         detail = f"observer {observer} relaxed by 10"
-    else:  # reveal_intel
+    elif kind == "reveal_intel":
         await add_directive(sid, f"[paid:{kind}] {target or 'intel request'}")
         detail = "intel request recorded"
+    else:
+        # A price without a branch would spend the points and record a director note as if the
+        # caller had asked for intel. The table and the branches are two lists; this refuses to
+        # let them disagree.
+        raise ValueError(f"sink {kind!r} has a price but no branch in spend()")
     await Database.execute(
         "UPDATE maya_rp.ooc_system_state SET roleplay_points=roleplay_points-$2, updated_at=now() WHERE session_id=$1",
         sid,
@@ -294,8 +303,10 @@ async def character_rules(session_id: int | None = None, name: str = "") -> dict
         return {"character": character["name"], "traits": [], "rules": []}
     rows = await Database.fetch(
         "SELECT id, kind, pattern FROM maya_rp.ooc_rules"
-        " WHERE enabled AND trait = ANY($1::text[]) ORDER BY id LIMIT 20",
+        " WHERE enabled AND trait = ANY($1::text[])"
+        "   AND (session_id IS NULL OR session_id=$2) ORDER BY id LIMIT 20",
         [str(t) for t in traits],
+        sid,
     )
     return {"character": character["name"], "traits": traits, "rules": [dict(row) for row in rows]}
 
@@ -375,11 +386,30 @@ def load_snapshot(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _as_datetime(value: Any) -> Any:
+    """A snapshot timestamp, back as a datetime.
+
+    `save_snapshot` writes JSON, so every datetime in a loaded snapshot is text, and asyncpg refuses
+    text for a timestamptz parameter. The in-process caller (`snapshot()` straight into
+    `restore_snapshot()`) hands over real datetimes, so both shapes arrive here.
+    """
+    if value is None or isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError as exc:
+        raise ValueError(f"snapshot carries an unreadable timestamp {value!r}") from exc
+
+
 async def restore_snapshot(data: dict[str, Any]) -> dict[str, Any]:
     """Apply a snapshot: state, milestone completions, exemptions, suspicion.
 
     Used to start a later act directly (their "Starting Scenario 2"): the
     snapshot owns the numbers, the beats and the meters for that moment.
+
+    All four are written. The exemptions and the suspicion rows used to be counted in the return
+    value without being applied, so an act resumed from a file lost every purchased exemption and
+    every observer's suspicion while the result said they had come back.
     """
     sid = int(data.get("session_id") or Config.SESSION_ID)
     state = data.get("state") or {}
@@ -399,12 +429,50 @@ async def restore_snapshot(data: dict[str, Any]) -> dict[str, Any]:
             int(state.get("findings", 0) or 0),
             state.get("debuff"),
         )
+    milestones = 0
     for milestone in data.get("milestones") or []:
-        await Database.execute(
-            "UPDATE maya_rp.ooc_milestones SET completed_at=$3 WHERE session_id=$1 AND name=$2",
+        applied = await Database.fetchval(
+            "UPDATE maya_rp.ooc_milestones SET completed_at=$3"
+            " WHERE session_id=$1 AND name=$2 RETURNING name",
             sid,
             milestone.get("name"),
-            milestone.get("completed_at"),
+            _as_datetime(milestone.get("completed_at")),
         )
-    return {"ok": True, "session_id": sid, "state": bool(state), "milestones": len(data.get("milestones") or []),
-            "exemptions": len(data.get("exemptions") or []), "suspicion": len(data.get("suspicion") or [])}
+        # Counted only when a row was there: a snapshot can name a beat the target session does not
+        # carry, and the return value must not report that as restored.
+        milestones += 1 if applied else 0
+    exemptions = 0
+    for exemption in data.get("exemptions") or []:
+        await Database.execute(
+            "INSERT INTO maya_rp.ooc_exemptions"
+            " (session_id, rule_id, action_key, condition, cost_rpp, permanent, expires_at)"
+            " VALUES ($1,$2,$3,$4,$5,$6,$7)"
+            " ON CONFLICT (session_id, rule_id, action_key) DO UPDATE SET"
+            " condition=EXCLUDED.condition, cost_rpp=EXCLUDED.cost_rpp,"
+            " permanent=EXCLUDED.permanent, expires_at=EXCLUDED.expires_at",
+            sid,
+            exemption.get("rule_id"),
+            exemption.get("action_key"),
+            exemption.get("condition"),
+            int(exemption.get("cost_rpp") or 0),
+            bool(exemption.get("permanent")),
+            _as_datetime(exemption.get("expires_at")),
+        )
+        exemptions += 1
+    observers = 0
+    for observer in data.get("suspicion") or []:
+        if observer.get("observer_id") is None:
+            raise ValueError("snapshot carries a suspicion row with no observer_id")
+        await Database.execute(
+            "INSERT INTO maya_rp.ooc_suspicion (session_id, observer_id, suspicion, last_reason)"
+            " VALUES ($1,$2,$3,$4)"
+            " ON CONFLICT (session_id, observer_id) DO UPDATE SET"
+            " suspicion=EXCLUDED.suspicion, last_reason=EXCLUDED.last_reason, updated_at=now()",
+            sid,
+            int(observer["observer_id"]),
+            int(observer.get("suspicion") or 0),
+            observer.get("last_reason"),
+        )
+        observers += 1
+    return {"ok": True, "session_id": sid, "state": bool(state), "milestones": milestones,
+            "exemptions": exemptions, "suspicion": observers}

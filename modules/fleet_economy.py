@@ -23,14 +23,17 @@ async def calculate_daily_burn(session_id: int) -> dict:
 
 async def apply_burn(session_id: int) -> dict:
     burn = await calculate_daily_burn(session_id)
-    res = await Database.fetchrow("SELECT fuel, alloys, credits FROM maya_rp.resources WHERE session_id=$1", session_id)
-    if not res: return {"error": "No resources"}
-    new_fuel = max(0, res["fuel"] - burn["fuel"])
-    new_alloy = max(0, res["alloys"] - burn["alloy"])
-    new_credits = max(0, res["credits"] - burn["credits"])
-    await Database.execute("UPDATE maya_rp.resources SET fuel=$1, alloys=$2, credits=$3 WHERE session_id=$4",
-                           new_fuel, new_alloy, new_credits, session_id)
-    return {"burn": burn, "fuel_remaining": new_fuel, "alloy_remaining": new_alloy, "credits_remaining": new_credits}
+    # One statement, decremented in the database: the old read-modify-write set
+    # absolute values from a snapshot, so a concurrent tick could lose its burn.
+    row = await Database.fetchrow(
+        "UPDATE maya_rp.resources SET fuel=GREATEST(0, fuel-$1), alloys=GREATEST(0, alloys-$2), "
+        "credits=GREATEST(0, credits-$3) WHERE session_id=$4 "
+        "RETURNING fuel, alloys, credits",
+        burn["fuel"], burn["alloy"], burn["credits"], session_id)
+    if not row:
+        return {"error": f"No resources row for session {session_id}: burn not applied"}
+    return {"burn": burn, "fuel_remaining": row["fuel"], "alloy_remaining": row["alloys"],
+            "credits_remaining": row["credits"]}
 
 async def get_burn_summary(session_id: int) -> dict:
     burn = await calculate_daily_burn(session_id)

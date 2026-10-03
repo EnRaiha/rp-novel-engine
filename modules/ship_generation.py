@@ -14,25 +14,36 @@ def roll_stat(base: int, tier: int, scale: float = 1.15, variance: float = 0.10)
     return round(base * tier_mult(tier, scale) * (1 + random.uniform(-variance, variance)))
 
 def parse_slots(slots_str: str) -> list[tuple[str, int]]:
+    """Read a weapon-slot spec like "2XH 2H 4M" into [(size, count), ...].
+
+    A bare size means one mount ("M" -> ("M", 1)).
+
+    A token that is neither is REPORTED rather than dropped: five live classes
+    carry specs this parser cannot read ("8", "300", "30", "0", "M"), and they
+    silently generated with no weapons at all. Only "0" is a legitimate empty
+    spec, so anything unread is named.
+    """
     if not slots_str or slots_str.lower() == "none":
         return []
     slots = []
+    unread = []
     for tok in slots_str.split():
+        if tok in ("WMD", "SH", "XH", "H", "M", "L"):
+            slots.append((tok, 1))          # a bare size is one mount
+            continue
         for so in ["WMD","SH","XH","H","M","L"]:
             if tok.endswith(so):
                 try:
                     c = int(tok[:-len(so)])
                     slots.append((so, c))
                 except ValueError:
-                    pass
+                    unread.append(tok)
                 break
         else:
-            size = tok[-1]
-            try:
-                c = int(tok[:-1])
-                slots.append((size, c))
-            except ValueError:
-                pass
+            unread.append(tok)
+    if unread:
+        info("ship_generation", f"weapon_slots {slots_str!r}: could not read {unread} — "
+                                f"those mounts will be empty")
     return slots
 
 async def get_class(class_name: str) -> dict | None:
@@ -80,7 +91,7 @@ async def generate_ship(class_name: str, tier: int, ship_type: str, name: str | 
     armaments = roll_weapons(slot_specs, weapon_pool)
 
     module_pool = await get_modules(tier)
-    modules = roll_modules(sc["module_slots"], module_pool)
+    modules = roll_modules(sc["module_slots"] or 0, module_pool)
 
     ship_name = name or sc["class_name"]
     alloy_cost = sum(m.get("cost_alloys", 0) for m in modules) + round(sc["base_mass"] * 0.3 * (tier ** 0.7))
@@ -93,6 +104,10 @@ async def generate_ship(class_name: str, tier: int, ship_type: str, name: str | 
         "module_slots": sc["module_slots"], "weapon_slots_str": sc["weapon_slots"],
         "total_alloy_cost": alloy_cost, "total_credit_cost": credit_cost,
         "armaments": armaments, "modules": modules,
+        # A variant outside TYPE_MULTIPLIERS used to take 1.0 in silence; the
+        # caller can see whether the code it named did anything.
+        "type_multiplier": type_mult,
+        "type_recognised": ship_type in TYPE_MULTIPLIERS,
     }
 
 def roll_weapons(slot_specs: list[tuple[str, int]], weapon_pool: list[dict]) -> list[dict]:
@@ -143,6 +158,8 @@ def roll_modules(module_slots: int, module_pool: list[dict]) -> list[dict]:
 
 async def generate_batch(class_name: str, tier: int, ship_type: str, count: int,
                           prefix: str = "", session_id: int | None = None) -> list[dict]:
+    if count < 0:
+        raise ValueError(f"count cannot be negative, got {count}")
     ships = []
     for i in range(count):
         name = f"{prefix} {i+1}" if prefix else None

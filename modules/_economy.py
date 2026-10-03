@@ -68,9 +68,18 @@ async def _deduct_resources(session_id: int, costs: dict) -> dict:
             f"Known columns: {list(RESOURCE_COLUMNS)}")
     charged: dict[str, float] = {}
     for res, qty in costs.items():
-        await Database.execute(
-            f"UPDATE maya_rp.resources SET {res} = GREATEST(0, {res} - $1) WHERE session_id = $2",
+        remaining = await Database.fetchval(
+            f"UPDATE maya_rp.resources SET {res} = GREATEST(0, {res} - $1)"
+            " WHERE session_id = $2 RETURNING " + res,
             qty, session_id,
         )
+        # GREATEST(0, ...) clamps the result, which means a charge that arrives twice leaves the treasury
+        # short with no trace of the second one: once the column reaches zero the replay changes nothing it
+        # can be seen by. The value returned here is the balance AFTER the charge, so a replay inside
+        # `Database._run`'s at-least-once retry shows as a second line with a smaller or zero balance rather
+        # than as nothing at all. Behaviour is unchanged; only the evidence is.
         charged[res] = qty
+        from core.log import info as _log
+
+        _log("economy", f"charged {qty} {res} from session {session_id}: balance now {remaining}")
     return charged

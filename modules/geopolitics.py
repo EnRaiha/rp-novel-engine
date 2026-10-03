@@ -56,12 +56,16 @@ async def run_tick(session_id: int = None) -> dict:
     for r in hot:
         existing = await Database.fetchval(
             "SELECT COUNT(*) FROM maya_rp.wars WHERE session_id=$1 AND status='active' "
-            "AND (opponent_faction=(SELECT name FROM maya_rp.factions WHERE id=$2) "
-            "OR opponent_faction=(SELECT name FROM maya_rp.factions WHERE id=$3))",
+            "AND (opponent_faction=(SELECT name FROM maya_rp.factions WHERE id=$2 AND session_id=$1) "
+            "OR opponent_faction=(SELECT name FROM maya_rp.factions WHERE id=$3 AND session_id=$1))",
             session_id, r["faction_a"], r["faction_b"])
         if not existing and random.random() < 0.02:
-            fa = await Database.fetchrow("SELECT name FROM maya_rp.factions WHERE id=$1", r["faction_a"])
-            fb = await Database.fetchrow("SELECT name FROM maya_rp.factions WHERE id=$1", r["faction_b"])
+            fa = await Database.fetchrow(
+                "SELECT name FROM maya_rp.factions WHERE id=$1 AND session_id=$2",
+                r["faction_a"], session_id)
+            fb = await Database.fetchrow(
+                "SELECT name FROM maya_rp.factions WHERE id=$1 AND session_id=$2",
+                r["faction_b"], session_id)
             if fa and fb:
                 game_day = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id)
                 await Database.execute(

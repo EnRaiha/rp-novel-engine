@@ -25,16 +25,20 @@ IMPACTS = {
     "family_executed": {"standard": {"fame": -6, "moral": -12, "brutality": 15}},
 }
 
+#: The outer band of each map is open: fame is never clamped, so a campaign that keeps winning
+#: walks past 100, and `_find` answered "Unknown" for every point beyond the last tuple. The same
+#: hole sat below -999 on fame and above 999 on brutality.
 _TITLE_MAP = {
-    (75, 101): "Legendary Hero", (25, 75): "Respected", (-24, 25): "Neutral",
-    (-74, -24): "Feared", (-999, -74): "Galactic Terror"
+    (75, float("inf")): "Legendary Hero", (25, 75): "Respected", (-24, 25): "Neutral",
+    (-74, -24): "Feared", (float("-inf"), -74): "Galactic Terror"
 }
 _ALIGN_MAP = {
-    (75, 101): "Paragon", (40, 75): "Honorable", (10, 40): "Renegade", (-999, 10): "Monster"
+    (75, float("inf")): "Paragon", (40, 75): "Honorable", (10, 40): "Renegade",
+    (float("-inf"), 10): "Monster"
 }
 _BRUTAL_MAP = {
-    (80, 999): "Unforgivable", (50, 80): "Butcher", (20, 50): "Bloodstained",
-    (1, 20): "Hard Choices", (-999, 1): "Clean"
+    (80, float("inf")): "Unforgivable", (50, 80): "Butcher", (20, 50): "Bloodstained",
+    (1, 20): "Hard Choices", (float("-inf"), 1): "Clean"
 }
 
 @dataclass
@@ -50,7 +54,18 @@ class Reputation:
               witnesses: Optional[List[str]] = None, secrecy: str = "public",
               context: str = "") -> Dict:
         witnesses = witnesses or []
-        impact = IMPACTS.get(action_type, {}).get(severity, {"fame": 0, "moral": 0, "brutality": 0})
+        # `IMPACTS.get(action_type, {}).get(severity, {0, 0, 0})` answered an unknown action, and an
+        # unknown severity for a known action, with a no-op that then reported the unchanged state
+        # as though the deed had been recorded. Both are refused by name now: severities are
+        # per-action (`mercy` has only `standard`), so a typo is the ordinary way to arrive here.
+        effects = IMPACTS.get(action_type)
+        if effects is None:
+            raise ValueError(f"unknown reputation action {action_type!r}; known: {sorted(IMPACTS)}")
+        impact = effects.get(severity)
+        if impact is None:
+            raise ValueError(
+                f"unknown severity {severity!r} for action {action_type!r};"
+                f" known severities: {sorted(effects)}")
         if secrecy == "public":
             self.fame += impact.get("fame", 0)
             self.moral += impact.get("moral", 0)

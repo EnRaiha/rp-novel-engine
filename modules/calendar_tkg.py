@@ -68,7 +68,9 @@ async def get_game_date(session_id: int, game_day: int = None) -> dict:
     holiday = None
     key = None if leftover else (m_idx + 1, dom)
     if key and key in HOLIDAYS:
-        holiday = HOLIDAYS[key]
+        # A copy: the old line wrote days_until into the module constant itself, so
+        # the first lookup of a holiday left it stamped on HOLIDAYS for the process.
+        holiday = dict(HOLIDAYS[key])
         holiday["days_until"] = 0
 
     return {
@@ -101,17 +103,26 @@ async def apply_holiday(date: dict, session_id: int):
     # Crown covers festival costs — somber days slow spending instead.
     bonus = h.get("bonus", 0)
     if bonus != 0:
-        await Database.execute(
+        crew = await Database.fetchrow(
             # GREATEST(0, ...) as well as LEAST(100, ...): the ceiling was there and the floor was
             # not, so a bad event could drive crew morale negative and the tick would report it.
             "UPDATE maya_rp.crew_roster SET morale=GREATEST(0, LEAST(100, morale+$1))"
-            " WHERE session_id=$2",
+            " WHERE session_id=$2 RETURNING id",
             bonus, session_id)
         spend = max(0, bonus) * 2000
         if spend:
-            await Database.execute(
-                "UPDATE maya_rp.resources SET credits=GREATEST(0, credits-$1) WHERE session_id=$2",
+            paid = await Database.fetchrow(
+                "UPDATE maya_rp.resources SET credits=GREATEST(0, credits-$1) "
+                "WHERE session_id=$2 RETURNING credits",
                 spend, session_id)
+            if paid is None:
+                # A session without a resources row used to cover the festival for free
+                # and say nothing. Session 5 is that session today.
+                info("calendar",
+                     f"{h['name']}: no resources row for session {session_id}, {spend}C not spent")
+        if crew is None:
+            info("calendar",
+                 f"{h['name']}: no crew row for session {session_id}, morale bonus not applied")
 
 async def get_upcoming(session_id: int, lookahead: int = 30) -> list[dict]:
     """Holidays in the next N game days."""

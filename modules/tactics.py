@@ -5,7 +5,7 @@ import random, math
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import info, error
 
 DAMAGE_TYPES = {
     "kinetic":   {"strong_vs": ["hull","armor"], "weak_vs": ["shield"], "mult": 1.0},
@@ -83,16 +83,23 @@ async def get_tactical_position(session_id: int, zone: str = "forward", terrain:
     "not specified": the CLI passes None for terrain and formation, and the module's own defaults are
     the ones that apply.
     """
+    # One case rule for both the checks and the multipliers. Formation was the
+    # only one checked case-insensitively while all three multiplied
+    # case-sensitively, so "WEDGE" passed validation and still took the 0.9
+    # fallback, and "AFT" was warned about and then treated as forward.
+    zone_l = zone.lower() if isinstance(zone, str) else zone
+    terrain_l = terrain.lower() if isinstance(terrain, str) else terrain
+    form_l = formation.lower() if isinstance(formation, str) else formation
     warnings = []
-    if zone not in ZONES:
+    if zone_l not in ZONES:
         warnings.append(f"unknown zone {zone!r}. Known zones: {', '.join(ZONES)}")
-    if terrain is not None and terrain not in TERRAINS:
+    if terrain_l is not None and terrain_l not in TERRAINS:
         warnings.append(f"unknown terrain {terrain!r}. Known terrains: {', '.join(TERRAINS)}")
-    if formation is not None and formation.lower() not in FORMATIONS:
+    if form_l is not None and form_l not in FORMATIONS:
         warnings.append(f"unknown formation {formation!r}. Known formations: {', '.join(FORMATIONS)}")
-    flank_bonus = 1.0 if zone in ("aft","ventral") else 0.8
-    terrain_bonus = 1.0 if terrain == "asteroid_field" else 0.9 if terrain == "nebula" else 0.8
-    form_bonus = 1.2 if formation == "spearhead" else 1.0 if formation == "wedge" else 0.9
+    flank_bonus = 1.0 if zone_l in ("aft","ventral") else 0.8
+    terrain_bonus = 1.0 if terrain_l == "asteroid_field" else 0.9 if terrain_l == "nebula" else 0.8
+    form_bonus = 1.2 if form_l == "spearhead" else 1.0 if form_l == "wedge" else 0.9
     out = {"effective_power": round(flank_bonus * terrain_bonus * form_bonus, 2), "zone": zone,
            "terrain": terrain, "formation": formation}
     if warnings:
@@ -116,7 +123,7 @@ async def run_tick(session_id: int = None) -> dict:
         info("tactics", f"Tick: fleet_power={fp['fleet_power']}, ships={fp['ship_count']}")
         return fp
     except Exception as e:
-        info("tactics", f"Error: {e}")
+        error("tactics", f"tick error: {e}")
         return {"error": str(e)}
 
 

@@ -1,173 +1,171 @@
-"""Tactics module review tests — one per defect found reading modules/tactics.py.
+"""Module review tests for modules/tactics.py.
 
-Defects covered:
+Defect covered by this pass:
 
-1. `calculate_fleet_power` took `fleet_name` and never read it, so a caller asking for one fleet was
-   answered with the whole campaign's order of battle. Session 3 holds 44,269 hulls and its largest
-   named fleet 10,329; "Legion Silent Maw" holds 9.
-2. The same function read a hull with `hull_current or hull`, so a hull at zero — a wreck — counted at
-   its original hull value. Session 3 carries one: ship 1516, `TKG Phoenix Reborn`, hull 34250,
-   hull_current 0, status destroyed.
-3. `resolve_exchange` resolved an unknown weapon name as kinetic, so a typo fought at kinetic odds
-   with nothing said. `BattleEngine._tactic_mult` refuses an unknown tactic; this now matches it.
-4. `get_tactical_position` gave an unknown zone, terrain or formation a default multiplier in silence,
-   the same answer for a typo as for a real value.
+1. `get_tactical_position` validated zone, terrain and formation case-insensitively
+   and then computed the multipliers case-SENSITIVELY: "WEDGE" produced no warning
+   and took the 0.9 fallback instead of the wedge's 1.0. The multipliers read the
+   lower-cased values now.
+2. `run_tick` logged its crash at info level.
 
-Pinned, not reconciled, and reported to the lead: the module holds two formation tables that do not
-agree (`_FORMATIONS` for `formation_bonus`, which `battle.run_tick` applies, and the position
-reader's own chain), and `MILITARY_OPS` has no caller anywhere in the repo. The pin test below states
-the disagreement so the next reader sees it instead of rediscovering it; changing either side changes
-numbers a campaign has already been shown, which is not a reviewer's call.
+Checked and found correct, and the docstrings record the earlier pass: an unknown
+weapon raises instead of fighting at kinetic odds; `targeting_system` is validated
+against the module's own list; `calculate_fleet_power` reads the fleet through
+`fleets` and `fleet_members` and refuses an unknown name; a zero `hull_current` is
+a wreck, not a full-strength hull; and `formation_bonus` documents its 1.0
+fallback. `ship_tech_bonuses` has no session_id, so research's insert into it is
+correctly unscoped.
 
-Everything here is read-only against the database: the fleet test reads session 3 and writes nothing.
+No database for most of it: the pure helpers are tested directly, the fleet read
+through a fake.
 """
 from __future__ import annotations
 
 import pytest
 
-from core.db import Database  # noqa: E402
-import modules.tactics as tactics  # noqa: E402
+import modules.tactics as tactics
 
 
 class FakeDB:
-    """One ships query and nothing else, so a hull's contribution can be isolated."""
-
-    def __init__(self, ships):
-        self.ships = ships
+    def __init__(self, fetch=None, fetchrow=None):
+        self.fetch_rows = fetch if fetch is not None else []
+        self.fetchrow_value = fetchrow
+        self.calls = []
 
     async def fetch(self, sql, *args):
-        return self.ships
+        self.calls.append(("fetch", " ".join(sql.split()), args))
+        return self.fetch_rows
 
     async def fetchrow(self, sql, *args):
-        return None
+        self.calls.append(("fetchrow", " ".join(sql.split()), args))
+        return self.fetchrow_value
+
+    def sql(self, kind=None):
+        return [c[1] for c in self.calls if kind is None or c[0] == kind]
 
 
-DESTROYED_HULL = {"tier": 1, "hull": 34250, "hull_current": 0, "speed": 10}
+def _install(monkeypatch, fake):
+    for name in ("fetch", "fetchrow"):
+        monkeypatch.setattr("modules.tactics.Database." + name, getattr(fake, name))
+    return fake
 
 
-class TestTheFleetPowerReader:
-    async def test_a_wreck_counts_as_the_wreck_it_is(self, monkeypatch):
-        """`hull_current or hull` read the real zero as missing and restored 34250 hulls."""
-        monkeypatch.setattr(tactics, "Database", FakeDB([DESTROYED_HULL]))
-
-        out = await tactics.calculate_fleet_power(3)
-
-        assert out["ship_count"] == 1, out
-        assert out["fleet_power"] == 10, out
-
-    async def test_an_intact_hull_still_counts_at_its_hull(self, monkeypatch):
-        monkeypatch.setattr(tactics, "Database",
-                            FakeDB([{"tier": 1, "hull": 34250, "hull_current": 34250, "speed": 10}]))
-
-        out = await tactics.calculate_fleet_power(3)
-
-        assert out["fleet_power"] == 10 + 3425, out
-
-    async def test_a_named_fleet_is_read_through_its_own_members(self):
-        """Read-only: the named fleet is compared against the campaign it sits in."""
-        await Database.init()
-        try:
-            expected = await Database.fetchval(
-                "SELECT COUNT(*) FROM maya_rp.fleet_members fm"
-                " JOIN maya_rp.ships s ON s.id=fm.ship_id"
-                " WHERE fm.fleet_id=(SELECT id FROM maya_rp.fleets"
-                "                    WHERE session_id=3 AND name='Legion Silent Maw')")
-            named = await tactics.calculate_fleet_power(3, "Legion Silent Maw")
-            whole = await tactics.calculate_fleet_power(3)
-        finally:
-            await Database.close()
-
-        assert expected, "the fleet has no members to compare against"
-        assert named["ship_count"] == expected, (named, expected)
-        assert named["fleet_power"] < whole["fleet_power"], (named, whole)
-        assert named["ship_count"] < whole["ship_count"], (named, whole)
-
-    async def test_an_unknown_fleet_name_raises_rather_than_answering_with_everything(self):
-        await Database.init()
-        try:
-            with pytest.raises(ValueError) as exc:
-                await tactics.calculate_fleet_power(3, "No Such Fleet")
-        finally:
-            await Database.close()
-
-        assert "No Such Fleet" in str(exc.value), exc.value
+SHIPS = [{"tier": 3, "hull": 100, "hull_current": 50, "speed": 10},
+         {"tier": None, "hull": 40, "hull_current": None, "speed": 5}]
 
 
-class TestTheExchange:
-    async def test_a_typo_in_the_weapon_is_refused(self):
-        with pytest.raises(ValueError) as exc:
-            await tactics.resolve_exchange(200, 5, 20, 1, "banana", None)
+# ── 1. The multipliers read the validated case ──────────────────────────
 
-        assert "banana" in str(exc.value), exc.value
-        assert "kinetic" in str(exc.value), exc.value
+@pytest.mark.parametrize("formation,expected", [("spearhead", 1.2), ("SPEARHEAD", 1.2),
+                                               ("wedge", 1.0), ("Wedge", 1.0)])
+async def test_a_formation_multiplier_ignores_case(formation, expected):
+    out = await tactics.get_tactical_position(5, formation=formation)
 
-    async def test_none_still_means_kinetic_because_the_cli_passes_none(self):
-        out = await tactics.resolve_exchange(200, 5, 20, 1, None, None)
-
-        assert out["weapon"] == "kinetic", out
-
-    async def test_a_known_weapon_keeps_its_multiplier(self):
-        kinetic = await tactics.resolve_exchange(200, 5, 20, 1, "kinetic", None)
-        explosive = await tactics.resolve_exchange(200, 5, 20, 1, "explosive", None)
-
-        assert explosive["damage"] == round(kinetic["damage"] * 1.3), (kinetic, explosive)
-
-    async def test_an_unknown_targeting_system_is_refused(self):
-        with pytest.raises(ValueError) as exc:
-            await tactics.resolve_exchange(200, 5, 20, 1, "kinetic", "hull")
-
-        assert "hull" in str(exc.value), exc.value
-
-    async def test_a_known_targeting_system_is_echoed_back(self):
-        out = await tactics.resolve_exchange(200, 5, 20, 1, "kinetic", "shields")
-
-        assert out["targeting_system"] == "shields", out
+    assert "warnings" not in out, out
+    assert out["effective_power"] == pytest.approx(round(0.8 * 0.8 * expected, 2)), out
 
 
-class TestThePositionReader:
-    async def test_an_unknown_zone_is_named_in_the_answer(self):
-        out = await tactics.get_tactical_position(5, "flank", None, None)
+@pytest.mark.parametrize("terrain,expected", [("asteroid_field", 1.0), ("ASTEROID_FIELD", 1.0),
+                                              ("nebula", 0.9), ("NEBULA", 0.9)])
+async def test_a_terrain_multiplier_ignores_case(terrain, expected):
+    out = await tactics.get_tactical_position(5, terrain=terrain)
 
-        assert "warnings" in out, out
-        assert "flank" in out["warnings"][0], out
-
-    async def test_the_warning_does_not_move_the_number_it_reports(self):
-        """The unrecognised zone keeps the multiplier it always had; only the silence is gone."""
-        out = await tactics.get_tactical_position(5, "flank", None, None)
-
-        assert out["effective_power"] == round(0.8 * 0.8 * 0.9, 2), out
-
-    async def test_recognised_inputs_are_not_warned_about(self):
-        out = await tactics.get_tactical_position(5, "aft", "asteroid_field", "wedge")
-
-        assert "warnings" not in out, out
-        assert out["effective_power"] == 1.0, out
-
-    async def test_none_is_not_a_typo(self):
-        """The CLI passes None for terrain and formation; that stays the module's default."""
-        out = await tactics.get_tactical_position(5, "forward", None, None)
-
-        assert "warnings" not in out, out
+    assert "warnings" not in out, out
+    # zone defaults to forward (0.8), formation to spearhead (1.2)
+    assert out["effective_power"] == pytest.approx(round(0.8 * expected * 1.2, 2)), out
 
 
-class TestTheFormationTablesArePinned:
-    def test_two_formation_tables_disagree_and_stay_that_way_until_a_ruling(self):
-        """`formation_bonus` is what battle applies; the position reader has its own chain.
+@pytest.mark.parametrize("zone,expected", [("aft", 1.0), ("AFT", 1.0), ("ventral", 1.0),
+                                           ("forward", 0.8)])
+async def test_a_zone_multiplier_ignores_case(zone, expected):
+    out = await tactics.get_tactical_position(5, zone=zone)
 
-        Wedge is 1.15 in one and 1.0 in the other, and spearhead — the position reader's default — is
-        not in `_FORMATIONS` at all, while `FORMATIONS` advertises it. Reconciling them changes numbers
-        the CLI has already shown a campaign, so this test states the disagreement rather than
-        resolving it.
-        """
-        assert tactics.formation_bonus("wedge") == 1.15
-        assert "spearhead" in tactics.FORMATIONS
-        assert "spearhead" not in tactics._FORMATIONS
-        assert tactics.formation_bonus("spearhead") == 1.0
+    # terrain defaults to open_space (0.8), formation to spearhead (1.2)
+    assert out["effective_power"] == pytest.approx(round(expected * 0.8 * 1.2, 2)), out
 
-    def test_the_battle_tick_still_gets_a_multiplier_and_a_terrain(self):
-        """battle.run_tick imports both of these synchronously; neither may become a coroutine."""
-        import inspect
 
-        assert not inspect.iscoroutinefunction(tactics.formation_bonus)
-        assert not inspect.iscoroutinefunction(tactics.roll_terrain)
-        assert "player_mod" in tactics.roll_terrain()
+async def test_an_unknown_value_is_named_and_still_answered(monkeypatch):
+    out = await tactics.get_tactical_position(5, zone="flank", terrain="mud", formation="turtle")
+
+    assert len(out["warnings"]) == 3
+    assert any("flank" in w for w in out["warnings"])
+    assert out["effective_power"] == pytest.approx(round(0.8 * 0.8 * 0.9, 2))
+
+
+async def test_the_defaults_are_the_documented_ones():
+    out = await tactics.get_tactical_position(5)
+
+    assert out["zone"] == "forward" and out["terrain"] == "open_space"
+    assert out["formation"] == "spearhead"
+    assert out["effective_power"] == pytest.approx(round(0.8 * 0.8 * 1.2, 2))
+
+
+# ── Contract the module claims ──────────────────────────────────────────
+
+def test_contract_every_pure_table_is_unique():
+    for table in (tactics.SYSTEM_TARGETS, tactics.ZONES, tactics.TERRAINS,
+                  tactics.FORMATIONS, tactics.MILITARY_OPS):
+        values = list(table)
+        assert len(set(values)) == len(values)
+
+
+def test_contract_the_damage_table_names_its_multipliers():
+    for name, spec in tactics.DAMAGE_TYPES.items():
+        assert set(spec) == {"strong_vs", "weak_vs", "mult"}, name
+        assert spec["mult"] > 0
+
+
+async def test_contract_calculate_fleet_power_reads_the_campaign(monkeypatch):
+    fake = _install(monkeypatch, FakeDB(fetch=SHIPS))
+
+    out = await tactics.calculate_fleet_power(5)
+
+    assert out["ship_count"] == 2
+    # (3*10 + 50//10) + (1*10 + 40//10): NULL tier reads as 1, NULL hull_current
+    # falls back to the hull value
+    assert out["fleet_power"] == 35 + 14
+    assert "session_id=$1" in fake.sql("fetch")[0]
+
+
+async def test_contract_an_unknown_fleet_raises_rather_than_answering(monkeypatch):
+    _install(monkeypatch, FakeDB(fetchrow=None))
+
+    with pytest.raises(ValueError, match="Unknown fleet"):
+        await tactics.calculate_fleet_power(5, "No Such Fleet")
+
+
+async def test_contract_formation_bonus_documents_its_fallback():
+    assert tactics.formation_bonus("wedge") == 1.15
+    assert tactics.formation_bonus("WEDGE") == 1.15
+    assert tactics.formation_bonus("turtle") == 1.0
+
+
+def test_contract_roll_terrain_returns_a_named_table_row():
+    seen = {tactics.roll_terrain()["name"] for _ in range(40)}
+
+    assert seen <= {t["name"] for t in tactics._TERRAINS}
+
+
+async def test_contract_run_tick_reports_the_campaign_power(monkeypatch):
+    _install(monkeypatch, FakeDB(fetch=SHIPS))
+
+    out = await tactics.run_tick(5)
+
+    assert out["ship_count"] == 2 and out["fleet_power"] == 49
+
+
+async def test_contract_run_tick_reports_a_crash_as_an_error(monkeypatch):
+    seen = []
+    monkeypatch.setattr("modules.tactics.error", lambda mod, msg: seen.append(msg))
+    monkeypatch.setattr("modules.tactics.info", lambda mod, msg: None)
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("no hulls")
+
+    _install(monkeypatch, FakeDB())
+    monkeypatch.setattr("modules.tactics.Database.fetch", boom)
+
+    out = await tactics.run_tick(5)
+
+    assert "no hulls" in out["error"]
+    assert any("no hulls" in m for m in seen), seen

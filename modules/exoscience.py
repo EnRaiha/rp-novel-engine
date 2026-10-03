@@ -5,7 +5,7 @@ import hashlib
 import random
 from core.db import Database
 from core.config import Config
-from core.log import info, warn
+from core.log import info, warn, error
 
 def _pace(*parts: object) -> int:
     """A stable 5..15 pace for one row, derived from the row's own state.
@@ -30,9 +30,14 @@ async def run_tick(session_id: int | None = None) -> dict:
         completed = 0
         unpaid = 0
         for m in missions:
-            gain = _pace(session_id, m["id"], m["progress"])
-            new_progress = min(m["target_progress"], m["progress"] + gain)
-            is_done = new_progress >= m["target_progress"]
+            # `progress` and `target_progress` are nullable columns. A row written without them made
+            # `None + gain` raise inside the tick's single try, so one malformed row stopped every
+            # mission in the session instead of being read as the zero progress it holds.
+            progress = m["progress"] if m["progress"] is not None else 0
+            target = m["target_progress"] if m["target_progress"] is not None else 100
+            gain = _pace(session_id, m["id"], progress)
+            new_progress = min(target, progress + gain)
+            is_done = new_progress >= target
             await Database.execute("UPDATE maya_rp.science_missions SET progress=$1, status=$2 WHERE id=$3", new_progress, "completed" if is_done else "active", m["id"])
             if is_done:
                 # A session with no resources row takes the reward and loses it silently: the UPDATE
@@ -52,8 +57,12 @@ async def run_tick(session_id: int | None = None) -> dict:
         anomalies = await Database.fetch("SELECT id, name, data_collected, data_threshold FROM maya_rp.anomalies_catalog WHERE session_id=$1 AND studied=false", session_id)
         studied = 0
         for a in anomalies:
-            collected = a["data_collected"] + _pace(session_id, a["id"], a["data_collected"])
-            if collected >= a["data_threshold"]:
+            # Same nullable-column read as the mission loop: `data_collected` and `data_threshold`
+            # can both be absent, and one such anomaly row killed the whole tick.
+            before = a["data_collected"] if a["data_collected"] is not None else 0
+            threshold = a["data_threshold"] if a["data_threshold"] is not None else 100
+            collected = before + _pace(session_id, a["id"], before)
+            if collected >= threshold:
                 await Database.execute("UPDATE maya_rp.anomalies_catalog SET studied=true, data_collected=$1 WHERE id=$2", collected, a["id"])
                 studied += 1
             else:
@@ -65,11 +74,14 @@ async def run_tick(session_id: int | None = None) -> dict:
             out["rewards_unpaid"] = unpaid
         return out
     except Exception as e:
-        info("exoscience", f"Error: {e}")
+        error("exoscience", f"Error: {e}")
         return {"error": str(e)}
 
 async def start_mission(mission_type: str, session_id: int | None = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
+    if not (mission_type or "").strip():
+        return {"error": "mission_type is required: a mission with no type cannot be progressed"}
+    mission_type = mission_type.strip()
     target = random.randint(50, 200)
     reward = target * 5
     mid = await Database.fetchval(
@@ -79,6 +91,11 @@ async def start_mission(mission_type: str, session_id: int | None = None) -> dic
 
 async def generate_anomaly(location: str, session_id: int | None = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
+    if not (location or "").strip():
+        # An empty location made the LIKE pattern `%%`, which matched the session's first sector, so
+        # an anomaly with no site was silently tied to whichever sector the scan happened to return.
+        return {"error": "location is required: an anomaly with no site cannot be placed"}
+    location = location.strip()
     name = f"{random.choice(ANOMALY_PREFIXES)} {random.choice(ANOMALY_SUFFIXES)}"
     atype = random.choice(ANOMALY_TYPES)
     threshold = random.randint(30, 100)

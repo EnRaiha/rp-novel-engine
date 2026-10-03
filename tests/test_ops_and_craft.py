@@ -71,9 +71,10 @@ class TestTheAcademyAndTheCrew:
         assert out is not None
         await Database.close()
 
-    async def test_producing_crew_answers(self):
+    async def test_producing_crew_answers(self, scratch_session):
+        # A scratch session, not session 5: this test used to credit the live arc's crew_pool and then
+        # delete the roster row it had just written. The fixture owns the cleanup now.
         await Database.init()
-        out = await crew_system.produce_crew(5)
-        await Database.execute("DELETE FROM maya_rp.crew_roster WHERE session_id=5 AND name LIKE 'red proof%'")
+        out = await crew_system.produce_crew(scratch_session)
         assert out is not None
         await Database.close()

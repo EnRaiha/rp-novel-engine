@@ -94,11 +94,25 @@ async def scratch_session() -> int:
 
     from core.db import Database
 
+    # The test usually called Database.close() before this runs, so the pool may be shut. Without this the
+    # fetch below raised, the except returned, and the teardown did nothing — silently, which is the exact
+    # defect this fixture was written to stop. The proof test caught it: one row left in complaint_boxes.
     try:
+        await Database.init()
+    except Exception as e:
+        print(f"scratch_session: could not open the pool, rows may remain: {e!r}")
+        return
+
+    try:
+        # Every column is qualified. Unqualified `table_schema` and `table_name` are ambiguous across the
+        # two joined information_schema views, which raised, which the except swallowed.
         tables = await Database.fetch(
-            "SELECT c.table_name FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE'"
-            " WHERE table_schema = 'maya_rp' AND column_name = 'session_id'")
-    except Exception:
+            "SELECT c.table_name FROM information_schema.columns c"
+            " JOIN information_schema.tables t ON t.table_schema = c.table_schema"
+            " AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE'"
+            " WHERE c.table_schema = 'maya_rp' AND c.column_name = 'session_id'")
+    except Exception as e:
+        print(f"scratch_session: could not list the tables it must clear: {e!r}")
         return
     for row in tables:
         try:

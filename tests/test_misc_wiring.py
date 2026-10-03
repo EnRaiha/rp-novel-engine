@@ -68,8 +68,10 @@ class TestTheLastTwoWrites:
         assert out is not None
         await Database.close()
 
-    async def test_producing_crew_answers(self):
+    async def test_producing_crew_answers(self, scratch_session):
+        # A scratch session, not session 5. produce_crew credits crew_pool on the row it is given, and
+        # the measurement for this suite was crew_pool +1604 per run against the live arc.
         await Database.init()
-        out = await crew_system.produce_crew(5)
+        out = await crew_system.produce_crew(scratch_session)
         assert out is not None
         await Database.close()

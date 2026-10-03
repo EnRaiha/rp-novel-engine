@@ -157,9 +157,9 @@ unless you pass it")
             " AND NOT (tags @> jsonb_build_array($3::text))",
             SESSION, list(POLLUTION_EVENT_TYPES), "noncanon:test-write")
         closed = await Database.execute(
-            "UPDATE maya_rp.story_arcs SET status='noncanon:engine-write'"
+            "UPDATE maya_rp.story_arcs SET status='noncanon:engine'"
             " WHERE session_id=$1 AND started_at::date = CURRENT_DATE"
-            " AND status <> 'noncanon:engine-write'", SESSION)
+            " AND status <> 'noncanon:engine'", SESSION)
         print(f"marked {marked} event rows and {closed} arc rows as non-canon (nothing deleted)")
 
         live = await Database.fetchval(

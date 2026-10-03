@@ -1,8 +1,9 @@
 """Async economy module — tax, population, trade."""
 from core.db import Database
+from core.config import Config
 from core.utils import calc_game_days, clamp
 from datetime import datetime, timezone
-from core.log import error
+from core.log import error, info
 
 # Progressive marginal tax brackets — PERCENTAGE rates that thin with world size.
 # Big worlds still pay more absolute tax (they are huge), but a smaller
@@ -44,13 +45,18 @@ GATE_TOLL_RATE = 25000            # fair toll per crossing — third parties pay
 GATE_TOLL_VOLUME_PER_CROSSING = 40  # units of trade volume = one crossing
 
 
-async def gate_toll_income(session_id: int = 3) -> int:
+async def gate_toll_income(session_id: int = None) -> int:
     """Foreign-faction gate tolls → Setia treasury (2026-08-15 Izzat canon).
 
     Setia uses its own gates FREE. Third parties pay the fair toll; income is
     grounded in active trade deals between Setia and non-Setia factions,
     scaled by volume (one crossing per GATE_TOLL_VOLUME_PER_CROSSING units).
+
+    Defaults to the engine's session (Config.SESSION_ID). The literal 3 is the
+    frozen reference campaign, so a bare call read the wrong arc.
     """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     try:
         volume = await Database.fetchval(
             """SELECT COALESCE(SUM(ftd.quantity), 0)
@@ -67,7 +73,14 @@ async def gate_toll_income(session_id: int = 3) -> int:
     return (int(volume or 0) // GATE_TOLL_VOLUME_PER_CROSSING) * GATE_TOLL_RATE
 
 
-async def run_tick(session_id: int = 3):
+async def run_tick(session_id: int = None):
+    """Tax, population and trade for one campaign.
+
+    Defaults to the engine's session (Config.SESSION_ID), not the literal 3:
+    that id is the frozen reference campaign, so a bare tick wrote there.
+    """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     row = await Database.fetchrow("SELECT last_tick_at FROM resources WHERE session_id=$1", session_id)
     if not row or not row.get("last_tick_at"):
         return
@@ -76,7 +89,8 @@ async def run_tick(session_id: int = 3):
         from modules.market import get_market_index
         _mk = get_market_index(session_id)
         market_mult = 0.9 + 0.2 * min(await _mk, 1.5)
-    except Exception:
+    except Exception as e:  # noqa: BLE001 - priced at neutral, and said so
+        error("economy", f"market index unavailable, trade tax at neutral: {e}")
         market_mult = 1.0
     if gd < 0.01:
         return
@@ -88,9 +102,24 @@ async def run_tick(session_id: int = 3):
         "FROM territory WHERE session_id=$1 AND controlling_faction='Setia Empire'",
         session_id)
 
-    morale = await Database.fetchval(
-        "SELECT aggregate_morale FROM resources WHERE session_id=$1", session_id) or 50
-    growth_mult = 0.5 + (morale or 50) / 100.0  # morale 50 = baseline, 100 = +50%, 0 = -50%
+    # `morale` 0 is the code below's own -50% case ("morale 0 = -50%"): `or 50`
+    # turned a collapsed empire into a baseline one. Only NULL is missing.
+    morale_row = await Database.fetchval(
+        "SELECT aggregate_morale FROM resources WHERE session_id=$1", session_id)
+    morale = 50.0 if morale_row is None else float(morale_row)
+    growth_mult = 0.5 + morale / 100.0     # morale 50 = baseline, 100 = +50%, 0 = -50%
+
+    # Ideology tolerance is one value per campaign. It was re-read once per
+    # territory (109 identical queries a tick) and its failure was silent.
+    try:
+        from modules.ideology import tax_tolerance
+        ideology = (await Database.fetchrow(
+            "SELECT ideology FROM maya_rp.ideology_state WHERE session_id=$1",
+            session_id) or {}).get("ideology", "benevolent_democracy")
+        tol = tax_tolerance(ideology)
+    except Exception as e:  # noqa: BLE001 - 0.20 is the declared fallback, and it is logged
+        error("economy", f"tax tolerance unavailable, using 0.20: {e}")
+        tol = 0.20
 
     total_rev = 0
     total_empire_pop = 0
@@ -104,7 +133,10 @@ async def run_tick(session_id: int = 3):
         if t["status"] == "abandoned":
             continue
 
-        pop = t["population"] or 1_000_000
+        # A stored 0 is zero residents, not a missing value: `or 1_000_000` gave
+        # every dead world the tick touched a million residents and put it back
+        # on the tax roll. Only NULL takes the default.
+        pop = 1_000_000 if t["population"] is None else int(t["population"])
         rate = float(t["tax_rate"] or 0.05)
         dev = t["development_level"] or 1
         crisis = t["crisis_level"] or 0
@@ -129,13 +161,6 @@ async def run_tick(session_id: int = 3):
             natural_growth = 0
 
         # 3. DEATH / ATTRITION — taxes above 20%, crisis, overpopulation.
-        try:
-            from modules.ideology import tax_tolerance
-            tol = tax_tolerance((await Database.fetchrow(
-                "SELECT ideology FROM maya_rp.ideology_state WHERE session_id=$1",
-                session_id) or {}).get("ideology", "benevolent_democracy"))
-        except Exception:
-            tol = 0.20
         tax_death_rate = max(0.0, rate - tol) * 2.0 * gd
         crisis_death_rate = (crisis * 0.01) * gd
         overpop_death_rate = (max(0.0, pop - carrying_cap) / carrying_cap) * 0.005 * gd
@@ -158,8 +183,10 @@ async def run_tick(session_id: int = 3):
         if new_pop < 1:
             new_pop = 0
             new_status = "abandoned"
-            pop_events.append(
-                f"{t['system_name']} DEPOPULATED — all {int(pop):,} residents dead or fled. Territory abandoned.")
+            # A world that was already empty has no depopulation to report.
+            if pop > 0:
+                pop_events.append(
+                    f"{t['system_name']} DEPOPULATED — all {int(pop):,} residents dead or fled. Territory abandoned.")
 
         await Database.execute(
             "UPDATE territory SET population=$1, status=$2, last_population_update=$3 WHERE id=$4",
@@ -229,9 +256,13 @@ async def run_tick(session_id: int = 3):
 # ─── Action Parser: resolve_intent ───────────────────────────────────────
 
 async def resolve_intent(session_id: int, action: str, target: str, amount: int = 0) -> dict:
-    """
-    Resolve an economic intent — buy/sell/invest/trade.
-    Returns {success, cost, result} for Deepseek narration.
+    """Resolve an economic intent — buy/sell/invest/trade.
+
+    @returns a JSON object shaped {domain, success, narrative_hook, ...} where
+        the extra keys depend on the branch: `cost` and `credits_remaining` on a
+        successful buy, `cost` and `credits_available` on a refused one, `gain`
+        on a sell, `invested` on an invest, `error` when there is no treasury.
+        The docstring used to promise a `result` key that no branch ever set.
     """
     r = await Database.fetchrow(
         "SELECT credits, alloys, fuel FROM maya_rp.resources WHERE session_id=$1", session_id)
@@ -262,7 +293,19 @@ async def resolve_intent(session_id: int, action: str, target: str, amount: int 
             }
 
     elif action == "invest":
-        invest_amt = min(amount or 500_000, r["credits"])
+        # `min(amount or 500_000, credits)` MINTED credits: a negative amount, or
+        # a treasury already below zero, made `credits = credits - invest_amt` go
+        # UP. Nothing invests what the treasury does not hold.
+        wanted = amount if amount > 0 else 500_000
+        invest_amt = max(0, min(wanted, int(r["credits"] or 0)))
+        if invest_amt == 0:
+            return {
+                "domain": "economy",
+                "success": False,
+                "invested": 0,
+                "credits_available": int(r["credits"] or 0),
+                "narrative_hook": f"Nothing to invest in {target}: the treasury holds {int(r['credits'] or 0):,}C.",
+            }
         await Database.execute(
             "UPDATE maya_rp.resources SET credits = credits - $1 WHERE session_id=$2",
             invest_amt, session_id)

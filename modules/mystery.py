@@ -10,7 +10,7 @@ import random
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import error, info
 
 DEFAULT_THRESHOLD = 3
 # clues.source_type is enum-checked in the schema; `source` is free text and
@@ -27,6 +27,21 @@ async def create_investigation(session_id: int, title: str, template: str = "gen
     info("mystery", f"Investigation started: {title}")
     return {"investigation_id": inv_id, "title": title, "difficulty": difficulty}
 
+async def _owned_investigation(session_id: int, investigation_id: int) -> str | None:
+    """None when this session owns the case, else the reason it does not.
+
+    `add_clue` grew this check during the previous review and `generate_red_herring` did not, so a
+    red herring could still be filed against another campaign's case.
+    """
+    owner = await Database.fetchval(
+        "SELECT session_id FROM maya_rp.investigations WHERE id=$1", investigation_id)
+    if owner is None:
+        return f"investigation {investigation_id} does not exist"
+    if int(owner) != int(session_id):
+        return f"investigation {investigation_id} belongs to session {owner}, not {session_id}"
+    return None
+
+
 async def add_clue(session_id: int, investigation_id: int, text: str, source: str = "discovery",
                    revealed_by: int | None = None, connects_to: int | None = None,
                    source_type: str = "discovery") -> dict:
@@ -39,13 +54,22 @@ async def add_clue(session_id: int, investigation_id: int, text: str, source: st
     """
     if source_type not in ALLOWED_SOURCE_TYPES:
         source_type = "discovery"
-    owner = await Database.fetchval(
-        "SELECT session_id FROM maya_rp.investigations WHERE id=$1", investigation_id)
-    if owner is None:
-        return {"error": f"investigation {investigation_id} does not exist"}
-    if int(owner) != int(session_id):
-        return {"error": f"investigation {investigation_id} belongs to session {owner},"
-                         f" not {session_id}"}
+    refusal = await _owned_investigation(session_id, investigation_id)
+    if refusal:
+        return {"error": refusal}
+    if connects_to is not None:
+        # A link is written to the row with the higher id, so a target that does not exist silently
+        # linked this clue to a shape that is not in the case.
+        target = await Database.fetchrow(
+            "SELECT id, session_id, investigation_id FROM maya_rp.clues WHERE id=$1", connects_to)
+        if not target:
+            return {"error": f"clue {connects_to} does not exist"}
+        if int(target["session_id"]) != int(session_id):
+            return {"error": f"clue {connects_to} belongs to session {target['session_id']},"
+                             f" not {session_id}"}
+        if int(target["investigation_id"]) != int(investigation_id):
+            return {"error": f"clue {connects_to} belongs to investigation"
+                             f" {target['investigation_id']}, not {investigation_id}"}
     clue_id = await Database.fetchval(
         "INSERT INTO maya_rp.clues (session_id, source, source_type, text, connects_to_clue, revealed, revealed_by_character, investigation_id) "
         "VALUES ($1,$2,$3,$4,$5,true,$6,$7) RETURNING id",
@@ -96,6 +120,9 @@ async def deduce(session_id: int, investigation_id: int, description: str = "") 
             "threshold": threshold, "investigation_id": investigation_id}
 
 async def generate_red_herring(session_id: int, investigation_id: int) -> dict:
+    refusal = await _owned_investigation(session_id, investigation_id)
+    if refusal:
+        return {"error": refusal}
     texts = ["False witness places suspect elsewhere", "Forged log entry misdirects investigation",
              "Signal turns out to be natural phenomenon", "Debris field leads nowhere"]
     text = random.choice(texts)
@@ -148,5 +175,5 @@ async def run_tick(session_id: int = None) -> dict:
         info("mystery", f"Tick: {len(active)} active, {decayed} aging")
         return {"active": len(active), "decayed": decayed}
     except Exception as e:
-        info("mystery", f"Error: {e}")
+        error("mystery", f"tick failed for session {session_id}: {e}")
         return {"error": str(e)}

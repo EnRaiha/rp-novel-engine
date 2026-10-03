@@ -4,11 +4,16 @@
 Semantica-inspired (plan 2026-08-18). Zero LLM in this path. The LLM may
 narrate a chain; it can never produce one.
 
-Sources (in priority order):
-  1. maya_rp.decision_stream   — unified decisions (decrees + grand_plan)
-  2. maya_rp.cabinet_decrees   — extended provenance columns
-  3. maya_rp.events            — evidence events
-  4. current-state tables      — via FACT_REGISTRY resolution
+Sources the fact path reads:
+
+  1. the fact's current-state table, resolved through FACT_REGISTRY
+  2. maya_rp.cabinet_decrees — the decisions and the chains that touch the fact,
+     read through `core.decision.by_fact` and `core.decision.chain`
+
+The unified maya_rp.decision_stream view is read by `core.decision.decisions`,
+not on this path. maya_rp.events is not read here either: each decision arrives
+with its `event_ids` and nothing resolves them, so a chain cites evidence the
+answer does not show.
 """
 from __future__ import annotations
 from typing import Any, Optional
@@ -70,11 +75,18 @@ async def resolve(fact: str) -> Optional[dict]:
 
 
 async def current_value(fact: str, session_id: Optional[int] = None) -> Any:
-    """Current value of a fact, from its source table."""
+    """Current value of a fact, from its source table.
+
+    An unknown fact is refused by name. `None` is the answer for a fact whose
+    session has no row, and a key the registry does not hold must not read the
+    same as a value that is empty.
+    """
     sid = session_id or Config.SESSION_ID
     entry = await resolve(fact)
-    if not entry or "sql" not in entry:
-        return None
+    if not entry:
+        raise ValueError(f"unknown fact {fact!r}: not in FACT_REGISTRY")
+    if "sql" not in entry:
+        raise ValueError(f"fact {fact!r} has no source SQL in FACT_REGISTRY")
     row = await Database.fetchrow(entry["sql"], sid)
     return row["value"] if row else None
 
@@ -84,14 +96,15 @@ async def why(fact: str, session_id: Optional[int] = None,
     """Answer 'why is X = Y': current value + touching decisions + chains.
 
     Returns:
-      {fact, current_value, decisions: [...], chains: [[...], ...]}
+      {fact, current_value, decision_count, decisions: [...], chains: [[...], ...]},
+      or the same keys with an `error` for a fact key the registry does not hold.
     """
     sid = session_id or Config.SESSION_ID
     entry = await resolve(fact)
-    value = await current_value(fact, sid)
     if not entry:
-        return {"fact": fact, "current_value": value, "decisions": [],
+        return {"fact": fact, "current_value": None, "decisions": [],
                 "chains": [], "error": f"unknown fact '{fact}'"}
+    value = await current_value(fact, sid)
 
     # decisions touching this fact (state_after / impact_deltas key match)
     from core.decision import by_fact, chain

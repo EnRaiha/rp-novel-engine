@@ -29,7 +29,9 @@ async def equip(artifact_id: int, target_id: int, session_id: int | None = None)
     if session_id is None: session_id = Config.SESSION_ID
     art = await Database.fetchrow("SELECT id, name FROM maya_rp.artifacts WHERE id=$1 AND session_id=$2", artifact_id, session_id)
     if not art: return {"error": "Artifact not found"}
-    await Database.execute("UPDATE maya_rp.artifacts SET equipped_to=$1 WHERE id=$2", target_id, artifact_id)
+    await Database.execute(
+        "UPDATE maya_rp.artifacts SET equipped_to=$1 WHERE id=$2 AND session_id=$3",
+        target_id, artifact_id, session_id)
     return {"equipped": art["name"], "target_id": target_id}
 
 async def run_tick(session_id: int = None) -> dict:
@@ -56,6 +58,10 @@ async def award_medal(session_id: int | None, recipient: str, tier: str = "merit
     if session_id is None: session_id = Config.SESSION_ID
     if tier not in MEDAL_TIERS:
         return {"error": f"Tier mesti: {list(MEDAL_TIERS.keys())}"}
+    if not (recipient or "").strip():
+        # Without a recipient the medal is named "Medal of Merit — " and the event
+        # reads " menerima Medal of Merit".
+        return {"error": "Medal needs a recipient."}
     conf = MEDAL_TIERS[tier]
     name = f"{conf['label']} — {recipient}"
     desc = conf["desc"] if not backstory else backstory

@@ -2,6 +2,7 @@
 import random, json
 from datetime import datetime, timezone, timedelta
 from core.db import Database
+from core.config import Config
 from modules._economy import _check_afford, _deduct_resources
 from core.events import EventBus
 from core.log import error
@@ -44,7 +45,7 @@ async def start_construction(session_id: int, megastructure_type_id: int,
         return {"error": f"Insufficient resources: {msg}"}
 
     # Deduct phase 1 cost
-    await _deduct_resources(session_id, phase1_cost)
+    charged = await _deduct_resources(session_id, phase1_cost)
 
     # Schedule completion
     total_days = sum(p.get("time_days", 0) for p in phases)
@@ -65,16 +66,21 @@ async def start_construction(session_id: int, megastructure_type_id: int,
                f"Construction of {mt['name']} begun. Estimated: {estimated.strftime('%Y-%m-%d')}", 4)
 
     return {"construction_id": cid["id"], "name": mt["name"],
-            "estimated_completion": estimated.isoformat()}
+            "estimated_completion": estimated.isoformat(), "charged": charged}
 
-async def advance_megastructure(session_id: int, game_days: float = 0.5):
-    """Tick — advance all active megastructure construction."""
+async def advance_megastructure(session_id: int, game_days: float = 0.5) -> dict:
+    """Tick — advance all active megastructure construction.
+
+    The read took no session, so one campaign's tick advanced every campaign's construction sites,
+    and a phase that fell due elsewhere was charged to whichever session ran the tick.
+    """
+    tally = {"advanced": 0, "paused": 0, "completed": 0}
     for const in await Database.fetch("""
         SELECT mc.*, mt.construction_phases, mt.name
         FROM maya_rp.megastructure_construction mc
         JOIN maya_rp.megastructure_types mt ON mt.id = mc.megastructure_type_id
-        WHERE mc.status = 'construction'
-    """):
+        WHERE mc.status = 'construction' AND mc.session_id = $1
+    """, session_id):
         phases = _j(const.get("construction_phases"))
         if not phases or const["current_phase"] > len(phases):
             continue
@@ -88,6 +94,7 @@ async def advance_megastructure(session_id: int, game_days: float = 0.5):
             "UPDATE maya_rp.megastructure_construction SET progress_pct = $1 WHERE id = $2",
             new_progress, const["id"]
         )
+        tally["advanced"] += 1
 
         if new_progress >= 100:
             if const["current_phase"] < len(phases):
@@ -109,6 +116,7 @@ async def advance_megastructure(session_id: int, game_days: float = 0.5):
                         "UPDATE maya_rp.megastructure_construction SET status = 'paused' WHERE id = $1",
                         const["id"]
                     )
+                    tally["paused"] += 1
                     await _log(session_id, "megastructure",
                                f"⏸️ Paused: {const['name']}",
                                "Insufficient resources for next phase. Paused.", 2)
@@ -118,10 +126,12 @@ async def advance_megastructure(session_id: int, game_days: float = 0.5):
                     "UPDATE maya_rp.megastructure_construction SET status = 'completed' WHERE id = $1",
                     const["id"]
                 )
+                tally["completed"] += 1
                 await _apply_benefits(session_id, const)
                 await _log(session_id, "megastructure",
                            f"🎉 Megastructure Complete: {const['name']}",
                            f"The {const['name']} is fully operational!", 5)
+    return tally
 
 async def get_megastructure_status(session_id: int | None = None):
     """This session's megastructures, in construction or completed.
@@ -216,10 +226,15 @@ async def build_port(session_id: int, territory_id: int, port_type_id: int, name
 
 
 async def upgrade_port(session_id: int, port_id: int, upgrade_name: str) -> dict:
-    """Upgrade a port with a named upgrade."""
-    port = await Database.fetchrow("SELECT * FROM maya_rp.ports WHERE id = $1", port_id)
+    """Upgrade a port with a named upgrade.
+
+    The port was resolved by id alone, so a campaign could spend its own credits raising another
+    campaign's port.
+    """
+    port = await Database.fetchrow(
+        "SELECT * FROM maya_rp.ports WHERE id = $1 AND session_id = $2", port_id, session_id)
     if not port:
-        return {"error": "Port not found."}
+        return {"error": f"Port {port_id} not found in session {session_id}."}
 
     pt = await Database.fetchrow(
         "SELECT upgrades FROM maya_rp.port_types WHERE id = $1", port["port_type_id"]
@@ -265,12 +280,18 @@ async def get_port_overview(session_id: int | None = None):
 # Tick
 # ============================================================
 
-async def run_tick(session_id: int = 3):
+async def run_tick(session_id: int | None = None) -> dict:
     """Megastructure + Port tick — advance construction."""
+    if session_id is None:
+        # The default was the literal 3, the frozen reference campaign: a tick run without an
+        # argument advanced that campaign's building sites.
+        session_id = Config.SESSION_ID
     try:
-        await advance_megastructure(session_id)
+        return await advance_megastructure(session_id)
     except Exception as e:
-        print(f"  Megastructures: {e}")
+        # A `print` into the tick's stdout is not a log: nothing durable recorded the fault.
+        error("megastructures-ports", f"tick failed for session {session_id}: {e}")
+        return {"error": str(e)}
 
 # ============================================================
 # Helpers

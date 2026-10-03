@@ -31,6 +31,7 @@ from typing import Any, Sequence
 
 from core.config import Config
 from core.db import Database
+from core.log import error
 from modules.magic_cost import declared_acts, price_acts
 
 # ── Layers (§2) ─────────────────────────────────────────────────────────
@@ -46,6 +47,8 @@ KIND_KNOWLEDGE = "knowledge"
 MAX_AUDIT_CHARS = 20_000
 MAX_PATTERN_CHARS = 400
 _PATTERN_CACHE: dict[tuple[str, bool], re.Pattern[str]] = {}
+#: Rule ids whose pattern would not compile. Reported once each; the rule is inert.
+_BROKEN_RULES: set[str] = set()
 
 # ── Stage thresholds (§7) ───────────────────────────────────────────────
 STAGES: tuple[str, ...] = ("lockdown", "selective", "confrontation")
@@ -289,7 +292,14 @@ def audit_text(text: str, rules: Sequence[OocRule], layer: str = LAYER_DIALOGUE)
             continue
         try:
             matcher = compile_rule(rule)
-        except (ValueError, re.error):
+        except (ValueError, re.error) as exc:
+            # An inert rule that nothing reports is invisible: the turn reads clean
+            # because the rule never ran, not because the prose was clean. Said once
+            # per rule id per process, because the failure is not cached and a line
+            # per audit would drown the log.
+            if rule.id not in _BROKEN_RULES:
+                _BROKEN_RULES.add(rule.id)
+                error("ooc", f"rule {rule.id} has an unusable pattern and is inert: {exc}")
             continue  # an unusable pattern is inert, never a crash mid-turn
         for match in matcher.finditer(target):
             findings.append(OocFinding(rule.id, rule.kind, surface, match.group(0), rule.delta))
@@ -390,6 +400,11 @@ async def state(session_id: int | None = None) -> dict[str, Any]:
         sid,
     )
     if row is None:
+        # Reached only when the SELECT found nothing, so the conflict branch is a
+        # lost-race guard, not a per-read write: a read of an existing session never
+        # arrives here. This was reviewed as a read that bumps updated_at on every call
+        # and the claim was withdrawn, because the mutation that restores this branch
+        # leaves the timestamp test green.
         row = await Database.fetchrow(
             "INSERT INTO maya_rp.ooc_system_state (session_id) VALUES ($1)"
             " ON CONFLICT (session_id) DO UPDATE SET updated_at=now()"
@@ -1040,6 +1055,15 @@ async def buy_exemption(
     """
     if not rule_id or not action_key:
         raise ValueError("buy_exemption needs rule_id and action_key")
+    if not permanent and not ttl_hours:
+        # `expires_at` is computed as now() + ttl_hours, and a missing ttl used to be
+        # rendered as the string "0". The row was written with expires_at = now(), so
+        # `live_exemptions` never saw it: a purchase that cost roleplay points and
+        # expired in the same instant, with nothing saying so.
+        raise ValueError(
+            "buy_exemption needs ttl_hours when permanent is False; without one the "
+            "exemption expires the moment it is bought"
+        )
     sid = _session_key(session_id)
     rule = await Database.fetchrow(
         "SELECT id, delta FROM maya_rp.ooc_rules WHERE id=$1", rule_id
@@ -1346,7 +1370,14 @@ async def stage_readiness(
         sid,
     )
     bought = await Database.fetchval(
-        "SELECT count(*) FROM maya_rp.ooc_exemptions WHERE session_id=$1", sid
+        # Live exemptions only. The bare count included every exemption ever bought,
+        # expired ones included, while `live_exemptions` filters `permanent OR
+        # expires_at > now()`. So a purchase that ran out hours ago still satisfied
+        # the confrontation gate, and the gate and the ruleset disagreed about what
+        # the session actually holds.
+        "SELECT count(*) FROM maya_rp.ooc_exemptions WHERE session_id=$1"
+        " AND (permanent OR expires_at > now())",
+        sid,
     )
     values = {
         "milestones": int(done or 0),

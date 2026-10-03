@@ -136,6 +136,27 @@ async def main() -> int:
             print(f"NOT CLEAN: {drifted} did not take. Something is writing to this row.")
             return 1
 
+        # MARK, never delete. The events carry tags already (["bus","resources:add"]), so the mark is one
+        # more tag on the same array; the arcs have no CHECK constraint on status, so the mark is a status
+        # value that says what it is rather than a deletion. Arc 117 is closed by this: the collapse it
+        # records came from fuel 0 on a row this engine left wrong, not from the story.
+        marked = await Database.execute(
+            # jsonb_build_array rather than a quoted literal: no nested quotes to escape, and the tag
+            # is a parameter the driver binds instead of a string this file has to get right twice.
+            "UPDATE maya_rp.events SET tags = tags || jsonb_build_array($3::text)"
+            " WHERE session_id=$1 AND event_type = ANY($2::text[])"
+            " AND NOT (tags @> jsonb_build_array($3::text))",
+            SESSION, list(POLLUTION_EVENT_TYPES), "noncanon:test-write")
+        closed = await Database.execute(
+            "UPDATE maya_rp.story_arcs SET status='noncanon:engine-write'"
+            " WHERE session_id=$1 AND started_at::date = CURRENT_DATE"
+            " AND status <> 'noncanon:engine-write'", SESSION)
+        print(f"marked {marked} event rows and {closed} arc rows as non-canon (nothing deleted)")
+
+        live = await Database.fetchval(
+            "SELECT count(*) FROM maya_rp.story_arcs WHERE session_id=$1 AND status='active'", SESSION)
+        print(f"active arcs left for session {SESSION}: {live}")
+
         from modules.collapse import check_for_collapse
         state = await check_for_collapse(SESSION, dry_run=True)
         print("check_for_collapse(dry_run) ->", "stable" if state is None else state.get("title"))

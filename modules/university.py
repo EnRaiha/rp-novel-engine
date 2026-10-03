@@ -37,16 +37,31 @@ async def run_tick(session_id: int | None = None) -> dict:
             "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 0
         graduated = 0
         if campuses and gd % 30 == 0:
-            graduated = int(campuses * 1.5 + labs)
-            await Database.execute(
-                "UPDATE maya_rp.resources SET tech_score=COALESCE(tech_score,0)+$1 "
-                "WHERE session_id=$2", graduated, session_id)
-            await Database.execute(
-                "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
-                "VALUES ($1, NOW(), 'science', $2, $3, $4, 3)",
-                session_id, "University Graduation",
-                f"{graduated} scientists graduated across {campuses} campuses ({labs} labs) — tech_score +{graduated}",
-                json.dumps(["science", "university"]))
+            # The cycle is per game day, and a manual tick plus the orchestrator tick
+            # on day 30 used to graduate twice. The day is recorded in the event tags
+            # (the events table carries no game_day column) and checked first.
+            marker = json.dumps([f"day:{gd}"])
+            already = await Database.fetchval(
+                "SELECT COUNT(*) FROM maya_rp.events WHERE session_id=$1 "
+                "AND title='University Graduation' AND tags @> $2::jsonb",
+                session_id, marker) or 0
+            if already:
+                info("university", f"Graduation for day {gd} is already recorded; nothing added")
+            else:
+                graduated = int(campuses * 1.5 + labs)
+                row = await Database.fetchrow(
+                    "UPDATE maya_rp.resources SET tech_score=COALESCE(tech_score,0)+$1 "
+                    "WHERE session_id=$2 RETURNING tech_score", graduated, session_id)
+                if row is None:
+                    # A session without a resources row graduated on paper only.
+                    info("university",
+                         f"No resources row for session {session_id}: tech_score +{graduated} not applied")
+                await Database.execute(
+                    "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
+                    "VALUES ($1, NOW(), 'science', $2, $3, $4, 3)",
+                    session_id, "University Graduation",
+                    f"{graduated} scientists graduated across {campuses} campuses ({labs} labs) — tech_score +{graduated}",
+                    json.dumps(["science", "university", f"day:{gd}"]))
         info("university", f"Tick: {campuses} campuses rate={rate:.2f} · "
              f"{total} projects ({finished} done) · graduated={graduated}")
         return {"total": total, "finished": finished, "campuses": campuses,

@@ -151,9 +151,15 @@ STYLES: dict[str, dict[str, str]] = {
 
 
 def style(name: str | None = None) -> dict[str, str]:
-    """The render style table for `TKG_PORTRAIT_STYLE` (default `semi`)."""
+    """The render style table for `TKG_PORTRAIT_STYLE` (default `semi`).
+
+    An unknown value is refused by name. The variable is the batch switch, so a typo used to render
+    a whole wave in the default style with no line anywhere saying the style had been ignored.
+    """
     key = (name or os.environ.get("TKG_PORTRAIT_STYLE") or "semi").strip().lower()
-    return STYLES.get(key, STYLES["semi"])
+    if key not in STYLES:
+        raise ValueError(f"unknown render style {key!r}; use one of {', '.join(STYLES)}")
+    return STYLES[key]
 
 
 def negative_for(framing: str = DEFAULT_FRAMING, style_name: str | None = None) -> str:
@@ -538,7 +544,7 @@ async def pending(
     """
     if order not in QUEUE_ORDERS:
         raise ValueError(f"unknown queue order {order!r}; use one of {', '.join(QUEUE_ORDERS)}")
-    sql = ("SELECT a.id, a.occasion, a.prompt, a.negative_prompt, a.framing, c.name"
+    sql = ("SELECT a.id, a.session_id, a.occasion, a.prompt, a.negative_prompt, a.framing, c.name"
            " FROM maya_rp.character_assets a JOIN maya_rp.characters c ON c.id = a.character_id"
            " WHERE a.session_id=$1 AND a.status='pending'")
     params: list[Any] = [int(session_id), int(limit)]
@@ -553,27 +559,42 @@ async def pending(
     return [dict(row) for row in rows]
 
 
-async def mark_ready(asset_id: int, image_path: str, *, model: str, seed: int | None, width: int, height: int) -> None:
-    """Record one finished render."""
-    await Database.execute(
+async def mark_ready(asset_id: int, image_path: str, *, session_id: int, model: str, seed: int | None,
+                     width: int, height: int) -> bool:
+    """Record one finished render against the session that queued it.
+
+    The session is required and filtered on: an update by id alone could record one campaign's
+    render onto another campaign's row. The return says what happened, so a caller can report an id
+    that belongs elsewhere or does not exist instead of assuming it landed.
+    """
+    updated = await Database.fetchval(
         "UPDATE maya_rp.character_assets SET image_path=$2, model=$3, seed=$4, width=$5, height=$6,"
-        " status='ready', error=NULL, updated_at=now() WHERE id=$1",
+        " status='ready', error=NULL, updated_at=now()"
+        " WHERE id=$1 AND session_id=$7 RETURNING id",
         int(asset_id),
         image_path,
         model,
         None if seed is None else int(seed),
         int(width),
         int(height),
+        int(session_id),
     )
+    return updated is not None
 
 
-async def mark_failed(asset_id: int, error: str) -> None:
-    """Record one failed render without losing the queue entry's prompt."""
-    await Database.execute(
-        "UPDATE maya_rp.character_assets SET status='failed', error=$2, updated_at=now() WHERE id=$1",
+async def mark_failed(asset_id: int, error: str, *, session_id: int) -> bool:
+    """Record one failed render without losing the queue entry's prompt.
+
+    Refused for a row that belongs to another session, the same way `mark_ready` is.
+    """
+    updated = await Database.fetchval(
+        "UPDATE maya_rp.character_assets SET status='failed', error=$2, updated_at=now()"
+        " WHERE id=$1 AND session_id=$3 RETURNING id",
         int(asset_id),
         error[:500],
+        int(session_id),
     )
+    return updated is not None
 
 
 def ensure_dirs(name: str) -> dict[str, Path]:

@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core.config import Config  # noqa: E402
 from core.db import Database  # noqa: E402
 from core import portraits  # noqa: E402
-from core.log import info  # noqa: E402
+from core.log import info, warn  # noqa: E402
 
 GENERATOR = Path.home() / "scripts" / "maya-generate"
 MODEL = "Deliberate_v2.safetensors"
@@ -68,16 +68,26 @@ async def render_one(asset: dict, *, steps: int, dry_run: bool) -> bool:
     )
     if result.returncode != 0 or not version_file.is_file():
         error = (result.stderr or result.stdout or "render failed").strip().splitlines()[-1:]
-        await portraits.mark_failed(asset["id"], error[0] if error else "render failed")
+        recorded = await portraits.mark_failed(asset["id"], error[0] if error else "render failed",
+                                               session_id=asset["session_id"])
+        if not recorded:
+            warn("portraits", f"asset {asset['id']} is not session {asset['session_id']};"
+                              " the failure was not recorded")
         info("portraits", f"render failed for {name}/{asset['occasion']}: {error}")
         return False
     # The engine reads the live emotion image; the versioned file is the history.
     shutil.copyfile(version_file, target)
     portraits.set_live_version(name, emotion, version)
-    await portraits.mark_ready(
-        asset["id"], str(target), model=MODEL, seed=None,
+    recorded = await portraits.mark_ready(
+        asset["id"], str(target), session_id=asset["session_id"], model=MODEL, seed=None,
         width=frame["width"], height=frame["height"],
     )
+    if not recorded:
+        # The image is on disk, but the row was not this session's to write. Report that rather
+        # than counting a render the queue will not see.
+        warn("portraits", f"asset {asset['id']} is not session {asset['session_id']};"
+                          " the render was not recorded")
+        return False
     info("portraits", f"rendered {name}/{asset['occasion']} -> v{version} {version_file.name} (live: {target.name})")
     return True
 

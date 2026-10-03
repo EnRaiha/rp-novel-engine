@@ -187,3 +187,72 @@ class TestTheInspectRead:
         answer = await portraits.inspect_line(SCRATCH_SESSION, SUBJECT, emotion="battle")
         assert portraits.INSPECT_READS["battle"] in answer["hint"]
         assert said == [("portraits", f"registers unavailable for {SUBJECT}: rules table gone")]
+
+
+class TestTheRenderStyleIsNamedOrRefused:
+    """`TKG_PORTRAIT_STYLE` is the batch switch, and a typo used to render the default silently."""
+
+    def test_the_default_style_is_semi(self, monkeypatch):
+        monkeypatch.delenv("TKG_PORTRAIT_STYLE", raising=False)
+        assert portraits.style() is portraits.STYLES["semi"]
+
+    def test_every_style_key_round_trips(self):
+        for key in portraits.STYLES:
+            assert portraits.style(key) is portraits.STYLES[key]
+
+    def test_an_unknown_name_is_refused_with_the_ones_that_exist(self):
+        with pytest.raises(ValueError, match="unknown render style 'anim'; use one of"):
+            portraits.style("anim")
+
+    def test_an_unknown_environment_value_is_refused(self, monkeypatch):
+        monkeypatch.setenv("TKG_PORTRAIT_STYLE", "photoreal")
+        with pytest.raises(ValueError, match="unknown render style 'photoreal'"):
+            portraits.style()
+
+    def test_a_refused_style_stops_the_prompt_instead_of_rendering_the_default(self, monkeypatch):
+        monkeypatch.setenv("TKG_PORTRAIT_STYLE", "photoreal")
+        with pytest.raises(ValueError, match="unknown render style 'photoreal'"):
+            portraits.build_prompt({"name": "X", "role": "review"}, "neutral")
+
+
+class TestAWriterProvesTheRowIsItsOwn:
+    """`mark_ready` and `mark_failed` updated `WHERE id=$1` alone, across campaigns."""
+
+    #: A session id no other row uses, so nothing exists for a writer to touch by accident.
+    OTHER_SESSION = SCRATCH_SESSION + 500
+
+    async def test_a_render_is_recorded_for_the_session_that_queued_it(self, subject):
+        queued = await portraits.queue(SCRATCH_SESSION, SUBJECT, "portrait")
+        recorded = await portraits.mark_ready(
+            queued["asset_id"], "/tmp/portrait-review.png", session_id=SCRATCH_SESSION,
+            model="review", seed=7, width=512, height=640)
+        assert recorded is True
+        row = await Database.fetchrow(
+            "SELECT status, image_path, model, seed, width, height FROM maya_rp.character_assets"
+            " WHERE id=$1", queued["asset_id"])
+        assert (row["status"], row["image_path"], row["model"], row["seed"], row["width"], row["height"]) == (
+            "ready", "/tmp/portrait-review.png", "review", 7, 512, 640)
+
+    async def test_another_session_cannot_record_the_render(self, subject):
+        queued = await portraits.queue(SCRATCH_SESSION, SUBJECT, "portrait")
+        recorded = await portraits.mark_ready(
+            queued["asset_id"], "/tmp/other-campaign.png", session_id=self.OTHER_SESSION,
+            model="review", seed=None, width=1, height=1)
+        assert recorded is False, "another campaign wrote the row"
+        assert await Database.fetchval(
+            "SELECT status FROM maya_rp.character_assets WHERE id=$1", queued["asset_id"]) == "pending"
+
+    async def test_another_session_cannot_record_a_failure(self, subject):
+        queued = await portraits.queue(SCRATCH_SESSION, SUBJECT, "portrait")
+        assert await portraits.mark_failed(queued["asset_id"], "boom",
+                                           session_id=self.OTHER_SESSION) is False
+        assert await Database.fetchval(
+            "SELECT status FROM maya_rp.character_assets WHERE id=$1", queued["asset_id"]) == "pending"
+
+    async def test_an_id_that_does_not_exist_is_reported_rather_than_assumed(self, subject):
+        assert await portraits.mark_failed(999999999, "boom", session_id=SCRATCH_SESSION) is False
+
+    async def test_the_queue_hands_the_renderer_the_session_it_must_pass_back(self, subject):
+        await portraits.queue(SCRATCH_SESSION, SUBJECT, "portrait")
+        rows = await portraits.pending(SCRATCH_SESSION, limit=5)
+        assert [row["session_id"] for row in rows] == [SCRATCH_SESSION]

@@ -2,6 +2,7 @@
 import random, json
 from datetime import datetime, timezone
 from core.db import Database
+from core.config import Config
 from modules._economy import _check_afford, _deduct_resources
 from core.events import EventBus
 from core.log import error
@@ -13,8 +14,9 @@ from core.log import error
 async def seed_infestation(session_id: int, sector_id: int, territory_id: int = None) -> dict:
     """Seed a new space bug infestation. The horror begins."""
     existing = await Database.fetchrow(
-        "SELECT id FROM maya_rp.infestation_instances WHERE sector_id = $1 AND status NOT IN ('destroyed','eradicated')",
-        sector_id
+        "SELECT id FROM maya_rp.infestation_instances WHERE session_id = $1 AND sector_id = $2 "
+        "AND status NOT IN ('destroyed','eradicated')",
+        session_id, sector_id
     )
     if existing:
         return {"error": "Sector already infested."}
@@ -43,13 +45,17 @@ async def seed_infestation(session_id: int, sector_id: int, territory_id: int = 
     return {"infestation_id": iid["id"], "sector": sname, "stage": "Spore Drift"}
 
 async def spread_infestation(session_id: int, game_days: float = 0.5):
-    """Tick — spread infestation across sectors and escalate stages."""
+    """Tick — spread infestation across sectors and escalate stages.
+
+    The read took no session, so every campaign's infestations spread on every campaign's tick and
+    the writes below landed on rows belonging to the other one. A campaign is its own horror.
+    """
     for inst in await Database.fetch("""
         SELECT ii.*, st.spread_rate, st.threat_level, st.name AS stage_name
         FROM maya_rp.infestation_instances ii
         JOIN maya_rp.infestation_stages st ON st.id = ii.stage_id
-        WHERE ii.status = 'active'
-    """):
+        WHERE ii.status = 'active' AND ii.session_id = $1
+    """, session_id):
         base_spread = inst["spread_rate"] * game_days
         if inst.get("contained"):
             base_spread *= max(0, 1 - (inst["containment_level"] or 0) / 100)
@@ -92,14 +98,15 @@ async def spread_infestation(session_id: int, game_days: float = 0.5):
         # Spread to neighbor sectors
         if random.random() < (0.01 * inst["threat_level"] * game_days):
             neighbors = await Database.fetch(
-                "SELECT destination FROM maya_rp.space_lanes WHERE origin = $1",
-                inst["sector_id"]
+                "SELECT destination FROM maya_rp.space_lanes WHERE session_id = $1 AND origin = $2",
+                session_id, inst["sector_id"]
             )
             if neighbors:
                 target = random.choice(neighbors)["destination"]
                 existing = await Database.fetchrow(
                     "SELECT id FROM maya_rp.infestation_instances "
-                    "WHERE sector_id = $1 AND status = 'active'", target
+                    "WHERE session_id = $1 AND sector_id = $2 AND status = 'active'",
+                    session_id, target
                 )
                 if not existing:
                     await seed_infestation(session_id, target)
@@ -206,7 +213,8 @@ async def launch_eradication(session_id: int, infestation_id: int,
 async def advance_eradication(session_id: int, game_days: float = 0.5):
     """Tick — advance all active eradication campaigns."""
     for camp in await Database.fetch(
-        "SELECT * FROM maya_rp.eradication_campaigns WHERE status = 'active'"
+        "SELECT * FROM maya_rp.eradication_campaigns WHERE status = 'active' AND session_id = $1",
+        session_id
     ):
         inf = await Database.fetchrow(
             "SELECT * FROM maya_rp.infestation_instances WHERE id = $1",
@@ -309,8 +317,12 @@ async def get_infestation_detail(infestation_id: int, session_id: int | None = N
 # Tick
 # ============================================================
 
-async def run_tick(session_id: int = 3):
+async def run_tick(session_id: int | None = None):
     """Full space horror tick — spread, eradicate, seed new."""
+    if session_id is None:
+        # The default was the literal 3, which is the frozen reference campaign: a tick run without
+        # an argument advanced that campaign's horror.
+        session_id = Config.SESSION_ID
     try:
         gd = 0.5
         await spread_infestation(session_id, gd)
@@ -320,15 +332,18 @@ async def run_tick(session_id: int = 3):
         if random.random() < 0.01 * gd:
             sectors = await Database.fetch("""
                 SELECT id FROM maya_rp.sectors
-                WHERE id NOT IN (
-                    SELECT sector_id FROM maya_rp.infestation_instances WHERE status NOT IN ('destroyed','eradicated')
+                WHERE session_id = $1 AND id NOT IN (
+                    SELECT sector_id FROM maya_rp.infestation_instances
+                    WHERE session_id = $1 AND status NOT IN ('destroyed','eradicated')
                 )
                 ORDER BY random() LIMIT 1
-            """)
+            """, session_id)
             if sectors:
                 await seed_infestation(session_id, sectors[0]["id"])
     except Exception as e:
-        print(f"  Space Horror: {e}")
+        # A `print` into the tick's stdout is not a log: nothing durable recorded the fault.
+        error("space-horror", f"tick failed for session {session_id}: {e}")
+        return {"error": str(e)}
 
 # ============================================================
 # Helpers

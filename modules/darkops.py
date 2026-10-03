@@ -13,8 +13,21 @@ OP_COSTS = {"assassinate":(2000,5000,-40,10),"sabotage":(1000,2000,-20,5),"terro
 MORALITY_COST = {"assassinate":-10,"sabotage":-5,"terror":-20,"planet_crack":-40,"enslave":-50,"purge":-60,"interrogate_hard":-10}
 
 async def run_op(operation: str, target: str, session_id: int | None = None) -> dict:
+    """Run one dark operation against a faction of this campaign.
+
+    The target is resolved BEFORE anything is charged: a misspelled name used to
+    match no faction, take the alloys and credits anyway, and report success.
+    The operation is recorded now too — `list_darkops` reads `maya_rp.dark_ops`
+    and nothing in the repo wrote to it, so the log door opened on an empty room.
+    """
     if session_id is None: session_id = Config.SESSION_ID
     if operation not in VALID_OPS: return {"error": f"Unknown: {operation}. Valid: {VALID_OPS}"}
+    faction = await Database.fetchrow(
+        "SELECT id, name FROM maya_rp.factions WHERE session_id=$1 "
+        "AND LOWER(name) LIKE LOWER($2) ORDER BY id LIMIT 1",
+        session_id, f"%{target}%")
+    if not faction:
+        return {"error": f"No faction matching '{target}' in session {session_id}"}
     cost_a, cost_c, rep_delta, fear = OP_COSTS[operation]
     res = await Database.fetchrow("SELECT alloys, credits FROM maya_rp.resources WHERE session_id=$1", session_id)
     if not res or res["alloys"] < cost_a or res["credits"] < cost_c:
@@ -28,8 +41,17 @@ async def run_op(operation: str, target: str, session_id: int | None = None) -> 
     eff_rep = rep_delta if outcome == "success" else rep_delta // 2 if outcome == "failure" else rep_delta * 2
     morality = MORALITY_COST.get(operation, -5)
 
-    await Database.execute("UPDATE maya_rp.factions SET reputation=GREATEST(reputation+$1,-100), fear_of_player=COALESCE(fear_of_player,0)+$2 WHERE LOWER(name)=LOWER($3) AND session_id=$4", eff_rep, fear, target, session_id)
+    await Database.execute(
+        "UPDATE maya_rp.factions SET reputation=GREATEST(reputation+$1,-100), "
+        "fear_of_player=COALESCE(fear_of_player,0)+$2 WHERE id=$3 AND session_id=$4",
+        eff_rep, fear, faction["id"], session_id)
     await Database.execute("UPDATE maya_rp.resources SET fear=COALESCE(fear,0)+$1 WHERE session_id=$2", fear, session_id)
+    await Database.execute(
+        "INSERT INTO maya_rp.dark_ops (session_id, target_type, target_name, operation, "
+        "success_chance, collateral, reputation_delta, outcome, narrative, launched_at) "
+        "VALUES ($1,'faction',$2,$3,$4,$5,$6,$7,$8,NOW())",
+        session_id, faction["name"], operation, chance, collat, eff_rep, outcome,
+        f"{operation} against {faction['name']}: {outcome}, collateral {collat}")
     info("darkops", f"{operation} → {target}: {outcome} (collat: {collat})")
     return {"operation": operation, "target": target, "outcome": outcome, "cost_alloys": cost_a, "cost_credits": cost_c, "rep_delta": eff_rep, "collateral": collat, "morality": morality}
 

@@ -114,6 +114,7 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
         credits_gained = 0
         alloys_gained = 0
         events = []
+        unknown_industries: set[str] = set()
 
         for con in contracts:
             days_left = con["days_remaining"] - 1
@@ -145,7 +146,18 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
                     "WHERE id = $2", days_left, con["id"])
 
                 # Random corporate event.
-                risk = INDUSTRIES.get(con["industry"], {}).get("risk", 0.1)
+                industry = con["industry"]
+                spec = INDUSTRIES.get(industry)
+                if spec is None:
+                    # Fifteen of the twenty industries on live rows are not in this
+                    # table (smuggling, banking, insurance, ...), so the default risk
+                    # silently covered almost every corporation. Said once per tick.
+                    if industry not in unknown_industries:
+                        unknown_industries.add(industry)
+                        info("corporations",
+                             f"Industry {industry!r} is not in INDUSTRIES; event risk reads 0.1")
+                    spec = {}
+                risk = spec.get("risk", 0.1)
                 if random.random() < risk:
                     event_type = random.choice(["labor_dispute", "breakthrough", "market_shift"])
                     if event_type == "labor_dispute":
@@ -188,6 +200,11 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════
 
 async def list_saleable_blueprints(session_id: int | None = None) -> list[dict]:
+    """The blueprints on the market.
+
+    `maya_rp.research_projects` carries no session_id, so the catalogue is
+    galaxy-wide and the session argument is interface parity, not a filter.
+    """
     rows = await Database.fetch(
         "SELECT id, name, field, effect_type, effect_value, blueprint_price FROM maya_rp.research_projects "
         "WHERE unlocked=true AND saleable=true ORDER BY blueprint_price DESC")
@@ -195,35 +212,66 @@ async def list_saleable_blueprints(session_id: int | None = None) -> list[dict]:
 
 
 async def sell_blueprint(session_id: int | None, project_id: int, buyer: str = "Iron Concord",
-                         markdown_pct: float = 0.20) -> dict:
+                         markdown_pct: float = 20) -> dict:
     """Jual blueprint (80% data, redacted) ke faction. Buyer bayar; kita simpan tech.
-    Redacted = buyer dapat tech, tapi perlu R&D sendiri untuk full spec (novel bab 23)."""
+    Redacted = buyer dapat tech, tapi perlu R&D sendiri untuk full spec (novel bab 23).
+
+    `markdown_pct` is a PERCENTAGE, 0..100, which is what `cli.py craft sell` passes
+    and what its usage line calls it. The body used to multiply `1 - markdown_pct`,
+    so the documented `20` became `1 - 20 = -19`: the sale paid the buyer 19 times
+    the blueprint's price and drained the player treasury by the same amount.
+    """
     if session_id is None: session_id = Config.SESSION_ID
+    if not 0 <= markdown_pct <= 100:
+        return {"error": f"markdown_pct is a percentage 0..100, got {markdown_pct}"}
     proj = await Database.fetchrow(
         "SELECT id, name, blueprint_price, saleable, unlocked FROM maya_rp.research_projects "
         "WHERE id=$1", project_id)
     if not proj or not proj["unlocked"] or not proj["saleable"]:
         return {"error": "Blueprint tak saleable / belum unlocked"}
+    if proj["blueprint_price"] is None:
+        return {"error": f"Blueprint {proj['name']} has no price on the row"}
 
-    price = int(proj["blueprint_price"] * (1 - markdown_pct))  # redacted discount
-    # Buyer (faction) bayar → treasury naik
-    await Database.execute(
-        "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2", price, session_id)
-    # Faction gain tech (faction_tech flag — simulated via faction treasury deduction)
-    await Database.execute(
-        "UPDATE maya_rp.factions SET treasury=GREATEST(0, treasury-$1) WHERE session_id=$2 AND name=$3",
+    price = int(proj["blueprint_price"] * (1 - markdown_pct / 100.0))  # redacted discount
+
+    # Buyer (faction) bayar → treasury naik. Both moves report whether the row existed:
+    # sessions without a resources row used to book the sale and pay nothing.
+    credited = await Database.fetchrow(
+        "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2 RETURNING credits",
+        price, session_id)
+    charged = await Database.fetchrow(
+        "UPDATE maya_rp.factions SET treasury=GREATEST(0, treasury-$1) "
+        "WHERE session_id=$2 AND name=$3 RETURNING treasury",
         price, session_id, buyer)
-    # Log contract
+    if credited is None:
+        info("corporations",
+             f"Blueprint sale: no resources row for session {session_id}, {price:,}C not banked")
+    if charged is None:
+        info("corporations",
+             f"Blueprint sale: buyer {buyer!r} is not a faction in session {session_id}, "
+             f"{price:,}C not charged")
+
+    # Ledger contract. The row is written with the BHI corporation when one exists;
+    # no session has ever chartered one, so the row arrives invisible to the tick
+    # join and the sale stays a record rather than a second payout.
+    ledger_corp = await Database.fetchval(
+        "SELECT id FROM maya_rp.corporations WHERE session_id=$1 AND name='BHI' LIMIT 1",
+        session_id)
     cid = await Database.fetchval(
         """INSERT INTO maya_rp.corporate_contracts (session_id, corp_id, contract_type, target_system,
            payout_credits, duration_days, days_remaining, status)
-           VALUES ($1, (SELECT id FROM maya_rp.corporations WHERE session_id=$2 AND name='BHI' LIMIT 1),
-           'blueprint_sale', $3, $4, 30, 30, 'active') RETURNING id""",
-        session_id, session_id, buyer, price)
+           VALUES ($1, $2, 'blueprint_sale', $3, $4, 30, 30, 'active') RETURNING id""",
+        session_id, ledger_corp, buyer, price)
+    if ledger_corp is None:
+        info("corporations",
+             f"Blueprint sale {proj['name']}: no BHI corporation in session {session_id}, "
+             f"contract {cid} is a ledger row the tick cannot see")
     await Database.execute(
         "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance, tags) "
         "VALUES ($1, 'trade', $2, $3, 3, '[\"blueprint\",\"trade\"]'::jsonb)",
         session_id, f"Blueprint Sold: {proj['name']}",
         f"80% data redacted blueprint {proj['name']} dijual ke {buyer} untuk {price:,}C. "
         f"Buyer perlu R&D sendiri untuk full spec.")
-    return {"sold": proj["name"], "buyer": buyer, "price": price, "contract_id": cid}
+    return {"sold": proj["name"], "buyer": buyer, "price": price, "contract_id": cid,
+            "markdown_pct": markdown_pct, "banked": credited is not None,
+            "charged_buyer": charged is not None}

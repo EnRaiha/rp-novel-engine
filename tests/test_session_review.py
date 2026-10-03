@@ -177,6 +177,52 @@ class TestModeLabel:
         assert any("maintenance" in message for message in said), said
 
 
+class TestTheDriftDetectorIsReachable:
+    """`stale_process_default` was tested and called by nobody. This is its caller."""
+
+    def test_the_orchestrator_reports_drift_at_startup(self):
+        source = (ROOT / "scripts" / "orchestrator.py").read_text()
+        assert 'if __name__ == "__main__":' in source, "the entry block moved"
+        startup = source.split('if __name__ == "__main__":', 1)[1]
+        assert "report_session_drift()" in startup, \
+            "the detector is wired but nothing calls it at startup"
+
+    def test_the_bridge_helper_says_nothing_when_the_values_agree(self):
+        from scripts import kilo_bridge
+
+        assert kilo_bridge.report_session_drift() is None
+
+    def test_the_bridge_helper_names_a_stale_default(self, monkeypatch):
+        from scripts import kilo_bridge
+        from core.config import Config
+
+        monkeypatch.setattr(kilo_bridge, "_drift_reported", False)
+        monkeypatch.setattr(Config, "SESSION_ID", 3)  # what a process started on arc 3 holds
+        message = kilo_bridge.report_session_drift()
+        assert message is not None and "session 3" in message, message
+
+    def test_the_bridge_helper_reports_once_per_process(self, monkeypatch):
+        from scripts import kilo_bridge
+        from core.config import Config
+
+        said = []
+        monkeypatch.setattr(kilo_bridge, "_drift_reported", False)
+        monkeypatch.setattr(Config, "SESSION_ID", 3)
+        monkeypatch.setattr(kilo_bridge, "warn", lambda module, msg: said.append(msg))
+        kilo_bridge.report_session_drift()
+        kilo_bridge.report_session_drift()
+        assert len(said) == 1, said
+
+    async def test_every_bridge_call_asks_the_question(self, monkeypatch):
+        """A wiring test: the helper exists is not the claim, the caller is."""
+        from scripts import kilo_bridge
+
+        asked = []
+        monkeypatch.setattr(kilo_bridge, "report_session_drift", lambda: asked.append(1))
+        await kilo_bridge.handle("status", {})
+        assert asked, "handle() must ask whether this process is still on the right session"
+
+
 class TestTheImportOrder:
     """This module sits inside an import cycle, and the cycle is silent when it breaks.
 

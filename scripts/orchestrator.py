@@ -7,7 +7,8 @@ sys.path.insert(0, str(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 from core.db import Database
 from core.config import Config
 from core.events import EventBus
-from core.log import info, error
+from core.log import info, error, warn
+from core.session import stale_process_default
 
 from modules import economy, narrative, diplomacy, research, victory, market
 from modules import pirates, slave_system, space_wonders
@@ -36,6 +37,27 @@ from core.pacing import PacingDirector
 
 _tick_lock = asyncio.Lock()
 _shutdown = False
+
+
+def report_session_drift() -> str | None:
+    """Say out loud when this process's default session is no longer the engine's.
+
+    `Config.SESSION_ID` is resolved once, at import, and the whole tick hands it to
+    every module that does not name a session. `core.session.stale_process_default`
+    has detected that drift since the session work and nothing ran it, which is the
+    same shape as the caller-less functions this review has been wiring all day: a
+    detector that reports to nobody reports nothing.
+
+    At process start the two values agree by construction, so a one-shot tick stays
+    silent. The line this prints is for a process that has been alive across an arc
+    change, which is the orchestrator when it is imported and driven in-process.
+
+    @returns the warning line, or None when the two agree.
+    """
+    message = stale_process_default()
+    if message:
+        warn("orchestrator", message)
+    return message
 
 def _handle_signal(sig, frame):
     global _shutdown
@@ -451,6 +473,7 @@ async def run_single(session_id: int, module_name: str):
     await Database.close()
 
 if __name__ == "__main__":
+    report_session_drift()
     if len(sys.argv) > 1 and sys.argv[1] != "all":
         asyncio.run(run_single(Config.SESSION_ID, sys.argv[1]))
     else:

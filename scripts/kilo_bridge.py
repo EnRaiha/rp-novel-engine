@@ -9,15 +9,45 @@ import asyncio, sys, json, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from core.config import Config
 from core.db import Database
-from core.log import info, error
+from core.log import info, error, warn
 from core.memory import embed_text
-from core.session import resolve_session
+from core.session import resolve_session, stale_process_default
+
+#: Set once, the first time this process is found to be running on a stale default.
+_drift_reported = False
+
+
+def report_session_drift() -> str | None:
+    """Say once, out loud, that this process's default session is no longer the engine's.
+
+    The bridge resolves the session per call, so the bridge itself follows the arc.
+    The modules it imports do not: a module-level `SID = Config.SESSION_ID`, or a
+    function falling back to it, keeps whatever the process started with. That is fine
+    for `python3 kilo_bridge.py status`, which lives for one call, and wrong for the
+    DSH worker, which imports this module once and serves the plugin for hours. Every
+    unnamed read in that worker goes to the campaign the worker started on.
+
+    Once per process, because the drift does not un-drift and a line per call is a
+    line nobody reads. `core.session.stale_process_default` is the detector; this is
+    its caller.
+
+    @returns the warning line, or None when the two agree.
+    """
+    global _drift_reported
+    if _drift_reported:
+        return None
+    message = stale_process_default()
+    if message:
+        _drift_reported = True
+        warn("kilo_bridge", message)
+    return message
 
 
 async def handle(action: str, params: dict = None) -> dict:
     params = params or {}
     await Database.init()
     sid = resolve_session((params or {}).get("session"))
+    report_session_drift()
     result = {"action": action, "status": "error", "data": None}
     try:
         if action == "briefing":

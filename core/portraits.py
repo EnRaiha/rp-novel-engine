@@ -79,6 +79,27 @@ OCCASIONS: dict[str, tuple[str, tuple[str, ...]]] = {
     "wardrobe": ("neutral", ("wardrobe",)),
 }
 
+#: Every key `emotion_for` accepts: the game's occasions plus the emotion keys a render writes.
+#: An emotion key is an occasion the CLI can ask for (`cli.py ooc portrait <name> angry`), so both
+#: sets are legal and neither is a typo.
+OCCASION_KEYS: tuple[str, ...] = tuple(sorted(set(OCCASIONS) | set(EMOTIONS)))
+
+
+def emotion_for(occasion: str) -> str:
+    """The emotion key one occasion renders to; an unknown key is refused.
+
+    A typo used to be handed back as its own emotion, so the renderer wrote `emotions/<typo>.png`
+    and the queue gained a row nothing could finish, with no line anywhere saying which key was
+    wrong. The renderer and the workbench repeat this lookup inline; they should call it instead.
+    """
+    key = (occasion or "").strip()
+    if key in OCCASIONS:
+        return OCCASIONS[key][0]
+    if key in EMOTIONS:
+        return key
+    raise ValueError(f"unknown occasion {occasion!r}; use one of {', '.join(OCCASION_KEYS)}")
+
+
 #: Composition. The clause and the latent size must agree, or the model fights the frame: a waist
 #: clause in a square latent still crops at the chest, and a tall latent with a bust clause pads the
 #: bottom. The renderer takes the size from the same entry, so the two cannot drift apart.
@@ -133,6 +154,19 @@ def style(name: str | None = None) -> dict[str, str]:
     """The render style table for `TKG_PORTRAIT_STYLE` (default `semi`)."""
     key = (name or os.environ.get("TKG_PORTRAIT_STYLE") or "semi").strip().lower()
     return STYLES.get(key, STYLES["semi"])
+
+
+def negative_for(framing: str = DEFAULT_FRAMING, style_name: str | None = None) -> str:
+    """The negative prompt a render at this framing will use.
+
+    One rule, one place. The style table carries a negative per style and the renderer takes it
+    from there, while `queue` recorded `NEGATIVE_PROMPT` whatever style the prompt was built with:
+    at the default `semi` the stored row described a semi prompt and a photoreal negative, and the
+    renderer never read it. `bust` wants the close crop the other framings guard against, so it is
+    the one framing that does not carry `FRAMING_NEGATIVE`.
+    """
+    base = style(style_name)["negative"]
+    return base if framing == "bust" else f"{base}, {FRAMING_NEGATIVE}"
 
 
 def parse_traits(value: Any) -> list[str]:
@@ -356,8 +390,16 @@ def build_prompt(character: dict[str, Any], emotion: str, *, sheet: str = "",
     The face comes first — the sheet's `## Appearance` prose, else the database
     `appearance` field — because that is what has to stay the same across
     occasions. Role, traits and outfit follow, then the emotion fragment.
+
+    An unknown emotion or framing is refused. Both used to fall back to a default, so a typo
+    rendered a neutral waist shot while the asset row recorded the key that was asked for.
     """
-    fragment = EMOTIONS.get(emotion, EMOTIONS["neutral"])
+    if emotion not in EMOTIONS:
+        raise ValueError(f"unknown emotion {emotion!r}; use one of {', '.join(sorted(EMOTIONS))}")
+    frame = FRAMING.get(framing)
+    if frame is None:
+        raise ValueError(f"unknown framing {framing!r}; use one of {', '.join(FRAMING)}")
+    fragment = EMOTIONS[emotion]
     face = _section(sheet, "Appearance") or " ".join(
         str(character.get("appearance") or character.get("description") or "").split()
     )
@@ -377,9 +419,9 @@ def build_prompt(character: dict[str, Any], emotion: str, *, sheet: str = "",
     # weight after the face clause has been truncated.
     hair = "" if emotion in NO_HAIR_CLAUSE else _hair_clause(face)
     tail = f"{hair}; {fragment}" if hair else fragment
-    frame = FRAMING.get(framing, FRAMING[DEFAULT_FRAMING])["clause"]
     suffix = style()["suffix"]
-    return f"{identity}; {tail}; {frame}; {suffix}" if identity else f"{tail}; {frame}; {suffix}"
+    clause = frame["clause"]
+    return f"{identity}; {tail}; {clause}; {suffix}" if identity else f"{tail}; {clause}; {suffix}"
 
 
 async def find_character(session_id: int, name: str) -> dict[str, Any] | None:
@@ -399,16 +441,21 @@ async def find_character(session_id: int, name: str) -> dict[str, Any] | None:
 
 
 async def lookup(session_id: int, name: str, occasion: str) -> dict[str, Any] | None:
-    """The preset asset for one character and occasion, when it exists on disk."""
+    """The preset asset for one character and occasion, when it exists on disk.
+
+    An unknown occasion is refused before the character is read: the emotion table is the list of
+    keys this module owns, and a key outside it answers nothing on any character.
+    """
+    key = (occasion or "").strip()
+    emotion = emotion_for(key)
     character = await find_character(session_id, name)
     if character is None:
         return None
-    emotion = OCCASIONS.get(occasion, (occasion, ()))[0]
     row = await Database.fetchrow(
         "SELECT id, kind, occasion, image_path, status FROM maya_rp.character_assets"
         " WHERE character_id=$1 AND occasion=$2 AND kind='portrait'",
         character["id"],
-        occasion,
+        key,
     )
     if row is None:
         # An asset recorded under the emotion key still answers the occasion.
@@ -429,12 +476,17 @@ async def queue(session_id: int, name: str, occasion: str,
                 framing: str = DEFAULT_FRAMING) -> dict[str, Any]:
     """Queue a render for one character and occasion (idempotent per pair).
 
+    An unknown occasion or framing is refused before anything is written, so a typo cannot leave a
+    row that renders the default face under the wrong key. The negative prompt is the one the
+    style the prompt was built from carries, not a second style's.
+
     @returns the character, the emotion, the built prompt, and the row status.
     """
+    key = (occasion or "").strip()
+    emotion = emotion_for(key)
     character = await find_character(session_id, name)
     if character is None:
         raise ValueError(f"character not found: {name}")
-    emotion = OCCASIONS.get(occasion, (occasion, ()))[0]
     prompt = build_prompt(character, emotion, sheet=sheet_text(character["name"]), framing=framing)
     row = await Database.fetchrow(
         "INSERT INTO maya_rp.character_assets"
@@ -447,9 +499,9 @@ async def queue(session_id: int, name: str, occasion: str,
         " RETURNING id, status, image_path",
         int(session_id),
         character["id"],
-        occasion,
+        key,
         prompt,
-        NEGATIVE_PROMPT if framing == "bust" else f"{NEGATIVE_PROMPT}, {FRAMING_NEGATIVE}",
+        negative_for(framing),
         framing,
     )
     return {
@@ -549,22 +601,29 @@ INSPECT_READS = {
 }
 
 
-async def inspect_line(session_id: int | None = None, name: str = "") -> dict[str, Any]:
+async def inspect_line(session_id: int | None = None, name: str = "",
+                       emotion: str | None = None) -> dict[str, Any]:
     """A micro-expression hint for the narrator (M30 `/inspect`).
 
-    Reads the character's sheet and current emotion so the model can describe
-    body language instead of inventing it — a prompt aid, never a rule.
+    Reads the character's sheet and one emotion so the model can describe body language instead of
+    inventing it. The emotion is the one the caller is narrating; without one it is the portrait
+    asset's, which is the neutral read. The other twelve lines in `INSPECT_READS` were unreachable
+    while the portrait key was the only source, so every hint answered the same way.
 
     @param session_id - session key.
     @param name - character name.
+    @param emotion - an `INSPECT_READS` key; an unknown one is refused.
     @returns the hint, or `found: False` when the character is unknown.
     """
     sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    if emotion is not None and emotion not in INSPECT_READS:
+        raise ValueError(f"unknown emotion {emotion!r}; use one of {', '.join(sorted(INSPECT_READS))}")
     character = await find_character(sid, name)
     if character is None:
         return {"found": False, "character": None}
-    hit = await lookup(sid, name, "portrait")
-    emotion = hit["emotion"] if hit else "neutral"
+    if emotion is None:
+        hit = await lookup(sid, name, "portrait")
+        emotion = hit["emotion"] if hit else "neutral"
     traits = parse_traits(character.get("traits"))
     appearance = (character.get("appearance") or character.get("description") or "")[:180]
     registers: list[str] = []
@@ -572,12 +631,15 @@ async def inspect_line(session_id: int | None = None, name: str = "") -> dict[st
         from core import campaign
 
         registers = [row["id"] for row in (await campaign.character_rules(sid, character["name"]))["rules"]][:4]
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - a hint is worth less than the answer it decorates, and never nothing
+        from core.log import warn
+
+        warn("portraits", f"registers unavailable for {character['name']}: {exc}")
         registers = []
     hint = (
         f"{character['name']} — {character.get('role') or '—'}; bond {character.get('bond') or 0}"
         + (f", stage {character['romance_stage']}" if character.get("romance_stage") else "")
-        + f". Read: {INSPECT_READS.get(emotion, INSPECT_READS['neutral'])}."
+        + f". Read: {INSPECT_READS[emotion]}."
         + (f" Traits: {', '.join(str(t) for t in traits)}." if traits else "")
         + (f" Appearance: {appearance}" if appearance else "")
         + (f" Registers: {', '.join(registers)}." if registers else "")

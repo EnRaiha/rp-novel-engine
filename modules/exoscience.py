@@ -38,7 +38,10 @@ async def run_tick(session_id: int | None = None) -> dict:
             gain = _pace(session_id, m["id"], progress)
             new_progress = min(target, progress + gain)
             is_done = new_progress >= target
-            await Database.execute("UPDATE maya_rp.science_missions SET progress=$1, status=$2 WHERE id=$3", new_progress, "completed" if is_done else "active", m["id"])
+            await Database.execute(
+                "UPDATE maya_rp.science_missions SET progress=$1, status=$2 "
+                "WHERE id=$3 AND session_id=$4",
+                new_progress, "completed" if is_done else "active", m["id"], session_id)
             if is_done:
                 # A session with no resources row takes the reward and loses it silently: the UPDATE
                 # matches nothing and reports no error. Session 5 is in exactly that state, so the
@@ -63,10 +66,16 @@ async def run_tick(session_id: int | None = None) -> dict:
             threshold = a["data_threshold"] if a["data_threshold"] is not None else 100
             collected = before + _pace(session_id, a["id"], before)
             if collected >= threshold:
-                await Database.execute("UPDATE maya_rp.anomalies_catalog SET studied=true, data_collected=$1 WHERE id=$2", collected, a["id"])
+                await Database.execute(
+                    "UPDATE maya_rp.anomalies_catalog SET studied=true, data_collected=$1 "
+                    "WHERE id=$2 AND session_id=$3",
+                    collected, a["id"], session_id)
                 studied += 1
             else:
-                await Database.execute("UPDATE maya_rp.anomalies_catalog SET data_collected=$1 WHERE id=$2", collected, a["id"])
+                await Database.execute(
+                    "UPDATE maya_rp.anomalies_catalog SET data_collected=$1 "
+                    "WHERE id=$2 AND session_id=$3",
+                    collected, a["id"], session_id)
 
         info("exoscience", f"Tick: {completed} missions, {studied} anomalies studied")
         out = {"missions_completed": completed, "anomalies_studied": studied}
@@ -103,7 +112,8 @@ async def generate_anomaly(location: str, session_id: int | None = None) -> dict
     # column): resolve the location name to a sector and keep the raw text in
     # the description so nothing is lost when the name is not a sector.
     sector_id = await Database.fetchval(
-        "SELECT id FROM maya_rp.sectors WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) LIMIT 1",
+        "SELECT id FROM maya_rp.sectors WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) "
+        "ORDER BY id LIMIT 1",
         session_id, f"%{location}%")
     aid = await Database.fetchval(
         "INSERT INTO maya_rp.anomalies_catalog (session_id, name, anomaly_type, sector_id, data_threshold, studied, description) "

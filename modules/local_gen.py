@@ -24,10 +24,21 @@ PRIMARY_MODEL = ds.DEFAULT_MODEL
 FAST_MODEL = ds.DEFAULT_MODEL
 
 
+#: Artifact tokens the qwen3 build leaked into prose. The strip is this list, not a blanket
+#: `/\w+`: the blanket form also ate ordinary writing out of every generated template — "24/7",
+#: "he/she", "and/or" — and this module is the only writer of stream template text.
+_ARTIFACT_TAGS = (
+    "think", "thinking", "analysis", "reasoning", "response", "reply",
+    "answer", "output", "assistant", "user", "system",
+)
+
+
 def _strip_think(text: str) -> str:
-    """Remove qwen3 /think blocks and artifacts from output."""
-    text = re.sub(r"\s*/think\s*/?\s*", " ", text, flags=re.I)
-    text = re.sub(r"\s*/\w+\s*", " ", text, flags=re.I)  # stray /tags
+    """Remove qwen3 /think blocks and known stray artifacts from output."""
+    # `\b` matters: without it `/thinking` matched the `/think` alternative, was replaced by a
+    # single space, and left its tail behind as "ING" in the middle of the prose.
+    text = re.sub(r"\s*/think\b\s*/?\s*", " ", text, flags=re.I)
+    text = re.sub(r"\s*/(" + "|".join(_ARTIFACT_TAGS) + r")\b\s*", " ", text, flags=re.I)
     return text.strip()
 
 
@@ -105,7 +116,11 @@ async def upsert_template(
         "category = EXCLUDED.category, "
         "readable_hint = EXCLUDED.readable_hint, "
         "required_context = EXCLUDED.required_context, "
-        "trigger_tag_embed = EXCLUDED.trigger_tag_embed",
+        # A caller that supplies no `readable_hint` computed no vector, so EXCLUDED's is NULL.
+        # Overwriting with it dropped the template out of the interceptor's semantic tier, which
+        # reads `trigger_tag_embed` and skips every row where it is NULL.
+        "trigger_tag_embed = COALESCE(EXCLUDED.trigger_tag_embed,"
+        " stream_templates.trigger_tag_embed)",
         trigger_tag,
         expanded_text,
         category,

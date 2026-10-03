@@ -9,6 +9,27 @@ from __future__ import annotations
 import pathlib
 import sys
 
+import pytest_asyncio
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _clean_story_log():
+    """Remove the story_log rows this file writes.
+
+    `explore_anomaly` records an entry for the session it explores. This file never deleted them, so each
+    full-suite run left a row in session 5 and a teammate cleared nine by hand before reporting it. The
+    ceiling is taken before the test and only rows above it are removed, so nothing a teammate wrote in
+    the meantime is touched.
+    """
+    from core.db import Database
+
+    await Database.init()
+    ceiling = await Database.fetchval(
+        "SELECT COALESCE(max(id), 0) FROM maya_rp.story_log WHERE session_id=5")
+    yield
+    await Database.execute("DELETE FROM maya_rp.story_log WHERE session_id=5 AND id > $1", ceiling)
+    await Database.close()
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 

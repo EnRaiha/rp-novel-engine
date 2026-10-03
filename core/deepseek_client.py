@@ -32,6 +32,15 @@ DEFAULT_TEMPERATURE = 0.7
 # max_tokens=10 + thinking enabled → empty content; disabled → direct reply).
 THINKING_DISABLED = {"type": "disabled"}
 _TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)
+# Failures that happen before the request reaches the model. Nothing was
+# generated, so the retry below is safe for them. A read or write timeout is not
+# in this set: the request may have reached the server, and the docstring's rule
+# is retry-before-first-token only.
+_RETRYABLE_TRANSPORT = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
 
 
 class DeepSeekError(Exception):
@@ -73,23 +82,51 @@ async def generate(
         connect=10.0, read=timeout or 120.0, write=30.0, pool=10.0
     )
     async with httpx.AsyncClient(timeout=timeout_cfg) as client:
-        resp = await _post_once(client, payload)
-        if resp.status_code >= 500 or resp.status_code in (408, 429):
-            # Retry once (idempotent-safe: no tokens emitted yet)
-            info("deepseek", f"Retry after HTTP {resp.status_code}")
+        try:
             resp = await _post_once(client, payload)
-        resp.raise_for_status()
+        except _RETRYABLE_TRANSPORT as exc:
+            # The docstring's retry policy has three triggers — network error,
+            # 5xx, and a timeout on connect — and only the status code was
+            # implemented, so a connection that never opened failed the call.
+            info("deepseek", f"Retry after {type(exc).__name__} before any token was sent")
+            resp = await _post_once(client, payload)
+        else:
+            if resp.status_code >= 500 or resp.status_code in (408, 429):
+                # Retry once (idempotent-safe: no tokens emitted yet)
+                info("deepseek", f"Retry after HTTP {resp.status_code}")
+                resp = await _post_once(client, payload)
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # This class documents itself as the error for a non-2xx; a raw
+            # httpx exception from the sole provider client is not that contract.
+            raise DeepSeekError(
+                f"DeepSeek HTTP {exc.response.status_code}: {exc.response.text[:200]}"
+            ) from exc
         try:
             data = resp.json()
         except json.JSONDecodeError as e:
             raise DeepSeekError(f"Non-JSON response: {e}") from e
 
     try:
-        return data["choices"][0]["message"]["content"].strip()
+        content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as e:
         raise DeepSeekError(
             f"Unexpected DeepSeek payload: {data.get('error', data)}"
         ) from e
+    # A null or non-string content is an unusable body, not a crash: `.strip()`
+    # on None raised AttributeError, which no caller catches as a provider fault.
+    if not isinstance(content, str):
+        raise DeepSeekError(f"Unexpected DeepSeek payload: content is {type(content).__name__}")
+    if not content.strip():
+        # Documented symptom of the reasoning-token bug this module disables:
+        # an empty completion is a failure, and returning "" handed the caller
+        # blank prose as if the model had written it.
+        raise DeepSeekError(
+            f"Empty completion for model {model} (max_tokens={max_tokens}); "
+            "the model produced no content"
+        )
+    return content.strip()
 
 
 async def _post_once(

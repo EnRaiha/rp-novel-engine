@@ -43,6 +43,13 @@ class FakeDB:
         self.calls.append(("fetchrow", " ".join(sql.split()), args))
         return self.fetchrow_value
 
+    async def fetchval(self, sql, *args):
+        # The charge path moved from execute() to fetchval(UPDATE ... RETURNING <col>) so a replayed charge
+        # leaves a trace. Not stubbing fetchval did not merely make this test red: it let the charge through
+        # to the live pool, so the test wrote to maya_rp.resources for real and the fake recorded nothing.
+        self.calls.append(("fetchval", " ".join(sql.split()), args))
+        return 0.0
+
     async def execute(self, sql, *args):
         self.calls.append(("execute", " ".join(sql.split()), args))
         return "UPDATE 1"
@@ -52,7 +59,7 @@ class FakeDB:
 
 
 def _install(monkeypatch, fake):
-    for name in ("fetchrow", "execute"):
+    for name in ("fetchrow", "execute", "fetchval"):
         monkeypatch.setattr("modules._economy.Database." + name, getattr(fake, name))
     return fake
 
@@ -86,7 +93,7 @@ async def test_charged_holds_numbers_only(monkeypatch):
     assert charged == {"credits": 100, "alloys": 20}
     assert all(isinstance(v, (int, float)) for v in charged.values())
     assert all(isinstance(k, str) and not k.startswith("#") for k in charged)
-    assert len(fake.sql("execute")) == 2
+    assert len(fake.sql("fetchval")) == 2
 
 
 async def test_an_empty_cost_charges_nothing(monkeypatch):

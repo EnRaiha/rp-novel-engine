@@ -108,6 +108,18 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
     if session_id is None:
         session_id = Config.SESSION_ID
 
+    # GM MAYA maintenance stops the tick. Measured on 2026-10-03: `gm_maint status` reported the mode and
+    # four modules read it, but this entry point never asked, so the tick kept writing to the live session
+    # while the brake the operator reached for was armed. It opened a `fuel_zero` collapse arc (Dead in the
+    # Water, 12:00) against a session whose resources row this engine had zeroed. A guard that four callers
+    # honour and the one that drives them ignores is not a guard.
+    from core import maintenance
+
+    if maintenance.active():
+        if verbose:
+            print("  RP ENGINE TICK SKIPPED — GM MAYA maintenance is armed")
+        return
+
     if _tick_lock.locked():
         print("Tick already in progress. Aborting.")
         return

@@ -14,18 +14,64 @@ from __future__ import annotations
 
 import os
 import pathlib
+import sys
 
 STATE_DIR = pathlib.Path(os.environ.get("RP_MAINT_DIR", pathlib.Path.home() / ".config" / "rp-engine"))
 ACTIVE_ARC = STATE_DIR / "active_arc"
 FROZEN = STATE_DIR / "frozen_sessions"
 
 
+def _warn(message: str) -> None:
+    """Say something worth seeing, without closing an import cycle.
+
+    `core.log` imports `core.config`, and `core.config` imports this module to
+    resolve the process default. A module-level `from core.log import warn` here
+    therefore closes the loop: `resolve_session` raises ImportError while
+    `core.config` is still half-built, `_default_session` catches it, and every
+    process silently starts on the frozen legacy session instead of the live arc.
+    It arrives as the fallback warning with no obvious cause. Importing the logger
+    at call time keeps the warning and the import order.
+    """
+    try:
+        from core.log import warn
+        warn("session", message)
+    except Exception:
+        # Deliberately wide, and the reason matters. Importing `core.log` runs its
+        # module body, which makes the log directory and builds a file handler, so
+        # the failure can be ImportError (the cycle above), OSError (an unwritable
+        # log directory) or anything the logger raises. Every one of them must still
+        # leave the warning on stderr: a warning about the session matters more than
+        # the channel it goes out on. Nothing is swallowed, and the text is repeated
+        # verbatim.
+        print(f"warning: {message}", file=sys.stderr)
+
+
 def unset(value) -> bool:
-    """True for absent, blank, or 0: the sentinel every caller uses for 'no value'."""
+    """True for absent, blank, or zero: the sentinel every caller uses for 'no value'.
+
+    The zero test is numeric, not textual. It compared the text to "0", so `"00"`,
+    `"0.0"` and `False` were read as a real session id, and `--session=00` asked for
+    a campaign that cannot exist rather than following the arc.
+    """
     if value is None:
         return True
+    if isinstance(value, bool):
+        return not value
     text = str(value).strip()
-    return text == "" or text == "0"
+    if text == "":
+        return True
+    try:
+        return float(text) == 0
+    except ValueError:
+        return False
+
+
+def _as_id(value, source: str) -> int:
+    """A session id from a caller, or an error that names where the bad value came from."""
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"session id from {source} is not a number: {value!r}") from exc
 
 
 def _maintenance_active() -> bool:
@@ -53,6 +99,11 @@ def set_active_arc(session_id: int) -> int:
 
 
 def frozen() -> set[int]:
+    """The reference-only campaigns. An entry that is not a number is named, not skipped.
+
+    A typo used to disappear: the campaign it named stayed writable while the file
+    read as if that campaign were protected.
+    """
     try:
         raw = FROZEN.read_text()
     except Exception:
@@ -62,6 +113,7 @@ def frozen() -> set[int]:
         try:
             ids.add(int(part))
         except ValueError:
+            _warn(f"frozen_sessions entry is not a session id: {part!r}")
             continue
     return ids
 
@@ -85,13 +137,13 @@ def set_frozen(session_ids) -> set[int]:
 
 def resolve_session(explicit=None) -> int | None:
     if not unset(explicit):
-        return int(explicit)
+        return _as_id(explicit, "the caller")
     env = os.environ.get("RP_SESSION")
     if not unset(env):
-        return int(env)
+        return _as_id(env, "RP_SESSION")
     arc = active_arc()
     if arc is not None:
-        return arc
+        return _as_id(arc, str(ACTIVE_ARC))
     if _maintenance_active():
         return None
     raise RuntimeError(
@@ -105,7 +157,10 @@ def mode_label() -> str:
     try:
         from core import maintenance
         return "GM MAYA maintenance" if maintenance.active() else "play"
-    except Exception:
+    except Exception as exc:
+        # Reporting "play" is the safe answer, but an unreadable maintenance flag is
+        # the difference between an operator writing canon and not, so it is said.
+        _warn(f"maintenance state unreadable, reporting play: {exc}")
         return "play"
 
 

@@ -2,10 +2,10 @@
 """Session Bookends — open/close rituals. 'Previously on' and 'Next time on'."""
 from __future__ import annotations
 from datetime import datetime, timezone
-from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info, error
+from core.log import error
+from core.utils import comma
 
 async def generate_open(session_id: int = None) -> str:
     if session_id is None: session_id = Config.SESSION_ID
@@ -58,12 +58,12 @@ async def generate_close(session_id: int = None) -> str:
     if evs:
         parts.append("**What happened:**")
         for e in evs:
-            icon = "!" if e["importance"] >= 4 else "\u2022"
+            icon = "!" if (e["importance"] or 0) >= 4 else "\u2022"
             parts.append(f"  {icon} {e['title']}")
         parts.append("")
     r = await Database.fetchrow("SELECT credits, alloys, fuel FROM maya_rp.resources WHERE session_id=$1", session_id)
-    if r: parts.append(f"**State:** {r['credits']:,}C | {r['alloys']:,}A | {r['fuel']:,}F\n")
-    bs = await Database.fetch("SELECT c.name, c.bond FROM maya_rp.romance_arcs ra JOIN maya_rp.characters c ON c.id=ra.character_id WHERE ra.session_id=$1 AND c.bond>=5 ORDER BY c.bond DESC LIMIT 5", session_id)
+    if r: parts.append(f"**State:** {comma(r['credits'])}C | {comma(r['alloys'])}A | {comma(r['fuel'])}F\n")
+    bs = await Database.fetch("SELECT c.name, c.bond FROM maya_rp.romance_arcs ra JOIN maya_rp.characters c ON c.id=ra.character_id WHERE ra.session_id=$1 AND c.session_id=$1 AND c.bond>=5 ORDER BY c.bond DESC LIMIT 5", session_id)
     if bs:
         parts.append("**Bonds:**")
         for b in bs: parts.append(f"  {b['name']}: {'\u2665'*min(10,b['bond'])+'\u2661'*max(0,10-b['bond'])}")

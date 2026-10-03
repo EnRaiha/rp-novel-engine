@@ -23,18 +23,16 @@ _RECONNECT_ERRORS = (
     asyncpg.exceptions.PostgresConnectionError,
 )
 
-#: The only reconnect errors that prove nothing reached the socket.
+#: The reconnect errors that prove nothing was sent even though `fn` ran.
 #:
 #: `Connection._check_open()` and the pool's own guards raise `InterfaceError` before a statement is
-#: sent, so re-issuing the call cannot apply a write twice.
+#: serialised, so re-issuing the call cannot apply a write twice.
 #:
-#: The other two are not replayable. `ConnectionDoesNotExistError` has exactly one raise site in
-#: asyncpg 0.31.0, `protocol/protocol.pyx:691`, the `connection_lost` handler, which fires after the
-#: statement was written to the socket. Whether the server applied it is unknown to the client, and
-#: `PostgresConnectionError` is that error's parent. Replaying either runs the write a second time
-#: whenever the first one landed. Nothing is lost by refusing: measured against the live database, a
-#: holder whose connection died is reconnected by the next `acquire()`, so the common case never
-#: reaches this handler.
+#: The other two prove nothing on their own. `ConnectionDoesNotExistError` has one raise site in
+#: asyncpg 0.31.0, `protocol/protocol.pyx:691`, and it fires on whatever the protocol is awaiting
+#: when the connection is lost: the operation's future for a statement, and the connect future
+#: during a handshake (`protocol/protocol.pyx:85`). The type cannot say whether a statement exists,
+#: so `_run` decides on where the failure happened rather than on the type alone.
 _PRE_FLIGHT_ERRORS = (asyncpg.exceptions.InterfaceError,)
 
 
@@ -87,20 +85,24 @@ class Database:
     async def _run(cls, fn, *args):
         """Run fn(conn, *args) with ONE reconnect retry on dead-pool errors.
 
-        The retry re-issues the call only when the failure happened before anything reached the
-        socket. A statement that was already written is never replayed: the client cannot tell
-        whether the server applied it, and a second execution of a relative write
+        The retry re-issues the call only when nothing can have been written. Two cases qualify:
+        the pool failed before `fn` ran, or `fn` met asyncpg's own pre-flight guard, which refuses
+        before a statement is serialised. An error raised from inside `fn` that is not pre-flight
+        means the statement was written, so it is not replayed: the client cannot tell whether the
+        server applied it, and a second execution of a relative write
         (`SET credits = credits - $1`) charges the session twice with no way to detect it.
         """
+        entered = False
         try:
             pool = await cls._ensure_pool()
             async with pool.acquire() as conn:
+                entered = True
                 return await fn(conn, *args)
         except _RECONNECT_ERRORS as e:
             info("db", f"Pool connection lost ({type(e).__name__}) — reconnecting once")
             await cls.close()
             pool = await cls.init()
-            if not isinstance(e, _PRE_FLIGHT_ERRORS):
+            if entered and not isinstance(e, _PRE_FLIGHT_ERRORS):
                 raise
             async with pool.acquire() as conn:
                 return await fn(conn, *args)

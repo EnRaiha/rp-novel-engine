@@ -59,12 +59,19 @@ class FakeConn:
 
 
 class _Acquire:
-    """Mirrors asyncpg's PoolAcquireContext: awaitable and an async context manager."""
+    """Mirrors asyncpg's PoolAcquireContext: awaitable and an async context manager.
 
-    def __init__(self, conn):
+    `raise_with` models the pool losing the connection while it was establishing one. That failure
+    happens before `fn` exists, so no statement can have been written by it.
+    """
+
+    def __init__(self, conn, raise_with: Exception | None = None):
         self.conn = conn
+        self.raise_with = raise_with
 
     async def __aenter__(self):
+        if self.raise_with is not None:
+            raise self.raise_with
         return self.conn
 
     async def __aexit__(self, *exc):
@@ -72,6 +79,8 @@ class _Acquire:
 
     def __await__(self):
         async def _get():
+            if self.raise_with is not None:
+                raise self.raise_with
             return self.conn
 
         return _get().__await__()
@@ -87,11 +96,14 @@ class FakePool:
     def __init__(self, received: list, raise_with: Exception | None = None):
         self.received = received
         self.raise_with = raise_with or asyncpg.exceptions.ConnectionDoesNotExistError(MID_FLIGHT)
+        #: Set to make the FIRST acquire fail, which is the handshake dropping before `fn` runs.
+        self.acquire_fail: Exception | None = None
         self.served = 0
 
     def acquire(self):
         self.served += 1
-        return _Acquire(FakeConn(self.received, 1 if self.served == 1 else 0, self.raise_with))
+        return _Acquire(FakeConn(self.received, 1 if self.served == 1 else 0, self.raise_with),
+                        self.acquire_fail if self.served == 1 else None)
 
 
 @pytest.fixture
@@ -163,5 +175,22 @@ async def test_a_call_that_never_reached_the_socket_is_still_replayed(pool):
     assert await db.Database.fetchval("SELECT 1") == 0.0
 
     assert fake.served == 2, "the pre-flight failure was not re-issued on a second connection"
+    assert len(received) == 1, f"the statement ran {len(received)} times: {received}"
+    assert calls == {"init": 1, "close": 1}, calls
+
+
+async def test_a_handshake_that_dropped_before_fn_ran_is_still_replayed(pool):
+    """The pool can lose a connection while establishing one, with no statement in existence.
+
+    `ConnectionDoesNotExistError` is raised on whatever the protocol is awaiting, and during a
+    handshake that waiter is the connect future (`protocol/protocol.pyx:85`), so the exception type
+    cannot decide on its own. The failure happening outside `fn` is what makes the retry safe.
+    """
+    fake, calls, received = pool
+    fake.acquire_fail = asyncpg.exceptions.ConnectionDoesNotExistError(MID_FLIGHT)
+
+    assert await db.Database.fetchval("SELECT 1") == 0.0
+
+    assert fake.served == 2, "the handshake failure was not re-issued on a second connection"
     assert len(received) == 1, f"the statement ran {len(received)} times: {received}"
     assert calls == {"init": 1, "close": 1}, calls

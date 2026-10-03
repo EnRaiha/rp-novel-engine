@@ -356,8 +356,13 @@ async def cmd_craft():
     elif action == "sell":
         if len(sys.argv) < 5:
             print(usage); await Database.close(); return
-        markdown = int(sys.argv[5]) if len(sys.argv) > 5 else 0
-        out = await corporations.sell_blueprint(sid, int(sys.argv[3]), sys.argv[4], markdown)
+        # Omit the argument when the caller did not give one, so the module's own default stands. My
+        # first version passed 0 and silently overrode it: `craft sell <id> <buyer>` sold at full
+        # price while calling the function directly sold at the module's default markdown.
+        if len(sys.argv) > 5:
+            out = await corporations.sell_blueprint(sid, int(sys.argv[3]), sys.argv[4], int(sys.argv[5]))
+        else:
+            out = await corporations.sell_blueprint(sid, int(sys.argv[3]), sys.argv[4])
     elif action == "enroll":
         if len(sys.argv) < 6:
             print(usage); await Database.close(); return

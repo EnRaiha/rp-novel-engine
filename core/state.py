@@ -1,15 +1,39 @@
 """Global state manager — session, save/load, checkpoint orchestration."""
-import json, asyncio
 from datetime import datetime, timezone
-from typing import Dict, Optional, List
+from typing import Any, Dict
 from pathlib import Path
 from .db import Database
 from .config import Config
+from core.log import warn
+
+
+def _resolve_session(session_id: int | None) -> int:
+    """The session the caller named, or the one the arc resolves to.
+
+    The default used to be the literal 3 — the frozen reference campaign — so a
+    caller that named none gathered from, and checkpointed, the one campaign that
+    must not be written to. `core.session.resolve_session` refuses to guess.
+    """
+    from core.session import resolve_session
+
+    resolved = resolve_session(session_id)
+    if resolved is None:
+        raise ValueError("no session named and the engine is in maintenance mode")
+    return int(resolved)
+
+
+def _num(value: Any, spec: str = ",") -> str:
+    """A number for the snapshot, with a missing figure named instead of raising."""
+    if value is None:
+        return "n/a"
+    return format(value, spec)
+
 
 class StateManager:
     @classmethod
-    async def gather(cls, session_id: int = 3) -> Dict:
+    async def gather(cls, session_id: int | None = None) -> Dict:
         """Gather full game state for checkpoint export."""
+        session_id = _resolve_session(session_id)
         state = {}
         state["session"] = await Database.fetchrow("SELECT * FROM sessions WHERE id=$1", session_id)
         state["resources"] = await Database.fetchrow("SELECT alloys, fuel, credits, dream_essence FROM resources WHERE session_id=$1", session_id)
@@ -38,23 +62,27 @@ class StateManager:
                     scored.append((predict_event_importance(ev), dict(r)))
                 scored.sort(key=lambda x: -x[0])
                 state["story"] = [s[1] for s in scored[:15]]
-        except Exception:
-            pass  # ML off/degraded → recency list above stays authoritative
+        except Exception as exc:
+            # ML off/degraded → the recency list above stays authoritative, and
+            # the reason is logged: a silent pass hid a model that failed to load.
+            warn("state", f"event-importance model unavailable, keeping the recency list: {exc!r}")
         return state
 
     @classmethod
-    async def export_md(cls, session_id: int = 3) -> str:
+    async def export_md(cls, session_id: int | None = None) -> str:
         """Generate Markdown snapshot of entire game state."""
+        session_id = _resolve_session(session_id)
         state = await cls.gather(session_id)
         lines = [f"# RP Engine State — Session {session_id}"]
         lines.append(f"**Generated:** {datetime.now(timezone.utc).isoformat()}\n")
         if state.get("resources"):
             r = state["resources"]
-            lines.append(f"## Resources\nCredits: {r['credits']:,} | Alloys: {r['alloys']:,} | Fuel: {r['fuel']:,}\n")
+            lines.append(f"## Resources\nCredits: {_num(r['credits'])} | Alloys: {_num(r['alloys'])} | Fuel: {_num(r['fuel'])}\n")
         if state.get("territories"):
             lines.append("## Territories")
             for t in state["territories"]:
-                lines.append(f"- {t['system_name']}: Pop {t['population']:,}, Tax {float(t['tax_rate'])*100:.0f}%, Dev {t['development_level']}, Crisis {t['crisis_level']}")
+                tax = f"{float(t['tax_rate'])*100:.0f}%" if t["tax_rate"] is not None else "n/a"
+                lines.append(f"- {t['system_name']}: Pop {_num(t['population'])}, Tax {tax}, Dev {t['development_level']}, Crisis {t['crisis_level']}")
             lines.append("")
         if state.get("factions"):
             lines.append("## Factions")
@@ -69,19 +97,24 @@ class StateManager:
         return "\n".join(lines)
 
     @classmethod
-    async def save_checkpoint(cls, session_id: int = 3, label: str = "") -> str:
-        """Save a story checkpoint."""
+    async def save_checkpoint(cls, session_id: int | None = None, label: str = "") -> str:
+        """Save a story checkpoint into one of three slots."""
+        session_id = _resolve_session(session_id)
         cfg = Config.get()
         md = await cls.export_md(session_id)
-        num = 1
-        existing = await Database.fetch("SELECT checkpoint_number FROM story_checkpoints WHERE session_id=$1", session_id)
-        used = {r["checkpoint_number"] for r in existing}
-        for n in (1, 2, 3):
-            if n not in used:
-                num = n
-                break
+        rows = await Database.fetch(
+            "SELECT checkpoint_number, MAX(created_at) AS last_used FROM story_checkpoints "
+            "WHERE session_id=$1 GROUP BY checkpoint_number",
+            session_id)
+        last_used = {r["checkpoint_number"]: r["last_used"] for r in rows}
+        free = [n for n in (1, 2, 3) if n not in last_used]
+        # Three slots. With all three taken the oldest is the one this checkpoint
+        # replaces; the previous selection kept its initial 1 whenever every slot
+        # was used, so every save after the third claimed slot 1 again — measured
+        # 395 rows numbered 1 against one each of 2 and 3 for session 3.
+        num = min(free) if free else min(last_used, key=lambda n: (last_used[n] is not None, last_used[n]))
         fp = Path(cfg.BACKUP_DIR) / f"checkpoint_{num}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-        fp.write_text(md)
+        fp.write_text(md, encoding="utf-8")
         await Database.execute(
             "INSERT INTO story_checkpoints (session_id, checkpoint_number, label, md_file_path) VALUES ($1, $2, $3, $4) "
             "ON CONFLICT DO NOTHING",

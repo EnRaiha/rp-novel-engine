@@ -51,7 +51,14 @@ def persona_dir(slug: str) -> Path:
 
 
 def field_path(slug: str, field: str) -> Path:
-    """Path of one persona field file."""
+    """Path of one persona field file.
+
+    `field` is one of `FIELDS`. An unknown name is refused rather than resolved:
+    it is joined into a path, so a typo would read as "the file is absent" and a
+    caller-supplied name could point outside the persona folder.
+    """
+    if field not in FIELDS:
+        raise ValueError(f"unknown persona field {field!r}; expected one of {list(FIELDS)}")
     return persona_dir(slug) / f"{field}.md"
 
 
@@ -76,14 +83,18 @@ def build_block(slug: str, *, audits: int | None = None) -> str:
     Voice first (rules and examples), then the opening beat — but only while the
     session is still opening (`audits <= INTRO_MAX_AUDITS`): after that the beat
     has done its work and would only spend tokens.
+
+    The fields read are `INJECTED`, in its order, so the allowlist that keeps
+    `lore` and `play-guide` away from the model is the one this reads.
     """
-    voice = read_field(slug, "voice")
-    intro = read_field(slug, "intro") if audits is None or audits <= INTRO_MAX_AUDITS else ""
     parts: list[str] = []
-    if voice:
-        parts.append(voice)
-    if intro:
-        parts.append(f"## Opening beat\n\n{intro}")
+    for field in INJECTED:
+        if field == "intro" and audits is not None and audits > INTRO_MAX_AUDITS:
+            continue
+        text = read_field(slug, field)
+        if not text:
+            continue
+        parts.append(f"## Opening beat\n\n{text}" if field == "intro" else text)
     return "\n\n".join(parts).strip()
 
 

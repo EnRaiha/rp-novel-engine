@@ -633,6 +633,11 @@ async def get_available_intimacy_paths(
     """
     Determine available intimacy paths for a prisoner.
     Ported from PrisonerIntimacy.getAvailablePaths().
+
+    `charisma` is accepted and read by nothing: the three paths are keyed to brutality, resistance
+    and time held. No caller passes it today, and it stays so the ported signature keeps its shape.
+    A parameter that looks like it scopes the answer but does not is how three defects in this engine
+    started, so it is named here rather than left to be discovered again.
     """
     if session_id is None:
         session_id = Config.SESSION_ID
@@ -1000,18 +1005,23 @@ async def upgrade_security(
         return {"error": f"unknown security level '{new_level}'", "available": valid}
 
     row = await Database.fetchrow(
-        "SELECT resistance FROM maya_rp.prisoners WHERE id = $1 AND session_id = $2", prisoner_id, session_id
+        "SELECT escape_risk_pct, cell_security FROM maya_rp.prisoners "
+        "WHERE id = $1 AND session_id = $2", prisoner_id, session_id
     )
     if not row:
-        return {"error": "Prisoner not found"}
+        return {"error": f"prisoner {prisoner_id} not found in session {session_id}"}
 
     mult = SECURITY_MULTIPLIERS[new_level]
-    new_risk = round(_num(row["resistance"], 50) * mult)
+    # `escape_risk_pct` holds the base risk; `calculate_escape_risk` applies the security multiplier
+    # to it. The old body wrote `resistance * mult` into that column, so the multiplier landed twice:
+    # moved to `isolated` (0.05) a prisoner came out at base 25 and effective 1.25 percent, and a risk
+    # already driven to 0 by countermeasures was resurrected as 25. Only the level moves here, and the
+    # base stays the prisoner's own.
+    base_risk = _num(row["escape_risk_pct"], 15)
 
     await Database.execute(
-        "UPDATE maya_rp.prisoners SET cell_security = $1, escape_risk_pct = $2 "
-        "WHERE id = $3 AND session_id = $4",
-        new_level, new_risk, prisoner_id, session_id,
+        "UPDATE maya_rp.prisoners SET cell_security = $1 WHERE id = $2 AND session_id = $3",
+        new_level, prisoner_id, session_id,
     )
 
     # Log countermeasure
@@ -1024,7 +1034,9 @@ async def upgrade_security(
 
     return {
         "cell_security": new_level,
-        "escape_risk_pct": new_risk,
+        "previous_security": row["cell_security"],
+        "escape_risk_pct": base_risk,
+        "effective_risk_pct": min(95, round(base_risk * mult)),
         "guards": guards,
         "cost_per_day": guards * 50,
     }

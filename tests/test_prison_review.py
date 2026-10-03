@@ -402,6 +402,37 @@ class TestZeroIsAValue:
             await Database.close()
 
 
+class TestSecurityIsAppliedOnce:
+    """`escape_risk_pct` is a base risk, and calculate_escape_risk applies the multiplier to it."""
+
+    async def test_upgrading_security_does_not_rescale_the_base_risk(self):
+        await Database.init()
+        row = await _prisoner(escape_risk_pct=40, cell_security="minimal")
+        try:
+            out = await prison.upgrade_security(row["id"], "isolated", 0, SESSION)
+            assert out["escape_risk_pct"] == 40, out
+            assert out["effective_risk_pct"] == 2, out
+            stored = await Database.fetchval(
+                "SELECT escape_risk_pct FROM maya_rp.prisoners WHERE id = $1", row["id"])
+            assert stored == 40, "the security level was folded into the base risk as well"
+            risk = await prison.calculate_escape_risk(row["id"], session_id=SESSION, roll=0.99)
+            assert risk["probability"] == 2, risk
+        finally:
+            await _drop_prisoner(row["id"])
+            await Database.close()
+
+    async def test_a_zero_risk_is_not_resurrected_by_an_upgrade(self):
+        await Database.init()
+        row = await _prisoner(escape_risk_pct=0, cell_security="minimal")
+        try:
+            out = await prison.upgrade_security(row["id"], "maximum", 0, SESSION)
+            assert out["escape_risk_pct"] == 0, out
+            assert out["effective_risk_pct"] == 0, out
+        finally:
+            await _drop_prisoner(row["id"])
+            await Database.close()
+
+
 class TestTheRiskLookupSpeaks:
     async def test_a_failed_lookup_is_logged(self, monkeypatch):
         seen = []

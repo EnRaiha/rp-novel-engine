@@ -32,15 +32,18 @@ class TestTheArmouryIsShared:
 
     async def test_the_same_name_twice_is_refused_anywhere(self):
         await Database.init()
-        made_resources = False
+        # What the arc's row held before this test raised its balance. `None` means the test created
+        # the row and may remove it; a row that was already there is put back, not deleted.
+        previous = await Database.fetchrow(
+            "SELECT credits FROM maya_rp.resources WHERE session_id=5")
         try:
-            made_resources = not await _enough_credits(5)
             # ON CONFLICT matters: the row may exist with a balance this test needs raised, and the
             # first version of this test only inserted when the row was absent.
-            await Database.execute(
-                "INSERT INTO maya_rp.resources (session_id, credits) VALUES (5, 50000000)"
-                " ON CONFLICT (session_id) DO UPDATE SET credits = GREATEST(maya_rp.resources.credits,"
-                " 50000000)")
+            if not await _enough_credits(5):
+                await Database.execute(
+                    "INSERT INTO maya_rp.resources (session_id, credits) VALUES (5, 50000000)"
+                    " ON CONFLICT (session_id) DO UPDATE SET credits = GREATEST(maya_rp.resources.credits,"
+                    " 50000000)")
             first = await wd.design_blueprint("red proof twice", "Special", 0, 1, "L", 1, 5)
             assert first.get("error") is None, first
             second = await wd.design_blueprint("red proof twice", "Special", 0, 1, "L", 1, 5)
@@ -48,8 +51,11 @@ class TestTheArmouryIsShared:
         finally:
             await Database.execute(
                 "DELETE FROM maya_rp.weapon_blueprints WHERE LOWER(name)=LOWER($1)", "red proof twice")
-            if made_resources:
+            if previous is None:
                 await Database.execute("DELETE FROM maya_rp.resources WHERE session_id=5")
+            else:
+                await Database.execute(
+                    "UPDATE maya_rp.resources SET credits = $1 WHERE session_id=5", previous["credits"])
             await Database.close()
 
 

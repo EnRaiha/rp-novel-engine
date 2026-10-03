@@ -33,35 +33,59 @@ class TestTheTechTreeIsScoped:
 
 
 class TestTheCloaksRoundTrip:
-    async def test_building_a_cloak_puts_it_on_the_list(self):
-        await Database.init()
-        # The builder pays in alloys, and session 5 has no resources row at all, so the test owns one.
-        made_resources = False
-        if await Database.fetchval("SELECT 1 FROM maya_rp.resources WHERE session_id=5") is None:
+    """The builder pays in alloys, so it runs in a scratch session with its own ledger row.
+
+    Seeding session 5 was wrong twice: the arc owns that row now, so an INSERT there is refused by the
+    unique key on `session_id`, and both teardowns deleted `anti_cloak_grids` for the whole campaign
+    (`WHERE session_id=5`) instead of the one grid the test built. A test may only delete what it
+    created; a row a test needs for one run belongs in a scratch session.
+    """
+
+    async def _seed(self, session_id: int, alloys: int) -> dict:
+        made = {"session": False, "resources": False}
+        if await Database.fetchval("SELECT 1 FROM maya_rp.sessions WHERE id = $1", session_id) is None:
             await Database.execute(
-                "INSERT INTO maya_rp.resources (session_id, alloys, credits) VALUES (5, 1000000, 0)")
-            made_resources = True
-        made = await stealth.build_anticloak("red proof system", 2, 5)
+                "INSERT INTO maya_rp.sessions (id, name) VALUES ($1, $2)",
+                session_id, f"scratch-stealth-{session_id}")
+            made["session"] = True
+        if await Database.fetchval("SELECT 1 FROM maya_rp.resources WHERE session_id = $1", session_id) is None:
+            made["resources"] = True
+        await Database.execute(
+            "INSERT INTO maya_rp.resources (session_id, alloys, credits) VALUES ($1, $2, 0) "
+            "ON CONFLICT (session_id) DO UPDATE SET alloys = EXCLUDED.alloys",
+            session_id, alloys)
+        return made
+
+    async def _drop(self, session_id: int, made: dict) -> None:
+        await Database.execute("DELETE FROM maya_rp.anti_cloak_grids WHERE session_id = $1", session_id)
+        if made.get("resources"):
+            await Database.execute("DELETE FROM maya_rp.resources WHERE session_id = $1", session_id)
+        if made.get("session"):
+            await Database.execute("DELETE FROM maya_rp.sessions WHERE id = $1", session_id)
+
+    async def test_building_a_cloak_puts_it_on_the_list(self, scratch_session):
+        await Database.init()
+        made = None
         try:
-            assert made.get("error") is None, made
-            rows = await stealth.list_anticloak(5)
+            made = await self._seed(scratch_session, 1_000_000)
+            built = await stealth.build_anticloak("red proof system", 2, scratch_session)
+            assert built.get("error") is None, built
+            rows = await stealth.list_anticloak(scratch_session)
             assert any(str(r).find("red proof system") >= 0 for r in rows), rows
         finally:
-            await Database.execute(
-                "DELETE FROM maya_rp.anti_cloak_grids WHERE session_id=5")
-            if made_resources:
-                await Database.execute("DELETE FROM maya_rp.resources WHERE session_id=5")
+            if made is not None:
+                await self._drop(scratch_session, made)
             await Database.close()
 
-    async def test_the_list_is_scoped_to_its_session(self):
+    async def test_the_list_is_scoped_to_its_session(self, scratch_session):
         await Database.init()
-        if await Database.fetchval("SELECT 1 FROM maya_rp.resources WHERE session_id=5") is None:
-            await Database.execute(
-                "INSERT INTO maya_rp.resources (session_id, alloys, credits) VALUES (5, 1000000, 0)")
-        await stealth.build_anticloak("red proof scoped", 1, 5)
+        made = None
         try:
+            made = await self._seed(scratch_session, 1_000_000)
+            await stealth.build_anticloak("red proof scoped", 1, scratch_session)
             assert await stealth.list_anticloak(3) == [] or all(
                 "red proof scoped" not in str(r) for r in await stealth.list_anticloak(3))
         finally:
-            await Database.execute("DELETE FROM maya_rp.anti_cloak_grids WHERE session_id=5")
+            if made is not None:
+                await self._drop(scratch_session, made)
             await Database.close()

@@ -19,17 +19,24 @@ from modules import crew_system  # noqa: E402
 
 
 class TestTheCreditIsReported:
-    async def test_a_session_with_no_resources_row_is_told_nothing_was_credited(self):
-        """Before the fix this returned produced=401 and wrote nothing anywhere."""
+    async def test_a_session_with_no_resources_row_is_told_nothing_was_credited(self, scratch_session):
+        """Before the fix this returned produced=401 and wrote nothing anywhere.
+
+        The case is "a campaign with no ledger row", and session 5 is no longer one: the arc owns a
+        row now. A scratch session has none by definition, so the test names that instead of pinning
+        the live arc's state.
+        """
         await Database.init()
-        has_row = await Database.fetchval(
-            "SELECT 1 FROM maya_rp.resources WHERE session_id=5")
-        assert has_row is None, "this test assumes session 5 has no resources row"
-        out = await crew_system.produce_crew(5)
-        assert out["produced"] == 0, out
-        assert out.get("unpaid"), out
-        assert out.get("would_produce", 0) > 0, out
-        await Database.close()
+        try:
+            has_row = await Database.fetchval(
+                "SELECT 1 FROM maya_rp.resources WHERE session_id=$1", scratch_session)
+            assert has_row is None, "a scratch session must have no resources row"
+            out = await crew_system.produce_crew(scratch_session)
+            assert out["produced"] == 0, out
+            assert out.get("unpaid"), out
+            assert out.get("would_produce", 0) > 0, out
+        finally:
+            await Database.close()
 
 
 class TestTheShipIsScoped:
@@ -51,8 +58,10 @@ class TestTheShipIsScoped:
 
 
 class TestTheReport:
-    async def test_the_report_answers_for_a_session_with_nothing(self):
+    async def test_the_report_answers_for_a_session_with_nothing(self, scratch_session):
         await Database.init()
-        out = await crew_system.crew_report(5)
-        assert out["crew_pool"] == 0 and out["named_officers"] == 0, out
-        await Database.close()
+        try:
+            out = await crew_system.crew_report(scratch_session)
+            assert out["crew_pool"] == 0 and out["named_officers"] == 0, out
+        finally:
+            await Database.close()

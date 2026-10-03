@@ -65,17 +65,34 @@ async def _drop_ship(sid):
 #: carry the real treasury, so only this exact figure is ever deleted.
 MARKER = 987654321
 
+#: What session 5's row held before this file first touched it. `None` means the file created the row;
+#: `"absent"` means nothing was seeded in this run. The teardown reads this instead of guessing from a
+#: shape: `WHERE credits = ANY(...)` deleted the arc's own row whenever a test seeded zero credits,
+#: because the arc's row is zero credits too.
+_TOUCHED: dict[int, dict | None | str] = {}
+
 
 async def _resources(credits):
+    if SESSION not in _TOUCHED:
+        _TOUCHED[SESSION] = await Database.fetchrow(
+            "SELECT credits, research_points FROM maya_rp.resources WHERE session_id = $1", SESSION)
     await Database.execute(
-        "INSERT INTO maya_rp.resources (session_id, credits, research_points) VALUES ($1, $2, 0)",
+        "INSERT INTO maya_rp.resources (session_id, credits, research_points) VALUES ($1, $2, 0) "
+        "ON CONFLICT (session_id) DO UPDATE SET credits = $2, research_points = 0",
         SESSION, credits)
 
 
 async def _drop_resources(*credits):
+    """Undo what `_resources` did to session 5: remove the row it created, or put the arc's row back."""
+    previous = _TOUCHED.pop(SESSION, "absent")
+    if previous == "absent":
+        return
+    if previous is None:
+        await Database.execute("DELETE FROM maya_rp.resources WHERE session_id = $1", SESSION)
+        return
     await Database.execute(
-        "DELETE FROM maya_rp.resources WHERE session_id = $1 AND credits = ANY($2::bigint[])",
-        SESSION, list(credits))
+        "UPDATE maya_rp.resources SET credits = $2, research_points = $3 WHERE session_id = $1",
+        SESSION, previous["credits"], previous["research_points"])
 
 
 class TestConversionAnswersInsteadOfCrashing:

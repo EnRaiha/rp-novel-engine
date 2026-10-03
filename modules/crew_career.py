@@ -11,25 +11,43 @@ SKILLS = {"combat":["gunnery","tactics","melee","boarding"],"engineering":["reac
 ALL_SKILLS = [s for sub in SKILLS.values() for s in sub]
 RANKS = ["Crewman","Specialist","Veteran","Expert","Officer","Commander","Legend"]
 
-async def award(crew_id: int, xp: int, source: str, session_id: int = None):
+async def award(crew_id: int, xp: int, source: str, session_id: int = None) -> dict:
+    """Award XP to one crew member of this campaign.
+
+    The award is scoped, and so is the log entry: an XP write for a crew member
+    of another campaign matched no roster row and still wrote a log row, so the
+    ledger recorded an award nobody received. The follow-up read and the level-up
+    write carried no session either.
+    """
     if session_id is None: session_id = Config.SESSION_ID
-    await Database.execute("UPDATE maya_rp.crew_roster SET xp=COALESCE(xp,0)+$1 WHERE id=$2 AND session_id=$3", xp,crew_id,session_id)
+    tag = await Database.execute(
+        "UPDATE maya_rp.crew_roster SET xp=COALESCE(xp,0)+$1 WHERE id=$2 AND session_id=$3",
+        xp, crew_id, session_id)
+    if isinstance(tag, str) and tag.split()[-1:] == ["0"]:
+        info("crew_career", f"crew {crew_id} is not in session {session_id} — "
+                            f"{xp} XP NOT awarded, nothing logged")
+        return {"leveled": False, "error": f"Crew {crew_id} not in session {session_id}"}
     await Database.execute("INSERT INTO maya_rp.crew_xp_log(crew_id,session_id,amount,source) VALUES($1,$2,$3,$4)", crew_id,session_id,xp,source)
-    cr = await Database.fetchrow("SELECT xp,level,role FROM maya_rp.crew_roster WHERE id=$1", crew_id)
-    if not cr: return
+    cr = await Database.fetchrow(
+        "SELECT xp,level,role FROM maya_rp.crew_roster WHERE id=$1 AND session_id=$2",
+        crew_id, session_id)
+    if not cr:
+        return {"leveled": False, "error": f"Crew {crew_id} vanished after the award"}
     needed = (cr["level"] or 1) * 100
     if (cr["xp"] or 0) >= needed:
         nl = (cr["level"] or 1) + 1
         nr = RANKS[min(nl-1, len(RANKS)-1)]
         ns = random.choice(ALL_SKILLS)
-        await Database.execute("UPDATE maya_rp.crew_roster SET level=$1,rank=$2,xp=COALESCE(xp,0)-$3 WHERE id=$4", nl,nr,needed,crew_id)
+        await Database.execute(
+            "UPDATE maya_rp.crew_roster SET level=$1,rank=$2,xp=COALESCE(xp,0)-$3 "
+            "WHERE id=$4 AND session_id=$5",
+            nl, nr, needed, crew_id, session_id)
         await Database.execute("INSERT INTO maya_rp.crew_skills(crew_id,session_id,skill_name,proficiency) VALUES($1,$2,$3,1) ON CONFLICT(crew_id,skill_name)DO UPDATE SET proficiency=crew_skills.proficiency+1", crew_id,session_id,ns)
         return {"leveled":True,"new_rank":nr,"skill":ns}
     return {"leveled":False}
 
 async def run_tick(session_id: int = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
-    gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)
     try:
         await Database.execute("UPDATE maya_rp.crew_roster SET level=COALESCE(level,1),rank=COALESCE(rank,'Crewman') WHERE session_id=$1 AND level IS NULL", session_id)
     except Exception as e:
@@ -47,12 +65,19 @@ SPECIALIZATIONS = ["artisan", "planner", "navigator", "officer", "engineer"]
 
 
 async def assign_specialization(crew_id: int, specialization: str, session_id: int = None) -> dict:
+    """Set one crew member's specialization. Reports whether a row matched.
+
+    It returned success even when the id was not in this session, so the caller
+    was told a specialization had been assigned that was never written.
+    """
     if session_id is None: session_id = Config.SESSION_ID
     if specialization not in SPECIALIZATIONS:
         return {"error": f"Specialization mesti salah satu: {SPECIALIZATIONS}"}
-    await Database.execute(
+    tag = await Database.execute(
         "UPDATE maya_rp.crew_roster SET specialization=$1 WHERE id=$2 AND session_id=$3",
         specialization, crew_id, session_id)
+    if isinstance(tag, str) and tag.split()[-1:] == ["0"]:
+        return {"error": f"Crew {crew_id} not in session {session_id}"}
     return {"crew_id": crew_id, "specialization": specialization}
 
 
@@ -74,8 +99,9 @@ async def promote_crew(crew_id: int, session_id: int = None) -> dict:
                    "navigator": ["ftl"], "officer": ["leadership"], "engineer": ["reactor", "ftl"]}
     skills = spec_skills.get(cr["specialization"] or "officer", ["tactics"])
     await Database.execute(
-        "UPDATE maya_rp.crew_roster SET level=$1, rank=$2, xp=COALESCE(xp,0)-$3, promotion_source='novel_promotion' WHERE id=$4",
-        nl, nr, needed, crew_id)
+        "UPDATE maya_rp.crew_roster SET level=$1, rank=$2, xp=COALESCE(xp,0)-$3, "
+        "promotion_source='novel_promotion' WHERE id=$4 AND session_id=$5",
+        nl, nr, needed, crew_id, session_id)
     for sk in skills:
         await Database.execute(
             "INSERT INTO maya_rp.crew_skills (crew_id, session_id, skill_name, proficiency) "

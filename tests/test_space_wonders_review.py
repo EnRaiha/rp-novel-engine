@@ -199,25 +199,35 @@ def _read(row, key):
 
 class TestSessionScope:
     def test_survey_refuses_another_sessions_planet(self):
+        """The survey borrows a real row and never creates one.
+
+        `tests/test_dry_run_safety.py` fingerprints maya_rp.planets, so this test
+        inserts nothing: it takes an existing unsurveyed session-3 planet, asserts
+        the call from session 5 is refused, and writes the original value back in
+        the finally whatever happened.
+        """
+
         async def scenario():
             await Database.init()
-            pid = await Database.fetchval(
-                "INSERT INTO maya_rp.planets (session_id, name, planet_type, surveyed) "
-                "VALUES (5, 'review-temp-planet', 'Barren', FALSE) RETURNING id")
+            row = await Database.fetchrow(
+                "SELECT id, surveyed FROM maya_rp.planets "
+                "WHERE session_id = 3 AND surveyed = FALSE ORDER BY id LIMIT 1")
             try:
-                before = await Database.fetchval(
-                    "SELECT surveyed FROM maya_rp.planets WHERE id=$1", pid)
-                out = await sw.survey_planet(pid, session_id=3)
+                assert row, "no unsurveyed session-3 planet to borrow"
+                out = await sw.survey_planet(row["id"], session_id=5)
                 after = await Database.fetchval(
-                    "SELECT surveyed FROM maya_rp.planets WHERE id=$1", pid)
-                return out, before, after
+                    "SELECT surveyed FROM maya_rp.planets WHERE id=$1", row["id"])
+                return out, after
             finally:
-                await Database.execute("DELETE FROM maya_rp.planets WHERE id=$1", pid)
+                if row:
+                    await Database.execute(
+                        "UPDATE maya_rp.planets SET surveyed=$1 WHERE id=$2",
+                        row["surveyed"], row["id"])
                 await Database.close()
 
-        out, before, after = _run(scenario())
-        assert "not found in session 3" in out.get("error", ""), out
-        assert (before, after) == (False, False), "the refused survey wrote anyway"
+        out, after = _run(scenario())
+        assert "not found in session 5" in out.get("error", ""), out
+        assert after is False, "the refused survey marked another campaign's planet surveyed"
 
     def test_a_discovery_lands_in_the_named_session(self):
         async def scenario():

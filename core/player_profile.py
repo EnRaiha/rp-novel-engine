@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Player Style Tracker — learns what the player tends to do and adjusts."""
 from __future__ import annotations
+import re
 from typing import Any
 from core.db import Database
 from core.config import Config
@@ -33,7 +34,11 @@ async def record(text: str, session_id: int = None):
     lower = text.lower()
     hits = []
     for cat, kws in ACTION_CATS.items():
-        c = sum(1 for kw in kws if kw in lower)
+        # `kw in lower` is a substring test, so it counted "kill" inside "skill", "deal" inside
+        # "ideal", "hold" inside "household", "break" inside "breakfast", and "search" inside
+        # "research" — which is also a `building` keyword, so one word scored two categories.
+        # `core/guard.py` learned this one already: a substring test flagged "gun" inside "begun".
+        c = sum(1 for kw in kws if re.search(rf"\b{re.escape(kw)}\b", lower))
         if c > 0: hits.append((cat, c))
     for cat, c in hits:
         await Database.execute("INSERT INTO maya_rp.player_action_log (session_id,action_category,count,raw_input) VALUES ($1,$2,$3,$4)", session_id, cat, c, text[:200])
@@ -41,7 +46,8 @@ async def record(text: str, session_id: int = None):
 async def get_profile(session_id: int = None) -> dict:
     if session_id is None: session_id = Config.SESSION_ID
     rows = await Database.fetch("SELECT action_category,SUM(count) as total FROM maya_rp.player_action_log WHERE session_id=$1 GROUP BY action_category ORDER BY total DESC", session_id)
-    total = sum(r["total"] for r in rows) or 1
+    recorded = sum(r["total"] for r in rows)
+    total = recorded or 1   # the divisor only: with no rows there is nothing to divide
     dist = {r["action_category"]: round(r["total"]/total*100) for r in rows}
 
     style = "balanced"
@@ -52,5 +58,8 @@ async def get_profile(session_id: int = None) -> dict:
                     ("explorer",dist.get("exploration",0)>30)]:
         if cond: style = s; break
 
-    partner = await Database.fetchrow("SELECT c.name FROM maya_rp.romance_arcs ra JOIN maya_rp.characters c ON c.id=ra.character_id WHERE ra.session_id=$1 ORDER BY ra.nights_shared DESC LIMIT 1", session_id)
-    return {"style":style,"distribution":dist,"total":int(total),"preferred_companion":partner["name"] if partner else None,"advice":STYLE_ADVICE.get(style,STYLE_ADVICE["balanced"])}
+    # `ORDER BY ra.nights_shared DESC` puts NULLs first in Postgres, so a row with no count would
+    # take the preferred-companion slot from a companion with one. Measured: 0 of the 49 live rows
+    # hold NULL, so nothing is wrong today; NULLS LAST keeps it that way.
+    partner = await Database.fetchrow("SELECT c.name FROM maya_rp.romance_arcs ra JOIN maya_rp.characters c ON c.id=ra.character_id WHERE ra.session_id=$1 ORDER BY ra.nights_shared DESC NULLS LAST LIMIT 1", session_id)
+    return {"style":style,"distribution":dist,"total":int(recorded),"preferred_companion":partner["name"] if partner else None,"advice":STYLE_ADVICE.get(style,STYLE_ADVICE["balanced"])}

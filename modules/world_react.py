@@ -5,11 +5,19 @@ import random
 from typing import Any
 from core.db import Database
 from core.config import Config
-from core.log import info
+from core.log import info, error
+
+async def _game_day(session_id: int) -> int:
+    """The session's day, or 1. The COALESCE is inside the SQL, so a session that
+    does not exist returns None and `gd + delay` raised TypeError."""
+    return await Database.fetchval(
+        "SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id) or 1
+
 
 async def propagate(event_type: str, details: dict, session_id: int = None) -> list[dict]:
+    """Queue the reactions one event provokes. Unknown event types provoke none."""
     if session_id is None: session_id = Config.SESSION_ID
-    gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)
+    gd = await _game_day(session_id)
     reactions = []
     if event_type=="territory_conquered":
         sys_name = details.get("system_name","?")
@@ -34,14 +42,35 @@ async def propagate(event_type: str, details: dict, session_id: int = None) -> l
 
 async def get_due(session_id: int = None) -> list[dict]:
     if session_id is None: session_id = Config.SESSION_ID
-    gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)
+    gd = await _game_day(session_id)
     rows = await Database.fetch("SELECT id,reaction_type,description,source_faction FROM maya_rp.world_reactions WHERE session_id=$1 AND surfaced=false AND surfaces_at_game_day<=$2 ORDER BY surfaces_at_game_day ASC LIMIT 3", session_id,gd)
     return [dict(r) for r in rows]
 
-async def surface(reaction_id: int, session_id: int = None):
-    await Database.execute("UPDATE maya_rp.world_reactions SET surfaced=true WHERE id=$1 AND session_id=$2", reaction_id,session_id or Config.SESSION_ID)
+async def surface(reaction_id: int, session_id: int = None) -> bool:
+    """Mark one reaction surfaced. Reports whether it matched.
+
+    It returned None either way, so a caller could not tell a surfaced reaction
+    from a miss.
+    """
+    if session_id is None: session_id = Config.SESSION_ID
+    tag = await Database.execute(
+        "UPDATE maya_rp.world_reactions SET surfaced=true WHERE id=$1 AND session_id=$2",
+        reaction_id, session_id)
+    surfaced = not (isinstance(tag, str) and tag.split()[-1:] == ["0"])
+    if not surfaced:
+        info("world_react", f"reaction {reaction_id} is not in session {session_id} — nothing surfaced")
+    return surfaced
+
 
 async def run_tick(session_id: int = None) -> dict:
+    """Count the reactions whose day has come.
+
+    Deliberately does NOT surface them. The consumer is
+    `core/master_briefing.get_due`, and a tick that marked them surfaced first
+    would leave the briefing with nothing to show. That the briefing never calls
+    `surface` either is reported to the lead: with no caller, the same three
+    reactions are due in every briefing.
+    """
     if session_id is None: session_id = Config.SESSION_ID
     due = await get_due(session_id)
     return {"due_reactions":len(due)}

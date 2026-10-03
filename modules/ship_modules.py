@@ -39,8 +39,19 @@ async def install_module(ship_id: int, module_name: str,
         ship_id, session_id)
     if not ship:
         raise ValueError(f"No ship id={ship_id}")
+    # The name is a pattern, so 'drive' matches both Void Drive and Quiet Drive
+    # Nullifier and fetchrow silently took whichever row the plan returned first.
+    pattern = f"%{module_name}%"
+    matches = await Database.fetchval(
+        "SELECT count(*) FROM maya_rp.modules WHERE name ILIKE $1", pattern) or 0
+    if matches > 1:
+        names = await Database.fetch(
+            "SELECT name FROM maya_rp.modules WHERE name ILIKE $1 ORDER BY id", pattern)
+        raise ValueError(
+            f"{module_name!r} matches {matches} modules: "
+            + ", ".join(r["name"] for r in names))
     mod = await Database.fetchrow(
-        """SELECT * FROM maya_rp.modules WHERE name ILIKE $1""", f"%{module_name}%")
+        """SELECT * FROM maya_rp.modules WHERE name ILIKE $1""", pattern)
     if not mod:
         raise ValueError(f"No module named {module_name!r}")
     tier = ship["tier"] or 0
@@ -71,15 +82,22 @@ async def install_module(ship_id: int, module_name: str,
             "category": mod["category"], "slot": used + 1}
 
 
-async def list_modules(ship_id: int) -> list[dict]:
-    """List fitted modules with effects + special rules."""
+async def list_modules(ship_id: int, session_id: int | None = None) -> list[dict]:
+    """List fitted modules with effects + special rules.
+
+    `maya_rp.ship_modules` carries no session_id, so the scope comes through
+    ships: a ship id from another campaign lists nothing.
+    """
+    if session_id is None:
+        session_id = Config.SESSION_ID
     return await Database.fetch(
         """SELECT m.name, m.category, m.effect_type, m.effect_value, m.grade,
                   m.special_rules, sm.slot_index
            FROM maya_rp.ship_modules sm
            JOIN maya_rp.modules m ON m.id = sm.module_id
-           WHERE sm.ship_id=$1 ORDER BY sm.slot_index""",
-        ship_id)
+           JOIN maya_rp.ships s ON s.id = sm.ship_id
+           WHERE sm.ship_id=$1 AND s.session_id=$2 ORDER BY sm.slot_index""",
+        ship_id, session_id)
 
 
 async def fleet_void_capable(fleet_name: str | None,

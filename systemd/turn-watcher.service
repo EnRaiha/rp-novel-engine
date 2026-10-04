@@ -1,0 +1,39 @@
+# Turn watcher — read new turns, track what they declare, write no prose.
+#
+# INSTALL (needs root, and the King's word before it runs):
+#
+#     sudo cp /home/maya/Bumi-Hijau/rp-engine-py/systemd/turn-watcher.service /etc/systemd/system/
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now turn-watcher.service
+#
+# AND ONE GRANT, because the play record lives in maya_rag and the engine role did not hold it:
+#
+#     psql "$DSN" -c "GRANT SELECT ON maya_rag.dsh_turns TO rp_engine"
+#
+# Applied 2026-10-04. It is consistent with what rp_engine already holds: INSERT, SELECT and UPDATE
+# on maya_rag.novel_chunks, and read access to maya_rag.unified. SELECT only here, because the
+# watcher reads turns and never writes them.
+#
+# WHY A LONG-RUNNING SERVICE AND NOT A TIMER. `tick-engine.timer` runs every six hours because a
+# game day is a unit of time. A turn is not: it arrives when the GM writes one, and a poll costs one
+# indexed query. `--watch` polls every 60 seconds and each pass is independent, so a turn that fails
+# cannot wedge the loop.
+
+[Unit]
+Description=TKG turn watcher — track what each turn declares (scene and terms)
+Documentation=file:///home/maya/Bumi-Hijau/rp-engine-py/scripts/turn_watcher.py
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=maya
+WorkingDirectory=/home/maya/Bumi-Hijau/rp-engine-py
+Environment=PYTHONPATH=/home/maya/Bumi-Hijau/rp-engine-py:/home/maya/scripts
+ExecStart=/bin/bash -c 'set -a; source /home/maya/.env; set +a; exec /usr/bin/python3 scripts/turn_watcher.py --watch --apply --seconds 60'
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

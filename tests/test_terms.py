@@ -98,12 +98,40 @@ async def _ensure_session(session: int, name: str = "Terms") -> None:
 
 @pytest_asyncio.fixture
 async def ledger(scratch_session):
+    """A session with Zulaikha on the roster.
+
+    The roster matters: `record` blanks a speaker that is not a character, because run over the real
+    turns the nearest heading is often `Harga` or `Mahar` rather than a person. Without her row here
+    every term would come back unnamed, which is the correct behaviour and the wrong fixture.
+    """
     await Database.init()
     await _ensure_session(scratch_session)
+    await Database.execute(
+        "INSERT INTO maya_rp.characters (session_id, name, status) VALUES ($1, 'Zulaikha Nadira', 'active')",
+        scratch_session)
     await Database.execute("DELETE FROM maya_rp.terms WHERE session_id=$1", scratch_session)
     yield scratch_session
     await Database.execute("DELETE FROM maya_rp.terms WHERE session_id=$1", scratch_session)
+    await Database.execute("DELETE FROM maya_rp.characters WHERE session_id=$1", scratch_session)
     await Database.execute("DELETE FROM maya_rp.sessions WHERE id=$1", scratch_session)
+
+
+async def test_a_heading_that_is_not_a_person_leaves_the_term_unnamed(ledger):
+    """`Harga`, `Mahar` and `Tanda` are section headings in the play record, not speakers. A term
+    attributed to a price is worse than one attributed to nobody."""
+    await record(ledger, turn_id=9, text="### Harga\n\n*Dengan syarat saya yang bertanggungjawab.*\n")
+
+    rows = await open_terms(ledger)
+
+    assert len(rows) == 1
+    assert rows[0]["speaker"] is None, "a price is not a person"
+
+
+async def test_a_table_row_is_not_a_term(ledger):
+    """Three of the first seventeen matches were table cells that happened to carry a marker."""
+    result = await record(ledger, turn_id=50, text="| Calon | Asas | Harga sanggup bayar |\n")
+
+    assert result["found"] == 0
 
 
 TURN = ("### 4. Zulaikha Nadira\n\n*Perkara satu kamu tidak boleh diukur.*\n\n"
@@ -136,6 +164,15 @@ async def test_the_same_words_in_a_different_turn_are_a_different_term(ledger):
     second = await record(ledger, turn_id=76, text=TURN)
 
     assert second["written"] == 2, "a term restated in a later turn is its own term"
+
+
+async def test_ordinary_future_tense_is_not_a_term(ledger):
+    """`saya akan` and `kamu akan` were markers in the first version. Over the real record they
+    produced 110 of 116 matches and almost all were noise: "Saya akan bayar dengan kerja", "Saya
+    akan kembali," katanya, "Kamu akan tinggal di sini sampai berapa lama?"."""
+    result = await record(ledger, turn_id=4, text='Saya akan bayar dengan kerja. Kamu akan tinggal di sini.')
+
+    assert result["found"] == 0, "future tense is not an obligation"
 
 
 async def test_a_turn_with_no_terms_records_nothing(ledger):

@@ -157,6 +157,26 @@ async def ooc_status_lines(session_id: int, traits: Sequence[str] = ("general",)
     return lines
 
 
+async def terms_lines(session_id: int, limit: int = 8) -> list[str]:
+    """The standing obligations, one line each, for the `[TERMS]` block.
+
+    `core/terms.py` finds them in the turn that stated them and quotes them verbatim; this is where
+    they reach the GM. Filled by the turn watcher, which reads `maya_rag.dsh_turns`, so the block
+    appears without the GM having to report anything.
+
+    A failure here is reported and never fatal. A block that cannot be built must not take the turn
+    with it, and an empty list simply drops the section out of the context.
+    """
+    from core.log import warn
+    from core.terms import lines as term_lines
+
+    try:
+        return await term_lines(session_id, limit=limit)
+    except Exception as e:  # noqa: BLE001 - reported, never fatal
+        warn("context", f"terms block unavailable: {e}")
+        return []
+
+
 async def scene_state(session_id: int) -> dict[str, Any]:
     """Game day, campaign summary, and the location when one is recorded."""
     session = await Database.fetchrow(
@@ -235,6 +255,14 @@ def render_blocks(blocks: dict[str, Any]) -> str:
         lines.append("[SYSTEM]")
         lines.extend(system)
 
+    terms = blocks.get("terms") or []
+    if terms:
+        # Standing obligations. `core/terms.py` finds them in the turn that stated them and quotes
+        # them verbatim; this is where they reach the GM. A character who set a condition has not
+        # forgotten it, and this is the only block that remembers on their behalf.
+        lines.append("[TERMS]")
+        lines.extend(terms)
+
     scene = blocks.get("scene") or {}
     if scene.get("game_day") is not None or scene.get("location"):
         lines.append("[SCENE]")
@@ -275,6 +303,7 @@ async def build_context(
         "goals": await current_goals(sid),
         "system": await ooc_status_lines(sid, traits),
         "scene": await scene_state(sid),
+        "terms": await terms_lines(sid),
     }
     # Lore triggers on this turn's own scene text (act, chronicle, goals), and
     # near-ending hints ride the [SYSTEM] block so the edge stays visible.

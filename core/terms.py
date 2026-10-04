@@ -33,9 +33,17 @@ from core.log import info
 
 # Marker, then the kind it introduces. Longest first, because `perjanjian` contains `janji` and
 # `persetujuan` contains `setuju`: checking the short form first would mislabel both.
+#
+# `saya akan` AND `kamu akan` WERE HERE AND ARE GONE. They were in the first version and they are
+# ordinary future tense, not obligation: run over the real play record they produced 110 of 116
+# matches and almost all were noise — "Saya akan bayar dengan kerja", "Saya akan kembali," katanya,
+# "Kamu akan tinggal di sini sampai berapa lama?" The markers below are the ones that introduce a
+# commitment rather than describe what happens next.
 MARKERS: tuple[tuple[str, str], ...] = (
     ("perjanjian", "perjanjian"),
     ("aku boleh janjikan", "janji"),
+    ("aku minta kamu", "janji"),
+    ("aku meminta kamu", "janji"),
     ("aku janji", "janji"),
     ("saya bersetuju", "persetujuan"),
     ("aku bersetuju", "persetujuan"),
@@ -45,8 +53,7 @@ MARKERS: tuple[tuple[str, str], ...] = (
     ("perkara satu", "syarat"),
     ("perkara dua", "syarat"),
     ("perkara tiga", "syarat"),
-    ("kamu akan", "syarat"),
-    ("saya akan", "syarat"),
+    ("ini satu perjanjian", "perjanjian"),
 )
 
 SECTION = re.compile(r"^#{2,4}[ \t]+(?:\d+\.)?[ \t]*(?P<name>[^\n]+)$", re.M)
@@ -78,6 +85,16 @@ def speaker_before(text: str, offset: int) -> str | None:
 
 
 def _kind(paragraph: str) -> str | None:
+    """The kind a paragraph introduces, or None.
+
+    TABLE ROWS AND HEADINGS ARE SKIPPED. Run over the real turns, three of seventeen matches were
+    table cells that happened to contain a marker — `| Calon | Asas | Minat (dadu) | Harga sanggup
+    bayar |` and two like it, from the ledger tables the record uses. A row is not a sentence
+    somebody said, and a heading introduces nothing by itself.
+    """
+    stripped = paragraph.lstrip()
+    if stripped.startswith("|") or stripped.startswith("#"):
+        return None
     low = paragraph.lower()
     for marker, kind in MARKERS:
         if marker in low:
@@ -107,24 +124,41 @@ def extract(text: str) -> list[dict[str, Any]]:
 
 async def record(session_id: int | None = None, turn_id: int | None = None,
                  text: str = "") -> dict[str, Any]:
-    """Store the terms a turn states. Idempotent: the same passage in the same turn is one row."""
+    """Store the terms a turn states. Idempotent: the same passage in the same turn is one row.
+
+    A SPEAKER THAT IS NOT A CHARACTER IS BLANKED. `speaker_before` takes the nearest heading, and
+    the play record heads sections with things that are not people: run over the real turns it
+    returned `Harga`, `Ejen di tanjakan`, `Mahar`, `Tanda` and `Yang dia pilih`. A term attributed to
+    a price is worse than one attributed to nobody, so the name is checked against the roster here,
+    where the database is available, and set to None when it does not resolve.
+    """
     if session_id is None:
         session_id = Config.SESSION_ID
     terms = extract(text)
-    written, already = 0, 0
+    roster = {r["name"] for r in await Database.fetch(
+        "SELECT name FROM maya_rp.characters WHERE session_id=$1", session_id)}
+    known = roster | {n for n in roster if " " in n}  # exact names only; the roster is authoritative
+
+    written, already, unnamed = 0, 0, 0
     for term in terms:
+        speaker = term["speaker"]
+        if speaker and speaker not in known:
+            unnamed += 1
+            speaker = None
         tag = await Database.execute(
             "INSERT INTO maya_rp.terms (session_id, turn_id, speaker, kind, quote)"
             " VALUES ($1, $2, $3, $4, $5)"
             " ON CONFLICT (session_id, COALESCE(turn_id, 0), md5(quote)) DO NOTHING",
-            session_id, turn_id, term["speaker"], term["kind"], term["quote"])
+            session_id, turn_id, speaker, term["kind"], term["quote"])
         if tag.rsplit(" ", 1)[-1] == "1":
             written += 1
         else:
             already += 1
     if written:
-        info("terms", f"turn {turn_id}: recorded {written} term(s), {already} already held")
-    return {"found": len(terms), "written": written, "already": already, "terms": terms}
+        info("terms", f"turn {turn_id}: recorded {written} term(s), {already} already held, "
+                      f"{unnamed} heading(s) were not people")
+    return {"found": len(terms), "written": written, "already": already,
+            "speakers_blanked": unnamed, "terms": terms}
 
 
 async def open_terms(session_id: int | None = None) -> list[dict]:
@@ -146,3 +180,21 @@ async def render(session_id: int | None = None) -> str:
         who = row["speaker"] or "tiada penutur"
         lines.append(f"- **{row['kind']}** · {who} · giliran {row['turn_id']}: {row['quote']}")
     return "\n".join(lines)
+
+
+async def lines(session_id: int | None = None, *, limit: int = 8, width: int = 240) -> list[str]:
+    """The open terms as one line each, for the `[TERMS]` block in the turn's context.
+
+    The quote is collapsed to single spaces and capped, because this goes into a prompt. A term
+    longer than `width` keeps its beginning and ends with an ellipsis rather than being dropped: an
+    obligation that is silently absent is worse than one that is visibly shortened.
+    """
+    rows = await open_terms(session_id)
+    out: list[str] = []
+    for row in rows[:limit]:
+        quote = " ".join((row["quote"] or "").split())
+        if len(quote) > width:
+            quote = quote[:width].rstrip() + "…"
+        who = row["speaker"] or "tiada penutur"
+        out.append(f"- {row['kind']} · {who} · giliran {row['turn_id']}: {quote}")
+    return out

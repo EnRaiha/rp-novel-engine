@@ -89,3 +89,34 @@ async def test_a_statistics_read_that_fails_does_not_stop_the_tick(recorded, mon
         pass
 
     assert recorded, "an unreadable statistics view stopped the tick before any module ran"
+
+
+async def test_the_phase_headers_are_numbered_coherently():
+    """The tick had two numbering schemes at once.
+
+    Measured on 2026-10-04: phases 1 to 23 read `Phase N/24`, phase 24 did not exist as a header
+    at all, and phases 25 to 32 read `Phase N/32`. There are 31 `tick_header` calls. So the code ran
+    31 phases, the first 23 understated the total, eight overstated it, and the sequence had a hole
+    where 24 should have been. A log reader counting the phases got a different answer from the code
+    every time.
+
+    This reads the source rather than a run, because the numbering is a property of the file.
+    """
+    import re
+    import pathlib
+
+    source = pathlib.Path(orch.__file__).read_text(encoding="utf-8")
+    heads = re.findall(r'tick_header\("Phase (\d+)/(\d+): ([^"]+)"\)', source)
+
+    assert heads, "no phase headers found; the pattern changed"
+    total = len(heads)
+    numbers = [int(number) for number, _stated, _title in heads]
+    stated = {int(head[1]) for head in heads}
+
+    assert numbers == list(range(1, total + 1)), (
+        f"the phases are not numbered 1..{total} in order: {numbers}")
+    assert stated == {total}, (
+        f"the headers disagree about how many phases there are: {sorted(stated)} for {total} phases")
+
+    # And the count is real: every header is followed by at least one module tick.
+    assert source.count("await tick(") >= total, "a phase header with no module under it"

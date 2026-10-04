@@ -192,3 +192,40 @@ async def test_a_turn_with_no_declaration_changes_nothing(scene):
 def test_the_field_and_time_sets_are_what_the_module_says():
     assert FIELDS == ("lokasi", "masuk", "keluar", "masa")
     assert "petang" in TIMES
+
+
+async def test_a_declaration_moves_only_the_names_it_names(scene):
+    """`controlled_by='gm'` is not the player.
+
+    A first version of `apply_declaration` moved every row with that column set, to keep the player's
+    context and the player's character in step. Measured on session 5 the column holds 63 rows, ids
+    2931 to 2993, all `supporting` and all `bond 0`: the Arc I supporting cast. The update put all 63
+    into town, 52 of which had no recorded location before it, and they had to be restored.
+
+    So this holds the boundary: the scene moves, the named cast moves, and nobody else does.
+    """
+    bystander = await Database.fetchval(
+        "INSERT INTO maya_rp.characters (session_id, name, status, controlled_by, scene_location)"
+        " VALUES ($1, 'A Bystander', 'active', 'gm', NULL) RETURNING id",
+        scene)
+    await Database.execute(
+        "UPDATE maya_rp.characters SET controlled_by='gm' WHERE session_id=$1", scene)
+
+    await consume(scene, "[SCENE] lokasi=amanah_arkib | masuk=Ersya Ardani")
+
+    moved = await Database.fetchval(
+        "SELECT scene_location FROM maya_rp.characters WHERE id=$1", bystander)
+    assert moved is None, "a character the declaration did not name was moved by it"
+    named = await Database.fetchval(
+        "SELECT scene_location FROM maya_rp.characters WHERE session_id=$1 AND name='Ersya Ardani'",
+        scene)
+    assert named == "amanah_arkib"
+
+
+async def test_a_dash_placeholder_is_not_a_person(scene):
+    """The first live declaration wrote `keluar=-`, and the reader reported that `-` is not in
+    session 5. A placeholder is not a name."""
+    result = await consume(scene, "[SCENE] lokasi=rumah_agung | keluar=-")
+
+    assert result["resolved"]["keluar"] == []
+    assert not any(c["said"] == "-" for c in result["corrections"]), "a dash was treated as a name"

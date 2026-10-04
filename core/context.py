@@ -178,7 +178,13 @@ async def terms_lines(session_id: int, limit: int = 8) -> list[str]:
 
 
 async def scene_state(session_id: int) -> dict[str, Any]:
-    """Game day, campaign summary, and the location when one is recorded."""
+    """Game day, campaign summary, the location, and the slugs a declaration may use.
+
+    `locations` is the catalogue, because the first live `[SCENE]` line wrote `lokasi=dewan-bandar`
+    and the catalogue holds `garden_city_dewan`. The tracker refused it, correctly, and the scene
+    stayed where it was. A vocabulary the writer cannot see is a vocabulary the writer will miss, so
+    the block carries it. Capped, because 35 slugs every turn is noise.
+    """
     session = await Database.fetchrow(
         "SELECT name, game_day, summary, status FROM maya_rp.sessions WHERE id=$1", int(session_id)
     )
@@ -187,11 +193,14 @@ async def scene_state(session_id: int) -> dict[str, Any]:
         " WHERE session_id=$1 AND presence='present' AND scene_location IS NOT NULL",
         int(session_id),
     )
+    slugs = [r["name"] for r in await Database.fetch(
+        "SELECT name FROM maya_rp.location_catalog ORDER BY name")]
     return {
         "name": session["name"] if session else None,
         "game_day": session["game_day"] if session else None,
         "summary": (session["summary"] or "")[:280] if session else "",
         "location": location,
+        "locations": slugs,
     }
 
 
@@ -272,6 +281,10 @@ def render_blocks(blocks: dict[str, Any]) -> str:
         if scene.get("name"):
             bits.append(scene["name"])
         lines.append("- " + " · ".join(bits))
+        if scene.get("locations"):
+            # The writer has to name one of these in `[SCENE] lokasi=`. A slug that is not here is
+            # refused by the tracker, and a refusal nobody can see coming wastes the turn.
+            lines.append("- lokasi yang sah: " + ", ".join(scene["locations"][:24]))
 
     return "\n".join(lines).strip()
 

@@ -38,6 +38,11 @@ FIELDS = ("lokasi", "masuk", "keluar", "masa")
 TIMES = ("subuh", "pagi", "tengah hari", "petang", "malam")
 CUTOFF = 0.6
 
+# What a declaration writes when it means "nobody". The first live turn used `keluar=-`, and the
+# reader treated the dash as a character name and warned that `-` is not in session 5. A placeholder
+# is not a person, so it is dropped at the parse rather than reported as a miss.
+EMPTY_MARKERS = frozenset({"-", "--", "—", "–", "none", "nobody", "tiada", "kosong", "(none)"})
+
 
 def parse(text: str) -> dict[str, Any] | None:
     """The declaration in a turn, or None when the turn carries none.
@@ -58,7 +63,8 @@ def parse(text: str) -> dict[str, Any] | None:
         key = key.strip().lower()
         value = value.strip()
         if key in ("masuk", "keluar"):
-            decl[key] = [name.strip() for name in re.split(r"[,;]", value) if name.strip()]
+            decl[key] = [name.strip() for name in re.split(r"[,;]", value)
+                         if name.strip() and name.strip() not in EMPTY_MARKERS]
         elif key in ("lokasi", "masa"):
             decl[key] = value or None
         elif key:
@@ -176,6 +182,20 @@ async def apply_declaration(session_id: int | None, resolved: dict[str, Any]) ->
         read_back = await Database.fetchval(
             "SELECT location FROM maya_rp.player_context WHERE session_id=$1", session_id)
         moved["location"] = read_back
+
+    # NO PLAYER-CHARACTER MOVE HAPPENS HERE, AND A FIRST ATTEMPT AT ONE WAS REVERTED.
+    #
+    # `player_context.location` and `characters.scene_location` describe different things: the scene
+    # and a person. The instinct was to keep them in step by moving the row behind the player, so
+    # this function moved `WHERE controlled_by='gm'`. That column is not the player. Measured on
+    # session 5 it holds **63 rows**, ids 2931 to 2993, every one `character_type='supporting'` and
+    # `bond 0`: the Arc I supporting cast, the same block the `arc1-cast` marker exists for. The
+    # update put all 63 into the town hall, 52 of which had no recorded location at all before it.
+    #
+    # They were restored to NULL and the twelve known values were reapplied. There is no column that
+    # says which character is the player's, so `apply_declaration` moves exactly the names the
+    # declaration names and nothing else. A declaration that wants the player's own row moved lists
+    # him in `masuk` like anybody else.
 
     for name in resolved.get("masuk") or []:
         await Database.execute(

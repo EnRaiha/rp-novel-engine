@@ -18,12 +18,27 @@ COLONY_LOCATIONS = [
 
 
 async def set_player_location(session_id: int, location: str, ship: str = None):
-    """Update where Izzat is."""
+    """Update where Izzat is.
+
+    Writes `location`, the column readers use, and keeps `current_focus` as the prose
+    line the CLI prints. The round trip used to be prose written here and prose read
+    back out by `get_player_location`, which is why a location the parser could not
+    split came back as the hardcoded `bridge`.
+
+    The location is checked against the catalogue and only warned about, not refused:
+    a name that is not in it cannot be matched by `get_characters_at_location`, so the
+    scene cast would read empty for a reason nothing else would explain.
+    """
+    known = await Database.fetchval(
+        "SELECT 1 FROM maya_rp.location_catalog WHERE name=$1", location)
+    if not known:
+        warn("locations", f"{location!r} is not in maya_rp.location_catalog; readers that match "
+                          "scene_location against the catalogue will not find this scene")
     await Database.execute(
-        "INSERT INTO maya_rp.player_context (session_id, current_focus, mood, updated_at) "
-        "VALUES ($1, $2, 'normal', NOW()) "
-        "ON CONFLICT (session_id) DO UPDATE SET current_focus=$2, updated_at=NOW()",
-        session_id, f"Location: {location} on {ship or 'unknown'}")
+        "INSERT INTO maya_rp.player_context (session_id, location, current_focus, mood, updated_at) "
+        "VALUES ($1, $2, $3, 'normal', NOW()) "
+        "ON CONFLICT (session_id) DO UPDATE SET location=$2, current_focus=$3, updated_at=NOW()",
+        session_id, location, f"Location: {location} on {ship or 'unknown'}")
     info("locations", f"Player moved to: {location} on {ship or 'unknown'}")
 
 

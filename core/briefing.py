@@ -33,14 +33,21 @@ async def generate_briefing(session_id: int = None) -> dict[str, Any]:
             "WHERE session_id=$1 AND status='active' ORDER BY id LIMIT 5",
             session_id)]
 
-    # 3. Who is present (from location tracking)
+    # 3. Where the scene is, from the column that owns it.
+    #
+    # This was a second copy of the same parse `modules.locations.get_player_location` did — look for
+    # the substring `Location:` in `current_focus`, split on `" on "` — with the same hardcoded
+    # `bridge` when it found nothing. Two readers of one field, both guessing, and `player_context`
+    # held no rows for any session, so the guess was the only path either of them ever took.
     loc = await Database.fetchrow(
-        "SELECT current_focus FROM maya_rp.player_context WHERE session_id=$1",
+        "SELECT location, current_focus FROM maya_rp.player_context WHERE session_id=$1",
         session_id)
-    current_location = "bridge"
-    if loc and loc["current_focus"] and "Location:" in loc["current_focus"]:
-        parts = loc["current_focus"].replace("Location: ", "").split(" on ")
-        current_location = parts[0].strip()
+    if loc and loc["location"]:
+        current_location = loc["location"]
+    elif loc and loc["current_focus"] and "Location:" in loc["current_focus"]:
+        current_location = loc["current_focus"].replace("Location: ", "").split(" on ")[0].strip()
+    else:
+        current_location = None
     briefing["location"] = current_location
     briefing["present"] = [
         {"name": r["name"], "bond": r["bond"], "role": r["role"]}

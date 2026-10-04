@@ -35,8 +35,9 @@ from modules import locations
 
 
 class FakeDB:
-    def __init__(self, tags=("UPDATE 1",)):
+    def __init__(self, tags=("UPDATE 1",), value=1):
         self.tags = list(tags)
+        self.value = value
         self.executes: list[tuple[str, tuple]] = []
         self.rows: list[dict] = []
 
@@ -50,6 +51,11 @@ class FakeDB:
     async def fetchrow(self, sql, *args):
         return self.rows[0] if self.rows else None
 
+    async def fetchval(self, sql, *args):
+        """The catalogue lookup in `set_player_location`. Without this the call reaches the real
+        database, which makes a unit test depend on what is in `location_catalog` that day."""
+        return self.value
+
 
 @pytest.fixture
 def db(monkeypatch):
@@ -60,6 +66,7 @@ def db(monkeypatch):
     monkeypatch.setattr(locations.Database, "execute", staticmethod(fake.execute))
     monkeypatch.setattr(locations.Database, "fetch", staticmethod(fake.fetch))
     monkeypatch.setattr(locations.Database, "fetchrow", staticmethod(fake.fetchrow))
+    monkeypatch.setattr(locations.Database, "fetchval", staticmethod(fake.fetchval))
     return fake, logs
 
 
@@ -81,11 +88,28 @@ async def test_placing_another_campaigns_character_says_so(db):
     assert logs["warn"], "a placement that moved nothing was silent"
 
 
-async def test_set_player_location_writes_the_line_its_reader_parses(db):
+async def test_set_player_location_writes_the_column_readers_use(db):
+    """The write that used to be prose, and the prose it still keeps beside it.
+
+    This test was `..._writes_the_line_its_reader_parses`, and it held the round trip: the writer
+    produced `Location: observation_deck on Flagship` and the reader split that string back apart.
+    Both halves guessed. `player_context` held no rows for any session, so the hardcoded `bridge`
+    was the only answer either of them ever gave.
+    """
     fake, _ = db
     await locations.set_player_location(5, "observation_deck", "Flagship")
-    _, args = fake.executes[0]
-    assert args == (5, "Location: observation_deck on Flagship"), args
+    writes = [e for e in fake.executes if e[0].startswith("INSERT INTO maya_rp.player_context")]
+    assert len(writes) == 1, fake.executes
+    _, args = writes[0]
+    assert args == (5, "observation_deck", "Location: observation_deck on Flagship"), args
+
+
+async def test_set_player_location_says_when_the_place_is_not_in_the_catalogue(db):
+    """A slug outside the catalogue matches no character, so the empty scene needs a reason."""
+    fake, logs = db
+    fake.value = None  # `SELECT 1 FROM location_catalog` finds nothing
+    await locations.set_player_location(5, "somewhere_invented", "Flagship")
+    assert logs["warn"], "a location no reader can match was written without a word"
 
 
 async def test_get_characters_at_location_uses_its_location(db, monkeypatch):

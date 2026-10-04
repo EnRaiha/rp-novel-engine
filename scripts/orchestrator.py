@@ -127,6 +127,20 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
         tick_start = time.monotonic()
         await Database.init()
         modules_ok, modules_failed = 0, 0
+        # What the tick writes, measured rather than reported. `modules_ok` counts ticks that
+        # returned without raising, and a successful tick returns `{"ok": True}` whether it moved
+        # the campaign or read two tables and changed nothing. Postgres already records per-table
+        # writes, so two snapshots around the phases give the difference without instrumenting a
+        # single module.
+        from core import tick_writes
+        # A measurement must not be able to stop the thing it measures. If the statistics view is
+        # unreadable the tick still runs, and the report says it could not look rather than
+        # reporting zero writes, because those two look identical in a number.
+        try:
+            writes_before = await tick_writes.snapshot()
+        except Exception as e:  # noqa: BLE001 - reported, never fatal
+            writes_before = {}
+            warn("orchestrator", f"tick write-tracking unavailable: {e}")
         print(f"\n{'='*60}")
         print(f"  RP ENGINE TICK — Session {session_id}  ({datetime.now():%H:%M:%S})")
         print(f"{'='*60}")
@@ -419,6 +433,17 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
 
         print(f"{'='*60}")
         print(f"  Tick complete: {modules_ok} OK, {modules_failed} failed ({duration_ms}ms)")
+        # The second number that matters, and the one `modules_ok` cannot give: did the tick
+        # write anything. A report of 80 OK with 3 tables moved is a tick that mostly looked.
+        writes = await tick_writes.report(writes_before, await tick_writes.snapshot())
+        if writes["readable"]:
+            print(f"  Wrote to {writes['tables_moved']} table(s), {writes['rows']} row(s) — "
+                  f"{len(writes['never_written'])} tables have never been written")
+            for table, delta in sorted(writes["moved"].items(),
+                                       key=lambda kv: -sum(kv[1].values()))[:12]:
+                print(f"     {table:34} +{delta['ins']} ins, {delta['upd']} upd, {delta['del']} del")
+        else:
+            print(f"  ⚠ {writes['note']}")
         print(f"{'='*60}\n")
 
         # Auto-savegame after tick (game-engine style .sav + rotation)

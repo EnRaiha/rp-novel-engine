@@ -65,3 +65,27 @@ async def test_the_tick_still_ticks_when_maintenance_is_disarmed(recorded, monke
         pass
 
     assert recorded, "the tick ran no module while maintenance was disarmed"
+
+
+async def test_a_statistics_read_that_fails_does_not_stop_the_tick(recorded, monkeypatch):
+    """The write-tracking snapshot runs before the phases, and it must not be able to hold them up.
+
+    This test exists because the first version did: `snapshot()` called the database before any
+    module ran, the fixture here stubs `Database.init` and not the pool, and the raise travelled up
+    through `run_full_tick` so no module ran at all. A measurement that can stop the thing it
+    measures is worse than no measurement, because the outage looks like a tick that did nothing.
+    """
+    monkeypatch.setattr("core.maintenance.active", lambda: False)
+
+    async def explode(*_a, **_k):
+        raise RuntimeError("pg_stat_user_tables is not readable by this role")
+
+    from core import tick_writes
+    monkeypatch.setattr(tick_writes, "snapshot", explode)
+
+    try:
+        await orch.run_full_tick(session_id=5, verbose=False)
+    except Exception:
+        pass
+
+    assert recorded, "an unreadable statistics view stopped the tick before any module ran"

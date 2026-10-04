@@ -50,7 +50,7 @@ async def run_migrations():
         print("No migration files found.")
         return
 
-    _, legacy = classify(files, applied, newest_recorded)
+    pending, legacy = classify(files, applied, newest_recorded)
     if legacy:
         print(f"⛔ {len(legacy)} migration(s) predate {newest_recorded} and were never recorded.")
         print("   They are NOT run. Replaying them is not idempotent; some carry UPDATE or DROP.")
@@ -61,7 +61,12 @@ async def run_migrations():
         print("   Record the ones that were applied: scripts/record_legacy_migrations.py --apply")
         print("   Run them anyway (dangerous): MIGRATE_ALLOW_LEGACY=1")
         if os.environ.get("MIGRATE_ALLOW_LEGACY") != "1":
-            return
+            # Do not return here. The loop below skips `legacy` on its own, so a warning is enough
+            # to protect them. Returning would stop every future migration as well, for as long as
+            # one old file stays unrecorded — and `record_legacy_migrations.py` can prove none of
+            # them applied, since a DROP or an UPDATE names nothing the recorder can look for. So
+            # the block was permanent, and no new migration could ever be applied.
+            print(f"   Continuing with {len(pending)} pending migration(s), which are not legacy.")
 
     count = 0
     for f in files:

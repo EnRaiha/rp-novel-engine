@@ -88,12 +88,16 @@ async def test_set_player_location_writes_the_line_its_reader_parses(db):
     assert args == (5, "Location: observation_deck on Flagship"), args
 
 
-async def test_get_characters_at_location_ignores_the_location_PINNED(db, monkeypatch):
-    """Reported, not fixed: an equality filter would empty session 5's scene.
+async def test_get_characters_at_location_uses_its_location(db, monkeypatch):
+    """The pin was lifted, and this is what replaced it.
 
-    Every character location in session 5 is NULL and session 3's are free-form
-    scene names, while the player's location is a slug. The test pins what the
-    function does today so a later change is deliberate.
+    This test used to assert the opposite, under the name
+    `..._ignores_the_location_PINNED`, because an equality filter could not match
+    anything: every character location in session 5 was NULL, session 3's were
+    free-form scene names like `MASTIKA — Royal Palace (household)`, and the
+    player's side was a slug parsed out of `current_focus`. Migration
+    `131_scene_location_catalog.sql` gave both sides one vocabulary — a
+    `maya_rp.location_catalog.name` — so the filter is now the behaviour to hold.
     """
     fake, _ = db
     seen: list[tuple] = []
@@ -106,4 +110,55 @@ async def test_get_characters_at_location_ignores_the_location_PINNED(db, monkey
     await locations.get_characters_at_location(5, "medbay")
     assert seen == [(
         "SELECT c.name, c.bond, c.role FROM maya_rp.characters c "
-        "WHERE c.session_id=$1 AND c.status='active' ORDER BY c.bond DESC", (5,))], seen
+        "WHERE c.session_id=$1 AND c.status='active' AND c.scene_location=$2 "
+        "ORDER BY c.bond DESC", (5, "medbay"))], seen
+
+
+async def test_get_characters_at_location_asks_nothing_when_the_scene_is_unset(db, monkeypatch):
+    """An unset scene is empty, and it does not become the roster as a consolation."""
+    fake, _ = db
+    seen: list[tuple] = []
+
+    async def capture(sql, *args):
+        seen.append((sql, args))
+        return []
+
+    monkeypatch.setattr(locations.Database, "fetch", staticmethod(capture))
+    assert await locations.get_characters_at_location(5, None) == []
+    assert seen == [], "no query is issued for a scene that has no location"
+
+
+async def test_get_player_location_reads_the_column_before_parsing_prose(db, monkeypatch):
+    """The column is the answer. `current_focus` is only a fallback, and a loud one."""
+    fake, _ = db
+
+    async def with_column(sql, *args):
+        return {"location": "heaven_reach", "current_focus": "Location: bridge on Flagship", "mood": None}
+
+    monkeypatch.setattr(locations.Database, "fetchrow", staticmethod(with_column))
+    got = await locations.get_player_location(5)
+    assert got == {"location": "heaven_reach", "ship": None, "source": "column"}, got
+
+
+async def test_get_player_location_parses_only_when_the_column_is_empty(db, monkeypatch):
+    fake, _ = db
+
+    async def prose_only(sql, *args):
+        return {"location": None, "current_focus": "Location: observation_deck on Flagship", "mood": None}
+
+    monkeypatch.setattr(locations.Database, "fetchrow", staticmethod(prose_only))
+    got = await locations.get_player_location(5)
+    assert got["location"] == "observation_deck"
+    assert got["source"] == "parsed", "a parsed location must say that it was parsed"
+
+
+async def test_get_player_location_invents_nothing_when_both_are_empty(db, monkeypatch):
+    """It used to answer `bridge` here, for every session that never set a focus."""
+    fake, _ = db
+
+    async def nothing(sql, *args):
+        return None
+
+    monkeypatch.setattr(locations.Database, "fetchrow", staticmethod(nothing))
+    got = await locations.get_player_location(5)
+    assert got == {"location": None, "ship": None, "source": "unset"}, got

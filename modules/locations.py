@@ -28,13 +28,37 @@ async def set_player_location(session_id: int, location: str, ship: str = None):
 
 
 async def get_player_location(session_id: int) -> dict:
+    """Where the player is, read from the column that owns it.
+
+    `player_context.location` holds a `maya_rp.location_catalog.name`. Before that
+    column existed this function parsed `current_focus` for the substring
+    `Location:`, split on `" on "`, and returned the hardcoded `"bridge"` when the
+    parse found nothing. Every session that never wrote a `current_focus` was
+    therefore reported as standing on the bridge, and session 5 has no
+    `player_context` row at all.
+
+    The parse stays for a session that has not set the column, and it says so with
+    a warning. Nothing is invented when both are empty: the answer is `None`, which
+    the caller can pass to a filter and get no rows, rather than a place the engine
+    guessed.
+
+    @returns `location` (a catalogue name or None), `ship`, and `source`, which is
+        `column`, `parsed` or `unset`.
+    """
     row = await Database.fetchrow(
-        "SELECT current_focus, mood FROM maya_rp.player_context WHERE session_id=$1",
+        "SELECT location, current_focus, mood FROM maya_rp.player_context WHERE session_id=$1",
         session_id)
+    if row and row["location"]:
+        return {"location": row["location"], "ship": None, "source": "column"}
     if row and row["current_focus"] and "Location:" in row["current_focus"]:
         parts = row["current_focus"].replace("Location: ", "").split(" on ")
-        return {"location": parts[0].strip(), "ship": parts[1].strip() if len(parts) > 1 else "Flagship"}
-    return {"location": "bridge", "ship": "Flagship"}
+        parsed = parts[0].strip()
+        warn("locations", f"session {session_id} has no player_context.location; "
+                          f"parsed {parsed!r} out of current_focus, which is prose")
+        return {"location": parsed,
+                "ship": parts[1].strip() if len(parts) > 1 else "Flagship",
+                "source": "parsed"}
+    return {"location": None, "ship": None, "source": "unset"}
 
 
 async def set_character_presence(character_id: int, location: str, session_id: int = None):
@@ -61,19 +85,45 @@ async def set_character_presence(character_id: int, location: str, session_id: i
     return None
 
 
-async def get_characters_at_location(session_id: int, location: str) -> list[dict]:
-    """Who else is here? (Uses characters table directly — presence log has different schema)"""
+async def get_characters_at_location(session_id: int, location: str | None) -> list[dict]:
+    """Who is at this location, matched against the same vocabulary the player uses.
+
+    `characters.scene_location` and `player_context.location` both name a row in
+    `maya_rp.location_catalog`. Before the catalogue described the story, the
+    player's side was a slug parsed from prose and the characters' side was free
+    text like `MASTIKA — Royal Palace (household)`, so no filter could ever match
+    and this function returned the whole active roster regardless of what it was
+    asked. The parameter was accepted and dropped.
+
+    An empty result is a real answer: nobody is recorded here. It is not the
+    roster, and a caller must not substitute one for the other.
+
+    @param location - a catalogue name, or None (an unset scene), which matches
+        nothing and is reported.
+    """
+    if location is None:
+        warn("locations", f"session {session_id} has no player location set; the scene cast is empty")
+        return []
     rows = await Database.fetch(
         "SELECT c.name, c.bond, c.role "
         "FROM maya_rp.characters c "
-        "WHERE c.session_id=$1 AND c.status='active' "
+        "WHERE c.session_id=$1 AND c.status='active' AND c.scene_location=$2 "
         "ORDER BY c.bond DESC",
-        session_id)
+        session_id, location)
+    if not rows:
+        warn("locations", f"no active character is recorded at {location!r} in session {session_id}; "
+                          "the scene cast is empty and is not the roster")
     return [dict(r) for r in rows]
 
 
 async def get_scene_context(session_id: int) -> dict:
-    """Full scene packet for Maya."""
+    """Full scene packet for Maya.
+
+    `location_source` and `present_scope` are carried so a reader can tell an unset
+    scene from an empty one. Both arrive as an empty list otherwise, and they are
+    not the same fact: one means nobody is here, the other means nobody has said
+    where here is.
+    """
     loc = await get_player_location(session_id)
     present = await get_characters_at_location(session_id, loc["location"])
 
@@ -86,13 +136,15 @@ async def get_scene_context(session_id: int) -> dict:
     atmosphere = await Database.fetchrow(
         "SELECT default_lighting, default_sound, default_smell, atmosphere "
         "FROM maya_rp.location_catalog WHERE name=$1",
-        loc["location"])
+        loc["location"]) if loc["location"] else None
 
     return {
         "location": loc["location"],
+        "location_source": loc.get("source"),
         "ship": loc.get("ship"),
         "ship_time": ship_time,
         "present": present,
+        "present_scope": "scene" if present else ("unset" if loc["location"] is None else "empty"),
         "atmosphere": dict(atmosphere) if atmosphere else {
             "default_lighting": "standard ship lighting",
             "atmosphere": "neutral",

@@ -141,6 +141,92 @@ def sheet_for(fields: dict, row: dict) -> str:
     return "\n".join(block)
 
 
+# Stock names shipped by card generators. This is a floor, not a classifier: it
+# catches the handful that appear in every pack, and it will never catch a name
+# that is generic in a way this list does not know. A hit is a question to ask,
+# never a refusal.
+GENERIC_NAMES = frozenset({
+    "aiden", "alex", "aria", "asher", "aurora", "elara", "elena", "ezra", "kael",
+    "kai", "lena", "luna", "maya", "nova", "raven", "rowan", "sage", "seraphina",
+    "silas", "sky", "talia", "thorn", "valeria", "willow", "zara", "zephyr",
+})
+
+# Below this many letters, one normalised name being contained in another means
+# nothing. The roster's designations normalise to one or two characters, and a
+# single `a` is contained in most names ever written.
+_CONTAINMENT_FLOOR = 4
+
+
+def _normalise_name(name: str) -> str:
+    """Letters only, lowercased. What a name is when its spelling is not the point."""
+    return re.sub(r"[^a-z]", "", name.lower())
+
+
+def _name_distance(a: str, b: str) -> int:
+    """Levenshtein distance, two rows of memory. Names are short."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    previous = list(range(len(b) + 1))
+    for i, char_a in enumerate(a, 1):
+        current = [i]
+        for j, char_b in enumerate(b, 1):
+            current.append(min(previous[j] + 1,
+                               current[j - 1] + 1,
+                               previous[j - 1] + (char_a != char_b)))
+        previous = current
+    return previous[-1]
+
+
+async def name_report(session: int, name: str, *, near_limit: int = 2) -> dict:
+    """What the campaign already holds under this name, and what this name resembles.
+
+    The import path matches on the whole name exactly. A name one letter away from
+    an existing one therefore inserts a second character, and nothing says so. This
+    reports the neighbour instead of guessing at it.
+
+    @param session - session whose roster to compare against.
+    @param name - the name about to be imported.
+    @param near_limit - edit distance at or below which a neighbour is reported.
+    @returns exact matches, near neighbours ordered by distance, and a generic flag.
+    """
+    rows = await Database.fetch(
+        "SELECT id, name FROM maya_rp.characters WHERE session_id=$1", session)
+    wanted = _normalise_name(name)
+    exact: list[dict] = []
+    near: list[dict] = []
+    for row in rows:
+        other = _normalise_name(row["name"])
+        if other == wanted:
+            exact.append({"id": int(row["id"]), "name": row["name"]})
+            continue
+        if not wanted or not other:
+            continue
+        if wanted in other or other in wanted:
+            # One name contains the other: a variant or a title, not a typo.
+            #
+            # Only when both sides carry enough letters to mean something. The
+            # roster holds designations like `A-011`, which normalise to a single
+            # `a`, and a lone `a` is contained in most names ever written. Without
+            # this floor every designation is reported as a neighbour of every
+            # person in the campaign, and the five slots are spent on them.
+            if min(len(wanted), len(other)) < _CONTAINMENT_FLOOR:
+                continue
+            near.append({"id": int(row["id"]), "name": row["name"],
+                         "distance": abs(len(other) - len(wanted))})
+            continue
+        if abs(len(other) - len(wanted)) <= near_limit:
+            distance = _name_distance(wanted, other)
+            if distance <= near_limit:
+                near.append({"id": int(row["id"]), "name": row["name"], "distance": distance})
+    near.sort(key=lambda item: (item["distance"], item["name"]))
+    return {"exact": exact, "near": near[:5], "generic": wanted in GENERIC_NAMES,
+            "checked": len(rows)}
+
+
 async def import_card(session: int, fields: dict, *, force: bool, dry_run: bool,
                       queue_portrait: bool) -> str:
     if not fields["name"]:
@@ -158,6 +244,14 @@ async def import_card(session: int, fields: dict, *, force: bool, dry_run: bool,
     if dry_run:
         print(json.dumps({"would import": row, "first_mes": fields["first_mes"][:120]}, indent=2, ensure_ascii=False))
         return "dry-run"
+
+    report = await name_report(session, row["name"])
+    if report["generic"]:
+        print(f"  note: {row['name']!r} is a stock name from the common card packs; "
+              f"the campaign roots its names in its own places ({report['checked']} checked)")
+    for neighbour in report["near"]:
+        print(f"  note: {row['name']!r} sits {neighbour['distance']} edit(s) from "
+              f"#{neighbour['id']} {neighbour['name']!r} — confirm they are not one person")
 
     existing = await Database.fetchrow(
         "SELECT id, appearance, background, description, traits FROM maya_rp.characters"

@@ -242,7 +242,7 @@ async def handle(request: dict) -> dict:
         note = str(request.get("note") or "")
         try:
             row = await campaign.add_directive(sid, note)
-        except ValueError as error:
+        except (ValueError, ooc.FrozenSession) as error:
             return {"ok": False, "error": str(error)}
         return {"ok": True, "call": call, "session_id": sid, "directive_id": row["id"]}
 

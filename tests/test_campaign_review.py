@@ -55,6 +55,9 @@ SUBJECT = "Campaign Review Subject"
 REVIEW_TRAIT = f"review-trait-{os.getpid()}"
 
 CLEANUP = (
+    "DELETE FROM maya_rp.ooc_directives WHERE session_id=$1",
+    "DELETE FROM maya_rp.character_knowledge WHERE session_id=$1",
+    "DELETE FROM maya_rp.character_assets WHERE session_id=$1",
     "DELETE FROM maya_rp.ooc_suspicion WHERE session_id=$1",
     "DELETE FROM maya_rp.ooc_exemptions WHERE session_id=$1",
     "DELETE FROM maya_rp.ooc_milestones WHERE session_id=$1",
@@ -253,3 +256,91 @@ class TestTheSinksAndTheLadder:
         """The statement carries the session; the id it is given comes from a scoped read."""
         source = inspect.getsource(campaign.triggered_endings)
         assert "session_id=$2" in source and "WHERE id=$1" in source
+
+
+class TestEveryCampaignWriterRefusesAFrozenCampaign:
+    """`ooc.py` writers refused a frozen campaign; the campaign layer did not.
+
+    Before the fix `add_directive`, `spend`, `learn`, `restore_snapshot`, `portraits.queue`
+    and the CLI's raw `milestone add` SQL each wrote into a reference-only campaign, so the
+    guard that `audit` and `set_stage` honour was open on six other doors. Each test asserts
+    the refusal AND that no row moved, because a guard placed after the write would raise
+    and still have written.
+
+    The freeze is simulated by patching `core.session.is_frozen`; the real
+    `~/.config/rp-engine/frozen_sessions` is never touched.
+    """
+
+    @pytest.fixture()
+    def frozen(self, monkeypatch):
+        import core.session as session_mod
+
+        monkeypatch.setattr(session_mod, "is_frozen", lambda sid: True)
+        monkeypatch.setattr(ooc, "_maintenance_active", lambda: False)
+        return True
+
+    async def _count(self, table: str) -> int:
+        return int(await Database.fetchval(
+            f"SELECT count(*) FROM maya_rp.{table} WHERE session_id=$1", SCRATCH_SESSION))
+
+    async def test_add_directive_is_refused_and_writes_nothing(self, scratch_session, frozen):
+        """Pre-fix: the note was inserted into the frozen campaign."""
+        with pytest.raises(ooc.FrozenSession):
+            await campaign.add_directive(SCRATCH_SESSION, "a note")
+        assert await self._count("ooc_directives") == 0, "a refused note must not be stored"
+
+    async def test_spend_is_refused_and_keeps_the_balance(self, scratch_session, frozen):
+        """Pre-fix: reveal_intel recorded a note and debited the points."""
+        await Database.execute(
+            "UPDATE maya_rp.ooc_system_state SET roleplay_points=100 WHERE session_id=$1", SCRATCH_SESSION)
+        with pytest.raises(ooc.FrozenSession):
+            await campaign.spend(SCRATCH_SESSION, "reveal_intel", "who holds the key")
+        balance = await Database.fetchval(
+            "SELECT roleplay_points FROM maya_rp.ooc_system_state WHERE session_id=$1", SCRATCH_SESSION)
+        assert balance == 100, "a refused spend must not debit the crown"
+        assert await self._count("ooc_directives") == 0, "a refused spend must not record intel"
+
+    async def test_learn_is_refused_and_writes_nothing(self, scratch_session, frozen):
+        """Pre-fix: the fact was upserted into the frozen campaign's ledger."""
+        with pytest.raises(ooc.FrozenSession):
+            await campaign.learn(SCRATCH_SESSION, scratch_session["subject"], "a-fact")
+        assert await self._count("character_knowledge") == 0, "a refused fact must not be stored"
+
+    async def test_restore_snapshot_is_refused_by_the_session_the_file_names(self, scratch_session, frozen):
+        """Pre-fix: the file's state overwrote the frozen session's numbers."""
+        data = {"session_id": SCRATCH_SESSION,
+                "state": {"arc_stage": "selective", "roleplay_points": 77},
+                "milestones": [], "exemptions": [], "suspicion": []}
+        with pytest.raises(ooc.FrozenSession):
+            await campaign.restore_snapshot(data)
+        row = await Database.fetchrow(
+            "SELECT arc_stage, roleplay_points FROM maya_rp.ooc_system_state WHERE session_id=$1",
+            SCRATCH_SESSION)
+        assert (row["arc_stage"], row["roleplay_points"]) == ("lockdown", 0), "state must be untouched"
+
+    async def test_portrait_queue_is_refused_and_writes_nothing(self, scratch_session, frozen):
+        """Pre-fix: a pending render row was inserted for the frozen campaign."""
+        from core import portraits
+
+        with pytest.raises(ooc.FrozenSession):
+            await portraits.queue(SCRATCH_SESSION, SUBJECT, "portrait")
+        assert await self._count("character_assets") == 0, "a refused queue must not leave a row"
+
+    async def test_add_milestone_is_refused_and_writes_no_beat_or_rule(self, scratch_session, frozen):
+        """Pre-fix: the CLI ran the upserts itself, bypassing core and the guard."""
+        with pytest.raises(ooc.FrozenSession):
+            await ooc.add_milestone(SCRATCH_SESSION, "frozen-beat", pattern="re:x")
+        assert await self._count("ooc_milestones") == 0, "a refused beat must not be stored"
+        assert await self._count("ooc_rules") == 0, "a refused beat must not author its rule"
+
+    async def test_arming_maintenance_lets_a_write_through(self, scratch_session, monkeypatch):
+        """The refusal must not close the documented way in."""
+        import core.session as session_mod
+
+        monkeypatch.setattr(session_mod, "is_frozen", lambda sid: True)
+        monkeypatch.setattr(ooc, "_maintenance_active", lambda: True)
+        row = await campaign.add_directive(SCRATCH_SESSION, "maintenance note")
+        assert row["note"] == "maintenance note"
+        assert await self._count("ooc_directives") == 1
+        await ooc.add_milestone(SCRATCH_SESSION, "maint-beat", pattern="re:x")
+        assert await self._count("ooc_milestones") == 1

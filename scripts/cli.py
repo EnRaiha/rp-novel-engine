@@ -3332,7 +3332,11 @@ async def cmd_ooc():
 
     elif sub == "note":
         note = " ".join(args[1:]) or flag("text") or ""
-        row = await campaign.add_directive(session, note)
+        try:
+            row = await campaign.add_directive(session, note)
+        except ooc.FrozenSession as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return
         print(f"director note #{row['id']} recorded (never audited as prose)")
 
     elif sub == "snapshot":
@@ -3345,7 +3349,12 @@ async def cmd_ooc():
                   f"exemptions {len(data['exemptions'])}, suspicion {len(data['suspicion'])})")
         elif action == "load":
             data = campaign.load_snapshot(path)
-            print(json.dumps(await campaign.restore_snapshot(data), default=str))
+            try:
+                restored = await campaign.restore_snapshot(data)
+            except ooc.FrozenSession as exc:
+                print(f"refused: {exc}", file=sys.stderr)
+                return
+            print(json.dumps(restored, default=str))
         else:
             print("Usage: cli.py ooc snapshot save|load [--path=…]")
 
@@ -3355,7 +3364,7 @@ async def cmd_ooc():
         try:
             row = await campaign.spend(session, kind, target)
             print(f"spent {row['price']} rpp on {row['sink']} — {row['detail']} (balance was {row['spent_from']})")
-        except ValueError as error:
+        except (ValueError, ooc.FrozenSession) as error:
             print(f"refused: {error}")
 
     elif sub == "effects":
@@ -3370,7 +3379,11 @@ async def cmd_ooc():
         observer = int(flag("observer", "0") or 0) or await ooc.observer_id(session)
         if action == "learn":
             fact = " ".join(args[2:]) or flag("fact") or ""
-            row = await _campaign.learn(session, observer, fact, flag("source") or "")
+            try:
+                row = await _campaign.learn(session, observer, fact, flag("source") or "")
+            except ooc.FrozenSession as exc:
+                print(f"refused: {exc}", file=sys.stderr)
+                return
             print(f"observer {row['character_id']} knows: {row['fact_key']}")
         else:
             rows = await _campaign.knowledge_of(session, observer)
@@ -3400,7 +3413,11 @@ async def cmd_ooc():
             if hit:
                 print(f"{hit['character']['name']} [{occasion}] → {hit['asset']['image_path']}")
             else:
-                queued = await portraits.queue(session, name, occasion)
+                try:
+                    queued = await portraits.queue(session, name, occasion)
+                except ooc.FrozenSession as exc:
+                    print(f"refused: {exc}", file=sys.stderr)
+                    return
                 print(f"queued {queued['character']['name']} [{occasion}] — run: python3 scripts/portrait_render.py --session {session}")
 
     elif sub == "beats" and flag("from-text"):
@@ -3433,21 +3450,12 @@ async def cmd_ooc():
                 latch = flag("latch") or None
                 rpp = int(flag("rpp", "5"))
                 pattern = flag("pattern")
-                await Database.execute(
-                    "INSERT INTO maya_rp.ooc_milestones (session_id, name, trait, stage, rpp_reward, latch_ruleset)"
-                    " VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (session_id, name) DO UPDATE SET"
-                    " trait=EXCLUDED.trait, stage=EXCLUDED.stage, rpp_reward=EXCLUDED.rpp_reward,"
-                    " latch_ruleset=EXCLUDED.latch_ruleset",
-                    session, name, trait, stage, rpp, latch,
-                )
-                if pattern:
-                    await Database.execute(
-                        "INSERT INTO maya_rp.ooc_rules"
-                        " (id, scope, session_id, trait, kind, layer, pattern, is_regex, delta)"
-                        " VALUES ($1,'session',$2,$3,'scripted_beat','both',$4,true,1)"
-                        " ON CONFLICT (id) DO UPDATE SET trait=EXCLUDED.trait, pattern=EXCLUDED.pattern",
-                        f"beat:{name}", session, trait, pattern,
-                    )
+                try:
+                    await ooc.add_milestone(session, name, trait=trait, stage=stage,
+                                            rpp_reward=rpp, latch_ruleset=latch, pattern=pattern)
+                except ooc.FrozenSession as exc:
+                    print(f"refused: {exc}", file=sys.stderr)
+                    return
                 print(f"beat {name} authored (stage {stage}, rpp {rpp}" + (f", rule {pattern}" if pattern else "") + ")")
 
         elif action == "done":

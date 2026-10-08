@@ -173,10 +173,21 @@ def near_endings(entries: Sequence[dict[str, Any]], values: dict[str, Any], rati
 # ── Director notes (M30) ────────────────────────────────────────────────────
 
 async def add_directive(session_id: int | None = None, note: str = "") -> dict[str, Any]:
-    """Record one out-of-character note; it is never audited as prose."""
+    """Record one out-of-character note; it is never audited as prose.
+
+    @param session_id - session key; the configured session when omitted.
+    @param note - the note text.
+    @raises FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
     if not note.strip():
         raise ValueError("directive needs a non-empty note")
     sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    # A frozen campaign is reference. `add_directive` wrote into one with no check, so the one
+    # door that `audit` and the ooc writers keep shut was open here. Guard on the resolved
+    # id, before any read-then-write.
+    from core.ooc import _refuse_frozen
+
+    _refuse_frozen(sid)
     row = await Database.fetchrow(
         "INSERT INTO maya_rp.ooc_directives (session_id, note) VALUES ($1,$2) RETURNING id, note, created_at",
         sid,
@@ -210,8 +221,19 @@ async def spend(session_id: int | None = None, kind: str = "", target: str | Non
 
     Kept deliberately small and honest: an unknown sink refuses rather than
     guessing, and a spend the balance cannot cover is refused with the price.
+
+    @param session_id - session key; the configured session when omitted.
+    @param kind - sink name from `SPEND_PRICES`.
+    @param target - milestone name or intel text, depending on the sink.
+    @raises FrozenSession - the campaign is frozen and maintenance is not armed.
     """
     sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    # A frozen campaign is reference. `spend` wrote into one with no check, so the one
+    # door that `audit` and the ooc writers keep shut was open here. Guard on the resolved
+    # id, before any read-then-write.
+    from core.ooc import _refuse_frozen
+
+    _refuse_frozen(sid)
     price = SPEND_PRICES.get(kind)
     if price is None:
         raise ValueError(f"unknown sink {kind!r}; known: {', '.join(sorted(SPEND_PRICES))}")
@@ -314,10 +336,23 @@ async def character_rules(session_id: int | None = None, name: str = "") -> dict
 # ── Knowledge ledger (M4, data layer) ───────────────────────────────────────
 
 async def learn(session_id: int | None, observer_id: int, fact_key: str, source: str = "") -> dict[str, Any]:
-    """Record that a character learned a fact (M4)."""
+    """Record that a character learned a fact (M4).
+
+    @param session_id - session key; the configured session when omitted.
+    @param observer_id - the character who learned it.
+    @param fact_key - the fact.
+    @param source - where it was learned from.
+    @raises FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
     if not fact_key.strip():
         raise ValueError("fact_key must be non-empty")
     sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    # A frozen campaign is reference. `learn` wrote into one with no check, so the one
+    # door that `audit` and the ooc writers keep shut was open here. Guard on the resolved
+    # id, before any read-then-write.
+    from core.ooc import _refuse_frozen
+
+    _refuse_frozen(sid)
     row = await Database.fetchrow(
         "INSERT INTO maya_rp.character_knowledge (session_id, character_id, fact_key, source)"
         " VALUES ($1,$2,$3,$4)"
@@ -410,8 +445,17 @@ async def restore_snapshot(data: dict[str, Any]) -> dict[str, Any]:
     All four are written. The exemptions and the suspicion rows used to be counted in the return
     value without being applied, so an act resumed from a file lost every purchased exemption and
     every observer's suspicion while the result said they had come back.
+
+    @param data - snapshot as `snapshot()` or `load_snapshot()` returns it; its `session_id` is the target.
+    @raises FrozenSession - the session the file names is frozen and maintenance is not armed.
     """
     sid = int(data.get("session_id") or Config.SESSION_ID)
+    # A frozen campaign is reference. `restore_snapshot` wrote into one with no check, so the one
+    # door that `audit` and the ooc writers keep shut was open here. Guard on the resolved
+    # id, before any read-then-write.
+    from core.ooc import _refuse_frozen
+
+    _refuse_frozen(sid)
     state = data.get("state") or {}
     if state:
         await Database.execute(

@@ -486,10 +486,20 @@ async def queue(session_id: int, name: str, occasion: str,
     row that renders the default face under the wrong key. The negative prompt is the one the
     style the prompt was built from carries, not a second style's.
 
+    @param session_id - session key.
+    @param name - character name.
+    @param occasion - occasion key.
+    @param framing - framing key.
     @returns the character, the emotion, the built prompt, and the row status.
+    @raises FrozenSession - the campaign is frozen and maintenance is not armed.
     """
     key = (occasion or "").strip()
     emotion = emotion_for(key)
+    # A frozen campaign is reference. `queue` inserted a render row into one with no check;
+    # refuse before the character lookup so nothing is read-then-written.
+    from core.ooc import _refuse_frozen
+
+    _refuse_frozen(int(session_id))
     character = await find_character(session_id, name)
     if character is None:
         raise ValueError(f"character not found: {name}")

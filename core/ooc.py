@@ -860,6 +860,55 @@ async def overdue_milestones(
     return [beat for beat in due if beat["overdue"]]
 
 
+async def add_milestone(
+    session_id: int | None,
+    name: str,
+    *,
+    trait: str | None = None,
+    stage: str = "lockdown",
+    rpp_reward: int = 5,
+    latch_ruleset: str | None = None,
+    pattern: str | None = None,
+) -> dict[str, Any]:
+    """Author one scripted beat, and the rule that detects it when a pattern is given.
+
+    Both writes run in one transaction on the yielded connection, so a beat is never
+    authored without the rule that completes it.
+
+    @param session_id - session key.
+    @param name - beat name; an existing beat of that name is updated.
+    @param trait - trait the beat belongs to, or None for any.
+    @param stage - arc stage it is due in.
+    @param rpp_reward - points paid on completion.
+    @param latch_ruleset - ruleset latched on completion.
+    @param pattern - regex that completes the beat from prose; writes a `beat:<name>` rule.
+    @returns `{"session_id", "name", "stage", "rpp_reward", "pattern"}`.
+    @raises FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    sid = _session_key(session_id)
+    # A frozen campaign is reference. `ooc milestone add` ran raw SQL from the CLI and
+    # bypassed core, so a beat and its rule could be authored into one. The guard is the
+    # same call, on the resolved id, before either write.
+    _refuse_frozen(sid)
+    async with Database.transaction() as conn:
+        await conn.execute(
+            "INSERT INTO maya_rp.ooc_milestones (session_id, name, trait, stage, rpp_reward, latch_ruleset)"
+            " VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (session_id, name) DO UPDATE SET"
+            " trait=EXCLUDED.trait, stage=EXCLUDED.stage, rpp_reward=EXCLUDED.rpp_reward,"
+            " latch_ruleset=EXCLUDED.latch_ruleset",
+            sid, name, trait, stage, int(rpp_reward), latch_ruleset,
+        )
+        if pattern:
+            await conn.execute(
+                "INSERT INTO maya_rp.ooc_rules"
+                " (id, scope, session_id, trait, kind, layer, pattern, is_regex, delta)"
+                " VALUES ($1,'session',$2,$3,'scripted_beat','both',$4,true,1)"
+                " ON CONFLICT (id) DO UPDATE SET trait=EXCLUDED.trait, pattern=EXCLUDED.pattern",
+                f"beat:{name}", sid, trait, pattern,
+            )
+    return {"session_id": sid, "name": name, "stage": stage, "rpp_reward": int(rpp_reward), "pattern": pattern}
+
+
 async def complete_milestone(
     session_id: int | None = None,
     name: str | None = None,

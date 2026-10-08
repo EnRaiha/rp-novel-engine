@@ -10,6 +10,7 @@ reconnect path only executes on actual errors.
 """
 
 from __future__ import annotations
+import asyncio
 import asyncpg
 from contextlib import asynccontextmanager
 from core.config import Config
@@ -40,9 +41,41 @@ class Database:
     """One pool, one DSN, reconnection + transaction support."""
 
     pool: asyncpg.Pool | None = None
+    _lock: asyncio.Lock | None = None
+    _lock_loop: asyncio.AbstractEventLoop | None = None
+
+    @classmethod
+    def _pool_lock(cls) -> asyncio.Lock:
+        """The pool-creation lock of the running loop, created on first use.
+
+        An `asyncio.Lock` belongs to one loop; the test suite and the CLI start several. A lock
+        made at import would be bound to the wrong one, so it is rebuilt when the loop changes.
+
+        @returns the lock for the running event loop.
+        """
+        loop = asyncio.get_running_loop()
+        if cls._lock is None or cls._lock_loop is not loop:
+            cls._lock, cls._lock_loop = asyncio.Lock(), loop
+        return cls._lock
 
     @classmethod
     async def init(cls) -> asyncpg.Pool:
+        """Return the pool, creating it once.
+
+        After a PG restart N tasks hit a dead pool together; each saw `pool is None` across the
+        `create_pool` await and built its own, so the earlier pools leaked. The lock plus the
+        re-check inside makes the first creator the only one.
+
+        @returns the live pool.
+        """
+        if cls.pool is not None:
+            return cls.pool
+        async with cls._pool_lock():
+            return await cls._create_locked()
+
+    @classmethod
+    async def _create_locked(cls) -> asyncpg.Pool:
+        """Create the pool if absent. The caller holds `_pool_lock()`."""
         if cls.pool is None:
             cls.pool = await asyncpg.create_pool(
                 dsn=Config.DSN,
@@ -62,6 +95,28 @@ class Database:
                 # right to. A name generator without a connection is a symptom worth seeing.
                 warn("db", f"name_gen hook not installed: {exc}")
         return cls.pool
+
+    @classmethod
+    async def _reconnect(cls, failed: asyncpg.Pool | None) -> asyncpg.Pool:
+        """Replace `failed` with a fresh pool, once however many tasks saw it die.
+
+        Each failing task used to `close()` then `init()`: one task's close could shut the pool
+        another had just built, and a waiting `close()` on a dead pool hangs on its connections.
+        Only the task whose failing pool is still `cls.pool` swaps it; the rest reuse the new one.
+        The dead pool is terminated, not closed: `close()` waits for connections that will never
+        return.
+
+        @param failed - the pool the caller was using when it failed (None when it never got one).
+        @returns the live pool.
+        """
+        async with cls._pool_lock():
+            if failed is not None and cls.pool is failed:
+                cls.pool = None
+                try:
+                    failed.terminate()
+                except Exception as exc:  # noqa: BLE001 - a dead pool failing to die must not mask the retry
+                    warn("db", f"terminate of dead pool failed: {exc}")
+            return await cls._create_locked()
 
     @classmethod
     async def close(cls) -> None:
@@ -93,6 +148,7 @@ class Database:
         (`SET credits = credits - $1`) charges the session twice with no way to detect it.
         """
         entered = False
+        pool = None
         try:
             pool = await cls._ensure_pool()
             async with pool.acquire() as conn:
@@ -100,8 +156,7 @@ class Database:
                 return await fn(conn, *args)
         except _RECONNECT_ERRORS as e:
             info("db", f"Pool connection lost ({type(e).__name__}) — reconnecting once")
-            await cls.close()
-            pool = await cls.init()
+            pool = await cls._reconnect(pool)
             if entered and not isinstance(e, _PRE_FLIGHT_ERRORS):
                 raise
             async with pool.acquire() as conn:
@@ -147,22 +202,31 @@ class Database:
         docstring always claimed: `_ensure_pool` only covers the pool being None,
         so a pool that is non-None but closed failed at `pool.acquire()` without
         the reconnect `_run` performs."""
+        pool = None
         try:
             pool = await cls._ensure_pool()
             conn = await pool.acquire()
         except _RECONNECT_ERRORS as e:
             info("db", f"Pool lost at transaction start ({type(e).__name__}) — reconnecting once")
-            await cls.close()
-            pool = await cls.init()
+            pool = await cls._reconnect(pool)
             conn = await pool.acquire()
         try:
             tx = conn.transaction()
             await tx.start()
+            committing = False
             try:
                 yield conn
+                committing = True
                 await tx.commit()
             except Exception:
-                await tx.rollback()
+                # A failed commit leaves the transaction finished; rolling it back raised
+                # "already committed/rolled back" and replaced the real error (serialization
+                # failure, deferred constraint) with that one.
+                if not committing:
+                    try:
+                        await tx.rollback()
+                    except Exception as rb:  # noqa: BLE001 - the caller's error is the one to surface
+                        warn("db", f"rollback failed after {type(rb).__name__}: {rb}")
                 raise
         finally:
             await pool.release(conn)

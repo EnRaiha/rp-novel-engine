@@ -112,13 +112,13 @@ def pool(monkeypatch):
         calls["init"] += 1
         return fake
 
-    async def close():
-        calls["close"] += 1
-
+    # The reconnect terminates the dead pool (`close()` waits on connections that never return) and
+    # builds the replacement under the pool lock, so both are counted at those seams.
     monkeypatch.setattr(db.Database, "pool", fake)
     monkeypatch.setattr(db.Database, "_ensure_pool", staticmethod(lambda: _same(fake)))
     monkeypatch.setattr(db.Database, "init", staticmethod(init))
-    monkeypatch.setattr(db.Database, "close", staticmethod(close))
+    monkeypatch.setattr(db.Database, "_create_locked", staticmethod(init))
+    monkeypatch.setattr(fake, "terminate", lambda: calls.__setitem__("close", calls["close"] + 1), raising=False)
     return fake, calls
 
 
@@ -195,7 +195,9 @@ async def test_transaction_reconnects_when_the_pool_is_closed(pool, monkeypatch)
         body.append(conn)
 
     assert body, "the transaction body never ran"
-    assert calls == {"init": 1, "close": 1}, calls
+    # `closed` is not the pool stored on `Database`, so the swap builds the new pool without
+    # terminating anything; the termination path is covered by the run-reconnect test above.
+    assert calls["init"] == 1, calls
     assert fake.released, "the connection was never released back to the pool"
 
 

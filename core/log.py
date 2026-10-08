@@ -41,8 +41,15 @@ class _DatedFileHandler(logging.FileHandler):
         super().__init__(_log_path())
 
     def emit(self, record: logging.LogRecord) -> None:
-        if os.path.abspath(self.baseFilename) != os.path.abspath(_log_path()):
-            self._roll_to_today()
+        # The roll opens a file, so it can raise (disk full, permissions) on the first record after
+        # midnight. It ran outside Handler.emit's own error handling, so the OSError escaped
+        # warn()/info()/error() into business code. It goes to handleError like any failed write.
+        try:
+            if os.path.abspath(self.baseFilename) != os.path.abspath(_log_path()):
+                self._roll_to_today()
+        except Exception:  # noqa: BLE001 - logging must never raise into the caller
+            self.handleError(record)
+            return
         super().emit(record)
 
     def _roll_to_today(self) -> None:

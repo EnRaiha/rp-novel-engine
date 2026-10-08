@@ -2,6 +2,7 @@
 """Contradiction Guard — checks output against known state before delivery. Catches wrong weapons, dead characters, wrong bonds."""
 from __future__ import annotations
 import re
+import time
 from typing import Any
 from core.db import Database
 from core.config import Config
@@ -9,6 +10,10 @@ from core.log import error
 
 _cache: dict[int, dict] = {}
 _cache_session: int | None = None
+_cache_at: float = 0.0
+
+#: Seconds a loaded cache stays valid.
+_CACHE_TTL_S = 30.0
 
 #: The engine's own death marker is `status='dead'`: twelve readers across modules/, core/ and
 #: scripts/ filter `status IS DISTINCT FROM 'dead'`. Measured: 0 characters hold it, and 22 hold
@@ -18,14 +23,31 @@ _cache_session: int | None = None
 #: question and it is reported, not settled here.
 _DEAD_STATUSES = ("dead", "executed")
 
-async def _ensure(session_id: int):
-    global _cache, _cache_session
-    # `and _cache` is load-bearing: it is what makes a second caller wait for an in-flight load
-    # instead of reading the empty dict and reporting no contradiction.
-    if _cache_session == session_id and _cache:
-        return
-    _cache = {}
-    _cache_session = session_id
+def invalidate() -> None:
+    """Drop the character cache so the next check re-reads maya_rp.characters.
+
+    @returns None.
+    """
+    global _cache, _cache_session, _cache_at
+    _cache, _cache_session, _cache_at = {}, None, 0.0
+
+
+async def _ensure(session_id: int) -> dict[int, dict]:
+    """Load the session's characters into the cache unless a fresh copy is held.
+
+    The load fills a local dict and publishes it with one assignment after the fetch returns. The
+    old code reset the shared cache first and wrote rows into whichever cache was current when the
+    fetch came back, so concurrent calls for sessions 1 and 2 mixed their characters: a session-2
+    corpse flagged in session 1's text. The cache is stale after `_CACHE_TTL_S` because nothing else
+    invalidated it: a death written mid-run stayed invisible until restart.
+
+    @param session_id - session whose characters to load.
+    @returns the characters of `session_id` by id; empty when the read failed.
+    """
+    global _cache, _cache_session, _cache_at
+    if _cache_session == session_id and time.monotonic() - _cache_at < _CACHE_TTL_S:
+        return _cache
+    local: dict[int, dict] = {}
     try:
         # This SELECT used to name `weapon`, `is_dead` and `death_cause`. None of the three columns
         # exists on maya_rp.characters, so every call raised UndefinedColumnError, the handler below
@@ -36,15 +58,16 @@ async def _ensure(session_id: int):
                 session_id):
             row = dict(r)
             row["is_dead"] = row["status"] in _DEAD_STATUSES
-            _cache[r["id"]] = row
+            local[r["id"]] = row
     except Exception as e:
         # An empty cache makes every check below answer "no contradiction", so a read that failed
-        # turned this guard into a blank pass with nothing to show for it. It stays empty and the
-        # next call retries; the failure is on the log now instead of only in the guard's silence.
-        _cache = {}
-        _cache_session = None
+        # turned this guard into a blank pass with nothing to show for it. Nothing is published and
+        # the next call retries; the failure is on the log now instead of only in the guard's silence.
         error("guard", f"character cache read failed for session {session_id}: "
                        f"{type(e).__name__}: {e}")
+        return {}
+    _cache, _cache_session, _cache_at = local, session_id, time.monotonic()
+    return local
 
 async def check(text: str, session_id: int = None) -> list[dict]:
     """Scan text for contradictions. Returns list of issues or empty."""
@@ -55,11 +78,11 @@ async def check(text: str, session_id: int = None) -> list[dict]:
         session_id = resolve_session(None)
         if session_id is None:
             return []
-    await _ensure(session_id)
+    chars = await _ensure(session_id)
     lower = text.lower()
     issues = []
 
-    for cid, f in _cache.items():
+    for cid, f in chars.items():
         n = f["name"].lower()
         if n not in lower: continue
         if f.get("is_dead") and any(v in lower for v in ["says","shouts","grabs","steps","turns","looks"]):
@@ -103,8 +126,8 @@ async def get_quick_facts(name: str, session_id: int = None) -> dict | None:
         session_id = resolve_session(None)
         if session_id is None:
             return None
-    await _ensure(session_id)
-    for c in _cache.values():
+    chars = await _ensure(session_id)
+    for c in chars.values():
         if c["name"].lower() == name.lower():
             return {"name":c["name"],"status":"DEAD" if c.get("is_dead") else c.get("status","active"),"bond":c.get("bond",0),"weapon":c.get("weapon","?")}
     return None

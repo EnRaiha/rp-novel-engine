@@ -20,10 +20,14 @@ without PostgreSQL. Only the `state`/`effective_rules`/`audit` trio touches the 
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import hashlib
 import json
 import os
 import re
+import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass
@@ -1558,8 +1562,51 @@ def _mirror_sort_key(entry: dict[str, Any]) -> tuple[int, str]:
 
 
 def state_file_path() -> Path:
-    """Where the harness plugin reads state from (`OOC_STATE_FILE` overrides)."""
-    return Path(os.getenv("OOC_STATE_FILE", "~/.dsh/ooc/tkg-state.json")).expanduser()
+    """Where the harness plugin reads state from (`OOC_STATE_FILE` overrides).
+
+    An empty `OOC_STATE_FILE` counts as unset: `Path("")` resolves to `.`, so the mirror tried to
+    replace the working directory.
+
+    @returns the state file path.
+    """
+    raw = os.getenv("OOC_STATE_FILE") or "~/.dsh/ooc/tkg-state.json"
+    return Path(raw).expanduser()
+
+
+#: Seconds `mirror_state_file` waits for the cross-process lock before giving up.
+_MIRROR_LOCK_WAIT_S = 10.0
+
+
+def _load_mirror_entries(path: Path, sid: int) -> list[dict[str, Any]]:
+    """Read the other sessions' entries from the state file; rebuild when it is unusable.
+
+    A dict-valued file used to pass as valid JSON and drop every other session's entry with no log;
+    non-UTF-8 bytes raised UnicodeDecodeError out of the mirror. Both now log, keep one copy of
+    the bad file as `<name>.corrupt` for inspection, and start from an empty list.
+
+    @param path - state file.
+    @param sid - session being written, for the log line.
+    @returns the dict entries of the file, empty when absent or unusable.
+    """
+    if not path.exists():
+        return []
+    try:
+        loaded = json.loads(path.read_text())
+        if not isinstance(loaded, list):
+            raise ValueError(f"top-level value is {type(loaded).__name__}, not a list")
+    except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError are both ValueError
+        # Rebuilt rather than left alone: a file the plugin reads cannot stay unparsable, and
+        # saying so is the difference between a repair and a silent wipe of the other sessions'
+        # entries.
+        error("ooc", f"mirror {path} is unusable ({exc}); rebuilding it for session {sid}")
+        corrupt = path.with_name(path.name + ".corrupt")
+        try:
+            if not corrupt.exists():
+                corrupt.write_bytes(path.read_bytes())
+        except OSError as cp:
+            error("ooc", f"mirror {path}: corrupt copy not kept: {cp}")
+        return []
+    return [entry for entry in loaded if isinstance(entry, dict)]
 
 
 async def mirror_state_file(session_id: int | None = None) -> str | None:
@@ -1568,6 +1615,15 @@ async def mirror_state_file(session_id: int | None = None) -> str | None:
     The engine is the single writer; the plugin keeps reading its file so the
     two planes cannot lose an update between them while phase 2 (plugin reads
     the engine directly) is not wired.
+
+    The read-modify-write runs under `flock(LOCK_EX)` on `<path>.lock`. kilo_bridge, the CLI, the
+    tick and the plugin refresh are separate processes: unlocked, each loaded the list, then the
+    last `os.replace` dropped the others' entries, and all of them shared one `<path>.tmp`, so the
+    loser's replace raised FileNotFoundError that the handler below turned into None. The session
+    state is read inside the lock too, so an older reader cannot publish after a newer one. The
+    lock is taken with a non-blocking retry loop and `asyncio.sleep`, which keeps the event loop
+    running while another process holds it; a blocking flock would stall every task in this one.
+    The temp file is unique (`mkstemp` in the target directory, so the replace stays atomic).
 
     A failure here is reported, never raised. The engine's own rows are committed by
     the time this runs, so raising leaves a half-write: the audit is in the ledger
@@ -1578,21 +1634,23 @@ async def mirror_state_file(session_id: int | None = None) -> str | None:
     @returns the path written, or None when the write failed.
     """
     sid = _session_key(session_id)
+    lock_fd: int | None = None
+    tmp_name: str | None = None
     try:
-        current = await state(sid)
         path = state_file_path()
-        entries: list[dict[str, Any]] = []
-        if path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + _MIRROR_LOCK_WAIT_S
+        while True:
             try:
-                loaded = json.loads(path.read_text())
-                if isinstance(loaded, list):
-                    entries = [entry for entry in loaded if isinstance(entry, dict)]
-            except json.JSONDecodeError as exc:
-                # Rebuilt rather than left alone: a file the plugin reads cannot stay
-                # unparsable, and saying so is the difference between a repair and a
-                # silent wipe of the other sessions' entries.
-                error("ooc", f"mirror {path} is not JSON ({exc}); rebuilding it for session {sid}")
-                entries = []
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"state file lock {path}.lock held for {_MIRROR_LOCK_WAIT_S}s")
+                await asyncio.sleep(0.02)
+        current = await state(sid)
+        entries = _load_mirror_entries(path, sid)
         mirror = {
             "sessionId": sid,
             "deviation": int(current["deviation"]),
@@ -1605,14 +1663,24 @@ async def mirror_state_file(session_id: int | None = None) -> str | None:
         }
         entries = [entry for entry in entries if entry.get("sessionId") != sid] + [mirror]
         entries.sort(key=_mirror_sort_key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(entries, indent=2) + "\n")
-        os.replace(tmp, path)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(entries, indent=2) + "\n")
+        os.chmod(tmp_name, 0o644)  # mkstemp makes 0600; the plugin and CLI read the file
+        os.replace(tmp_name, path)
+        tmp_name = None
         return str(path)
     except Exception as exc:  # noqa: BLE001 - see the docstring: the ledger already committed
         error("ooc", f"mirror for session {sid} not written: {exc}")
         return None
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass  # deliberate: the temp file is already gone
+        if lock_fd is not None:
+            os.close(lock_fd)  # closing the descriptor releases the flock
 
 
 def _iso(value: Any) -> str:

@@ -119,14 +119,14 @@ def pool(monkeypatch):
         calls["init"] += 1
         return fake
 
-    async def close():
-        calls["close"] += 1
-
     # Every door to a real socket is replaced, so a failing assertion cannot become a live write.
+    # The reconnect terminates the dead pool and builds the replacement under the pool lock, so
+    # "closed" and "init" are counted at those two seams.
     monkeypatch.setattr(db.Database, "pool", fake)
     monkeypatch.setattr(db.Database, "_ensure_pool", staticmethod(ensure_pool))
     monkeypatch.setattr(db.Database, "init", staticmethod(init))
-    monkeypatch.setattr(db.Database, "close", staticmethod(close))
+    monkeypatch.setattr(db.Database, "_create_locked", staticmethod(init))
+    monkeypatch.setattr(fake, "terminate", lambda: calls.__setitem__("close", calls["close"] + 1), raising=False)
     return fake, calls, received
 
 

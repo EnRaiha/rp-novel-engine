@@ -234,7 +234,8 @@ class TestTheMirrorDoesNotTakeTheLedgerDown:
         mirror.write_text("{not json at all")
         written = await ooc.mirror_state_file(scratch_session)
         assert written is not None
-        assert any("not JSON" in message for message in said), said
+        assert any("unusable" in message for message in said), said
+        assert mirror.with_name(mirror.name + ".corrupt").exists(), "the corrupt file is kept once for repair"
         assert [entry["sessionId"] for entry in json.loads(mirror.read_text())] == [scratch_session]
 
     async def test_an_unwritable_mirror_is_reported_not_raised(self, scratch_session, tmp_path, monkeypatch):

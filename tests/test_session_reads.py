@@ -57,6 +57,7 @@ class TestGuardResolvesPerCall:
 
         async def fake_ensure(sid):
             seen.append(sid)
+            return {}
 
         async def fake_fetchrow(*args, **kwargs):
             return None
@@ -77,6 +78,7 @@ class TestGuardResolvesPerCall:
 
         async def fake_ensure(sid):
             seen.append(sid)
+            return {}
 
         monkeypatch.setattr(guard, "_ensure", fake_ensure)
 

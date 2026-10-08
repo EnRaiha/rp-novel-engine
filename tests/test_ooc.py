@@ -968,6 +968,52 @@ class TestCampaignLayer:
         quiet = await ooc.knowledge_findings(SCRATCH_SESSION, "The vault opened that night.", rules, "both")
         assert quiet == [], "a watcher who knows the fact stops the leak"
 
+    async def test_knowledge_leak_bills_once_through_audit(self, scratch_session):
+        """Before the fix `audit` matched a knowledge rule as prose AND again through
+        `knowledge_findings`, so one leak was billed twice (and billed even when every
+        watcher knew the fact)."""
+        from core import ooc
+
+        rule_id = "fact:scratch_billing"
+        await self._insert_billing_rule(rule_id)
+        try:
+            result = await ooc.audit("The vault opened that night.", SCRATCH_SESSION,
+                                     traits=("general",), preview=True)
+            mine = [f for f in result["findings"] if f["rule_id"] == rule_id]
+            assert len(mine) == 1, f"the leak is billed once, got {len(mine)}: {mine}"
+            assert mine[0]["delta"] == 3, "the single finding carries the rule's own delta"
+        finally:
+            await Database.execute("DELETE FROM maya_rp.ooc_rules WHERE id=$1 AND session_id=$2",
+                                   rule_id, SCRATCH_SESSION)
+
+    async def test_knowledge_rule_is_silent_in_audit_once_the_watcher_knows(self, scratch_session):
+        """Before the fix the prose pass flagged the reveal even after the watcher had
+        learned the fact, because only `knowledge_findings` looks at who knows it."""
+        from core import ooc
+
+        rule_id = "fact:scratch_billing"
+        await self._insert_billing_rule(rule_id)
+        try:
+            await campaign_learn(SCRATCH_SESSION, scratch_session["observer"], "scratch_billing")
+            result = await ooc.audit("The vault opened that night.", SCRATCH_SESSION,
+                                     traits=("general",), preview=True)
+            mine = [f for f in result["findings"] if f["rule_id"] == rule_id]
+            assert mine == [], f"a watcher who knows the fact stops the bill, got {mine}"
+        finally:
+            await Database.execute("DELETE FROM maya_rp.ooc_rules WHERE id=$1 AND session_id=$2",
+                                   rule_id, SCRATCH_SESSION)
+
+    @staticmethod
+    async def _insert_billing_rule(rule_id: str) -> None:
+        """Session-scoped knowledge rule (delta 3); cleanup does not delete ooc_rules."""
+        await Database.execute(
+            "INSERT INTO maya_rp.ooc_rules (id, scope, session_id, kind, layer, pattern, is_regex, delta)"
+            " VALUES ($2,'session',$1,'knowledge','both','re:the vault opened',true,3)"
+            " ON CONFLICT (id) DO UPDATE SET enabled=true, delta=3",
+            SCRATCH_SESSION,
+            rule_id,
+        )
+
     async def test_debuff_reaches_battle_and_romance(self, scratch_session):
         from modules import battle, romance
 

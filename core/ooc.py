@@ -527,7 +527,10 @@ async def audit(
     # Scripted beats prove progress (D4); they are never penalties, so they stay
     # out of the deviation audit — `complete_milestone()` matches them instead.
     rules = [rule for rule in rules if rule.kind != "scripted_beat"]
-    raw_findings = audit_text(text, rules, layer)
+    # Knowledge rules bill through `knowledge_findings` below, which also checks who
+    # knows the fact; matching them here too would bill every leak twice.
+    prose_rules = [rule for rule in rules if rule.kind != KIND_KNOWLEDGE]
+    raw_findings = audit_text(text, prose_rules, layer)
     # M4: a reveal a present character cannot know is a finding of its own kind.
     knowledge = [] if standing_down else await knowledge_findings(sid, text, rules, layer)
     if knowledge:

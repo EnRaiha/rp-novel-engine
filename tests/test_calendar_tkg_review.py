@@ -6,6 +6,7 @@ history in session 3, and nothing here writes to it.
 from __future__ import annotations
 
 import asyncio
+import os
 import pathlib
 import sys
 
@@ -15,6 +16,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.calendar_tkg as cal  # noqa: E402
+
+
+#: Scratch campaign: sessions 3 and 5 are frozen, and apply_holiday refuses them.
+SID = 900 + os.getpid() % 100
 
 
 def _run(coro):
@@ -119,10 +124,10 @@ def test_a_holiday_says_when_the_treasury_row_is_missing(monkeypatch):
     monkeypatch.setattr(cal, "info", lambda *a: logged.append(a[-1]))
 
     date = _run(cal.get_game_date(3, 1))
-    _run(cal.apply_holiday(date, 5))
+    _run(cal.apply_holiday(date, SID))
 
-    assert any("no resources row for session 5" in line for line in logged), logged
-    assert any("no crew row for session 5" in line for line in logged), logged
+    assert any(f"no resources row for session {SID}" in line for line in logged), logged
+    assert any(f"no crew row for session {SID}" in line for line in logged), logged
 
 
 def test_a_holiday_charges_the_crown_and_lifts_the_crew(monkeypatch):
@@ -130,14 +135,14 @@ def test_a_holiday_charges_the_crown_and_lifts_the_crew(monkeypatch):
     monkeypatch.setattr(cal, "Database", stub)
 
     date = _run(cal.get_game_date(3, 1))
-    _run(cal.apply_holiday(date, 3))
+    _run(cal.apply_holiday(date, SID))
 
     crew = [args for sql, args in stub.reads if "UPDATE maya_rp.crew_roster" in sql]
     spend = [args for sql, args in stub.reads if "UPDATE maya_rp.resources" in sql]
     assert crew and crew[0][0] == 5, crew          # Hari Harapan bonus
     assert spend and spend[0][0] == 5 * 2000, spend
     event = [args for sql, args in stub.writes if "INSERT INTO maya_rp.events" in sql]
-    assert event and event[0][0] == 3
+    assert event and event[0][0] == SID
 
 
 def test_a_somber_holiday_costs_the_crown_nothing(monkeypatch):
@@ -145,7 +150,7 @@ def test_a_somber_holiday_costs_the_crown_nothing(monkeypatch):
     monkeypatch.setattr(cal, "Database", stub)
     date = _run(cal.get_game_date(3, 360))
     assert date["holiday"]["name"] == "Malam Hitam"
-    _run(cal.apply_holiday(date, 3))
+    _run(cal.apply_holiday(date, SID))
     assert [sql for sql, _ in stub.reads if "UPDATE maya_rp.resources" in sql] == []
 
 
@@ -154,5 +159,5 @@ def test_a_day_with_no_holiday_applies_nothing(monkeypatch):
     monkeypatch.setattr(cal, "Database", stub)
     date = _run(cal.get_game_date(3, 5))
     assert date["holiday"] is None
-    _run(cal.apply_holiday(date, 3))
+    _run(cal.apply_holiday(date, SID))
     assert stub.writes == []

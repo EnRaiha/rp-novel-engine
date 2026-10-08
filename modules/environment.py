@@ -4,7 +4,7 @@ from __future__ import annotations
 import random
 from typing import Any
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 from core.log import info
 
 TELLS = {
@@ -30,7 +30,17 @@ LOCATION_TELLS = {
 }
 
 async def generate_details(location: str = "bridge", session_id: int = None) -> list[str]:
-    if session_id is None: session_id = Config.SESSION_ID
+    """Pick up to four environmental tells for the session's current state.
+
+    Read-only. The fight window reads `combat_results.created_at`: the table has no `ended_at`,
+    and the old query raised UndefinedColumn on every call. A NULL `tension` is skipped; the
+    column is nullable and `None >= 7` raised TypeError.
+
+    @param location - key of LOCATION_TELLS; an unknown key adds no location tell.
+    @param session_id - session to read; `None` resolves through `require_session`.
+    @returns the tells, shuffled.
+    """
+    if session_id is None: session_id = require_session(None)
     details = []
 
     morale = await Database.fetchval("SELECT COALESCE(AVG(morale),50) FROM maya_rp.crew_roster WHERE session_id=$1", session_id)
@@ -46,7 +56,7 @@ async def generate_details(location: str = "bridge", session_id: int = None) -> 
 
     recent = await Database.fetchrow(
         "SELECT COUNT(*) AS fights, COALESCE(SUM(crew_casualties),0) AS casualties"
-        " FROM maya_rp.combat_results WHERE session_id=$1 AND ended_at > NOW() - INTERVAL '72 hours'",
+        " FROM maya_rp.combat_results WHERE session_id=$1 AND created_at > NOW() - INTERVAL '72 hours'",
         session_id)
     if recent and recent["fights"] > 0:
         details.append(random.choice(TELLS["combat"][0][2]))
@@ -56,7 +66,7 @@ async def generate_details(location: str = "bridge", session_id: int = None) -> 
             details.append(random.choice(TELLS["death"][0][2]))
 
     pacing = await Database.fetchrow("SELECT tension FROM maya_rp.narrative_pacing WHERE session_id=$1", session_id)
-    if pacing and pacing["tension"] >= 7:
+    if pacing and pacing["tension"] is not None and pacing["tension"] >= 7:
         details.append(random.choice(TELLS["tension"][0][2]))
 
     if location in LOCATION_TELLS:
@@ -79,7 +89,12 @@ def current_weather(session_id: int = None, game_day: int = None) -> dict:
     return {"weather": name, "voyage_mod": WEATHER_MOD[name], "game_day": game_day}
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    """Report the day's weather. Writes nothing, so a frozen campaign needs no refusal.
+
+    @param session_id - session to read; `None` resolves through `require_session`.
+    @returns `{"status": "on_demand", weather fields}`.
+    """
+    if session_id is None: session_id = require_session(None)
     gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 0
     w = current_weather(session_id, gd)
     return {"status": "on_demand", **w}

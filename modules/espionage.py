@@ -3,8 +3,31 @@
 from __future__ import annotations
 import json, random
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 from core.log import info, error
+
+def _contains(text: str) -> str:
+    """LIKE pattern matching `text` as a literal substring (pair with `ESCAPE '\\'`).
+
+    @param text - user text.
+    @returns the escaped `%text%` pattern.
+    """
+    return "%" + str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _writable_session(session_id: int | None) -> int:
+    """Resolve the session for one call and refuse a frozen campaign.
+
+    @param session_id - caller's session; `None` resolves through `core.session.require_session`.
+    @returns the resolved session id.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    sid = session_id if session_id is not None else require_session(None)
+    _refuse_frozen(sid)
+    return sid
+
 
 async def run_espionage(faction: str, mission_type: str, agent: str, session_id: int | None = None) -> dict:
     """Run one mission and RECORD it.
@@ -13,12 +36,23 @@ async def run_espionage(faction: str, mission_type: str, agent: str, session_id:
     could only ever show rows that predate the code, and the tick could only
     resolve rows nothing created. The mission row is written after the roll, so
     the log states what happened.
+
+    The roll ladder tests success first, then a critical failure in the TOP tail of the failing
+    rolls. The old ladder tested `roll <= success // 5` first, so the lowest rolls, the ones that
+    should succeed, were reported as captured agents.
+
+    @param faction - faction name fragment, matched literally.
+    @param mission_type - key of the base-chance table.
+    @param agent - agent name for the log.
+    @param session_id - session; `None` resolves through `require_session`.
+    @returns the outcome dict, or `{"error": ...}`.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
     fac = await Database.fetchrow(
         "SELECT id, name, reputation FROM maya_rp.factions WHERE session_id=$1 "
-        "AND LOWER(name) LIKE LOWER($2) ORDER BY (LOWER(name)=LOWER($2)) DESC, id LIMIT 1",
-        session_id, f"%{faction}%")
+        "AND LOWER(name) LIKE LOWER($2) ESCAPE '\\' ORDER BY (LOWER(name)=LOWER($3)) DESC, id LIMIT 1",
+        session_id, _contains(faction), faction)
     if not fac: return {"error": f"Faction '{faction}' not found"}
 
     base = {"steal_tech": 40, "sabotage": 35, "steal_resources": 55, "assassinate": 20, "plant_rumor": 60, "scout_fleet": 70}
@@ -29,7 +63,14 @@ async def run_espionage(faction: str, mission_type: str, agent: str, session_id:
     rep_mod = max(-10, int(fac["reputation"] or 0) // 10)
     success = max(5, min(95, chance + rep_mod + random.randint(-15, 15)))
     roll = random.randint(1, 100)
-    outcome = "critical_failure" if roll <= success // 5 else "success" if roll <= success else "detected" if roll <= success + 20 else "failure"
+    if roll <= success:
+        outcome = "success"
+    elif roll > 100 - success // 5:
+        outcome = "critical_failure"
+    elif roll <= success + 20:
+        outcome = "detected"
+    else:
+        outcome = "failure"
 
     loot_a, loot_c, rep_delta, narrative = 0, 0, 0, ""
     if outcome == "success":
@@ -67,14 +108,19 @@ async def run_espionage(faction: str, mission_type: str, agent: str, session_id:
     return {"outcome": outcome, "agent": agent, "mission": mission_type, "faction": fac["name"], "loot_alloys": loot_a, "loot_credits": loot_c, "rep_delta": rep_delta, "narrative": narrative}
 
 async def list_espionage_log(session_id: int | None = None) -> list[dict]:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     rows = await Database.fetch("SELECT em.mission_type, em.agent_name, em.outcome, em.narrative FROM maya_rp.espionage_missions em WHERE em.session_id=$1 ORDER BY em.created_at DESC LIMIT 15", session_id)
     return [dict(r) for r in rows]
 
 async def run_tick(session_id: int = None) -> dict:
     """Mission phase progression (added 2026-08-14): unresolved missions age
-    and resolve with delay — planted rumors fade, scouts go dark."""
-    if session_id is None: session_id = Config.SESSION_ID
+    and resolve with delay — planted rumors fade, scouts go dark.
+
+    @param session_id - session to tick; `None` resolves through `require_session`.
+    @returns `{"resolved_stale": n}`, or `{"error": ...}` on a database error.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
     try:
         stale = await Database.fetch(
             "SELECT id, mission_type, agent_name FROM maya_rp.espionage_missions "

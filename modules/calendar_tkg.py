@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 from core.log import info
 
 MONTHS = ["Harapan","Lautan","Bintang","Api","Daun","Hujan",
@@ -35,13 +35,36 @@ HOLIDAYS = {
     (12,30): {"name":"Malam Hitam","type":"somber","bonus":-2,"desc":"Stillness before renewal"},
 }
 
+def _writable_session(session_id: int | None) -> int:
+    """Resolve the session for one call and refuse a frozen campaign.
+
+    @param session_id - caller's session; `None` resolves through `core.session.require_session`.
+    @returns the resolved session id.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    sid = session_id if session_id is not None else require_session(None)
+    _refuse_frozen(sid)
+    return sid
+
+
 async def advance_day(session_id: int) -> dict:
-    """Advance game day by 1 and return the new date."""
-    row = await Database.fetchrow("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id)
-    if not row:
+    """Advance game day by 1 and return the new date.
+
+    The increment is one `game_day = COALESCE(game_day,1) + 1` statement. Read-then-write lost a
+    day when two ticks read the same value.
+
+    @param session_id - session to advance; a frozen campaign is refused.
+    @returns the date dict, or `{"error": ...}`.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
+    new_day = await Database.fetchval(
+        "UPDATE maya_rp.sessions SET game_day = COALESCE(game_day, 1) + 1 WHERE id=$1 RETURNING game_day",
+        session_id)
+    if new_day is None:
         return {"error": "No session found"}
-    new_day = (row["game_day"] or 1) + 1
-    await Database.execute("UPDATE maya_rp.sessions SET game_day=$1 WHERE id=$2", new_day, session_id)
     date = await get_game_date(session_id, new_day)
     if not date:
         return {"error": "Failed to get date"}
@@ -88,7 +111,13 @@ async def get_game_date(session_id: int, game_day: int = None) -> dict:
     }
 
 async def apply_holiday(date: dict, session_id: int):
-    """Apply holiday effects."""
+    """Apply holiday effects.
+
+    @param date - dict from `get_game_date`.
+    @param session_id - session to write; a frozen campaign is refused.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
     if not date or not date.get("holiday"):
         return
     h = date["holiday"]
@@ -146,9 +175,12 @@ async def get_upcoming(session_id: int, lookahead: int = 30) -> list[dict]:
     return events[:10]
 
 async def run_tick(session_id: int = None) -> dict:
-    """Calendar tick: advance day, apply holiday, check upcoming, quarterly tasks."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    """Calendar tick: advance day, apply holiday, check upcoming, quarterly tasks.
+
+    @param session_id - session to tick; `None` resolves through `require_session`.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
     try:
         date = await advance_day(session_id)
         if not date or "error" in date:

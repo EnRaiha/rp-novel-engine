@@ -7,23 +7,57 @@ campaign's treaties, processed its envoys, and decayed every faction's
 reputation in the database.
 """
 import random, json
-from datetime import datetime, timezone, timedelta
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 from core.utils import calc_game_days
 
 #: The session's faction ids, as a subquery over the session's own rows.
 _SESSION_FACTIONS = "SELECT id FROM factions WHERE session_id=$1"
 
 
+def _contains(text: str) -> str:
+    """LIKE pattern matching `text` as a literal substring (pair with `ESCAPE '\\'`).
+
+    A faction name with `%` or `_` used to act as a wildcard: target "%" resolved to the first
+    faction by id and declared war on it.
+
+    @param text - user text.
+    @returns the escaped `%text%` pattern.
+    """
+    return "%" + str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _writable_session(session_id: int | None) -> int:
+    """Resolve the session for one call and refuse a frozen campaign.
+
+    Sessions 3 and 5 are reference data. The tick and the intent writer resolved `Config.SESSION_ID`
+    (fixed at import) and wrote without a freeze check.
+
+    @param session_id - caller's session; `None` resolves through `core.session.require_session`.
+    @returns the resolved session id.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    sid = session_id if session_id is not None else require_session(None)
+    _refuse_frozen(sid)
+    return sid
+
+
 async def run_tick(session_id: int = None):
     """Treaty expiry, envoy resolution, AI diplomacy, reputation drift.
 
-    Defaults to the engine's session, not the literal 3: that id is the frozen
-    reference campaign.
+    Envoy odds use the TARGET faction's standing, read through the join. `envoys` has no `standing`
+    column, so the old `e.get("standing", "neutral")` was always neutral and the standing ladder
+    never moved past it. Elapsed time is computed by the database: `envoys.started_at` is
+    `timestamp without time zone` in the server zone, so subtracting it from an aware Python
+    datetime raised TypeError on every envoy and aborted the tick.
+
+    @param session_id - session to tick; `None` resolves through `require_session`.
+    @returns None.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
     row = await Database.fetchrow("SELECT last_tick_at FROM resources WHERE session_id=$1", session_id)
     if not row or not row.get("last_tick_at"): return
     gd = calc_game_days(row["last_tick_at"])
@@ -38,21 +72,22 @@ async def run_tick(session_id: int = None):
 
     # Process envoys — the sending faction decides the campaign.
     envoys = await Database.fetch(
-        "SELECT e.*, f.name AS fn, f2.name AS tn FROM envoys e "
+        "SELECT e.*, f.name AS fn, f2.name AS tn, f2.standing AS target_standing, "
+        "EXTRACT(EPOCH FROM (NOW() - e.started_at)) AS elapsed_secs FROM envoys e "
         "JOIN factions f ON f.id=e.faction_id JOIN factions f2 ON f2.id=e.target_faction_id "
         "WHERE e.status='active' AND f.session_id=$1",
         session_id)
     for e in envoys:
-        elapsed = (datetime.now(timezone.utc) - e["started_at"]).total_seconds() / 3600 / 6
+        elapsed = float(e["elapsed_secs"] or 0) / 3600 / 6
         if elapsed < e["duration_days"]: continue
-        standing = e.get("standing", "neutral")
+        standing = e.get("target_standing") or "neutral"
         sm = {"allied": 40, "friendly": 20, "neutral": 0, "hostile": -20, "enemy": -40}.get(standing, 0)
         success = random.random() * 100 < 50 + sm
         await Database.execute("UPDATE envoys SET status=$1, result=$2 WHERE id=$3",
                                "completed" if success else "failed",
                                json.dumps({"success": success}), e["id"])
         if success:
-            ns = {"hostile": "neutral", "neutral": "friendly", "friendly": "allied"}.get(standing, standing)
+            ns = {"enemy": "hostile", "hostile": "neutral", "neutral": "friendly", "friendly": "allied"}.get(standing, standing)
             await Database.execute(
                 "UPDATE factions SET standing=$1, reputation=reputation+5 WHERE id=$2 AND session_id=$3",
                 ns, e["target_faction_id"], session_id)
@@ -112,10 +147,20 @@ async def resolve_intent(session_id: int, action: str, target: str) -> dict:
     Resolve a diplomatic intent — talk/threaten/ally/declare war.
     Returns {success, standing_change, reaction} for Deepseek narration.
 
+    `neutral`, `hostile` and `enemy` set that standing on the faction. They are in KNOWN_ACTIONS and
+    used to fall to the "contact made" branch: success reported, nothing changed.
+
+    @param session_id - session of the faction; a frozen campaign is refused.
+    @param action - one of KNOWN_ACTIONS, any case; spaces and dashes read as `_`.
+    @param target - faction name fragment, matched literally.
+    @returns the result dict for narration.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+
     An action outside KNOWN_ACTIONS used to fall through to the "contact made"
     branch and report `success: True` with nothing changed. It is refused by
     name now, so a misunderstanding reads as one.
     """
+    session_id = _writable_session(session_id)
     act = str(action or "").strip().lower().replace(" ", "_").replace("-", "_")
     act = ACTION_ALIASES.get(act, act)
     if act not in KNOWN_ACTIONS:
@@ -128,8 +173,8 @@ async def resolve_intent(session_id: int, action: str, target: str) -> dict:
 
     faction = await Database.fetchrow(
         "SELECT id, name, standing, reputation FROM maya_rp.factions "
-        "WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) ORDER BY id LIMIT 1",
-        session_id, f"%{target}%")
+        "WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) ESCAPE '\\' ORDER BY id LIMIT 1",
+        session_id, _contains(target))
 
     if not faction:
         return {
@@ -165,6 +210,18 @@ async def resolve_intent(session_id: int, action: str, target: str) -> dict:
             "standing_change": target_standing,
             "narrative_hook": f"Relations with {faction['name']} improved to {target_standing}.",
             "reaction": f"{faction['name']} receives the envoy with {'warmth' if target_standing == 'allied' else 'cautious optimism'}.",
+        }
+
+    elif target_standing in ("neutral", "hostile", "enemy") and faction["standing"] != target_standing:
+        await Database.execute(
+            "UPDATE maya_rp.factions SET standing=$1 WHERE id=$2 AND session_id=$3",
+            target_standing, faction["id"], session_id)
+        return {
+            "domain": "diplomacy",
+            "success": True,
+            "standing_change": target_standing,
+            "narrative_hook": f"Relations with {faction['name']} changed to {target_standing}.",
+            "reaction": f"{faction['name']} registers the change in tone.",
         }
 
     else:

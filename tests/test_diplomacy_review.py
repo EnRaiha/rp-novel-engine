@@ -30,11 +30,14 @@ No database: every test drives a fake Database.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import os
 
 import pytest
 
 import modules.diplomacy as dip
+
+#: Scratch campaign: sessions 3 and 5 are frozen, and the writers refuse them.
+SID = 900 + os.getpid() % 100
 
 
 class FakeDB:
@@ -89,7 +92,7 @@ async def _tick(monkeypatch, success=True, **kw):
     fake = _install(monkeypatch, FakeDB(**kw))
     monkeypatch.setattr("modules.diplomacy.calc_game_days", lambda when: 1.0)
     monkeypatch.setattr("modules.diplomacy.random.random", lambda: 0.0 if success else 1.0)
-    await dip.run_tick(5)
+    await dip.run_tick(SID)
     return fake
 
 
@@ -103,7 +106,7 @@ async def test_the_tick_defaults_to_the_engine_session(monkeypatch):
         return None
 
     _install(monkeypatch, FakeDB())
-    monkeypatch.setattr("modules.diplomacy.Config.SESSION_ID", 77)
+    monkeypatch.setattr("modules.diplomacy.require_session", lambda explicit=None: 77)
     monkeypatch.setattr("modules.diplomacy.Database.fetchrow", fetchrow)
 
     await dip.run_tick()
@@ -116,18 +119,18 @@ async def test_the_treaty_expiry_is_bound_to_the_campaign(monkeypatch):
 
     sql = [s for s in fake.sql("execute") if "UPDATE treaties" in s][0]
     assert sql.count("SELECT id FROM factions WHERE session_id=$1") == 2, sql
-    assert fake.args_for("UPDATE treaties", "execute")[0] == (5,)
+    assert fake.args_for("UPDATE treaties", "execute")[0] == (SID,)
 
 
 async def test_the_envoy_pass_is_bound_to_the_sending_faction(monkeypatch):
-    started = datetime.now(timezone.utc) - timedelta(days=400)
-    envoy = {"id": 1, "faction_id": 2, "target_faction_id": 3, "started_at": started,
-             "duration_days": 1, "status": "active", "standing": "friendly"}
+    elapsed = 400 * 86400
+    envoy = {"id": 1, "faction_id": 2, "target_faction_id": 3, "elapsed_secs": elapsed,
+             "duration_days": 1, "status": "active", "target_standing": "friendly"}
     fake = await _tick(monkeypatch, fetch=[envoy])
 
     sql = [s for s in fake.sql("fetch") if "envoys" in s][0]
     assert "f.session_id=$1" in sql
-    assert fake.args_for("envoys", "fetch")[0] == (5,)
+    assert fake.args_for("envoys", "fetch")[0] == (SID,)
 
 
 async def test_the_ai_target_list_is_bound_to_the_campaign(monkeypatch):
@@ -136,7 +139,7 @@ async def test_the_ai_target_list_is_bound_to_the_campaign(monkeypatch):
 
     targets = [s for s in fake.sql("fetch") if "id!=$1" in s]
     assert targets and "session_id=$2" in targets[0], targets
-    assert fake.args_for("id!=$1", "fetch")[0] == (2, 5)
+    assert fake.args_for("id!=$1", "fetch")[0] == (2, SID)
 
 
 async def test_the_reputation_drift_is_bound_to_the_campaign(monkeypatch):
@@ -144,34 +147,34 @@ async def test_the_reputation_drift_is_bound_to_the_campaign(monkeypatch):
 
     drift = [s for s in fake.sql("execute") if "sign(reputation)" in s][0]
     assert "session_id=$1" in drift, drift
-    assert fake.args_for("sign(reputation)", "execute")[0] == (5,)
+    assert fake.args_for("sign(reputation)", "execute")[0] == (SID,)
 
 
 async def test_an_envoy_that_has_not_finished_is_left_alone(monkeypatch):
-    started = datetime.now(timezone.utc)
-    envoy = {"id": 1, "faction_id": 2, "target_faction_id": 3, "started_at": started,
-             "duration_days": 30, "status": "active", "standing": "neutral"}
+    elapsed = 0
+    envoy = {"id": 1, "faction_id": 2, "target_faction_id": 3, "elapsed_secs": elapsed,
+             "duration_days": 30, "status": "active", "target_standing": "neutral"}
     fake = await _tick(monkeypatch, fetch=[envoy])
 
     assert not [s for s in fake.sql("execute") if "UPDATE envoys" in s]
 
 
 async def test_a_due_envoy_resolves_and_moves_the_standing(monkeypatch):
-    started = datetime.now(timezone.utc) - timedelta(days=90)
-    envoy = {"id": 1, "faction_id": 2, "target_faction_id": 3, "started_at": started,
-             "duration_days": 1, "status": "active", "standing": "friendly"}
+    elapsed = 90 * 86400
+    envoy = {"id": 1, "faction_id": 2, "target_faction_id": 3, "elapsed_secs": elapsed,
+             "duration_days": 1, "status": "active", "target_standing": "friendly"}
     fake = await _tick(monkeypatch, fetch=[envoy], success=True)
 
     resolved = fake.args_for("UPDATE envoys", "execute")
     assert resolved and resolved[0][0] == "completed"
     moved = fake.args_for("UPDATE factions SET standing=$1, reputation=reputation+5", "execute")
-    assert moved and moved[0] == ("allied", 3, 5)
+    assert moved and moved[0] == ("allied", 3, SID)
 
 
 async def test_the_tick_stops_when_the_session_has_no_clock(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=None))
 
-    await dip.run_tick(5)
+    await dip.run_tick(SID)
 
     assert not fake.calls[1:], "the tick ran without a last_tick_at"
 
@@ -183,7 +186,7 @@ async def test_an_unknown_action_is_refused_not_reported_as_success(monkeypatch,
     fake = _install(monkeypatch, FakeDB(fetchrow={"id": 1, "name": "Iron Concord",
                                                   "standing": "neutral", "reputation": 0}))
 
-    out = await dip.resolve_intent(5, action, "Iron Concord")
+    out = await dip.resolve_intent(SID, action, "Iron Concord")
 
     assert out["success"] is False
     assert "Unknown diplomatic action" in out["narrative_hook"]
@@ -194,11 +197,11 @@ async def test_a_known_action_still_reaches_the_faction(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow={"id": 1, "name": "Iron Concord",
                                                   "standing": "hostile", "reputation": 0}))
 
-    out = await dip.resolve_intent(5, "ally", "Iron Concord")
+    out = await dip.resolve_intent(SID, "ally", "Iron Concord")
 
     assert out["success"] is True and out["standing_change"] == "allied"
     written = fake.args_for("SET standing=$1", "execute")[0]
-    assert written == ("allied", 1, 5)
+    assert written == ("allied", 1, SID)
 
 
 @pytest.mark.parametrize("action", ["war", "declare war", "declare_war"])
@@ -206,10 +209,10 @@ async def test_declaring_war_is_understood_in_every_spelling(monkeypatch, action
     fake = _install(monkeypatch, FakeDB(fetchrow={"id": 1, "name": "Iron Concord",
                                                   "standing": "neutral", "reputation": 0}))
 
-    out = await dip.resolve_intent(5, action, "Iron Concord")
+    out = await dip.resolve_intent(SID, action, "Iron Concord")
 
     assert out["standing_change"] == "enemy"
-    assert fake.args_for("SET standing='enemy'", "execute")[0] == (1, 5)
+    assert fake.args_for("SET standing='enemy'", "execute")[0] == (1, SID)
 
 
 # ── 4 + 5. The lookup and the writes ────────────────────────────────────
@@ -217,17 +220,17 @@ async def test_declaring_war_is_understood_in_every_spelling(monkeypatch, action
 async def test_the_faction_lookup_is_ordered_and_session_scoped(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=None))
 
-    await dip.resolve_intent(5, "talk", "Iron")
+    await dip.resolve_intent(SID, "talk", "Iron")
 
     sql = fake.sql("fetchrow")[0]
     assert "session_id=$1" in sql and "ORDER BY id LIMIT 1" in sql
-    assert fake.args_for("factions", "fetchrow")[0] == (5, "%Iron%")
+    assert fake.args_for("factions", "fetchrow")[0] == (SID, "%Iron%")
 
 
 async def test_a_missing_faction_says_so(monkeypatch):
     _install(monkeypatch, FakeDB(fetchrow=None))
 
-    out = await dip.resolve_intent(5, "talk", "Nobody")
+    out = await dip.resolve_intent(SID, "talk", "Nobody")
 
     assert out["success"] is False and "No faction found" in out["narrative_hook"]
 
@@ -236,7 +239,7 @@ async def test_an_already_allied_faction_is_not_re_written(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow={"id": 1, "name": "Iron Concord",
                                                   "standing": "allied", "reputation": 0}))
 
-    out = await dip.resolve_intent(5, "ally", "Iron Concord")
+    out = await dip.resolve_intent(SID, "ally", "Iron Concord")
 
     assert out["standing_change"] == "allied"
     assert not fake.sql("execute"), "an unchanged standing was written anyway"

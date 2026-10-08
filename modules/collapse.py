@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 from core.log import info
 
 
@@ -94,48 +94,36 @@ COLLAPSE_STATES: dict[str, dict] = {
 }
 
 
-async def check_for_collapse(session_id: int = None, dry_run: bool = False) -> dict | None:
+def _writable_session(session_id: int | None) -> int:
+    """Resolve the session for one call and refuse a frozen campaign.
+
+    @param session_id - caller's session; `None` resolves through `core.session.require_session`.
+    @returns the resolved session id.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    Check all collapse conditions. Returns the first triggered collapse,
-    or None if the system is stable.
+    from core.ooc import _refuse_frozen
 
-    Call this at the end of every tick and after every time skip.
+    sid = session_id if session_id is not None else require_session(None)
+    _refuse_frozen(sid)
+    return sid
 
-    `dry_run=True` reports what WOULD happen and writes nothing. The name says check, and the body
-    writes: it creates an `events` row, completes the session's active `story_arc`, and opens a collapse
-    arc. A status query asking this question therefore destroyed the campaign it was asked about — the
-    `collapse_status` action in `scripts/kilo_bridge.py` routed a read to it, so a GM asking how the arc
-    was doing would complete its arc. Any caller that is reporting rather than ticking must pass
-    `dry_run=True`.
+
+async def _active_conditions(session_id: int, r) -> list[str]:
+    """Every collapse type whose trigger holds now, in priority order.
+
+    @param session_id - session whose flagship is read.
+    @param r - the session's `resources` row.
+    @returns collapse types; the first is the one reported.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
-
-    r = await Database.fetchrow(
-        """SELECT credits, fuel, alloys, population, aggregate_morale
-           FROM maya_rp.resources WHERE session_id=$1""",
-        session_id,
-    )
-    if not r:
-        return None
-
-    # 1. Fuel zero
+    found: list[str] = []
     if r["fuel"] is not None and r["fuel"] <= 0:
-        return await _trigger_collapse("fuel_zero", session_id, dry_run=dry_run)
-
-    # 2. Morale collapse
+        found.append("fuel_zero")
     if r["aggregate_morale"] is not None and r["aggregate_morale"] <= 15:
-        return await _trigger_collapse("morale_collapse", session_id, dry_run=dry_run)
-
-    # 3. Credits zero
+        found.append("morale_collapse")
     if r["credits"] is not None and r["credits"] <= 0:
-        return await _trigger_collapse("credits_zero", session_id, dry_run=dry_run)
-
-    # 4. Population zero
+        found.append("credits_zero")
     if r["population"] is not None and r["population"] <= 0:
-        return await _trigger_collapse("population_zero", session_id, dry_run=dry_run)
-
-    # 5. Flagship hull critical
+        found.append("population_zero")
     flagship = await Database.fetchrow(
         """SELECT name, hull_current, hull FROM maya_rp.ships
            WHERE session_id=$1 AND status='active'
@@ -152,8 +140,57 @@ async def check_for_collapse(session_id: int = None, dry_run: bool = False) -> d
         and flagship["hull_current"] is not None
         and flagship["hull_current"] <= (flagship["hull"] * 0.1)
     ):
-        return await _trigger_collapse("hull_critical", session_id, dry_run=dry_run)
+        found.append("hull_critical")
+    return found
 
+
+async def check_for_collapse(session_id: int = None, dry_run: bool = False) -> dict | None:
+    """
+    Check all collapse conditions. Returns the first triggered collapse,
+    or None if the system is stable.
+
+    Call this at the end of every tick and after every time skip.
+
+    `dry_run=True` reports what WOULD happen and writes nothing. The name says check, and the body
+    writes: it creates an `events` row, completes the session's active `story_arc`, and opens a collapse
+    arc. A status query asking this question therefore destroyed the campaign it was asked about — the
+    `collapse_status` action in `scripts/kilo_bridge.py` routed a read to it, so a GM asking how the arc
+    was doing would complete its arc. Any caller that is reporting rather than ticking must pass
+    `dry_run=True`.
+
+    A collapse arc whose own trigger no longer holds is completed (`status='completed'`,
+    `ended_at=NOW()`). Nothing closed it before, so a recovered fleet kept a live collapse arc for
+    ever. The trigger, not the longer `recovery` text, is the test: the recovery thresholds are
+    narrative and name no stat the engine reads.
+
+    @param session_id - session to check; `None` resolves through `require_session`.
+    @param dry_run - report only; writes nothing and needs no unfrozen session.
+    @returns the first triggered collapse dict, or None.
+    @raises core.ooc.FrozenSession - a non-dry call on a frozen campaign.
+    """
+    if dry_run:
+        if session_id is None:
+            session_id = require_session(None)
+    else:
+        session_id = _writable_session(session_id)
+
+    r = await Database.fetchrow(
+        """SELECT credits, fuel, alloys, population, aggregate_morale
+           FROM maya_rp.resources WHERE session_id=$1""",
+        session_id,
+    )
+    if not r:
+        return None
+
+    active = await _active_conditions(session_id, r)
+    if not dry_run:
+        await Database.execute(
+            """UPDATE maya_rp.story_arcs SET status='completed', ended_at=NOW()
+               WHERE session_id=$1 AND status='active' AND collapse_type IS NOT NULL
+               AND NOT (collapse_type = ANY($2::text[]))""",
+            session_id, active)
+    if active:
+        return await _trigger_collapse(active[0], session_id, dry_run=dry_run)
     return None
 
 
@@ -173,21 +210,24 @@ async def _trigger_collapse(collapse_type: str, session_id: int, dry_run: bool =
 
     info("collapse", f"⚠️ COLLAPSE: {config['title']} ({config['new_arc_theme']})")
 
-    # 1. End any active non-collapse arc
-    await Database.execute(
-        """UPDATE maya_rp.story_arcs
-           SET status='completed', ended_at=NOW()
-           WHERE session_id=$1 AND status='active' AND collapse_type IS NULL""",
-        session_id,
-    )
+    session_id = _writable_session(session_id)
 
-    # 2. Start a new collapse arc
+    # 1. Start a new collapse arc, or find the one already running. Step 2 (ending the ordinary arc)
+    # sits inside the creation branch: it ran on every tick the condition held and re-completed each
+    # arc the GM opened since.
     existing_collapse = await Database.fetchval(
         """SELECT id FROM maya_rp.story_arcs
            WHERE session_id=$1 AND status='active' AND collapse_type=$2 LIMIT 1""",
         session_id, collapse_type,
     )
     if not existing_collapse:
+        # 2. End any active non-collapse arc, once, when the collapse arc is created.
+        await Database.execute(
+            """UPDATE maya_rp.story_arcs
+               SET status='completed', ended_at=NOW()
+               WHERE session_id=$1 AND status='active' AND collapse_type IS NULL""",
+            session_id,
+        )
         await Database.execute(
             """INSERT INTO maya_rp.story_arcs
                (session_id, title, theme, central_conflict, stakes_description,
@@ -231,9 +271,10 @@ async def run_tick(session_id: int = None) -> dict:
     """
     Called at the end of every engine tick.
     Returns collapse info if triggered, or {'status': 'stable'}.
+
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
 
     collapse = await check_for_collapse(session_id)
     if collapse:

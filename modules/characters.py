@@ -5,28 +5,63 @@ zero call sites; kilo_bridge queries characters directly). Presence/control
 changes go through the database directly.
 """
 from core.db import Database
-from core.config import Config
+from core.session import require_session
+
+def _contains(text: str) -> str:
+    """LIKE pattern matching `text` as a literal substring (pair with `ESCAPE '\\'`).
+
+    @param text - user text.
+    @returns the escaped `%text%` pattern.
+    """
+    return "%" + str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _writable_session(session_id: int | None) -> int:
+    """Resolve the session for one call and refuse a frozen campaign.
+
+    @param session_id - caller's session; `None` resolves through `core.session.require_session`.
+    @returns the resolved session id.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    sid = session_id if session_id is not None else require_session(None)
+    _refuse_frozen(sid)
+    return sid
+
 
 async def run_tick(session_id: int = None):
     """Character arc aging (added 2026-08-14): arcs inactive for 20+ days
-    are marked stale and surfaced as events so the GM can retire or resume."""
+    are marked stale and surfaced as events so the GM can retire or resume.
+
+    `character_arcs` has no `session_id`: it reaches a session through `characters`. The old
+    query and `UPDATE ... WHERE id=$1` ran on every campaign's arcs, so a tick for a live session
+    staled the frozen sessions' arcs. One scoped statement now selects and updates, and the event
+    row commits with it.
+
+    @param session_id - session to tick; `None` resolves through `require_session`.
+    @returns `{"character_arcs": 0, "stale_arcs": n}`, or `{"error": ...}` on a database error.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
     from core.log import info
     import json
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
     try:
-        stale = await Database.fetch(
-            "SELECT id, character_table, character_id, arc_name FROM maya_rp.character_arcs "
-            "WHERE status='active' AND started_at < NOW() - INTERVAL '20 days'")
-        if stale:
-            for a in stale:
-                await Database.execute(
-                    "UPDATE maya_rp.character_arcs SET status='stale' WHERE id=$1", a["id"])
-            await Database.execute(
-                "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
-                "VALUES ($1, NOW(), 'character_arc', $2, $3, $4, 2)",
-                session_id, "Character arcs went stale",
-                f"{len(stale)} character arcs untouched for 20+ days — resume or retire",
-                json.dumps(["character", "arcs"]))
+        async with Database.transaction() as conn:
+            stale = await conn.fetch(
+                "UPDATE maya_rp.character_arcs a SET status='stale' "
+                "FROM maya_rp.characters c "
+                "WHERE a.character_table='characters' AND c.id=a.character_id AND c.session_id=$1 "
+                "AND a.status='active' AND a.started_at < NOW() - INTERVAL '20 days' "
+                "RETURNING a.id",
+                session_id)
+            if stale:
+                await conn.execute(
+                    "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
+                    "VALUES ($1, NOW(), 'character_arc', $2, $3, $4, 2)",
+                    session_id, "Character arcs went stale",
+                    f"{len(stale)} character arcs untouched for 20+ days — resume or retire",
+                    json.dumps(["character", "arcs"]))
         info("characters", f"Tick: arcs={len(stale)} stale")
         return {"character_arcs": 0, "stale_arcs": len(stale)}
     except Exception as e:
@@ -40,7 +75,13 @@ async def resolve_intent(session_id: int, action: str, target: str, character_id
     """
     Resolve a character interaction intent — talk/gift/arrest/promote.
     Returns {success, bond_change, reaction} for Deepseek narration.
+
+    @param session_id - session of the character; a frozen campaign is refused.
+    @param target - name fragment, matched literally (`%` and `_` are not wildcards).
+    @returns the result dict for narration.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
+    session_id = _writable_session(session_id)
     if character_id:
         char = await Database.fetchrow(
             "SELECT id, name, bond, role FROM maya_rp.characters WHERE id=$1 AND session_id=$2",
@@ -48,8 +89,8 @@ async def resolve_intent(session_id: int, action: str, target: str, character_id
     elif target:
         char = await Database.fetchrow(
             "SELECT id, name, bond, role FROM maya_rp.characters "
-            "WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) LIMIT 1",
-            session_id, f"%{target}%")
+            "WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) ESCAPE '\\' LIMIT 1",
+            session_id, _contains(target))
     else:
         return {"domain": "character", "success": False, "narrative_hook": "No character specified."}
 

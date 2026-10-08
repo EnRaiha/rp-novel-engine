@@ -6,8 +6,10 @@ the world, so the tests read what the module would send and never send it.
 from __future__ import annotations
 
 import asyncio
+import os
 import pathlib
 import sys
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -16,6 +18,10 @@ sys.path.insert(0, str(ROOT))
 
 import modules.chrono_engine as chrono  # noqa: E402
 from modules.calendar_tkg import DAYS_PER_MONTH  # noqa: E402
+
+
+#: Scratch campaign: sessions 3 and 5 are frozen, and the skip refuses them.
+SID = 900 + os.getpid() % 100
 
 
 def _run(coro):
@@ -38,7 +44,15 @@ class _StubDB:
         return None
 
     async def fetchval(self, sql, *args):
+        if sql.lstrip().startswith("UPDATE"):
+            # Relative writes with RETURNING: the credits balance and the new game day.
+            self.writes.append((sql, args))
+            if "maya_rp.sessions" in sql:
+                return self.day
+            return self.resources_row["credits"] + args[0]
         self.reads.append((sql, args))
+        if "SELECT 1 FROM maya_rp.resources" in sql:
+            return 1 if self.resources_row else None
         if "FROM maya_rp.sessions" in sql:
             return self.day
         if "AVG(personal_morale)" in sql:
@@ -52,6 +66,10 @@ class _StubDB:
     async def execute(self, sql, *args):
         self.writes.append((sql, args))
         return "OK"
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield self
 
     def wrote(self, needle):
         return [(sql, args) for sql, args in self.writes if needle in sql]
@@ -82,10 +100,10 @@ def test_a_session_without_a_resources_row_is_refused_before_anything_moves(monk
     stub = _StubDB(resources_row=None)
     monkeypatch.setattr(chrono, "Database", stub)
 
-    out = _run(chrono.execute_time_skip(30, "economy", session_id=5))
+    out = _run(chrono.execute_time_skip(30, "economy", session_id=SID))
 
     assert "error" in out, out
-    assert "No resources row for session 5" in out["error"]
+    assert f"No resources row for session {SID}" in out["error"]
     assert stub.writes == [], "a refused skip wrote to the database"
 
 
@@ -94,7 +112,7 @@ def test_a_skip_moves_the_treasury_and_the_calendar_together(monkeypatch, quiet_
                                   "aggregate_morale": 50}, day=2253)
     monkeypatch.setattr(chrono, "Database", stub)
 
-    out = _run(chrono.execute_time_skip(30, "balanced", session_id=3))
+    out = _run(chrono.execute_time_skip(30, "balanced", session_id=SID))
 
     assert out["credits_before"] == 1000
     assert out["days_skipped"] == 30
@@ -108,7 +126,7 @@ def test_an_unknown_focus_is_refused_instead_of_silently_balancing(monkeypatch, 
                                   "aggregate_morale": 50})
     monkeypatch.setattr(chrono, "Database", stub)
 
-    out = _run(chrono.execute_time_skip(30, "economy ", session_id=3))
+    out = _run(chrono.execute_time_skip(30, "economy ", session_id=SID))
 
     assert "Unknown focus" in out["error"], out
     assert stub.writes == [], "an unknown focus still moved the world"
@@ -121,7 +139,7 @@ def test_the_four_documented_focuses_are_the_four_accepted(monkeypatch, quiet_wo
         stub = _StubDB(resources_row={"credits": 1000, "alloys": 0, "fuel": 0,
                                       "aggregate_morale": 50})
         monkeypatch.setattr(chrono, "Database", stub)
-        out = _run(chrono.execute_time_skip(30, focus, session_id=3))
+        out = _run(chrono.execute_time_skip(30, focus, session_id=SID))
         assert "error" not in out, (focus, out)
 
 
@@ -151,7 +169,7 @@ def test_the_montage_names_the_calendar_months():
 
 
 def test_the_days_bounds_still_hold():
-    out = _run(chrono.execute_time_skip(0, "balanced", session_id=3))
+    out = _run(chrono.execute_time_skip(0, "balanced", session_id=SID))
     assert "Days must be >= 1" in out["error"]
     with pytest.raises(ValueError, match="Max 365 days"):
-        _run(chrono.execute_time_skip(366, "balanced", session_id=3))
+        _run(chrono.execute_time_skip(366, "balanced", session_id=SID))

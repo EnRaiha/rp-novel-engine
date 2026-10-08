@@ -21,10 +21,14 @@ No database: every test drives a fake Database.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
 import modules.espionage as espionage
+
+#: Scratch campaign: sessions 3 and 5 are frozen, and the writers refuse them.
+SID = 900 + os.getpid() % 100
 
 
 class FakeDB:
@@ -80,12 +84,12 @@ async def test_a_run_is_written_to_the_mission_log(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=FACTION, execute_tag="UPDATE 1"))
     _roll(monkeypatch, 100)          # a high roll on a 70 base is still a failure-free path
 
-    out = await espionage.run_espionage("Reavers", "scout_fleet", "Vane", 3)
+    out = await espionage.run_espionage("Reavers", "scout_fleet", "Vane", SID)
 
     logged = fake.args_for("INSERT INTO maya_rp.espionage_missions ", "execute")
     assert logged, "the mission was never recorded"
     args = logged[0]
-    assert args[0] == 3 and args[1] == 24 and args[2] == "scout_fleet" and args[3] == "Vane"
+    assert args[0] == SID and args[1] == 24 and args[2] == "scout_fleet" and args[3] == "Vane"
     assert args[5] == out["outcome"]
     assert json.loads(args[6]) == {"alloys": out["loot_alloys"], "credits": out["loot_credits"]}
     assert args[7] == out["rep_delta"]
@@ -95,7 +99,7 @@ async def test_a_run_is_written_to_the_mission_log(monkeypatch):
 async def test_an_unknown_faction_is_not_recorded(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=None))
 
-    out = await espionage.run_espionage("Nobody", "scout_fleet", "Vane", 3)
+    out = await espionage.run_espionage("Nobody", "scout_fleet", "Vane", SID)
 
     assert "not found" in out["error"]
     assert not fake.sql("execute")
@@ -104,7 +108,7 @@ async def test_an_unknown_faction_is_not_recorded(monkeypatch):
 async def test_an_unknown_mission_is_not_recorded(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=FACTION))
 
-    out = await espionage.run_espionage("Reavers", "steal_moon", "Vane", 3)
+    out = await espionage.run_espionage("Reavers", "steal_moon", "Vane", SID)
 
     assert "Unknown mission" in out["error"]
     assert not fake.sql("execute")
@@ -115,9 +119,9 @@ async def test_an_unknown_mission_is_not_recorded(monkeypatch):
 async def test_a_null_reputation_mission_still_runs(monkeypatch):
     faction = dict(FACTION, reputation=None)
     fake = _install(monkeypatch, FakeDB(fetchrow=faction, execute_tag="UPDATE 1"))
-    _roll(monkeypatch, 1)
+    _roll(monkeypatch, 100)
 
-    out = await espionage.run_espionage("Reavers", "sabotage", "Vane", 3)
+    out = await espionage.run_espionage("Reavers", "sabotage", "Vane", SID)
 
     assert out["outcome"] in ("critical_failure", "failure"), out
     assert fake.args_for("espionage_missions", "execute")
@@ -131,7 +135,7 @@ async def test_loot_is_reported_only_when_it_banks(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=FACTION, execute_tag="UPDATE 0"))
     _roll(monkeypatch, 30)           # above the critical band, at or below success
 
-    out = await espionage.run_espionage("Reavers", "steal_resources", "Vane", 5)
+    out = await espionage.run_espionage("Reavers", "steal_resources", "Vane", SID)
 
     assert out["outcome"] == "success"
     assert out["loot_alloys"] == 0 and out["loot_credits"] == 0, "loot that never landed was claimed"
@@ -144,12 +148,12 @@ async def test_loot_that_lands_is_reported(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=FACTION, execute_tag="UPDATE 1"))
     _roll(monkeypatch, 30)
 
-    out = await espionage.run_espionage("Reavers", "steal_resources", "Vane", 3)
+    out = await espionage.run_espionage("Reavers", "steal_resources", "Vane", SID)
 
     assert out["outcome"] == "success"
     assert out["loot_alloys"] == 2000 and out["loot_credits"] == 1000
     banked = fake.args_for("alloys=alloys+$1", "execute")[0]
-    assert banked == (2000, 1000, 3)
+    assert banked == (2000, 1000, SID)
 
 
 # ── 4. The faction lookup is deterministic ───────────────────────────────
@@ -158,11 +162,11 @@ async def test_the_faction_lookup_prefers_an_exact_name(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=FACTION, execute_tag="UPDATE 1"))
     _roll(monkeypatch, 30)
 
-    await espionage.run_espionage("Raiding Den Reavers", "scout_fleet", "Vane", 3)
+    await espionage.run_espionage("Raiding Den Reavers", "scout_fleet", "Vane", SID)
 
     sql = fake.sql("fetchrow")[0]
-    assert "ORDER BY (LOWER(name)=LOWER($2)) DESC, id LIMIT 1" in sql, sql
-    assert fake.args_for("FROM maya_rp.factions", "fetchrow")[0] == (3, "%Raiding Den Reavers%")
+    assert "ESCAPE '\\' ORDER BY (LOWER(name)=LOWER($3)) DESC, id LIMIT 1" in sql, sql
+    assert fake.args_for("FROM maya_rp.factions", "fetchrow")[0] == (SID, "%Raiding Den Reavers%", "Raiding Den Reavers")
 
 
 # ── 5. The stale tick ────────────────────────────────────────────────────
@@ -172,11 +176,11 @@ async def test_the_stale_resolution_is_session_scoped(monkeypatch):
             {"id": 12, "mission_type": "sabotage", "agent_name": "Kesh"}]
     fake = _install(monkeypatch, FakeDB(fetch=rows))
 
-    out = await espionage.run_tick(3)
+    out = await espionage.run_tick(SID)
 
     assert out == {"resolved_stale": 2}
     writes = fake.args_for("SET outcome=$1", "execute")
-    assert writes == [("went_dark", 11, 3), ("compromised", 12, 3)]
+    assert writes == [("went_dark", 11, SID), ("compromised", 12, SID)]
     sql = fake.sql("fetch")[0]
     assert "session_id=$1" in sql and "resolved_at IS NULL" in sql
 
@@ -191,7 +195,7 @@ async def test_run_tick_reports_a_crash_as_an_error(monkeypatch):
     _install(monkeypatch, FakeDB())
     monkeypatch.setattr("modules.espionage.Database.fetch", boom)
 
-    out = await espionage.run_tick(3)
+    out = await espionage.run_tick(SID)
 
     assert "dead drop lost" in out["error"]
     assert any("dead drop lost" in m for m in seen), seen
@@ -202,9 +206,9 @@ async def test_run_tick_reports_a_crash_as_an_error(monkeypatch):
 async def test_contract_the_log_reads_the_newest_fifteen_for_this_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetch=[{"mission_type": "sabotage"}]))
 
-    out = await espionage.list_espionage_log(5)
+    out = await espionage.list_espionage_log(SID)
 
     assert out == [{"mission_type": "sabotage"}]
     sql = fake.sql("fetch")[0]
     assert "em.session_id=$1" in sql and "LIMIT 15" in sql
-    assert fake.args_for("espionage_missions", "fetch")[0] == (5,)
+    assert fake.args_for("espionage_missions", "fetch")[0] == (SID,)

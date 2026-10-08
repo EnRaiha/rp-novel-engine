@@ -146,3 +146,91 @@ class TestOocBridgeMainWithUnreachableDatabase:
         reply = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert reply["ok"] is False and "ConnectionRefusedError" in reply["error"], reply
         assert code == 1
+
+
+class TestOocBridgeMainReplyOutlivesTheMirrorFlush:
+    """The memory-block refresh runs after the reply is printed; its failure cannot cost the reply."""
+
+    @pytest.fixture()
+    def quiet_pool(self, monkeypatch):
+        import io
+
+        from core.db import Database
+        from scripts import ooc_bridge
+
+        async def noop():
+            return None
+
+        monkeypatch.setattr(Database, "init", noop)
+        monkeypatch.setattr(Database, "close", noop)
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"call": "state", "session_id": SCRATCH})))
+
+        async def answer(_request):
+            return {"ok": True}
+
+        monkeypatch.setattr(ooc_bridge, "handle", answer)
+
+    async def test_a_flush_that_raises_still_leaves_the_reply_on_stdout(self, quiet_pool, monkeypatch, capsys):
+        """Pre-fix the flush ran in `finally` before `json.dump`: an exception it raised
+        propagated out of `main` and the reply was never printed."""
+        from scripts import ooc_bridge
+
+        async def explode():
+            raise RuntimeError("refresh blew up")
+
+        monkeypatch.setattr(ooc_bridge, "_flush_context_mirror", explode)
+        code = await ooc_bridge.main()
+        lines = capsys.readouterr().out.strip().splitlines()
+        assert lines == ['{"ok": true}'], lines
+        assert code == 0
+
+    async def test_the_reply_is_printed_before_the_flush_starts(self, quiet_pool, monkeypatch, capsys):
+        """Pre-fix the flush ran first: at flush time stdout was still empty."""
+        from scripts import ooc_bridge
+
+        seen: list[str] = []
+
+        async def record():
+            seen.append(capsys.readouterr().out)
+
+        monkeypatch.setattr(ooc_bridge, "_flush_context_mirror", record)
+        await ooc_bridge.main()
+        assert seen == ['{"ok": true}\n'], f"stdout at flush time: {seen!r}"
+
+    async def test_the_pool_closes_after_the_flush(self, quiet_pool, monkeypatch):
+        """The flush reads through the pool, so `Database.close` must come last."""
+        from core.db import Database
+        from scripts import ooc_bridge
+
+        order: list[str] = []
+
+        async def flush():
+            order.append("flush")
+
+        async def close():
+            order.append("close")
+
+        monkeypatch.setattr(ooc_bridge, "_flush_context_mirror", flush)
+        monkeypatch.setattr(Database, "close", close)
+        await ooc_bridge.main()
+        assert order == ["flush", "close"], order
+
+    @pytest.mark.parametrize("failure", ["import", "build"])
+    async def test_the_real_flush_swallows_its_own_failures(self, monkeypatch, tmp_path, failure):
+        """Pre-fix the `core.context` import sat outside the flush's `try`: an ImportError escaped."""
+        import core
+        from scripts import ooc_bridge
+
+        monkeypatch.setattr(ooc_bridge, "_CONTEXT_PENDING", [(SCRATCH, str(tmp_path / "ctx.md"))])
+        if failure == "import":
+            monkeypatch.delattr(core, "context", raising=False)
+            monkeypatch.setitem(sys.modules, "core.context", None)
+        else:
+            from core import context as context_layer
+
+            async def broken(_session_id):
+                raise RuntimeError("build failed")
+
+            monkeypatch.setattr(context_layer, "build_context", broken)
+        await ooc_bridge._flush_context_mirror()
+        assert not (tmp_path / "ctx.md").exists(), "a failed refresh wrote a mirror file"

@@ -61,6 +61,7 @@ _load_env_file()
 from core import ooc  # noqa: E402
 from core.config import Config  # noqa: E402
 from core.db import Database  # noqa: E402
+from core.log import warn  # noqa: E402
 from core.session import resolve_session
 
 CALLS = ("state", "turn", "canon", "portrait", "context", "persona", "inspect", "direct", "slaves")
@@ -147,19 +148,24 @@ def _append_context_pending(session_id: int, context_path: str, audits: int = 0)
 
 
 async def _flush_context_mirror() -> None:
-    """Write the memory blocks once per call, after the caller already has its answer."""
+    """Write the memory blocks once per call, after the reply is already printed.
+
+    A failed refresh is logged to stderr and dropped: the mirror is a cache, the reply is the
+    contract.
+    """
     if not _CONTEXT_PENDING:
         return
-    from core import context as context_layer
-
     session_id, path = _CONTEXT_PENDING[-1]
     try:
+        # Inside the try: a broken import must not escape past the caller's reply.
+        from core import context as context_layer
+
         data = await context_layer.build_context(session_id)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(data["text"])
-    except Exception:
-        return
+    except Exception as error:  # noqa: BLE001 — a stale mirror is recoverable, a lost reply is not
+        warn("ooc_bridge", f"context mirror refresh failed: {type(error).__name__}: {error}")
 
 
 def _session(request: dict) -> int:
@@ -393,11 +399,19 @@ async def main() -> int:
         code = 1
     else:
         code = 0 if reply.get("ok") else 1
-    finally:
-        await _flush_context_mirror()
-        await Database.close()
+    # The reply goes out first. A caller that waits for process exit still waits for the flush
+    # below, so there is no latency win; the guarantee is that a failed refresh cannot destroy
+    # the reply, and a caller that reads the pipe early gets it early.
     json.dump(reply, sys.stdout, default=str)
     sys.stdout.write("\n")
+    sys.stdout.flush()
+    try:
+        await _flush_context_mirror()
+    except Exception as error:  # noqa: BLE001 — the reply is already out; a refresh failure only logs
+        warn("ooc_bridge", f"context mirror flush raised: {type(error).__name__}: {error}")
+    finally:
+        # The flush reads through the pool, so close stays after it.
+        await Database.close()
     return code
 
 

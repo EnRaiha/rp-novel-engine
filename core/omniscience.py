@@ -69,6 +69,31 @@ def resolve(name: str, roster: list[str]) -> str | None:
     return close[0] if close else None
 
 
+def resolve_speaker(said: str, roster: list[str]) -> str | None:
+    """The roster name a captured speaker phrase refers to, retrying single words of a two-word capture.
+
+    `SPOKE` takes an optional second capitalised word, so a sentence-initial word is captured as
+    part of the name: "Lalu Wulan berkata" and "Kemudian Doyo berkata" came back as `Lalu Wulan`
+    and `Kemudian Doyo`, resolved to nothing, and were reported not_in_roster for people the roster
+    holds. When the whole phrase does not resolve, the last word is tried, then the first.
+
+    @param said - the captured phrase, one or two words.
+    @param roster - roster names.
+    @returns the roster name, or None when no reading resolves.
+    """
+    whole = resolve(said, roster)
+    if whole is not None:
+        return whole
+    words = said.split()
+    if len(words) < 2:
+        return None
+    for word in (words[-1], words[0]):
+        found = resolve(word, roster)
+        if found is not None:
+            return found
+    return None
+
+
 def speakers(text: str) -> list[str]:
     """Names attributed with speech in a turn, in the order they appear, without repeats.
 
@@ -103,12 +128,14 @@ async def check(session_id: int | None = None, text: str = "") -> dict[str, Any]
 
     findings: list[dict[str, Any]] = []
     for said in speakers(text):
-        name = resolve(said, list(where))
+        name = resolve_speaker(said, list(where))
         if name is None:
             findings.append({"character": said, "kind": "not_in_roster", "said": said,
                              "recorded_at": None, "scene": scene})
             continue
-        if where[name] == scene:
+        # `player_context.location` is NULL for every session, so comparing against it flagged every
+        # speaker with a recorded location as elsewhere (scene=None). An unknown side is no evidence.
+        if scene is None or where[name] is None or where[name] == scene:
             continue
         findings.append({"character": name, "kind": "speaks_elsewhere", "said": said,
                          "recorded_at": where[name], "scene": scene})

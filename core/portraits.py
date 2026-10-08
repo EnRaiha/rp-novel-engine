@@ -431,13 +431,25 @@ def build_prompt(character: dict[str, Any], emotion: str, *, sheet: str = "",
 
 
 async def find_character(session_id: int, name: str) -> dict[str, Any] | None:
-    """Resolve one character by name: exact, then prefix, then contains."""
+    """Resolve one character by name: exact, then prefix, then contains.
+
+    An empty name falls through to `%%`, which matches every character: `campaign.character_rules`
+    and `inspect_line` default `name=""` and got the most important character back. A blank name
+    resolves to nothing. `%`, `_` and `\\` in the name are escaped so they match literally.
+
+    @param session_id - session key; the configured session when None.
+    @param name - character name or fragment.
+    @returns the character row, or None when the name is blank or nothing matches.
+    """
     sid = int(session_id if session_id is not None else Config.SESSION_ID)
-    for pattern in (name, f"{name}%", f"%{name}%"):
+    if not name or not name.strip():
+        return None
+    literal = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    for pattern in (literal, f"{literal}%", f"%{literal}%"):
         row = await Database.fetchrow(
             "SELECT id, name, role, archetype, character_type, appearance, description,"
             " current_outfit, traits, bond, romance_stage, is_spouse FROM maya_rp.characters"
-            " WHERE session_id=$1 AND name ILIKE $2 ORDER BY importance DESC NULLS LAST, id LIMIT 1",
+            " WHERE session_id=$1 AND name ILIKE $2 ESCAPE '\\' ORDER BY importance DESC NULLS LAST, id LIMIT 1",
             sid,
             pattern,
         )
@@ -532,11 +544,13 @@ async def queue(session_id: int, name: str, occasion: str,
 
 #: How a render queue may be ordered. `id` is the default because it is the order the rows
 #: were queued, which is stable and needs no judgement. `bond` puts the closest partners
-#: first, and `name` is alphabetical. The order is a lever because "oldest first" is not a
+#: first by `characters.bond` (the relationship scale; `bond_level` is the marriage bond and is 0 for
+#: everyone until the marriages happen, so ordering by it was `a.id` in disguise),
+#: and `name` is alphabetical. The order is a lever because "oldest first" is not a
 #: statement about who matters: queueing 35 wives by id renders Rika Voss before Maya.
 QUEUE_ORDERS: dict[str, str] = {
     "id": "a.id",
-    "bond": "c.bond_level DESC NULLS LAST, a.id",
+    "bond": "c.bond DESC NULLS LAST, a.id",
     "name": "c.name, a.id",
 }
 

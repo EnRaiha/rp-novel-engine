@@ -18,8 +18,9 @@ class TestQueueOrders:
     def test_the_default_is_the_queue_order(self):
         assert portraits.QUEUE_ORDERS["id"] == "a.id"
 
-    def test_bond_orders_by_bond_level_first(self):
-        assert portraits.QUEUE_ORDERS["bond"].startswith("c.bond_level DESC")
+    def test_bond_orders_by_the_relationship_bond_not_the_marriage_bond(self):
+        """`bond_level` is 0 until a marriage happens (migration 124), so it ordered by id in disguise."""
+        assert portraits.QUEUE_ORDERS["bond"].startswith("c.bond DESC")
 
     def test_no_fragment_can_end_the_statement(self):
         """The fragments are constants, and the check keeps them from becoming anything else."""

@@ -17,6 +17,7 @@ from typing import Any, Sequence
 
 from core.config import Config
 from core.db import Database
+from core.log import warn
 
 OPS = {
     ">=": lambda a, b: a >= b,
@@ -94,8 +95,16 @@ async def stats(session_id: int) -> dict[str, Any]:
     return values
 
 
+_WARNED_STATS: set[str] = set()
+
+
 def condition_met(condition: str | dict[str, Any], values: dict[str, Any]) -> bool:
-    """Evaluate one ending condition against the stat map."""
+    """Evaluate one ending condition against the stat map.
+
+    @param condition - JSON text or dict with `stat`, `op`, `value`.
+    @param values - stat map from `stats()`.
+    @returns False for an unknown stat (warned once), an unknown op or an unreadable condition.
+    """
     if isinstance(condition, str):
         try:
             condition = json.loads(condition)
@@ -106,6 +115,13 @@ def condition_met(condition: str | dict[str, Any], values: dict[str, Any]) -> bo
     stat = condition.get("stat")
     op = OPS.get(str(condition.get("op") or ">="))
     if stat is None or op is None:
+        return False
+    # An unknown stat read as 0, so a `<`/`<=` ending naming a misspelled stat fired at once and
+    # `triggered_endings` stamped it permanently. A stat the map does not carry is not evidence.
+    if stat not in values:
+        if stat not in _WARNED_STATS:
+            _WARNED_STATS.add(stat)
+            warn("campaign", f"ending condition names unknown stat {stat!r}; treated as not met")
         return False
     try:
         left = float(values.get(stat, 0) or 0)
@@ -160,6 +176,10 @@ def near_endings(entries: Sequence[dict[str, Any]], values: dict[str, Any], rati
         if not isinstance(condition, dict):
             continue
         stat = condition.get("stat")
+        # The hint measures distance up to the target, which is only true for `>=`/`>`. For `<`/`<=`
+        # it printed a stat already below the line as "near".
+        if str(condition.get("op") or ">=") not in (">=", ">") or stat not in values:
+            continue
         try:
             target = float(condition.get("value", 0) or 0)
             current = float(values.get(stat, 0) or 0)
@@ -237,16 +257,49 @@ async def spend(session_id: int | None = None, kind: str = "", target: str | Non
     price = SPEND_PRICES.get(kind)
     if price is None:
         raise ValueError(f"unknown sink {kind!r}; known: {', '.join(sorted(SPEND_PRICES))}")
-    balance = int(
-        await Database.fetchval("SELECT COALESCE(roleplay_points,0) FROM maya_rp.ooc_system_state WHERE session_id=$1", sid)
-        or 0
+    if kind == "skip_beat" and not target:
+        raise ValueError("skip_beat needs the milestone name")
+    # Two concurrent `skip_beat` calls both read balance 25, both completed the beat, and the second
+    # debit then broke `roleplay_points >= 0`: one payment, two completions. The debit is one
+    # conditional statement and runs first, so the balance check and the spend are the same
+    # atomic step; only the caller that wins the debit applies the effect.
+    debited = await Database.fetchval(
+        "UPDATE maya_rp.ooc_system_state SET roleplay_points=roleplay_points-$2, updated_at=now()"
+        " WHERE session_id=$1 AND COALESCE(roleplay_points,0)>=$2 RETURNING roleplay_points",
+        sid,
+        price,
     )
-    if balance < price:
+    if debited is None:
+        balance = int(
+            await Database.fetchval(
+                "SELECT COALESCE(roleplay_points,0) FROM maya_rp.ooc_system_state WHERE session_id=$1", sid)
+            or 0
+        )
         raise ValueError(f"{kind} costs {price} rpp; the crown holds {balance}")
-    detail = ""
+    try:
+        detail = await _apply_spend(sid, kind, target)
+    except BaseException:
+        # The effect failed after the debit: give the points back so a refused spend costs nothing.
+        await Database.execute(
+            "UPDATE maya_rp.ooc_system_state SET roleplay_points=roleplay_points+$2, updated_at=now()"
+            " WHERE session_id=$1",
+            sid,
+            price,
+        )
+        raise
+    return {"ok": True, "sink": kind, "price": price, "spent_from": int(debited) + price, "detail": detail}
+
+
+async def _apply_spend(sid: int, kind: str, target: str | None) -> str:
+    """Apply one sink's effect after its price has been debited.
+
+    @param sid - resolved session id.
+    @param kind - sink name from `SPEND_PRICES`.
+    @param target - milestone name or intel text.
+    @returns the detail line for the spend result.
+    @raises ValueError - the effect cannot apply (no open beat, no observer, sink without a branch).
+    """
     if kind == "skip_beat":
-        if not target:
-            raise ValueError("skip_beat needs the milestone name")
         row = await Database.fetchrow(
             "UPDATE maya_rp.ooc_milestones SET completed_at=now()"
             " WHERE session_id=$1 AND name=$2 AND completed_at IS NULL RETURNING name",
@@ -255,29 +308,22 @@ async def spend(session_id: int | None = None, kind: str = "", target: str | Non
         )
         if row is None:
             raise ValueError(f"no open beat named {target}")
-        detail = f"beat {target} paid past"
-    elif kind == "calm_observer":
+        return f"beat {target} paid past"
+    if kind == "calm_observer":
         from core import ooc
 
         observer = await ooc.observer_id(sid)
         if observer is None:
             raise ValueError("no observer to calm")
         await ooc.bump_suspicion(sid, observer, -10, f"paid:{kind}")
-        detail = f"observer {observer} relaxed by 10"
-    elif kind == "reveal_intel":
+        return f"observer {observer} relaxed by 10"
+    if kind == "reveal_intel":
         await add_directive(sid, f"[paid:{kind}] {target or 'intel request'}")
-        detail = "intel request recorded"
-    else:
-        # A price without a branch would spend the points and record a director note as if the
-        # caller had asked for intel. The table and the branches are two lists; this refuses to
-        # let them disagree.
-        raise ValueError(f"sink {kind!r} has a price but no branch in spend()")
-    await Database.execute(
-        "UPDATE maya_rp.ooc_system_state SET roleplay_points=roleplay_points-$2, updated_at=now() WHERE session_id=$1",
-        sid,
-        price,
-    )
-    return {"ok": True, "sink": kind, "price": price, "spent_from": balance, "detail": detail}
+        return "intel request recorded"
+    # A price without a branch would spend the points and record a director note as if the
+    # caller had asked for intel. The table and the branches are two lists; this refuses to
+    # let them disagree.
+    raise ValueError(f"sink {kind!r} has a price but no branch in spend()")
 
 
 # ── Debuff effects (M6) ─────────────────────────────────────────────────────
@@ -457,66 +503,79 @@ async def restore_snapshot(data: dict[str, Any]) -> dict[str, Any]:
 
     _refuse_frozen(sid)
     state = data.get("state") or {}
-    if state:
-        await Database.execute(
-            "INSERT INTO maya_rp.ooc_system_state"
-            " (session_id, arc_stage, deviation, roleplay_points, audits, findings, debuff)"
-            " VALUES ($1,$2,$3,$4,$5,$6,$7)"
-            " ON CONFLICT (session_id) DO UPDATE SET arc_stage=EXCLUDED.arc_stage,"
-            " deviation=EXCLUDED.deviation, roleplay_points=EXCLUDED.roleplay_points,"
-            " audits=EXCLUDED.audits, findings=EXCLUDED.findings, debuff=EXCLUDED.debuff, updated_at=now()",
-            sid,
-            state.get("arc_stage", "lockdown"),
-            int(state.get("deviation", 0) or 0),
-            int(state.get("roleplay_points", 0) or 0),
-            int(state.get("audits", 0) or 0),
-            int(state.get("findings", 0) or 0),
-            state.get("debuff"),
-        )
-    milestones = 0
-    for milestone in data.get("milestones") or []:
-        applied = await Database.fetchval(
-            "UPDATE maya_rp.ooc_milestones SET completed_at=$3"
-            " WHERE session_id=$1 AND name=$2 RETURNING name",
-            sid,
-            milestone.get("name"),
-            _as_datetime(milestone.get("completed_at")),
-        )
-        # Counted only when a row was there: a snapshot can name a beat the target session does not
-        # carry, and the return value must not report that as restored.
-        milestones += 1 if applied else 0
-    exemptions = 0
-    for exemption in data.get("exemptions") or []:
-        await Database.execute(
-            "INSERT INTO maya_rp.ooc_exemptions"
-            " (session_id, rule_id, action_key, condition, cost_rpp, permanent, expires_at)"
-            " VALUES ($1,$2,$3,$4,$5,$6,$7)"
-            " ON CONFLICT (session_id, rule_id, action_key) DO UPDATE SET"
-            " condition=EXCLUDED.condition, cost_rpp=EXCLUDED.cost_rpp,"
-            " permanent=EXCLUDED.permanent, expires_at=EXCLUDED.expires_at",
-            sid,
-            exemption.get("rule_id"),
-            exemption.get("action_key"),
-            exemption.get("condition"),
-            int(exemption.get("cost_rpp") or 0),
-            bool(exemption.get("permanent")),
-            _as_datetime(exemption.get("expires_at")),
-        )
-        exemptions += 1
-    observers = 0
+    # Validate before the first write. A bad row used to raise after state, milestones and
+    # exemptions were already committed, leaving the target half-restored.
     for observer in data.get("suspicion") or []:
         if observer.get("observer_id") is None:
             raise ValueError("snapshot carries a suspicion row with no observer_id")
-        await Database.execute(
-            "INSERT INTO maya_rp.ooc_suspicion (session_id, observer_id, suspicion, last_reason)"
-            " VALUES ($1,$2,$3,$4)"
-            " ON CONFLICT (session_id, observer_id) DO UPDATE SET"
-            " suspicion=EXCLUDED.suspicion, last_reason=EXCLUDED.last_reason, updated_at=now()",
-            sid,
-            int(observer["observer_id"]),
-            int(observer.get("suspicion") or 0),
-            observer.get("last_reason"),
-        )
-        observers += 1
+    for milestone in data.get("milestones") or []:
+        _as_datetime(milestone.get("completed_at"))
+    for exemption in data.get("exemptions") or []:
+        _as_datetime(exemption.get("expires_at"))
+    milestones = 0
+    exemptions = 0
+    observers = 0
+    # One transaction on the yielded connection: an FK failure on rule_id or any later row rolls
+    # back every earlier write. Every statement goes through `conn`; a `Database.execute` here
+    # would autocommit on another pool connection and escape the rollback.
+    async with Database.transaction() as conn:
+        if state:
+            await conn.execute(
+                "INSERT INTO maya_rp.ooc_system_state"
+                " (session_id, arc_stage, deviation, roleplay_points, audits, findings, debuff)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7)"
+                " ON CONFLICT (session_id) DO UPDATE SET arc_stage=EXCLUDED.arc_stage,"
+                " deviation=EXCLUDED.deviation, roleplay_points=EXCLUDED.roleplay_points,"
+                " audits=EXCLUDED.audits, findings=EXCLUDED.findings, debuff=EXCLUDED.debuff, updated_at=now()",
+                sid,
+                state.get("arc_stage", "lockdown"),
+                int(state.get("deviation", 0) or 0),
+                int(state.get("roleplay_points", 0) or 0),
+                int(state.get("audits", 0) or 0),
+                int(state.get("findings", 0) or 0),
+                state.get("debuff"),
+            )
+        for milestone in data.get("milestones") or []:
+            applied = await conn.fetchval(
+                "UPDATE maya_rp.ooc_milestones SET completed_at=$3"
+                " WHERE session_id=$1 AND name=$2 RETURNING name",
+                sid,
+                milestone.get("name"),
+                _as_datetime(milestone.get("completed_at")),
+            )
+            # Counted only when a row was there: a snapshot can name a beat the target session does not
+            # carry, and the return value must not report that as restored.
+            milestones += 1 if applied else 0
+        for exemption in data.get("exemptions") or []:
+            await conn.execute(
+                "INSERT INTO maya_rp.ooc_exemptions"
+                " (session_id, rule_id, action_key, condition, cost_rpp, permanent, expires_at)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7)"
+                " ON CONFLICT (session_id, rule_id, action_key) DO UPDATE SET"
+                " condition=EXCLUDED.condition, cost_rpp=EXCLUDED.cost_rpp,"
+                " permanent=EXCLUDED.permanent, expires_at=EXCLUDED.expires_at",
+                sid,
+                exemption.get("rule_id"),
+                exemption.get("action_key"),
+                exemption.get("condition"),
+                int(exemption.get("cost_rpp") or 0),
+                bool(exemption.get("permanent")),
+                _as_datetime(exemption.get("expires_at")),
+            )
+            exemptions += 1
+        for observer in data.get("suspicion") or []:
+            if observer.get("observer_id") is None:
+                raise ValueError("snapshot carries a suspicion row with no observer_id")
+            await conn.execute(
+                "INSERT INTO maya_rp.ooc_suspicion (session_id, observer_id, suspicion, last_reason)"
+                " VALUES ($1,$2,$3,$4)"
+                " ON CONFLICT (session_id, observer_id) DO UPDATE SET"
+                " suspicion=EXCLUDED.suspicion, last_reason=EXCLUDED.last_reason, updated_at=now()",
+                sid,
+                int(observer["observer_id"]),
+                int(observer.get("suspicion") or 0),
+                observer.get("last_reason"),
+            )
+            observers += 1
     return {"ok": True, "session_id": sid, "state": bool(state), "milestones": milestones,
             "exemptions": exemptions, "suspicion": observers}

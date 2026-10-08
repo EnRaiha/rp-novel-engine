@@ -1,10 +1,12 @@
 """Prison module review: what reading `modules/prison.py` in full turned up.
 
-Five classes of defect, one class per group of tests below. Nothing here mutates session 3, and every
-row this file creates in session 5 is removed in a `finally`.
+Five classes of defect, one class per group of tests below. Sessions 3 and 5 are frozen reference
+data and are never written. Every test acts on a scratch session (900 + pid % 100), and the autouse
+fixture removes every row of the scratch sessions afterwards.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -12,12 +14,50 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
 
 from core.config import Config  # noqa: E402
 from core.db import Database  # noqa: E402
 from modules import prison  # noqa: E402
 
-SESSION = 5
+SESSION = 900 + os.getpid() % 100
+#: A second scratch campaign, for tests that need "another campaign".
+OTHER = 900 + (os.getpid() + 50) % 100
+
+
+async def _purge(session_id: int) -> None:
+    """Remove one scratch session's rows in foreign-key order."""
+    q = Database.execute
+    await q("DELETE FROM maya_rp.interrogation_log WHERE session_id=$1", session_id)
+    await q("DELETE FROM maya_rp.escape_countermeasures WHERE session_id=$1", session_id)
+    await q("DELETE FROM maya_rp.prisoner_intel_pipeline WHERE prisoner_id IN "
+            "(SELECT id FROM maya_rp.prisoners WHERE session_id=$1)", session_id)
+    await q("DELETE FROM maya_rp.crew_roster WHERE session_id=$1", session_id)
+    await q("DELETE FROM maya_rp.prisoners WHERE session_id=$1", session_id)
+    await q("DELETE FROM maya_rp.ships WHERE session_id=$1", session_id)
+    await q("DELETE FROM maya_rp.resources WHERE session_id=$1", session_id)
+    await q("DELETE FROM maya_rp.sessions WHERE id=$1", session_id)
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _scratch_sessions():
+    """Create the two scratch `sessions` rows, and remove everything they own afterwards.
+
+    A test closes the pool itself, so the teardown opens it again before the purge.
+    """
+    await Database.init()
+    for s in (SESSION, OTHER):
+        await _purge(s)
+        await Database.execute(
+            "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'Prison review scratch','active') "
+            "ON CONFLICT DO NOTHING", s)
+    try:
+        yield
+    finally:
+        await Database.init()
+        for s in (OTHER, SESSION):
+            await _purge(s)
+        await Database.close()
 
 
 async def _prisoner(**over):
@@ -61,38 +101,16 @@ async def _drop_ship(sid):
     await Database.execute("DELETE FROM maya_rp.ships WHERE id = $1", sid)
 
 
-#: Marks the `resources` row this file makes. Session 5 has none, and a campaign row for it would
-#: carry the real treasury, so only this exact figure is ever deleted.
+#: Credits a test seeds into the scratch session's `resources` row.
 MARKER = 987654321
-
-#: What session 5's row held before this file first touched it. `None` means the file created the row;
-#: `"absent"` means nothing was seeded in this run. The teardown reads this instead of guessing from a
-#: shape: `WHERE credits = ANY(...)` deleted the arc's own row whenever a test seeded zero credits,
-#: because the arc's row is zero credits too.
-_TOUCHED: dict[int, dict | None | str] = {}
 
 
 async def _resources(credits):
-    if SESSION not in _TOUCHED:
-        _TOUCHED[SESSION] = await Database.fetchrow(
-            "SELECT credits, research_points FROM maya_rp.resources WHERE session_id = $1", SESSION)
+    """Seed the scratch session's `resources` row. The autouse fixture removes it."""
     await Database.execute(
         "INSERT INTO maya_rp.resources (session_id, credits, research_points) VALUES ($1, $2, 0) "
         "ON CONFLICT (session_id) DO UPDATE SET credits = $2, research_points = 0",
         SESSION, credits)
-
-
-async def _drop_resources(*credits):
-    """Undo what `_resources` did to session 5: remove the row it created, or put the arc's row back."""
-    previous = _TOUCHED.pop(SESSION, "absent")
-    if previous == "absent":
-        return
-    if previous is None:
-        await Database.execute("DELETE FROM maya_rp.resources WHERE session_id = $1", SESSION)
-        return
-    await Database.execute(
-        "UPDATE maya_rp.resources SET credits = $2, research_points = $3 WHERE session_id = $1",
-        SESSION, previous["credits"], previous["research_points"])
 
 
 class TestConversionAnswersInsteadOfCrashing:
@@ -113,7 +131,7 @@ class TestTheWriteStaysInTheCampaign:
         await Database.init()
         row = await _prisoner()
         try:
-            out = await prison.record_death(row["id"], "execution", 3)
+            out = await prison.record_death(row["id"], "execution", OTHER)
             assert out is None
             status = await Database.fetchval(
                 "SELECT status FROM maya_rp.prisoners WHERE id = $1", row["id"])
@@ -256,7 +274,6 @@ class TestCountermeasureCostsMoney:
             assert ledger == 15
         finally:
             await _drop_prisoner(row["id"])
-            await _drop_resources(MARKER, MARKER - 15)
             await Database.close()
 
     async def test_a_session_that_cannot_pay_is_told_so(self):
@@ -280,7 +297,6 @@ class TestCountermeasureCostsMoney:
             assert logged == 0
         finally:
             await _drop_prisoner(row["id"])
-            await _drop_resources(5)
             await Database.close()
 
 

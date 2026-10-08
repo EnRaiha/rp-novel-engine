@@ -1297,17 +1297,21 @@ async def _suspicion_turn(
 ) -> tuple[int, str | None]:
     """Suspicion this turn moves, from micro-inconsistency alone (§6).
 
-    A small finding that is corrected on the next turn reads as the Host
-    covering its tracks; a clean turn lets the observer relax slowly.
+    A small finding that is corrected on the very next turn reads as the Host
+    covering its tracks, once; any later turn finds a newer event and only
+    relaxes. A clean turn lets the observer relax slowly.
 
     @param session_id - session key.
     @param findings - findings of the current turn.
     @param stage - arc stage (unused for now, kept for trait/stage weighting).
     @returns `(delta, reason)`.
     """
+    # Only the immediately preceding turn can be corrected, so the newest event of any
+    # disposition decides: once a clean, exempt or skipped event follows a flagged one,
+    # the flagged row no longer counts.
     previous = await Database.fetchrow(
-        "SELECT rule_id, delta FROM maya_rp.ooc_audit_events"
-        " WHERE session_id=$1 AND disposition='flagged' ORDER BY id DESC LIMIT 1",
+        "SELECT rule_id, delta, disposition FROM maya_rp.ooc_audit_events"
+        " WHERE session_id=$1 ORDER BY id DESC LIMIT 1",
         session_id,
     )
     flagged = {finding.rule_id for finding in findings}
@@ -1316,6 +1320,7 @@ async def _suspicion_turn(
     # read the one rule named as if it were the only one that fired.
     if (
         previous is not None
+        and previous["disposition"] == "flagged"
         and previous["rule_id"]
         and int(previous["delta"]) <= SUSPICION_MICRO_MAX
         and previous["rule_id"] not in flagged

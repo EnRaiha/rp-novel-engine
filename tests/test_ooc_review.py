@@ -439,6 +439,41 @@ class TestTheLedgerNamesEveryRuleThatFired:
         assert returned["suspicion_delta"] == ooc.SUSPICION_MU
         assert returned["suspicion_reason"] == f"micro_consistency:{first}"
 
+    async def test_a_correction_counts_for_the_very_next_turn_only(self, scratch_session, monkeypatch):
+        """Later clean turns find a newer event than the flagged one, so they relax instead."""
+        (rule,) = await self._real_rules(1)
+        observer = await Database.fetchval(
+            "INSERT INTO maya_rp.characters (session_id, name, status)"
+            " VALUES ($1, 'Review Observer', 'active') RETURNING id", scratch_session)
+
+        async def stored() -> int:
+            return await Database.fetchval(
+                "SELECT suspicion FROM maya_rp.ooc_suspicion WHERE session_id=$1 AND observer_id=$2",
+                scratch_session, observer)
+
+        async def no_knowledge(*args):
+            return []
+
+        try:
+            # A second finding from the knowledge rules would leave the ledger row with no rule id.
+            monkeypatch.setattr(ooc, "knowledge_findings", no_knowledge)
+            monkeypatch.setattr(ooc, "audit_text", lambda text, rules, layer: [self._finding(rule)])
+            await ooc.audit("prose to audit", scratch_session, turn_ref="review")
+            monkeypatch.setattr(ooc, "audit_text", lambda text, rules, layer: [])
+            corrected = await ooc.audit("prose to audit", scratch_session, turn_ref="review")
+            assert corrected["suspicion_delta"] == ooc.SUSPICION_MU
+            assert corrected["suspicion_reason"] == f"micro_consistency:{rule}"
+            assert await stored() == ooc.SUSPICION_MU
+            for turn, expected in ((3, ooc.SUSPICION_MU - ooc.SUSPICION_MU_DECAY),
+                                   (4, ooc.SUSPICION_MU - 2 * ooc.SUSPICION_MU_DECAY)):
+                clean = await ooc.audit("prose to audit", scratch_session, turn_ref="review")
+                assert clean["suspicion_delta"] == -ooc.SUSPICION_MU_DECAY, f"turn {turn} relaxes"
+                assert clean["suspicion_reason"] is None, f"turn {turn} is not a correction"
+                assert await stored() == expected, f"turn {turn} leaves the stored suspicion relaxed"
+        finally:
+            # Deleting the character cascades to its `ooc_suspicion` row.
+            await Database.execute("DELETE FROM maya_rp.characters WHERE id=$1", observer)
+
     async def test_a_turn_with_several_rules_cannot_claim_a_correction(self, scratch_session, monkeypatch):
         """Before, the row named the first rule, so the second one re-firing still read as a fix."""
         first, second, third = await self._real_rules(3)

@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 from core.db import Database
-from core.config import Config
 from core.log import warn
 
 
@@ -41,15 +40,49 @@ async def record(
     provenance columns instead of inserting (single source of truth). Returns
     None when that row does not exist in this session, so a miss is not reported
     as a write.
+
+    jsonb parameters are bound as `json.dumps` text: `core.db` registers no jsonb
+    codec, so asyncpg rejected a dict with `DataError: expected str, got dict` and
+    every call failed. The INSERT writes `state_delta` to both `state_after` and
+    `impact_deltas`: `by_fact` and `chain` read both columns, so the delta must be
+    visible in each.
+
+    The UPDATE leaves an unset argument alone (`COALESCE($n, col)`). Defaulting
+    to `[]`/`{}` overwrote parent_id, game_day, event_ids and state_before that
+    `link_event` or an earlier record had written, erasing the provenance the
+    call was meant to extend. To clear a column, pass an explicit empty value.
+
+    @param actor - issuing party, stored in `issued_by`.
+    @param decision_type - a `decree_type` allowed by the table check constraint.
+    @param title - decision title.
+    @param description - free text, INSERT only.
+    @param parent_id - decision this one follows from; None keeps the stored value on UPDATE.
+    @param game_day - game day; None keeps the stored value on UPDATE.
+    @param state_delta - dict written to `state_after` (and `impact_deltas` on INSERT).
+    @param state_before - dict written to `state_before`.
+    @param event_ids - evidence event ids; None keeps the stored value on UPDATE.
+    @param decree_id - existing decree to update instead of inserting.
+    @param priority - INSERT only.
+    @param secrecy - INSERT only.
+    @param session_id - session, used as given when not None; resolved per call via `require_session` when None.
+    @returns the decision id, or None when `decree_id` is not in this session.
     """
-    sid = session_id if session_id is not None else Config.SESSION_ID
+    # Resolved per call: Config.SESSION_ID is fixed at import, so a long-lived
+    # process kept writing decisions into the session that was current at start.
+    from core.session import require_session
+    # An explicit id is read as given, 0 included; only an omitted one resolves per call.
+    sid = session_id if session_id is not None else require_session(None)
+    before = None if state_before is None else json.dumps(state_before)
+    after = None if state_delta is None else json.dumps(state_delta)
     if decree_id is not None:
         tag = await Database.execute(
-            "UPDATE maya_rp.cabinet_decrees SET parent_id=$1, game_day=$2, "
-            "event_ids=$3::int[], state_before=$4::jsonb, "
-            "state_after=$5::jsonb WHERE id=$6 AND session_id=$7",
-            parent_id, game_day, event_ids or [], state_before or {},
-            state_delta or {}, decree_id, sid,
+            "UPDATE maya_rp.cabinet_decrees SET "
+            "parent_id=COALESCE($1, parent_id), game_day=COALESCE($2, game_day), "
+            "event_ids=COALESCE($3::int[], event_ids), "
+            "state_before=COALESCE($4::jsonb, state_before), "
+            "state_after=COALESCE($5::jsonb, state_after) "
+            "WHERE id=$6 AND session_id=$7",
+            parent_id, game_day, event_ids, before, after, decree_id, sid,
         )
         if tag.rsplit(" ", 1)[-1] == "0":
             warn("decision", f"decree {decree_id} not found in session {sid}; "
@@ -63,7 +96,7 @@ async def record(
         "VALUES ($1,$2,$3,$4,$5,'executing',$6,$7,$8,$9,$10::int[],$11::jsonb,$12::jsonb,$12::jsonb) "
         "RETURNING id",
         sid, actor, decision_type, title, description, priority, secrecy,
-        parent_id, game_day, event_ids or [], state_before or {}, state_delta or {},
+        parent_id, game_day, event_ids or [], before or "{}", after or "{}",
     )
     return row["id"]
 
@@ -144,17 +177,23 @@ async def decisions(session_id: int, *, day: Optional[int] = None,
                     limit: int = 20) -> list[dict]:
     """Unified decision list (decrees + plan) with optional filters.
 
+    `day` matches `game_day`, which the view reports as NULL for every plan row,
+    so a `day` filter returns decrees only.
+
     The `decision_stream` view select-lists both branches without their
     `session_id`, so filtering has to ask the base tables which row belongs to
-    this session. Without it the call returned every campaign's decisions.
+    this session. Without it the call returned every campaign's decisions. The
+    base predicate is parenthesised as a whole: the appended `AND` filters bound
+    only to the plan branch of the `OR`, so `status`/`kind`/`day` let every
+    decree through.
     """
     sql = ["SELECT kind, decision_id, parent_id, game_day, actor, decision_type, "
            "       title, status, priority, secrecy_level, impact_deltas, "
            "       event_ids, occurred_at FROM maya_rp.decision_stream "
-           "WHERE (kind = 'decree' AND decision_id IN "
+           "WHERE ((kind = 'decree' AND decision_id IN "
            "         (SELECT id FROM maya_rp.cabinet_decrees WHERE session_id = $1)) "
            "   OR (kind = 'plan' AND decision_id IN "
-           "         (SELECT id FROM maya_rp.grand_plan WHERE session_id = $1))"]
+           "         (SELECT id FROM maya_rp.grand_plan WHERE session_id = $1)))"]
     args: list = [session_id]
     if day is not None:
         args.append(day)

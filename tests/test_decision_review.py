@@ -29,6 +29,8 @@ No database: every test drives a fake connection.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from core import decision
@@ -133,7 +135,7 @@ async def test_add_cli_records_a_decision(db):
     assert out == {"decision_id": 42, "title": "Ammunition"}
     _, _, args = db.last("fetchrow")
     assert args[3] == "Ammunition" and args[8] == 7, args
-    assert args[11] == {"credits": -5}, args
+    assert json.loads(args[11]) == {"credits": -5}, "jsonb parameters are bound as JSON text"
 
 
 async def test_link_event_logs_a_miss(db):

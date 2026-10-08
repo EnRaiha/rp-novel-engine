@@ -123,8 +123,9 @@ class TestTheRestoreCountsWhatLanded:
         # `suspicion` carries a CHECK of 0..100, so the second row fails the batch after the first
         # row inserted. The savepoint rolls both back and the retry inserts the good one.
         bad = dict(good, suspicion=500)
+        # A restore that leaves a row out rolls back by default; this test is about the count, so it opts in.
         path = _sav(tmp_path, {"ooc_suspicion": [good, bad]}, session_id=session)
-        result = await savegame.import_sav(path, session_id=session, wipe=False)
+        result = await savegame.import_sav(path, session_id=session, wipe=False, allow_partial=True)
         landed = await Database.fetchval(
             "SELECT count(*) FROM maya_rp.ooc_suspicion WHERE session_id=$1", session)
         assert landed == 1, "the retry inserts the good row and the bad one stays out"

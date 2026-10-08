@@ -31,10 +31,11 @@ and any table containing pgvector columns (vector types cannot round-trip
 through JSON; novel_chunks/wiki_articles are re-ingestible).
 """
 from __future__ import annotations
-import asyncio, hashlib, json, sys, time
+import asyncio, hashlib, json, re, sys, time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable, NamedTuple
 from core.config import Config
 from core.db import Database
 from core.log import info, error
@@ -218,6 +219,115 @@ def fk_cycle_members(tables: set, fk_edges: list) -> set:
     return set(tables) - done
 
 
+#: Every maya_rp table and column name matches this shape (checked against information_schema).
+_IDENT_RE = re.compile(r"[a-z_][a-z0-9_]*")
+
+
+def _ident(name: str, known: set | None = None) -> str:
+    """Validate one SQL identifier and return it double-quoted.
+
+    Table names in an import come from the .sav file, and column names come from its row keys. Both
+    are interpolated into SQL, so a crafted file with `x"; DROP ...` in a key ran as written.
+
+    @param name - table or column name.
+    @param known - when given, the name must be in this set (the live maya_rp table list).
+    @returns the name wrapped in double quotes.
+    @raises ValueError - the name has a quote or a non-identifier character, or is not in `known`.
+    """
+    if not isinstance(name, str) or not _IDENT_RE.fullmatch(name):
+        raise ValueError(f"unsafe SQL identifier {name!r}: only [a-z0-9_] names are accepted")
+    if known is not None and name not in known:
+        raise ValueError(f"unknown maya_rp table {name!r}")
+    return f'"{name}"'
+
+
+class FkRef(NamedTuple):
+    """One maya_rp foreign key. `on_delete` is pg_constraint.confdeltype:
+    a = no action, r = restrict, c = cascade, n = set null, d = set default."""
+    child: str
+    parent: str
+    columns: tuple
+    ref_columns: tuple
+    on_delete: str
+
+
+class DetachStep(NamedTuple):
+    """Detach statements for one FK. `update_sql` runs first; `delete_sql` runs only when the
+    update fails (NOT NULL column). Both are scoped to rows that reference the wiped parent rows."""
+    child: str
+    columns: tuple
+    update_sql: str
+    delete_sql: str
+    params: tuple
+
+
+#: Delete actions the database applies itself when the parent rows go, scoped to those rows.
+_DB_HANDLED_DELETE = {"c", "n", "d"}
+
+
+class DetachRefused(RuntimeError):
+    """A wipe would delete rows of a non-session table that a kept table still references.
+
+    The wipe deletes a non-session-scoped parent whole, so detaching its children cannot be scoped to
+    one session: it nulls or deletes the child rows of every session, frozen session 3 included.
+    """
+
+    def __init__(self, refs: list):
+        self.refs = list(refs)
+        edges = ", ".join(f"{r.child}.{'/'.join(r.columns)} -> {r.parent}" for r in self.refs[:8])
+        more = "" if len(self.refs) <= 8 else f" (+{len(self.refs) - 8} more)"
+        super().__init__(
+            f"wipe refused before any write: {len(self.refs)} kept table FK(s) point at non-session "
+            f"tables the wipe deletes whole, and detaching them would touch every session: "
+            f"{edges}{more}. Restore with wipe=False (CLI: --keep-session).")
+
+
+def _detach_plan(fk_rows: Iterable[FkRef], wipe_set: set, session_scoped_tables: set,
+                 session_id: int) -> list[DetachStep]:
+    """Plan the detach of kept tables from the rows a wipe deletes. Pure: no DB access.
+
+    Incident: the detach loop ran `UPDATE child SET col=NULL` with no WHERE, and on a NOT NULL column
+    fell back to `DELETE FROM child` with no WHERE. Restoring a session-5 file deleted every
+    ship_armaments and fleet_members row, frozen session 3's ~109k included; both tables are partial,
+    so the restore skipped them and the transaction committed the loss.
+
+    @param fk_rows - every maya_rp FK, as FkRef.
+    @param wipe_set - tables the wipe deletes from.
+    @param session_scoped_tables - tables with a session_id column; the wipe deletes only `session_id`'s rows there.
+    @param session_id - session being wiped; bound as $1 in every step.
+    @returns one DetachStep per FK that needs a detach. CASCADE / SET NULL / SET DEFAULT children of a
+        session-scoped parent get none: the database applies them to the deleted parent rows only.
+    @raises DetachRefused - a kept table references a wiped parent that is not session-scoped.
+    @raises ValueError - an identifier fails `_ident`.
+    """
+    steps: list[DetachStep] = []
+    refused: list[FkRef] = []
+    for fk in fk_rows:
+        if fk.parent not in wipe_set or fk.child in wipe_set:
+            continue
+        if fk.parent not in session_scoped_tables:
+            # Covers CASCADE too: the parent DELETE has no WHERE, so the cascade reaches every session.
+            refused.append(fk)
+            continue
+        if fk.on_delete in _DB_HANDLED_DELETE:
+            continue
+        child, parent = _ident(fk.child), _ident(fk.parent)
+        cols = [_ident(c) for c in fk.columns]
+        refs = [_ident(c) for c in fk.ref_columns]
+        lhs = cols[0] if len(cols) == 1 else "(" + ", ".join(cols) + ")"
+        scope = (f"{lhs} IN (SELECT {', '.join(refs)} FROM maya_rp.{parent} "
+                 f"WHERE session_id=$1)")
+        sets = ", ".join(f"{c}=NULL" for c in cols)
+        steps.append(DetachStep(
+            child=fk.child, columns=tuple(fk.columns),
+            update_sql=f"UPDATE maya_rp.{child} SET {sets} WHERE {scope}",
+            delete_sql=f"DELETE FROM maya_rp.{child} WHERE {scope}",
+            params=(session_id,)))
+    if refused:
+        raise DetachRefused(refused)
+    return steps
+
+
 # ─── Schema inventory (live DB) ─────────────────────────────────────────
 
 async def _schema_inventory() -> tuple[set, set, set, list]:
@@ -254,6 +364,29 @@ async def _fk_child_columns() -> list[tuple[str, str, str]]:
         "WHERE k.contype='f' AND n.nspname='maya_rp'")]
 
 
+async def _fk_refs() -> list[FkRef]:
+    """Every maya_rp FK with its column lists (in key order) and delete action.
+
+    @returns FkRef per constraint whose child and parent are both in maya_rp.
+    """
+    rows = await Database.fetch(
+        "SELECT c1.relname AS child, c2.relname AS parent, k.confdeltype::text AS on_delete, "
+        "(SELECT array_agg(a.attname ORDER BY u.ord) FROM unnest(k.conkey) WITH ORDINALITY "
+        " AS u(attnum, ord) JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum) "
+        " AS cols, "
+        "(SELECT array_agg(a.attname ORDER BY u.ord) FROM unnest(k.confkey) WITH ORDINALITY "
+        " AS u(attnum, ord) JOIN pg_attribute a ON a.attrelid = k.confrelid AND a.attnum = u.attnum) "
+        " AS ref_cols "
+        "FROM pg_constraint k "
+        "JOIN pg_class c1 ON c1.oid = k.conrelid "
+        "JOIN pg_class c2 ON c2.oid = k.confrelid "
+        "JOIN pg_namespace n ON n.oid = c1.relnamespace "
+        "JOIN pg_namespace n2 ON n2.oid = c2.relnamespace "
+        "WHERE k.contype='f' AND n.nspname='maya_rp' AND n2.nspname='maya_rp'")
+    return [FkRef(r["child"], r["parent"], tuple(r["cols"] or ()), tuple(r["ref_cols"] or ()),
+                  str(r["on_delete"])) for r in rows]
+
+
 # ─── Export ─────────────────────────────────────────────────────────────
 
 #: Above this many parent ids the child is exported whole rather than filtered: an `= ANY($1)` with
@@ -281,16 +414,30 @@ class SaveIncomplete(RuntimeError):
 async def export_sav(session_id: int = 3, out_dir: str | None = None) -> str:
     """Dump full state → .sav JSON file. Returns file path.
 
+    @param session_id - session to dump.
+    @param out_dir - target directory; defaults to Config BACKUP_DIR.
+    @returns path of the written .sav.
     @raises SaveIncomplete - when any table fails to read. Nothing is written in that case.
+    @raises ValueError - the session does not exist.
     """
+    # Close only a pool this call opened: the orchestrator exports in-process after every tick, and
+    # the unconditional close shut its shared pool. Early raises skipped the close and leaked it.
+    created = Database.pool is None
     await Database.init()
+    try:
+        return await _export(session_id, out_dir)
+    finally:
+        if created:
+            await Database.close()
+
+
+async def _export(session_id: int, out_dir: str | None) -> str:
     session_row = await Database.fetchrow(
         "SELECT id, game_day FROM maya_rp.sessions WHERE id=$1", session_id)
     if session_row is None:
         # Every session-scoped table would come back empty, the file would still look like a
         # checkpoint, and the restore path trusts it. Refuse by name, the way an audit of a session
         # that does not exist is refused, rather than write a file that restores an empty campaign.
-        await Database.close()
         raise ValueError(
             f"no session {session_id}: refusing to write a checkpoint of a campaign that does not exist")
 
@@ -366,7 +513,6 @@ async def export_sav(session_id: int = 3, out_dir: str | None = None) -> str:
 
     if failed:
         # Refuse rather than write a snapshot with a hole in it.
-        await Database.close()
         raise SaveIncomplete(failed)
 
     payload = {
@@ -393,7 +539,6 @@ async def export_sav(session_id: int = 3, out_dir: str | None = None) -> str:
     fp.write_text(json.dumps(payload, default=_json_default, indent=1))
     info("savegame", f"Exported {len([t for t, v in tables.items() if isinstance(v, list)])} "
                      f"tables → {fp.name}")
-    await Database.close()
     return str(fp)
 
 
@@ -428,16 +573,45 @@ class SessionMismatch(RuntimeError):
             f"is really what you want.")
 
 
+class RestoreIncomplete(RuntimeError):
+    """Rows of a .sav could not be restored, so the whole import rolled back.
+
+    The import used to log the leftovers and commit: the wipe stood, the rows it could not put back
+    stayed gone, and the result still said ok True.
+    """
+
+    def __init__(self, failures: list[tuple[str, str]]):
+        self.failures = list(failures)
+        tables = sorted({t for t, _ in self.failures})
+        causes = "; ".join(f"{t}: {c}" for t, c in self.failures[:3])
+        super().__init__(
+            f"{len(self.failures)} row(s) could not be restored, so nothing was committed "
+            f"(tables: {', '.join(tables[:8])}). First causes: {causes}. "
+            f"Pass allow_partial=True to commit the partial restore.")
+
+
 async def import_sav(path: str, session_id: int | None = None, wipe: bool = True,
-                     allow_session_mismatch: bool = False) -> dict:
+                     allow_session_mismatch: bool = False, force: bool = False,
+                     allow_partial: bool = False) -> dict:
     """Restore PG from a .sav file. wipe=True resets ALL current session/catalog
     tables to the snapshot (FK-safe ordered DELETE, no TRUNCATE CASCADE).
 
     Note: restoring a .sav produced before the 2026-08-14 fix will reset
     tables that were absent from that older partial snapshot — that is the
     correct full-reset semantic; keep a fresh export as your working save.
+
+    @param path - .sav file.
+    @param session_id - target session; defaults to the file's.
+    @param wipe - delete the session's rows and the catalog tables before loading.
+    @param allow_session_mismatch - restore another session's file on purpose.
+    @param force - restore a file whose checksum does not match.
+    @param allow_partial - commit even when rows could not be restored.
+    @returns {"ok": True, "restored_rows", ...}, or {"ok": False, "error"} for a file refused before any DB access.
+    @raises SessionMismatch, SaveIncomplete - file refused before any DB access.
+    @raises DetachRefused - the wipe would reach other sessions' rows; nothing written.
+    @raises RestoreIncomplete - rows could not be restored and allow_partial is False; rolled back.
+    @raises ValueError - a table or column name in the file is not a safe known identifier; rolled back.
     """
-    await Database.init()
     p = Path(path)
     if not p.exists():
         return {"ok": False, "error": f"not found: {path}"}
@@ -446,8 +620,6 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
         return {"ok": False, "error": "not a tkg-sav file"}
 
     checksum_ok = _verify_checksum(data)
-    if not checksum_ok:
-        info("savegame", f"WARNING: checksum mismatch on {p.name} — proceeding anyway")
 
     file_session = data["header"].get("session_id")
     if session_id is not None and file_session is not None and int(session_id) != int(file_session):
@@ -462,10 +634,39 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
               if isinstance(value, dict) and "__error__" in value}
     if broken:
         raise SaveIncomplete({name: str(err) for name, err in broken.items()})
+
+    if not checksum_ok:
+        # A mismatch used to log "proceeding anyway" and then wipe. A file that writes nothing
+        # (no wipe, no rows) is harmless and still passes. A file with no checksum at all (written
+        # before exports carried one, or by hand) cannot be shown altered: it warns and proceeds.
+        writes = wipe or any(isinstance(v, list) and v for v in tables.values())
+        if not data.get("header", {}).get("checksum"):
+            info("savegame", f"WARNING: {p.name} carries no checksum, restoring it unverified")
+        elif writes and not force:
+            return {"ok": False, "error": f"checksum mismatch on {p.name}: refusing to restore a "
+                                          f"file that changed after it was written. "
+                                          f"Pass force=True to restore it anyway."}
+        elif writes:
+            info("savegame", f"WARNING: checksum mismatch on {p.name}, restoring under force=True")
+
+    # Close only a pool this call opened: an in-process caller keeps its shared pool, and an
+    # early raise no longer leaks one.
+    created = Database.pool is None
+    await Database.init()
+    try:
+        return await _restore(data, tables, sid, wipe, allow_partial, checksum_ok)
+    finally:
+        if created:
+            await Database.close()
+
+
+async def _restore(data: dict, tables: dict, sid: int, wipe: bool, allow_partial: bool,
+                   checksum_ok: bool) -> dict:
     restored = 0
     row_errors = 0
     skipped_tables = 0
-    deferred: list[tuple[str, str]] = []   # (insert SQL, table) awaiting parents
+    sequences_reset = 0
+    deferred: list[tuple[str, str, str]] = []   # (insert SQL, table, last error) awaiting parents
     # A table the file carries only in part must not be wiped and must not be restored: the wipe
     # would delete rows the file cannot put back, and the insert would leave the table holding only
     # what the file happens to carry. Session 3's 109,149 ship_armaments would have gone that way.
@@ -477,70 +678,83 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
                          + ", ".join(sorted(partial)[:6]))
 
     async with Database.transaction() as conn:
+        all_tables, has_sid, vector_tables, fks = await _schema_inventory()
+        # Table names and row keys come from the file and are interpolated into SQL: validate them
+        # all before the first write.
+        # A well-formed name the live schema lacks (a table from a newer or older build) is skipped and
+        # counted, as before; a malformed name is refused.
+        unknown_tables: set[str] = set()
+        for t, rows in tables.items():
+            if t in partial or not isinstance(rows, list) or not rows:
+                continue
+            if _ident(t) and t not in all_tables:
+                unknown_tables.add(t)
+                info("savegame", f"restore skip {t}: no such table in maya_rp")
+                continue
+            if isinstance(rows[0], dict):
+                for c in rows[0].keys():
+                    _ident(c)
+
         if wipe:
-            all_tables, has_sid, vector_tables, fks = await _schema_inventory()
             session_scoped, global_tables = classify_tables(
                 all_tables, has_sid, vector_tables, EXCLUDED_TABLES)
             session_set = set(session_scoped)
             wipe_set = ((set(session_scoped) | set(global_tables)) - {"sessions"}) - partial
             order = fk_wipe_order(wipe_set, fks)
-            fk_cols = await _fk_child_columns()
-            # Tables left OUT of the wipe (excluded logs, vector/RAG tables) can
-            # still hold FKs into tables we are about to wipe — PostgreSQL then
-            # aborts the parent DELETE and the whole restore rolls back
-            # (e.g. sessions.primary_partner_id -> characters,
-            #  roll_history.difficulty_id -> difficulty_tiers). Detach first:
-            # NULL the referencing column, and only delete rows if it is NOT NULL.
-            for child, parent, col in fk_cols:
-                if parent not in wipe_set or child in wipe_set:
-                    continue
+            refs = await _fk_refs()
+            # Tables left OUT of the wipe (excluded logs, vector/RAG tables, partial tables) can
+            # still hold FKs into tables we are about to wipe — PostgreSQL then aborts the parent
+            # DELETE (e.g. sessions.primary_partner_id -> characters). Planned before any write:
+            # DetachRefused aborts with nothing touched.
+            plan = _detach_plan(refs, wipe_set, session_set, sid)
+            for step in plan:
                 try:
                     async with conn.transaction():  # savepoint
-                        await conn.execute(f'UPDATE maya_rp.{child} SET "{col}"=NULL')
+                        await conn.execute(step.update_sql, *step.params)
                 except Exception:
                     try:
                         async with conn.transaction():  # savepoint
-                            if child in has_sid:
-                                await conn.execute(
-                                    f"DELETE FROM maya_rp.{child} WHERE session_id=$1", sid)
-                            else:
-                                await conn.execute(f"DELETE FROM maya_rp.{child}")
+                            await conn.execute(step.delete_sql, *step.params)
                     except Exception as e:
                         # the parent wipe below will surface any real blocker
                         error("savegame",
-                              f"detach {child}.{col} skipped ({e})")
+                              f"detach {step.child}.{'/'.join(step.columns)} skipped ({e})")
             # FK cycles (10 tables in maya_rp: characters -> territory ->
             # locations, clues -> characters, self-referencing heirs/prerequisites)
             # cannot be topologically ordered; Kahn parks them at the end and the
             # first DELETE then violates a parent FK. Break each cycle-internal
-            # edge by NULLing the child column first.
+            # edge by NULLing the child column first. Both ends are in wipe_set, so an
+            # unscoped UPDATE here only touches a table the wipe deletes whole.
             cycles = fk_cycle_members(wipe_set, fks)
             if cycles:
                 info("savegame",
                      f"FK cycles: {len(cycles)} tables — breaking with NULLs")
-            for child, parent, col in fk_cols:
-                if child not in cycles or parent not in cycles:
+            for fk in refs:
+                if fk.child not in cycles or fk.parent not in cycles:
                     continue
-                try:
-                    async with conn.transaction():  # savepoint
-                        if child in has_sid:
-                            await conn.execute(
-                                f'UPDATE maya_rp.{child} SET "{col}"=NULL '
-                                f"WHERE session_id=$1", sid)
-                        else:
-                            await conn.execute(
-                                f'UPDATE maya_rp.{child} SET "{col}"=NULL')
-                except Exception as e:
-                    error("savegame", f"cycle break {child}.{col} skipped ({e})")
+                child = _ident(fk.child, all_tables)
+                for col in fk.columns:
+                    try:
+                        async with conn.transaction():  # savepoint
+                            if fk.child in has_sid:
+                                await conn.execute(
+                                    f"UPDATE maya_rp.{child} SET {_ident(col)}=NULL "
+                                    f"WHERE session_id=$1", sid)
+                            else:
+                                await conn.execute(
+                                    f"UPDATE maya_rp.{child} SET {_ident(col)}=NULL")
+                    except Exception as e:
+                        error("savegame", f"cycle break {fk.child}.{col} skipped ({e})")
             for t in order:
                 if t == "sessions":
                     continue  # preserve the session row itself
+                qt = _ident(t, all_tables)
                 try:
                     if t in session_set:
                         await conn.execute(
-                            f"DELETE FROM maya_rp.{t} WHERE session_id=$1", sid)
+                            f"DELETE FROM maya_rp.{qt} WHERE session_id=$1", sid)
                     else:
-                        await conn.execute(f"DELETE FROM maya_rp.{t}")
+                        await conn.execute(f"DELETE FROM maya_rp.{qt}")
                 except Exception as e:
                     error("savegame", f"wipe {t} failed (aborting restore): {e}")
                     raise  # no silent half-wipes — abort the transaction
@@ -548,10 +762,11 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
         # restore in the .sav's stored (parents-first) order
         udts = await _column_udts(list(tables))
         gens = await _generated_columns(list(tables))
+        with_id: list[str] = []   # restored tables whose `id` sequence may now trail max(id)
         for t, rows in tables.items():
-            if t in partial:
+            if t in partial or t in unknown_tables:
                 # Same reason as the wipe: a table carried in part cannot be restored without
-                # deleting what the file never had.
+                # deleting what the file never had. A table the schema lacks has nowhere to land.
                 skipped_tables += 1
                 continue
             if not isinstance(rows, list) or not rows:
@@ -560,21 +775,23 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
                 skipped_tables += 1
                 info("savegame", f"restore skip {t}: exported with error {rows[0]['__error__']}")
                 continue
+            qt = _ident(t, all_tables)
             cols = [c for c in rows[0].keys() if c not in gens.get(t, set())]
+            if "id" in cols:
+                with_id.append(t)
             # Type-aware encoding: ARRAY columns need an ARRAY literal, jsonb
             # columns need ::jsonb, everything else stays a scalar. The old
             # blanket `::jsonb` broke all 8 ARRAY columns.
             types = udts.get(t, {})
             conflict = _conflict_clause(t, cols)
 
-            def _sql(row: dict, _t=t, _cols=cols, _types=types,
+            def _sql(row: dict, _t=qt, _cols=cols, _types=types,
                      _conflict=conflict) -> str:
                 return _insert_sql(_t, _cols, row, _types, _conflict)
 
             # One savepoint per table: a single bad row must NOT abort the outer
-            # transaction (that used to abort every remaining INSERT, silently
-            # reporting ok:True with a partial restore). On failure the table is
-            # retried row-by-row under its own savepoint so the good rows land.
+            # transaction. On failure the table is retried row-by-row under its own
+            # savepoint so the good rows land; leftovers decide commit vs rollback below.
             try:
                 async with conn.transaction():
                     for row in rows:
@@ -593,7 +810,7 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
                         restored += 1
                     except Exception as e2:
                         row_errors += 1
-                        deferred.append((_sql(row), t))
+                        deferred.append((_sql(row), t, str(e2)))
                         if row_errors <= 10:
                             error("savegame", f"restore row {t} failed: {e2}")
 
@@ -604,16 +821,17 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
         for _round in range(4):
             if not deferred:
                 break
-            still: list[tuple[str, str]] = []
-            for sql, tbl in deferred:
+            still: list[tuple[str, str, str]] = []
+            for sql, tbl, _err in deferred:
                 try:
                     async with conn.transaction():  # savepoint
                         await conn.execute(sql)
                     restored += 1
                     row_errors -= 1
-                except Exception:
-                    still.append((sql, tbl))
+                except Exception as e:
+                    still.append((sql, tbl, str(e)))
             if len(still) == len(deferred):
+                deferred = still
                 break  # no progress — remaining rows are genuinely unresolvable
             info("savegame",
                  f"deferred pass {_round + 1}: {len(deferred) - len(still)} rows landed, "
@@ -622,11 +840,27 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
         if deferred:
             error("savegame",
                   f"{len(deferred)} rows could not be restored (FK-unresolvable): "
-                  f"{sorted({t for _, t in deferred})[:8]}")
+                  f"{sorted({t for _, t, _ in deferred})[:8]}")
+            if not allow_partial:
+                # Raised inside the transaction: the wipe rolls back with the inserts. Committing
+                # here kept the wipe and lost every row listed above, behind ok True.
+                raise RestoreIncomplete([(t, err) for _, t, err in deferred])
+
+        # Explicit ids leave each serial sequence where it was; the next INSERT then collides with
+        # a restored row. Skip tables whose `id` has no sequence (ooc_rules.id is text).
+        for t in with_id:
+            qt = _ident(t, all_tables)
+            seq = await conn.fetchval("SELECT pg_get_serial_sequence($1, 'id')", f"maya_rp.{qt}")
+            if seq:
+                await conn.execute(
+                    f"SELECT setval(CAST($1::text AS regclass), m) "
+                    f"FROM (SELECT MAX(id) AS m FROM maya_rp.{qt}) x WHERE m IS NOT NULL", seq)
+                sequences_reset += 1
 
     info("savegame", f"Restored {restored} rows, {row_errors} row errors, "
-                     f"{skipped_tables} skipped tables (checksum_ok={checksum_ok})")
-    await Database.close()
+                     f"{skipped_tables} skipped tables, {sequences_reset} sequences reset "
+                     f"(checksum_ok={checksum_ok})")
     return {"ok": True, "restored_rows": restored, "row_errors": row_errors,
-            "skipped_tables": skipped_tables, "checksum_ok": checksum_ok,
+            "skipped_tables": skipped_tables, "sequences_reset": sequences_reset,
+            "checksum_ok": checksum_ok,
             "session_id": sid, "game_day": data["header"].get("game_day")}

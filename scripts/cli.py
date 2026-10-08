@@ -1679,14 +1679,21 @@ async def cmd_load():
     """load <file.sav> [--keep-session] — restore PG from a .sav snapshot."""
     await Database.init()
     if len(sys.argv) < 3:
-        print("Usage: cli.py load <file.sav> [--keep-session] [--allow-session-mismatch]")
+        print("Usage: cli.py load <file.sav> [--keep-session] [--allow-session-mismatch] [--force]")
         await Database.close()
         return
-    from core.savegame import import_sav
+    from core.savegame import DetachRefused, RestoreIncomplete, SessionMismatch, import_sav
 
     wipe = "--keep-session" not in sys.argv
     forced = "--allow-session-mismatch" in sys.argv
-    r = await import_sav(sys.argv[2], wipe=wipe, allow_session_mismatch=forced)
+    # --force restores a file whose checksum does not match; it is a separate switch from the session check.
+    try:
+        r = await import_sav(sys.argv[2], wipe=wipe, allow_session_mismatch=forced, force="--force" in sys.argv)
+    except (DetachRefused, RestoreIncomplete, SessionMismatch) as exc:
+        # Each of these refuses before a write commits; say so instead of a traceback.
+        print(f"LOAD REFUSED: {exc}")
+        await Database.close()
+        return
     if not r.get("ok"):
         print(f"LOAD FAILED: {r.get('error')}")
     else:

@@ -22,6 +22,7 @@ would write `~/.config/rp-engine/maintenance.json` and arm maintenance on the li
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 import time
@@ -113,25 +114,113 @@ class TestTheWindowItArms:
         assert maintenance.status() == {"active": False, "expired": True}
 
 
-class TestThePlayLockHasNoWriter:
-    """The module's safety claim is "never armed while a play session is live".
+class TestThePlayFlagHasOneWriterAndOneReader:
+    """Only `core/maintenance.py` and `scripts/gm_maint.py` touch the play flag.
 
-    That refusal reads `PLAY_FLAG.exists()`, and nothing in `modules/`, `core/` or `scripts/` writes
-    the flag: the only writer in the tree is `tests/test_session.py`. So the guard fires only if a
-    human touches the file by hand, and the docstring describes a check the engine never arms.
-    Pinned as current behaviour so the day someone wires it is the day this test fails, which is the
-    signal that the pin can go.
+    Before the fix the flag had no writer, so `arm()` never refused. The writer is now
+    `mark_play`, driven by `gm_maint.py play on|off`. A third file naming the flag is a second
+    writer or reader that bypasses the staleness rule in `play_is_live`.
     """
 
-    def test_no_production_module_writes_the_play_flag(self):
-        writers = []
+    def test_only_the_module_and_its_cli_mention_the_play_flag(self):
+        mentions = []
         for folder in ("modules", "core", "scripts"):
             for path in sorted((ROOT / folder).glob("*.py")):
-                if path.name == "maintenance.py":
-                    continue
                 text = path.read_text(encoding="utf-8", errors="replace")
                 if "play.lock" in text or "PLAY_FLAG" in text:
-                    writers.append(str(path.relative_to(ROOT)))
-        assert writers == [], (
-            "a production writer for the play lock appeared; the refusal in arm() can now fire and"
-            f" this pin should be replaced by a test of the path: {writers}")
+                    mentions.append(str(path.relative_to(ROOT)))
+        assert mentions == ["core/maintenance.py", "scripts/gm_maint.py"], mentions
+
+
+def _dead_pid() -> int:
+    """A pid that existed and was reaped, so `os.kill(pid, 0)` raises ProcessLookupError."""
+    import subprocess
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    try:
+        os.kill(proc.pid, 0)
+    except ProcessLookupError:
+        return proc.pid
+    pytest.skip("reaped pid still answers os.kill; pid reused")
+
+
+def _age(path, seconds):
+    old = time.time() - seconds
+    os.utime(path, (old, old))
+
+
+class TestAPlayFlagBlocksArming:
+    """`arm()` read a flag nothing wrote, so GM MAYA armed mid-play. `mark_play` is the writer."""
+
+    def test_a_live_flag_refuses_arming_and_force_overrides(self, state_dir):
+        maintenance.mark_play(True, pid=os.getpid())
+        assert maintenance.play_is_live() is True
+        with pytest.raises(RuntimeError, match="play session is live"):
+            maintenance.arm(maintenance.PHRASE, source="test", ttl=60)
+        assert not maintenance.STATE_FILE.exists(), "a refused arm still wrote the state file"
+        out = maintenance.arm(maintenance.PHRASE, source="test", ttl=60, force=True)
+        assert out["active"] is True
+
+    def test_lowering_the_flag_lets_arm_succeed_and_is_idempotent(self, state_dir):
+        maintenance.mark_play(True, pid=os.getpid())
+        maintenance.mark_play(False)
+        maintenance.mark_play(False)
+        assert not maintenance.PLAY_FLAG.exists()
+        assert maintenance.arm(maintenance.PHRASE, source="test", ttl=60)["active"] is True
+
+    def test_the_flag_is_written_atomically_with_the_callers_pid(self, state_dir):
+        maintenance.mark_play(True, pid=4242)
+        body = json.loads(maintenance.PLAY_FLAG.read_text())
+        assert body["pid"] == 4242 and body["since"] <= time.time(), body
+        assert not maintenance.PLAY_FLAG.with_suffix(".tmp").exists(), "tmp file left behind"
+
+
+class TestAStaleFlagDoesNotBlockForever:
+    """A crashed player left the flag behind and would have blocked maintenance until hand-removed."""
+
+    def test_a_dead_pid_is_stale(self, state_dir):
+        maintenance.mark_play(True, pid=_dead_pid())
+        assert maintenance.play_is_live() is False
+        assert maintenance.arm(maintenance.PHRASE, source="test", ttl=60)["active"] is True
+
+    def test_a_live_pid_older_than_the_ttl_is_stale(self, state_dir):
+        maintenance.mark_play(True, pid=os.getpid())
+        _age(maintenance.PLAY_FLAG, maintenance.PLAY_FLAG_TTL_SECONDS + 60)
+        assert maintenance.play_is_live() is False
+
+    def test_a_pidless_flag_is_live_while_fresh_and_stale_past_the_ttl(self, state_dir):
+        maintenance.mark_play(True)
+        assert maintenance.play_is_live() is True
+        _age(maintenance.PLAY_FLAG, maintenance.PLAY_FLAG_TTL_SECONDS + 60)
+        assert maintenance.play_is_live() is False
+
+    def test_an_empty_legacy_flag_follows_the_same_age_rule(self, state_dir):
+        maintenance.PLAY_FLAG.write_text("")
+        assert maintenance.play_is_live() is True
+        _age(maintenance.PLAY_FLAG, maintenance.PLAY_FLAG_TTL_SECONDS + 60)
+        assert maintenance.play_is_live() is False
+
+
+class TestTheCliRaisesAndLowersTheFlag:
+    def _main(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("gm_maint_under_test", ROOT / "scripts" / "gm_maint.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.main
+
+    def test_play_on_writes_the_flag_under_the_patched_dir(self, state_dir, capsys):
+        main = self._main()
+        assert main(["play", "on", "--pid", str(os.getpid())]) == 0
+        assert maintenance.PLAY_FLAG == state_dir / "play.lock"
+        assert json.loads(maintenance.PLAY_FLAG.read_text())["pid"] == os.getpid()
+        assert capsys.readouterr().out.startswith("play: on")
+        assert not maintenance.STATE_FILE.exists(), "play on armed maintenance"
+
+    def test_play_off_removes_it_and_repeats_cleanly(self, state_dir, capsys):
+        main = self._main()
+        main(["play", "on"])
+        assert main(["play", "off"]) == 0
+        assert main(["play", "off"]) == 0
+        assert not maintenance.PLAY_FLAG.exists()
+        assert "play: off" in capsys.readouterr().out

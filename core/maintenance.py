@@ -25,6 +25,7 @@ DEFAULT_TTL_SECONDS = 12 * 60 * 60
 STATE_DIR = pathlib.Path(os.environ.get("RP_MAINT_DIR", pathlib.Path.home() / ".config" / "rp-engine"))
 STATE_FILE = STATE_DIR / "maintenance.json"
 PLAY_FLAG = STATE_DIR / "play.lock"
+PLAY_FLAG_TTL_SECONDS = 6 * 60 * 60  # upper bound on a play flag's life; see play_is_live
 
 
 def _read() -> dict:
@@ -50,8 +51,72 @@ def _write(d: dict) -> None:
     tmp.replace(STATE_FILE)
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    except OSError:
+        return False
+    return True
+
+
+def mark_play(live: bool, pid: int | None = None) -> None:
+    """Raise or lower the play-session flag that `arm()` checks.
+
+    The flag had a reader and no writer, so "never armed while a play session is live" never held:
+    GM MAYA could be armed mid-play. The writer is `gm_maint.py play on|off`.
+
+    @param live True writes the flag atomically (tmp file, then replace); False removes it and is
+        idempotent, a missing file is fine.
+    @param pid The play process's pid, recorded so `play_is_live` can tell a crashed player from a
+        live one. The caller supplies it: the CLI that writes the flag exits at once, so its own pid
+        says nothing about the session. None records no pid, and liveness is then age-only.
+    @returns None
+    """
+    if not live:
+        try:
+            PLAY_FLAG.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    PLAY_FLAG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PLAY_FLAG.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"pid": pid, "since": time.time()}) + "\n")
+    tmp.replace(PLAY_FLAG)
+
+
 def play_is_live() -> bool:
-    return PLAY_FLAG.exists()
+    """Whether a play session holds the flag.
+
+    Staleness rule: a crashed player must not block maintenance forever, so the flag counts only
+    while it can still be true.
+      - flag absent: not live
+      - flag older than PLAY_FLAG_TTL_SECONDS (by mtime): stale, whatever the pid says
+      - recorded pid: live only if that process exists (`os.kill(pid, 0)`; PermissionError = exists)
+      - no readable pid (pid=None, empty or legacy content): live while younger than the TTL
+    `arm(force=True)` stays the operator's override.
+
+    @returns True when maintenance must refuse to arm.
+    """
+    try:
+        age = time.time() - PLAY_FLAG.stat().st_mtime
+        raw = PLAY_FLAG.read_text()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True  # present but unreadable: fail toward refusing
+    if age > PLAY_FLAG_TTL_SECONDS:
+        return False
+    try:
+        pid = json.loads(raw).get("pid")
+    except (ValueError, AttributeError):
+        pid = None
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+        return _pid_alive(pid)
+    return True
 
 
 def status() -> dict:

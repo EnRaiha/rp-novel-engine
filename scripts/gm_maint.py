@@ -7,6 +7,8 @@
   python3 scripts/gm_maint.py session [--session N]
   python3 scripts/gm_maint.py arc [N]            # show or set the active arc
   python3 scripts/gm_maint.py freeze [N ...]     # show or replace the frozen list
+  python3 scripts/gm_maint.py play on [--pid N]  # raise the play flag; arm refuses while it is live
+  python3 scripts/gm_maint.py play off           # lower it
 """
 import argparse
 import os
@@ -18,15 +20,31 @@ from core import maintenance as m
 from core import session as s
 
 
-def main():
+def _int_or_switch(v):
+    """`play on|off` shares the positional with the integer verbs; argparse still rejects other words."""
+    return v if v in ("on", "off") else int(v)
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("verb", choices=["arm", "disarm", "status", "session", "mode", "arc", "freeze"])
-    ap.add_argument("values", nargs="*", type=int)
+    ap.add_argument("verb", choices=["arm", "disarm", "status", "session", "mode", "arc", "freeze", "play"])
+    ap.add_argument("values", nargs="*", type=_int_or_switch)
+    ap.add_argument("--pid", type=int, default=None)
     ap.add_argument("--session", type=int, default=None)
     ap.add_argument("--ttl", type=int, default=m.DEFAULT_TTL_SECONDS)
     ap.add_argument("--force", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
+    if a.verb == "play":
+        if a.values not in (["on"], ["off"]):
+            ap.error("play takes exactly one of: on, off")
+        if a.values == ["on"]:
+            m.mark_play(True, pid=a.pid)
+            print(f"play: on (pid {a.pid if a.pid is not None else 'none'}; stale after {m.PLAY_FLAG_TTL_SECONDS}s)")
+        else:
+            m.mark_play(False)
+            print("play: off")
+        return 0
     if a.verb == "arm":
         print(m.arm(m.PHRASE, source="operator", ttl=a.ttl, force=a.force))
     elif a.verb == "disarm":

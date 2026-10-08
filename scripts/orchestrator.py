@@ -123,6 +123,15 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
 
     session_id = require_session(session_id)
 
+    # A frozen session is reference data: every module writer refuses it, so ticking it only
+    # produced one FrozenSession error per module and no state change. Say so once and stop.
+    from core.session import is_frozen
+
+    if is_frozen(session_id):
+        if verbose:
+            print(f"  RP ENGINE TICK SKIPPED — session {session_id} is frozen for reference")
+        return
+
     if _tick_lock.locked():
         print("Tick already in progress. Aborting.")
         return

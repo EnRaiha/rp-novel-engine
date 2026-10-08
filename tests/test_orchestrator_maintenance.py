@@ -39,6 +39,8 @@ def recorded(monkeypatch):
 
     monkeypatch.setattr(orch, "tick", fake_tick)
     monkeypatch.setattr(orch.Database, "init", fake_init)
+    # These tests tick session 5, which is frozen on this machine; the frozen skip has its own test.
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: False)
     return seen
 
 
@@ -65,6 +67,17 @@ async def test_the_tick_still_ticks_when_maintenance_is_disarmed(recorded, monke
         pass
 
     assert recorded, "the tick ran no module while maintenance was disarmed"
+
+
+async def test_a_frozen_session_is_skipped_once_instead_of_failing_every_module(recorded, monkeypatch, capsys):
+    """The module writers refuse a frozen session, so ticking it gave 31 FrozenSession errors."""
+    monkeypatch.setattr("core.maintenance.active", lambda: False)
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: True)
+
+    await orch.run_full_tick(session_id=5, verbose=True)
+
+    assert recorded == [], f"the tick ran {recorded[:4]} against a frozen session"
+    assert "frozen" in capsys.readouterr().out, "the skip was silent"
 
 
 async def test_a_statistics_read_that_fails_does_not_stop_the_tick(recorded, monkeypatch):

@@ -6,11 +6,15 @@ three (the template list, the generator, the event log).
 Two of my own mistakes are recorded here because the tests exist to catch them: the encounter templates
 come back as a mapping rather than a list, and `generate_event` is async even though it touches no
 database, so a caller that treats it as pure gets a coroutine instead of an event.
+
+The one test that writes (`log_event`) runs in a scratch session created and removed here: the frozen
+guard refuses sessions 3 and 5.
 """
 from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import pathlib
 import sys
 
@@ -19,6 +23,8 @@ sys.path.insert(0, str(ROOT))
 
 from core.db import Database  # noqa: E402
 from modules import artifacts, encounters  # noqa: E402
+
+SID = 900 + os.getpid() % 100
 
 
 class TestTheEncounterShapes:
@@ -41,16 +47,19 @@ class TestTheEncounterShapes:
 
     async def test_logging_an_event_writes_it(self):
         await Database.init()
-        out = await encounters.log_event(5, "red proof", "a test event", "written by the suite")
+        await Database.execute(
+            "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'artifacts scratch','active')"
+            " ON CONFLICT (id) DO NOTHING", SID)
         try:
+            out = await encounters.log_event(SID, "red proof", "a test event", "written by the suite")
             assert out is not None
             found = await Database.fetchval(
-                "SELECT count(*) FROM maya_rp.events WHERE session_id=5"
-                " AND title='a test event'")
+                "SELECT count(*) FROM maya_rp.events WHERE session_id=$1"
+                " AND title='a test event'", SID)
             assert found == 1, f"the event was not written: {found}"
         finally:
-            await Database.execute(
-                "DELETE FROM maya_rp.events WHERE session_id=5 AND title='a test event'")
+            await Database.execute("DELETE FROM maya_rp.events WHERE session_id=$1", SID)
+            await Database.execute("DELETE FROM maya_rp.sessions WHERE id=$1", SID)
             await Database.close()
 
 
@@ -63,6 +72,6 @@ class TestTheRelics:
 
     async def test_an_unknown_artifact_cannot_be_equipped(self):
         await Database.init()
-        out = await artifacts.equip(999_999, 1, 5)
+        out = await artifacts.equip(999_999, 1, SID)
         assert out is not None
         await Database.close()

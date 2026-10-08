@@ -4,8 +4,29 @@ from __future__ import annotations
 import random
 from typing import Any
 from core.db import Database
-from core.config import Config
 from core.log import info, error
+from core.session import require_session
+
+#: Tag `run_tick` writes on an event once it has planted that event's consequence seed.
+#: `consequence_seeds` carries no event reference, so without a marker the 5-event scan
+#: planted a fresh seed for the same high-importance event on every tick it stayed in the window.
+SEEDED_TAG = "consequence_seeded"
+
+
+def _writable_session(session_id: int | None) -> int:
+    """Resolve the session for one call and refuse a frozen campaign.
+
+    Sessions 3 and 5 are reference data; a writer that skipped this check mutated them.
+
+    @param session_id - caller's session; `None` resolves through `core.session.require_session`.
+    @returns the resolved session id.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    sid = require_session(session_id)
+    _refuse_frozen(sid)
+    return sid
 
 ENCOUNTER_CATEGORIES = {
     "space_phenomena": ["solar_flare", "nebula_storm", "gravity_anomaly", "wormhole", "void_tear"],
@@ -55,24 +76,39 @@ async def generate_event(session_id: int, category: str | None = None, difficult
     return result
 
 async def log_event(session_id: int, event_type: str, title: str, description: str) -> dict:
+    """Write one event row.
+
+    @param session_id - campaign; `None` resolves through `require_session`.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
     await Database.execute(
         "INSERT INTO maya_rp.events (session_id, event_type, title, description, tags) VALUES ($1,$2,$3,$4,'[]')",
         session_id, event_type, title, description,
     )
     return {"logged": True, "event_type": event_type, "title": title}
 
-async def run_tick(session_id: int = None) -> dict:
+async def run_tick(session_id: int | None = None) -> dict:
     """Recent-events scan + catalog wiring + consequence planting (2026-08-14).
 
     - 3% per tick: a random event_catalog template fires as an encounter event.
     - 5% per recent high-importance event: plant a consequence_seed so
-      consequences.py has something to resolve (seeds table was empty)."""
+      consequences.py has something to resolve (seeds table was empty).
+
+    An event that already planted a seed carries `SEEDED_TAG` and is skipped. The seed insert and the
+    tag write share one transaction.
+
+    @param session_id - campaign; `None` resolves through `require_session`.
+    @returns `{recent_events, encounters_fired, consequences_planted}`, or `{error}` when a query raises.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
     import json as _j
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
     try:
         events = await Database.fetch(
-            "SELECT id, event_type, title, importance FROM maya_rp.events "
-            "WHERE session_id=$1 ORDER BY id DESC LIMIT 5", session_id)
+            "SELECT id, event_type, title, importance, "
+            "COALESCE(tags, '[]'::jsonb) ? $2 AS seeded FROM maya_rp.events "
+            "WHERE session_id=$1 ORDER BY id DESC LIMIT 5", session_id, SEEDED_TAG)
         fired = planted = 0
         if events and _r.random() < 0.03:
             from modules.event_catalog import get_random_encounter
@@ -84,14 +120,26 @@ async def run_tick(session_id: int = None) -> dict:
                 enc["desc"], _j.dumps(["encounter", str(enc["diff"])]))
             fired = 1
         for ev in events:
+            if ev["seeded"]:
+                continue
             if (ev["importance"] or 0) >= 5 and _r.random() < 0.05:
-                await Database.execute(
-                    "INSERT INTO maya_rp.consequence_seeds (session_id, trigger_type, cause_description, effects_jsonb, planted_at_tick, can_be_prevented, status) "
-                    "VALUES ($1,$2,$3,$4::jsonb,$5,true,'planted')",
-                    session_id, ev["event_type"] or "event",
-                    f"Ripple from: {ev['title']}",
-                    _j.dumps([{"type": "stat", "target": "morale", "delta": -1}]),
-                    await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 0)
+                async with Database.transaction() as conn:
+                    # The tag write is the claim: a concurrent tick that read the same untagged event
+                    # matches no row here and plants nothing.
+                    claimed = await conn.fetchval(
+                        "UPDATE maya_rp.events SET tags = COALESCE(tags, '[]'::jsonb) || $2::jsonb "
+                        "WHERE id=$1 AND session_id=$3 AND NOT (COALESCE(tags, '[]'::jsonb) ? $4) "
+                        "RETURNING id", ev["id"], _j.dumps([SEEDED_TAG]), session_id, SEEDED_TAG)
+                    if claimed is None:
+                        continue
+                    tick = await conn.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 0
+                    await conn.execute(
+                        "INSERT INTO maya_rp.consequence_seeds (session_id, trigger_type, cause_description, effects_jsonb, planted_at_tick, can_be_prevented, status) "
+                        "VALUES ($1,$2,$3,$4::jsonb,$5,true,'planted')",
+                        session_id, ev["event_type"] or "event",
+                        f"Ripple from: {ev['title']}",
+                        _j.dumps([{"type": "stat", "target": "morale", "delta": -1}]),
+                        tick)
                 try:
                     from modules.chekhov import introduce
                     await introduce("consequence", ev["title"], importance="medium", payoff_window=15, session_id=session_id)

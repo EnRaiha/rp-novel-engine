@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import pathlib
 import sys
 
@@ -9,6 +10,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.epilogue as epilogue  # noqa: E402
+
+#: Scratch session: the tick is a writer, so the frozen guard refuses sessions 3 and 5.
+SID = 900 + os.getpid() % 100
 
 
 def _run(coro):
@@ -62,5 +66,5 @@ def test_a_campaign_with_no_victory_rows_reports_an_empty_map(monkeypatch):
 def test_the_tick_is_reachable_and_silent(monkeypatch):
     stub = _StubDB()
     monkeypatch.setattr(epilogue, "Database", stub)
-    assert _run(epilogue.run_tick(session_id=5)) == {"status": "epilogue_ready"}
+    assert _run(epilogue.run_tick(session_id=SID)) == {"status": "epilogue_ready"}
     assert stub.reads == []

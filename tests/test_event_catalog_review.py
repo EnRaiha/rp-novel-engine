@@ -17,9 +17,14 @@ No database: the module reads none.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import modules.event_catalog as ec
+
+#: Scratch session: the tick is a writer, so the frozen guard refuses sessions 3 and 5.
+SID = 900 + os.getpid() % 100
 
 
 def test_an_unknown_category_is_answered_with_the_list():
@@ -88,4 +93,4 @@ def test_contract_the_catalogue_carries_all_six_categories():
 
 
 async def test_contract_run_tick_is_a_stub():
-    assert await ec.run_tick(5) == {"status": "event_catalog_ready"}
+    assert await ec.run_tick(SID) == {"status": "event_catalog_ready"}

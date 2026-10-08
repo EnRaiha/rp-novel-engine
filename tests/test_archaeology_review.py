@@ -18,13 +18,19 @@ Reported to the lead, not fixed: `seed_sites` picks a sector with
 a campaign with no sectors stores NULL for `sector_id`. Whether a site may exist
 without a sector is a canon question.
 
-No database: every test drives a fake Database.
+No database: every test drives a fake Database; its `transaction()` yields the fake itself.
 """
 from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
 
 import pytest
 
 import modules.archaeology as arch
+
+#: Scratch session: the frozen guard refuses sessions 3 and 5.
+SID = 900 + os.getpid() % 100
 
 
 class FakeDB:
@@ -51,6 +57,10 @@ class FakeDB:
         self.calls.append(("execute", " ".join(sql.split()), args))
         return self.execute_tag
 
+    @asynccontextmanager
+    async def transaction(self):
+        yield self
+
     def sql(self, kind=None):
         return [c[1] for c in self.calls if kind is None or c[0] == kind]
 
@@ -60,7 +70,7 @@ class FakeDB:
 
 
 def _install(monkeypatch, fake):
-    for name in ("fetch", "fetchrow", "fetchval", "execute"):
+    for name in ("fetch", "fetchrow", "fetchval", "execute", "transaction"):
         monkeypatch.setattr("modules.archaeology.Database." + name, getattr(fake, name))
     return fake
 
@@ -76,7 +86,7 @@ async def test_a_negative_seed_count_is_refused(monkeypatch):
     fake = _install(monkeypatch, FakeDB())
 
     with pytest.raises(ValueError, match="count cannot be negative"):
-        await arch.seed_sites(5, -3)
+        await arch.seed_sites(SID, -3)
 
     assert not fake.calls
 
@@ -84,18 +94,18 @@ async def test_a_negative_seed_count_is_refused(monkeypatch):
 async def test_seeding_writes_the_session_and_a_sector(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetch=[{"id": 12, "name": "Kappa"}], fetchval=901))
 
-    out = await arch.seed_sites(5, 2)
+    out = await arch.seed_sites(SID, 2)
 
     assert [s["id"] for s in out] == [901, 901]
     insert = fake.args_for("INSERT INTO maya_rp.dig_sites", "fetchval")[0]
-    assert insert[0] == 5 and insert[5] == 12
+    assert insert[0] == SID and insert[5] == 12
     assert insert[2] in arch.SITE_TYPES
 
 
 async def test_seeding_without_a_sector_still_works(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetch=[], fetchval=7))
 
-    out = await arch.seed_sites(5, 1)
+    out = await arch.seed_sites(SID, 1)
 
     assert out[0]["id"] == 7
     assert fake.args_for("INSERT INTO maya_rp.dig_sites", "fetchval")[0][5] is None
@@ -108,11 +118,11 @@ async def test_an_incomplete_dig_writes_progress_with_the_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=site))
     monkeypatch.setattr(arch.random, "randint", lambda a, b: a)
 
-    out = await arch.excavate(251, 5)
+    out = await arch.excavate(251, SID)
 
     assert out["completed"] is False
     written = fake.args_for("SET excavation_progress=$1", "execute")[0]
-    assert written[1] == 251 and written[2] == 5
+    assert written[1] == 251 and written[2] == SID
     assert out["progress"] == 100 + arch.random.randint(10, 25) + (10 - 5) * 2
 
 
@@ -121,27 +131,27 @@ async def test_a_completed_dig_depletes_the_site_and_yields_artifacts(monkeypatc
     fake = _install(monkeypatch, FakeDB(fetchrow=dict(SITE, excavation_progress=490)))
     monkeypatch.setattr(arch.random, "randint", lambda a, b: b)
 
-    out = await arch.excavate(251, 5)
+    out = await arch.excavate(251, SID)
 
     assert out == {"completed": True, "artifacts": 2}
     depleted = fake.args_for("SET status='depleted'", "execute")[0]
     assert depleted[0] == 500, "the site is completed at ITS ceiling, not a literal 100"
-    assert depleted[2] == 5
+    assert depleted[2] == SID
     assert len(fake.args_for("INSERT INTO maya_rp.artifacts", "execute")) == 2
 
 
 async def test_a_depleted_site_refuses_another_dig(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=dict(SITE, status="depleted")))
 
-    assert await arch.excavate(251, 5) == {"error": "Site depleted"}
+    assert await arch.excavate(251, SID) == {"error": "Site depleted"}
     assert not fake.sql("execute")
 
 
 async def test_a_site_from_another_campaign_is_not_found(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=None))
 
-    assert await arch.excavate(251, 5) == {"error": "Site not found"}
-    assert fake.args_for("dig_sites", "fetchrow")[0] == (251, 5)
+    assert await arch.excavate(251, SID) == {"error": "Site not found"}
+    assert fake.args_for("dig_sites", "fetchrow")[0] == (251, SID)
 
 
 # ── Contract an earlier pass already set ────────────────────────────────
@@ -151,7 +161,7 @@ async def test_a_null_ceiling_falls_back_to_one_hundred(monkeypatch):
     _install(monkeypatch, FakeDB(fetchrow=site))
     monkeypatch.setattr(arch.random, "randint", lambda a, b: b)
 
-    out = await arch.excavate(251, 5)
+    out = await arch.excavate(251, SID)
 
     assert out["completed"] is True
 
@@ -160,7 +170,7 @@ async def test_a_null_difficulty_and_yield_do_not_crash(monkeypatch):
     site = dict(SITE, difficulty=None, artifact_yield=None, excavation_progress=0)
     _install(monkeypatch, FakeDB(fetchrow=site))
 
-    out = await arch.excavate(251, 5)
+    out = await arch.excavate(251, SID)
 
     assert out["completed"] is False
     assert "progress" in out
@@ -178,4 +188,4 @@ def test_contract_every_site_type_is_named():
 
 
 async def test_contract_run_tick_is_a_stub():
-    assert await arch.run_tick(5) == {"status": "archaeology_ready"}
+    assert await arch.run_tick(SID) == {"status": "archaeology_ready"}

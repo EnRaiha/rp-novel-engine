@@ -12,16 +12,45 @@ Two duties, one tick:
 from __future__ import annotations
 
 from core.db import Database
-from core.config import Config
 from core.log import error, info
+from core.session import require_session
 
 MEDICAL_SUPPLY_COMMODITY = "Medical Supplies"
 MEDICAL_TRANSFER_PER_TICK = 5000  # stockpile → market per pharma corp per tick
 
 
+def _writable_session(session_id: int | None) -> int:
+    """Resolve the session for one call and refuse a frozen campaign.
+
+    Sessions 3 and 5 are reference data; a writer that skipped this check mutated them.
+
+    @param session_id - caller's session; `None` resolves through `core.session.require_session`.
+    @returns the resolved session id.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    sid = require_session(session_id)
+    _refuse_frozen(sid)
+    return sid
+
+
+def _like_escape(text: str) -> str:
+    """Escape `\\`, `%` and `_` so a ship-name prefix matches as literal text under `ESCAPE '\\'`.
+
+    @param text - ship name prefix from an `auto_queue` row.
+    @returns the text with LIKE wildcards neutralised.
+    """
+    return str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 async def run_tick(session_id: int | None = None) -> dict:
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    """Run the yard auto-queue and the pharma tick for this campaign.
+
+    @param session_id - campaign; `None` resolves through `require_session`.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
     results: dict = {}
     for name, fn in (("yard", _yard_auto_queue), ("pharma", _pharma_tick)):
         try:
@@ -45,43 +74,48 @@ async def _yard_auto_queue(session_id: int) -> dict:
     )
     enqueued = 0
     for o in orders:
-        open_count = await Database.fetchval(
-            "SELECT COUNT(*) FROM maya_rp.production_queue "
-            "WHERE session_id=$1 AND assigned_yard=$2 AND ship_type=$3 "
-            "AND status IN ('planned','building')",
-            session_id, o["yard"], o["ship_type"],
-        ) or 0
-        need = o["quota"] - open_count
-        if need <= 0:
-            continue
-        existing = await Database.fetchval(
-            # The name count ran with no session filter, so it counted every campaign's hulls with
-            # this prefix and one campaign's standing orders numbered themselves against another's.
-            "SELECT COUNT(*) FROM maya_rp.production_queue "
-            "WHERE session_id=$1 AND ship_name LIKE $2",
-            session_id, f"{o['ship_name_prefix']}%",
-        ) or 0
-        for i in range(1, need + 1):
-            n = existing + i
-            await Database.execute(
-                "INSERT INTO maya_rp.production_queue "
-                "(session_id, ship_name, ship_type, hull_class, status, priority, "
-                " alloy_cost, fuel_cost, credit_cost, build_time_hours, progress_pct, "
-                " assigned_yard, notes) "
-                "VALUES ($1,$2,$3,$4,'planned',$5,$6,$7,$8,$9,0,$10,$11)",
-                session_id,
-                f"{o['ship_name_prefix']}{n:03d}",
-                o["ship_type"],
-                o["hull_class"],
-                o["priority"],
-                o["alloy_cost"],
-                o["fuel_cost"],
-                o["credit_cost"],
-                o["build_time_hours"],
-                o["yard"],
-                "auto-queued",
-            )
-            enqueued += 1
+        # Count and insert under one per-session lock. Two ticks counted the same open builds, and each
+        # enqueued the full shortfall, doubling the quota.
+        async with Database.transaction() as conn:
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext('auto_queue'), $1)", session_id)
+            open_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM maya_rp.production_queue "
+                "WHERE session_id=$1 AND assigned_yard=$2 AND ship_type=$3 "
+                "AND status IN ('planned','building')",
+                session_id, o["yard"], o["ship_type"],
+            ) or 0
+            need = o["quota"] - open_count
+            if need <= 0:
+                continue
+            existing = await conn.fetchval(
+                # The name count ran with no session filter, so it counted every campaign's hulls with
+                # this prefix and one campaign's standing orders numbered themselves against another's.
+                # `%` and `_` in the prefix match literally.
+                "SELECT COUNT(*) FROM maya_rp.production_queue "
+                "WHERE session_id=$1 AND ship_name LIKE $2 ESCAPE '\\'",
+                session_id, f"{_like_escape(o['ship_name_prefix'])}%",
+            ) or 0
+            for i in range(1, need + 1):
+                n = existing + i
+                await conn.execute(
+                    "INSERT INTO maya_rp.production_queue "
+                    "(session_id, ship_name, ship_type, hull_class, status, priority, "
+                    " alloy_cost, fuel_cost, credit_cost, build_time_hours, progress_pct, "
+                    " assigned_yard, notes) "
+                    "VALUES ($1,$2,$3,$4,'planned',$5,$6,$7,$8,$9,0,$10,$11)",
+                    session_id,
+                    f"{o['ship_name_prefix']}{n:03d}",
+                    o["ship_type"],
+                    o["hull_class"],
+                    o["priority"],
+                    o["alloy_cost"],
+                    o["fuel_cost"],
+                    o["credit_cost"],
+                    o["build_time_hours"],
+                    o["yard"],
+                    "auto-queued",
+                )
+                enqueued += 1
     return {"orders": len(orders), "enqueued": enqueued}
 
 
@@ -141,25 +175,32 @@ async def _pharma_tick(session_id: int) -> dict:
     )
     budget = MEDICAL_TRANSFER_PER_TICK
     transfer = 0
-    for pile in piles:
-        if budget <= 0:
-            break
-        take = min(budget, pile["quantity"] - pile["reserved"])
-        if take <= 0:
-            continue
-        await Database.execute(
-            "UPDATE maya_rp.material_stockpiles SET quantity = quantity - $1 WHERE id = $2",
-            take, pile["id"],
-        )
-        budget -= take
-        transfer += take
-    if transfer > 0:
-        await Database.execute(
-            "UPDATE maya_rp.commodities SET supply=supply+$1 "
-            "WHERE session_id=$2 AND name=$3",
-            transfer, session_id, MEDICAL_SUPPLY_COMMODITY,
-        )
-        supply_moved += transfer
+    # The pile decrements and the market credit share one transaction, and each decrement is guarded by
+    # the unreserved stock, so a concurrent consumer cannot drive a pile negative and an error cannot
+    # remove stock without crediting the market.
+    async with Database.transaction() as conn:
+        for pile in piles:
+            if budget <= 0:
+                break
+            take = min(budget, pile["quantity"] - pile["reserved"])
+            if take <= 0:
+                continue
+            moved = await conn.fetchval(
+                "UPDATE maya_rp.material_stockpiles SET quantity = quantity - $1 "
+                "WHERE id = $2 AND quantity - COALESCE(reserved, 0) >= $1 RETURNING id",
+                take, pile["id"],
+            )
+            if moved is None:
+                continue
+            budget -= take
+            transfer += take
+        if transfer > 0:
+            await conn.execute(
+                "UPDATE maya_rp.commodities SET supply=supply+$1 "
+                "WHERE session_id=$2 AND name=$3",
+                transfer, session_id, MEDICAL_SUPPLY_COMMODITY,
+            )
+            supply_moved += transfer
 
     if hub_throughput > 0:
         await Database.execute(

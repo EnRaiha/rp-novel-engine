@@ -3,8 +3,24 @@
 from __future__ import annotations
 import random
 from core.db import Database
-from core.config import Config
 from core.log import info
+from core.session import require_session
+
+
+def _writable_session(session_id: int | None) -> int:
+    """Resolve the session for one call and refuse a frozen campaign.
+
+    Sessions 3 and 5 are reference data; a writer that skipped this check mutated them.
+
+    @param session_id - caller's session; `None` resolves through `core.session.require_session`.
+    @returns the resolved session id.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    sid = require_session(session_id)
+    _refuse_frozen(sid)
+    return sid
 
 ENCOUNTERS = {
     "trade": {
@@ -87,6 +103,7 @@ def get_random_encounter(category: str | None = None, max_diff: int = 10) -> dic
             "warnings": [f"no encounter at or below difficulty {max_diff}."
                          f" {name!r} is the closest at {entry['diff']}"]}
 
-async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+async def run_tick(session_id: int | None = None) -> dict:
+    """No-op tick. @raises core.ooc.FrozenSession - the campaign is frozen."""
+    _writable_session(session_id)
     return {"status": "event_catalog_ready"}

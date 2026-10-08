@@ -1,10 +1,12 @@
 """Encounters and narrative_seeds review: what reading both files in full turned up.
 
-Nothing here writes to session 3, and every row this file creates in session 5 is removed by the id it
-was given.
+Nothing here writes to sessions 3 or 5: the frozen guard refuses them. The live-database tests run in two
+scratch sessions created and removed by the autouse fixture, and every row they create is also removed by
+the id it was given.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -12,11 +14,30 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
 
 from core.db import Database  # noqa: E402
 from modules import encounters, narrative_seeds  # noqa: E402
 
-SESSION = 5
+SESSION = 900 + os.getpid() % 100
+OTHER = 900 + (os.getpid() + 50) % 100
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _scratch_sessions():
+    """Create both scratch sessions and remove everything they own, in FK order."""
+    await Database.init()
+    for sid in (SESSION, OTHER):
+        await Database.execute(
+            "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'encounters scratch','active')"
+            " ON CONFLICT (id) DO NOTHING", sid)
+    yield
+    await Database.init()
+    for sid in (SESSION, OTHER):
+        for table in ("narrative_seeds", "consequence_seeds", "events"):
+            await Database.execute(f"DELETE FROM maya_rp.{table} WHERE session_id = $1", sid)
+        await Database.execute("DELETE FROM maya_rp.sessions WHERE id = $1", sid)
+
 
 
 async def _seed(session_id=SESSION, status="planted", days=100_000):
@@ -64,7 +85,7 @@ class TestTheSeedBelongsToItsCampaign:
     async def test_another_campaigns_seed_cannot_be_foreshadowed(self):
         """The lookup ran by seed id alone and never read the session it was handed."""
         await Database.init()
-        seed = await _seed(session_id=3)
+        seed = await _seed(session_id=OTHER)
         try:
             out = await narrative_seeds.mark_foreshadowed(seed, SESSION)
             assert out["marked"] is False, out
@@ -91,10 +112,10 @@ class TestTheSeedBelongsToItsCampaign:
 
     async def test_another_campaigns_seed_cannot_be_paid_off(self):
         await Database.init()
-        seed = await _seed(session_id=3)
+        seed = await _seed(session_id=OTHER)
         try:
             out = await narrative_seeds.pay_off(seed, SESSION)
-            assert "not found in session 5" in out.get("error", ""), out
+            assert f"not found in session {SESSION}" in out.get("error", ""), out
             status = await Database.fetchval(
                 "SELECT status FROM maya_rp.narrative_seeds WHERE id = $1", seed)
             assert status == "planted", "another campaign's seed was paid off"
@@ -123,7 +144,7 @@ class TestTheSeedTick:
     async def test_the_tick_pays_off_only_what_is_due_in_its_campaign(self):
         await Database.init()
         mine = await _seed(days=-1)
-        theirs = await _seed(session_id=3, days=-1)
+        theirs = await _seed(session_id=OTHER, days=-1)
         try:
             out = await narrative_seeds.run_tick(SESSION)
             assert out == {"auto_payoffs": 1}, out
@@ -153,7 +174,7 @@ class TestTheSeedTick:
     async def test_the_foreshadow_plan_is_scoped_and_ordered(self):
         await Database.init()
         mine = await _seed()
-        theirs = await _seed(session_id=3)
+        theirs = await _seed(session_id=OTHER)
         try:
             plan = await narrative_seeds.get_foreshadow_ops(SESSION)
             assert [p["id"] for p in plan] == [mine], plan

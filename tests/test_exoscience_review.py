@@ -17,13 +17,19 @@ killing the tick; a completion that cannot be paid is counted under
 refuses a blank type; and `generate_anomaly` refuses a blank location and keeps
 the raw location text in the description.
 
-No database: every test drives a fake Database.
+No database: every test drives a fake Database; its `transaction()` yields the fake itself. Every call uses a
+scratch session id, because the frozen guard refuses sessions 3 and 5.
 """
 from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
 
 import pytest
 
 import modules.exoscience as exo
+
+SID = 900 + os.getpid() % 100
 
 
 class FakeDB:
@@ -56,6 +62,10 @@ class FakeDB:
         self.calls.append(("execute", " ".join(sql.split()), args))
         return "UPDATE 1"
 
+    @asynccontextmanager
+    async def transaction(self):
+        yield self
+
     def sql(self, kind=None):
         return [c[1] for c in self.calls if kind is None or c[0] == kind]
 
@@ -65,7 +75,7 @@ class FakeDB:
 
 
 def _install(monkeypatch, fake):
-    for name in ("fetch", "fetchval", "fetchrow", "execute"):
+    for name in ("fetch", "fetchval", "fetchrow", "execute", "transaction"):
         monkeypatch.setattr("modules.exoscience.Database." + name, getattr(fake, name))
     return fake
 
@@ -81,32 +91,32 @@ async def test_the_mission_write_carries_the_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetch={"science_missions": [MISSION],
                                                "anomalies_catalog": []}, fetchval=1))
 
-    out = await exo.run_tick(5)
+    out = await exo.run_tick(SID)
 
     assert out == {"missions_completed": 0, "anomalies_studied": 0}
-    written = fake.args_for("UPDATE maya_rp.science_missions", "execute")[0]
-    assert written[0] == 10 + exo._pace(5, 4, 10)
-    assert written[2] == 4 and written[3] == 5
+    written = fake.args_for("UPDATE maya_rp.science_missions", "fetchval")[0]
+    assert written[0] == 10 + exo._pace(SID, 4, 10)
+    assert written[2] == 4 and written[3] == SID
 
 
 async def test_the_anomaly_write_carries_the_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetch={"science_missions": [],
                                                "anomalies_catalog": [ANOMALY]}, fetchval=None))
 
-    await exo.run_tick(5)
+    await exo.run_tick(SID)
 
     written = fake.args_for("UPDATE maya_rp.anomalies_catalog", "execute")[0]
-    assert written[1] == 9 and written[2] == 5
+    assert written[1] == 9 and written[2] == SID
 
 
 async def test_every_read_is_session_scoped(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetch=[]))
 
-    await exo.run_tick(5)
+    await exo.run_tick(SID)
 
     for sql in fake.sql("fetch"):
         assert "session_id=$1" in sql, sql
-    assert fake.args_for("science_missions", "fetch")[0] == (5,)
+    assert fake.args_for("science_missions", "fetch")[0] == (SID,)
 
 
 # ── 2. The sector lookup is deterministic ───────────────────────────────
@@ -114,7 +124,7 @@ async def test_every_read_is_session_scoped(monkeypatch):
 async def test_the_sector_lookup_orders_its_match(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchval=lambda sql, args: 12 if "sectors" in sql else 77))
 
-    out = await exo.generate_anomaly("Kappa", 5)
+    out = await exo.generate_anomaly("Kappa", SID)
 
     sql = [s for s in fake.sql("fetchval") if "sectors" in s][0]
     assert "ORDER BY id LIMIT 1" in sql
@@ -125,7 +135,7 @@ async def test_the_sector_lookup_orders_its_match(monkeypatch):
 async def test_a_blank_location_is_refused(monkeypatch, location):
     fake = _install(monkeypatch, FakeDB())
 
-    out = await exo.generate_anomaly(location, 5)
+    out = await exo.generate_anomaly(location, SID)
 
     assert "location is required" in out["error"]
     assert not fake.calls
@@ -143,11 +153,12 @@ def test_contract_the_pace_is_stable_for_a_row_and_spread_across_rows():
 async def test_contract_a_completion_pays_once_and_counts_the_unpaid(monkeypatch):
     mission = dict(MISSION, progress=99, target_progress=100)
     fake = _install(monkeypatch, FakeDB(
-        fetch={"science_missions": [mission], "anomalies_catalog": []}, fetchval=None))
+        fetch={"science_missions": [mission], "anomalies_catalog": []},
+        fetchval=lambda sql, args: 4 if "UPDATE maya_rp.science_missions" in sql else None))
     seen = []
     monkeypatch.setattr("modules.exoscience.warn", lambda mod, msg: seen.append(msg))
 
-    out = await exo.run_tick(5)
+    out = await exo.run_tick(SID)
 
     assert out["missions_completed"] == 1 and out["rewards_unpaid"] == 1
     assert any("were not paid" in m for m in seen), seen
@@ -159,16 +170,16 @@ async def test_contract_a_null_progress_row_reads_as_zero(monkeypatch):
     fake = _install(monkeypatch, FakeDB(
         fetch={"science_missions": [mission], "anomalies_catalog": []}, fetchval=1))
 
-    await exo.run_tick(5)
+    await exo.run_tick(SID)
 
-    written = fake.args_for("UPDATE maya_rp.science_missions", "execute")[0]
-    assert written[0] == exo._pace(5, 4, 0)
+    written = fake.args_for("UPDATE maya_rp.science_missions", "fetchval")[0]
+    assert written[0] == exo._pace(SID, 4, 0)
 
 
 async def test_contract_start_mission_refuses_a_blank_type(monkeypatch):
     fake = _install(monkeypatch, FakeDB())
 
-    out = await exo.start_mission("   ", 5)
+    out = await exo.start_mission("   ", SID)
 
     assert "mission_type is required" in out["error"]
     assert not fake.calls
@@ -177,11 +188,11 @@ async def test_contract_start_mission_refuses_a_blank_type(monkeypatch):
 async def test_contract_start_mission_prices_the_reward_at_five_per_point(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchval=31))
 
-    out = await exo.start_mission("survey", 5)
+    out = await exo.start_mission("survey", SID)
 
     assert out["mission_id"] == 31 and out["reward"] == out["target"] * 5
     insert = fake.args_for("INSERT INTO maya_rp.science_missions", "fetchval")[0]
-    assert insert[0] == 5 and insert[1] == "survey"
+    assert insert[0] == SID and insert[1] == "survey"
 
 
 async def test_contract_a_crash_is_reported_as_an_error(monkeypatch):
@@ -194,7 +205,7 @@ async def test_contract_a_crash_is_reported_as_an_error(monkeypatch):
     _install(monkeypatch, FakeDB())
     monkeypatch.setattr("modules.exoscience.Database.fetch", boom)
 
-    out = await exo.run_tick(5)
+    out = await exo.run_tick(SID)
 
     assert "lab fire" in out["error"]
     assert any("lab fire" in m for m in seen), seen

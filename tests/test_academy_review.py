@@ -19,13 +19,21 @@ one and the insert sets it; the enrolled query joins `crew_roster` on its
 session; an enrolment whose program row has vanished is closed instead of
 retrying every tick; and a campus at its slot ceiling refuses the enrolment.
 
-No database: every test drives a fake Database.
+No database: every test drives a fake Database. The fake's `transaction()` yields the fake itself, so
+statements run on the transaction connection land in the same recording.
+
+Every call uses a scratch session id: the frozen guard refuses sessions 3 and 5.
 """
 from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
 
 import pytest
 
 import modules.academy as academy
+
+SID = 900 + os.getpid() % 100
 
 
 class FakeDB:
@@ -49,11 +57,17 @@ class FakeDB:
 
     async def fetchval(self, sql, *args):
         self.calls.append(("fetchval", " ".join(sql.split()), args))
+        if callable(self.fetchval_value):
+            return self.fetchval_value(sql, args)
         return self.fetchval_value
 
     async def execute(self, sql, *args):
         self.calls.append(("execute", " ".join(sql.split()), args))
         return self.execute_tag
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield self
 
     def sql(self, kind=None):
         return [c[1] for c in self.calls if kind is None or c[0] == kind]
@@ -64,7 +78,7 @@ class FakeDB:
 
 
 def _install(monkeypatch, fake):
-    for name in ("fetch", "fetchrow", "fetchval", "execute"):
+    for name in ("fetch", "fetchrow", "fetchval", "execute", "transaction"):
         monkeypatch.setattr("modules.academy.Database." + name, getattr(fake, name))
     return fake
 
@@ -78,22 +92,22 @@ PROGRAM = {"id": 5, "name": "Navigation", "duration": 120}
 async def test_enrol_refuses_another_campaigns_crew(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow={"crew_roster": None, "academy_campuses": CAMPUS}))
 
-    out = await academy.enroll_crew(77, 5, 1, 5)
+    out = await academy.enroll_crew(77, 5, 1, SID)
 
-    assert "not found in session 5" in out["error"], out
+    assert f"not found in session {SID}" in out["error"], out
     assert not fake.args_for("INSERT INTO maya_rp.enrolled_crew", "execute")
     sql = [s for s in fake.sql("fetchrow") if "crew_roster" in s][0]
     assert "session_id=$2" in sql
-    assert fake.args_for("crew_roster", "fetchrow")[0] == (77, 5)
+    assert fake.args_for("crew_roster", "fetchrow")[0] == (77, SID)
 
 
 async def test_a_crew_in_this_session_enrols(monkeypatch):
     fake = _install(monkeypatch, FakeDB(
         fetchrow={"crew_roster": {"id": 77}, "academy_campuses": CAMPUS,
                   "training_programs": PROGRAM},
-        fetchval=None))
+        fetchval=lambda sql, args: 1 if "UPDATE maya_rp.academy_campuses" in sql else None))
 
-    out = await academy.enroll_crew(77, 5, 1, 5)
+    out = await academy.enroll_crew(77, 5, 1, SID)
 
     assert out == {"crew_id": 77, "program": "Navigation", "campus": "Mastika Academy"}
     inserted = fake.args_for("INSERT INTO maya_rp.enrolled_crew", "execute")[0]
@@ -101,14 +115,18 @@ async def test_a_crew_in_this_session_enrols(monkeypatch):
 
 
 async def test_a_full_campus_refuses_the_enrolment(monkeypatch):
+    """The slot claim is a guarded UPDATE; no returned row means the campus is full and nothing is inserted."""
     full = dict(CAMPUS, student_slots_used=10)
     fake = _install(monkeypatch, FakeDB(
-        fetchrow={"crew_roster": {"id": 77}, "academy_campuses": full}))
+        fetchrow={"crew_roster": {"id": 77}, "academy_campuses": full,
+                  "training_programs": PROGRAM}, fetchval=None))
 
-    out = await academy.enroll_crew(77, 5, 1, 5)
+    out = await academy.enroll_crew(77, 5, 1, SID)
 
     assert out["error"] == "Campus full"
-    assert not fake.sql("execute")
+    assert not fake.sql("execute"), "an enrolment row was inserted without a slot"
+    claim = [s for s in fake.sql("fetchval") if "UPDATE maya_rp.academy_campuses" in s][0]
+    assert "< COALESCE(max_students,10)" in claim, claim
 
 
 # ── 2. No double enrolment ───────────────────────────────────────────────
@@ -119,7 +137,7 @@ async def test_a_second_enrolment_for_the_same_program_is_refused(monkeypatch):
                   "training_programs": PROGRAM},
         fetchval=1))
 
-    out = await academy.enroll_crew(77, 5, 1, 5)
+    out = await academy.enroll_crew(77, 5, 1, SID)
 
     assert "already enrolled" in out["error"], out
     assert not fake.args_for("student_slots_used=COALESCE", "execute")
@@ -133,32 +151,33 @@ ENROLMENT = {"id": 900, "crew_id": 77, "program_id": 5, "campus_id": 1,
 
 async def test_graduation_scopes_the_xp_write_to_the_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(
-        fetch=[ENROLMENT],
+        fetch=[ENROLMENT], fetchval=900,
         fetchrow={"training_programs": {"name": "Navigation", "field": "navigation",
                                         "skill_bonus": 3, "graduates_receive": "Navigator"}}))
     monkeypatch.setattr(academy.random, "randint", lambda a, b: b)
 
-    out = await academy.run_tick(5)
+    out = await academy.run_tick(SID)
 
     assert out == {"enrolled": 1, "graduated": 1}
     xp = fake.args_for("SET xp=COALESCE", "execute")[0]
-    assert xp == (30, 77, 5)
+    assert xp == (30, 77, SID)
     assert "session_id=$3" in [s for s in fake.sql("execute") if "SET xp=" in s][0]
     cert = fake.args_for("INSERT INTO maya_rp.certifications", "execute")[0]
-    assert cert[0] == 5 and cert[2] == "Navigator"
+    assert cert[0] == SID and cert[2] == "Navigator"
 
 
 async def test_graduation_closes_an_enrolment_whose_program_vanished(monkeypatch):
     seen = []
     monkeypatch.setattr("modules.academy.info", lambda mod, msg: seen.append(msg))
-    fake = _install(monkeypatch, FakeDB(fetch=[ENROLMENT], fetchrow={}))
+    fake = _install(monkeypatch, FakeDB(fetch=[ENROLMENT], fetchval=900, fetchrow={}))
     monkeypatch.setattr(academy.random, "randint", lambda a, b: b)
 
-    out = await academy.run_tick(5)
+    out = await academy.run_tick(SID)
 
     assert out == {"enrolled": 1, "graduated": 0}
-    closed = fake.args_for("SET graduated=true WHERE id=$1", "execute")
-    assert closed == [(900,)]
+    closed = fake.args_for("SET progress=$1, graduated=true", "fetchval")
+    assert closed == [(120, 900)], closed
+    assert not fake.sql("execute"), "an enrolment with no program must award nothing"
     assert any("no program" in m for m in seen), seen
 
 
@@ -167,7 +186,7 @@ async def test_progress_advances_without_graduating_below_the_target(monkeypatch
     fake = _install(monkeypatch, FakeDB(fetch=[early], fetchrow={}))
     monkeypatch.setattr(academy.random, "randint", lambda a, b: a)
 
-    out = await academy.run_tick(5)
+    out = await academy.run_tick(SID)
 
     assert out == {"enrolled": 1, "graduated": 0}
     assert fake.args_for("SET progress=$1 WHERE id=$2", "execute")[0] == (20, 900)
@@ -176,7 +195,7 @@ async def test_progress_advances_without_graduating_below_the_target(monkeypatch
 async def test_the_enrolment_read_joins_the_roster_on_this_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetch=[], fetchrow={}))
 
-    await academy.run_tick(5)
+    await academy.run_tick(SID)
 
     sql = fake.sql("fetch")[0]
     assert "cr.session_id=$1" in sql and "ec.graduated=false" in sql
@@ -192,7 +211,7 @@ async def test_run_tick_reports_a_crash_as_an_error(monkeypatch):
     _install(monkeypatch, FakeDB())
     monkeypatch.setattr("modules.academy.Database.fetch", boom)
 
-    out = await academy.run_tick(5)
+    out = await academy.run_tick(SID)
 
     assert "no campus" in out["error"]
     assert any("no campus" in m for m in seen), seen

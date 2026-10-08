@@ -1,10 +1,12 @@
 """Auto-queue review: what reading `modules/auto_queue.py` in full turned up.
 
-Three defects, one of them a stockpile that could be driven negative. Nothing here writes to session
-3, and every row this file creates in session 5 is removed in a `finally`.
+Three defects, one of them a stockpile that could be driven negative. Nothing here writes to sessions
+3 or 5: the live-database tests run in two scratch sessions, created and removed by the autouse fixture
+below, and every row they create is also removed in a `finally`.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -12,12 +14,34 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
 
 from core.db import Database  # noqa: E402
 from modules import auto_queue as aq  # noqa: E402
 
-SESSION = 5
+SESSION = 900 + os.getpid() % 100
+OTHER = 900 + (os.getpid() + 50) % 100
 MATERIAL = aq.MEDICAL_SUPPLY_COMMODITY
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _scratch_sessions():
+    """Create both scratch sessions and remove everything they own, in FK order."""
+    await Database.init()
+    for sid in (SESSION, OTHER):
+        await Database.execute(
+            "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'auto_queue scratch','active')"
+            " ON CONFLICT (id) DO NOTHING", sid)
+    yield
+    await Database.init()
+    for sid in (SESSION, OTHER):
+        await Database.execute(
+            "DELETE FROM maya_rp.corporate_assets WHERE corporation_id IN "
+            "(SELECT id FROM maya_rp.corporations WHERE session_id = $1)", sid)
+        for table in ("corporations", "production_queue", "auto_queue", "material_stockpiles",
+                      "commodities"):
+            await Database.execute(f"DELETE FROM maya_rp.{table} WHERE session_id = $1", sid)
+        await Database.execute("DELETE FROM maya_rp.sessions WHERE id = $1", sid)
 
 
 async def _pile(quantity, reserved=0):
@@ -154,7 +178,7 @@ class TestTheCorporateScope:
         await Database.init()
         cid = asset = None
         try:
-            cid = await _corp(session_id=3)
+            cid = await _corp(session_id=OTHER)
             asset = await _asset(cid, income=400)
             out = await aq._pharma_tick(SESSION)
             # One shape for every path: the empty answer carries the same keys as the full one.
@@ -162,7 +186,7 @@ class TestTheCorporateScope:
                            "medical_supply_added": 0, "note": "no pharmaceutical corporations"}, out
             treasury = await Database.fetchval(
                 "SELECT treasury FROM maya_rp.corporations WHERE id = $1", cid)
-            assert treasury == 0, "session 3's corporation earned during session 5's tick"
+            assert treasury == 0, "another campaign's corporation earned during this campaign's tick"
         finally:
             await _dropped()
             await Database.execute("DELETE FROM maya_rp.corporate_assets WHERE id = $1", asset)
@@ -177,7 +201,7 @@ class TestTheYardScope:
         await Database.execute(
             "INSERT INTO maya_rp.production_queue "
             "(session_id, ship_name, ship_type, hull_class, status, priority, assigned_yard) "
-            "VALUES (3, 'review-hull-001', 'frigate', 'light', 'planned', 1, 'review yard')")
+            "VALUES ($1, 'review-hull-001', 'frigate', 'light', 'planned', 1, 'review yard')", OTHER)
         order = await Database.fetchval(
             "INSERT INTO maya_rp.auto_queue "
             "(session_id, yard, ship_type, hull_class, quota, ship_name_prefix, priority, active) "

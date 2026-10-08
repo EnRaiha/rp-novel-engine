@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import Any
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 
 STOP = {"the","a","an","about","with","to","for","of","and","is","are","was","were","have","has","had","that","this","it","you","i","we","they","she","he","her","his","my","our","their","what","how","why","when","where","who","which","would","could","should","will","can","do","does","did","not","no","but","or","if","then","than","so","very","just","also","too","more","most","some","any","all","each","every","both","few","other","such","only","own","same","been","being","have","having","doing","going","thing","things"}
 
@@ -21,8 +21,14 @@ async def log(character_id: int, topic: str, outcome: str = "neutral", beat: str
 
     Nothing in the repo calls this yet, so `check` reads an empty table and can
     never report a duplicate: the writer needs a caller at the turn boundary.
+
+    @param session_id - campaign; `None` resolves through `require_session`.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None: session_id = Config.SESSION_ID
+    from core.ooc import _refuse_frozen
+
+    session_id = require_session(session_id)
+    _refuse_frozen(session_id)
     if not str(topic if topic is not None else "").strip():
         raise ValueError(f"topic must be a non-empty string, got {topic!r}")
     kws = _kw(topic)
@@ -33,9 +39,10 @@ async def check(character_id: int, proposed: str, session_id: int = None) -> dic
     """The most recent too-similar topic for this character, or None.
 
     None covers two cases on purpose: nothing to compare (no keywords), and no
-    duplicate found. The bridge reports null as "no duplicate".
+    duplicate found. The bridge reports null as "no duplicate". Read-only, so a frozen
+    campaign may call it.
     """
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     kws = _kw(proposed)
     if not kws: return None
     gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)

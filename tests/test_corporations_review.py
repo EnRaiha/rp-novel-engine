@@ -1,11 +1,16 @@
 """Module review tests for modules/corporations.py (2026-10-03).
 
 Every database call is stubbed. A blueprint sale moves the treasury and a faction
-war chest, so the tests read what the module would send and never send it.
+war chest, so the tests read what the module would send and never send it. The stub's
+`transaction()` hands back the stub and records how the block exited: a block that
+exits on an exception is a rollback.
+
+Writers use a scratch session: the frozen guard refuses sessions 3 and 5.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import pathlib
 import sys
 
@@ -16,6 +21,8 @@ sys.path.insert(0, str(ROOT))
 
 import modules.corporations as corps  # noqa: E402
 from core.db import Database  # noqa: E402
+
+SID = 900 + os.getpid() % 100
 
 
 def _run(coro):
@@ -36,6 +43,17 @@ class _StubDB:
         self.writes = []
         self.credits_updates = []
         self.faction_updates = []
+        self.exits = []
+
+    def transaction(self):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.exits.append(exc_type)
+        return False
 
     async def fetchrow(self, sql, *args):
         self.reads.append((sql, args))
@@ -82,11 +100,11 @@ def test_the_markdown_is_a_percentage_like_the_cli_calls_it(monkeypatch):
                    corp_row=None)
     monkeypatch.setattr(corps, "Database", stub)
 
-    out = _run(corps.sell_blueprint(3, 5, "Iron Concord", 20))
+    out = _run(corps.sell_blueprint(SID, 5, "Iron Concord", 20))
 
     assert out["price"] == 8000, out
-    assert stub.credits_updates == [(8000, 3)], "the crown was paid something other than 8000"
-    assert stub.faction_updates == [(8000, 3, "Iron Concord")]
+    assert stub.credits_updates == [(8000, SID)], "the crown was paid something other than 8000"
+    assert stub.faction_updates == [(8000, SID, "Iron Concord")]
     assert out["markdown_pct"] == 20
 
 
@@ -95,7 +113,7 @@ def test_a_full_markdown_asks_nothing_and_a_zero_markdown_asks_the_price(monkeyp
         stub = _StubDB(project=PROJECT, credits_row={"credits": 1},
                        faction_row={"treasury": 1}, corp_row=9)
         monkeypatch.setattr(corps, "Database", stub)
-        out = _run(corps.sell_blueprint(3, 5, "Iron Concord", markdown))
+        out = _run(corps.sell_blueprint(SID, 5, "Iron Concord", markdown))
         assert out["price"] == expected, (markdown, out)
 
 
@@ -103,7 +121,7 @@ def test_a_markdown_outside_the_percentage_range_is_refused(monkeypatch):
     stub = _StubDB(project=PROJECT)
     monkeypatch.setattr(corps, "Database", stub)
     for bad in (-5, 150, 1000):
-        out = _run(corps.sell_blueprint(3, 5, "Iron Concord", bad))
+        out = _run(corps.sell_blueprint(SID, 5, "Iron Concord", bad))
         assert "percentage 0..100" in out["error"], (bad, out)
     assert stub.reads == [], "a refused sale still read the database"
 
@@ -111,25 +129,37 @@ def test_a_markdown_outside_the_percentage_range_is_refused(monkeypatch):
 def test_a_blueprint_with_no_price_is_refused(monkeypatch):
     stub = _StubDB(project={**PROJECT, "blueprint_price": None}, corp_row=9)
     monkeypatch.setattr(corps, "Database", stub)
-    out = _run(corps.sell_blueprint(3, 5, "Iron Concord", 20))
+    out = _run(corps.sell_blueprint(SID, 5, "Iron Concord", 20))
     assert "no price" in out["error"], out
     assert stub.credits_updates == []
 
 
-def test_the_sale_says_when_a_wallet_is_missing(monkeypatch):
-    """Session 5 has no resources row, so the crown's half of the sale lands nowhere."""
-    stub = _StubDB(project=PROJECT, credits_row=None, faction_row=None, corp_row=None)
+def test_an_unknown_buyer_is_refused_and_the_player_is_not_paid(monkeypatch):
+    """Pre-fix the player was credited the full price first, so a buyer that does not exist minted money."""
+    stub = _StubDB(project=PROJECT, credits_row={"credits": 1}, faction_row=None, corp_row=None)
     monkeypatch.setattr(corps, "Database", stub)
     logged = []
     monkeypatch.setattr(corps, "info", lambda *a: logged.append(a[-1]))
 
-    out = _run(corps.sell_blueprint(5, 5, "Nobody", 20))
+    out = _run(corps.sell_blueprint(SID, 5, "Nobody", 20))
 
-    assert out["price"] == 8000
-    assert out["banked"] is False
-    assert out["charged_buyer"] is False
-    assert any("no resources row for session 5" in line for line in logged)
-    assert any("not a faction in session 5" in line for line in logged)
+    assert "error" in out and "Nobody" in out["error"], out
+    assert stub.credits_updates == [], "the player was credited for a sale to a nonexistent buyer"
+    assert stub.writes == [], "a refused sale still wrote a ledger row or an event"
+    assert "treasury >= $1" in [s for s, _ in stub.reads if "UPDATE maya_rp.factions" in s][0]
+    assert any("not a faction in session" in line for line in logged)
+
+
+def test_a_missing_player_wallet_rolls_the_buyer_charge_back(monkeypatch):
+    """The buyer is charged first; with no resources row the whole block must roll back."""
+    stub = _StubDB(project=PROJECT, credits_row=None, faction_row={"treasury": 1}, corp_row=None)
+    monkeypatch.setattr(corps, "Database", stub)
+
+    out = _run(corps.sell_blueprint(SID, 5, "Iron Concord", 20))
+
+    assert "No treasury row" in out["error"], out
+    assert stub.exits and stub.exits[-1] is not None, "the buyer charge was committed without the credit"
+    assert stub.writes == []
 
 
 def test_the_ledger_row_names_the_corporation_it_could_not_find(monkeypatch):
@@ -139,7 +169,7 @@ def test_the_ledger_row_names_the_corporation_it_could_not_find(monkeypatch):
     logged = []
     monkeypatch.setattr(corps, "info", lambda *a: logged.append(a[-1]))
 
-    out = _run(corps.sell_blueprint(3, 5, "Iron Concord", 20))
+    out = _run(corps.sell_blueprint(SID, 5, "Iron Concord", 20))
 
     assert out["contract_id"] == 77
     contract_args = [args for sql, args in stub.writes if "corporate_contracts" in sql]
@@ -158,19 +188,14 @@ class _TxnStub(_StubDB):
         self.credits = credits
         self.game_day = game_day
 
-    def transaction(self):
-        return self
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
     async def fetchrow(self, sql, *args):
         self.reads.append((sql, args))
-        if "FROM maya_rp.resources" in sql:
-            return {"credits": self.credits}
+        if "UPDATE maya_rp.resources" in sql:
+            # The guarded debit (`credits >= $1`) returns a row only when the treasury covers it.
+            if self.credits < args[0]:
+                return None
+            self.writes.append((sql, args))
+            return {"credits": self.credits - args[0]}
         return None
 
     async def fetchval(self, sql, *args):
@@ -187,7 +212,7 @@ def test_chartering_an_unaffordable_company_writes_nothing(monkeypatch):
     stub = _TxnStub(credits=1000)
     monkeypatch.setattr(corps, "Database", stub)
 
-    out = _run(corps.charter_company("Review Ltd", "mining", None, 5))
+    out = _run(corps.charter_company("Review Ltd", "mining", None, SID))
 
     assert "Insufficient funds" in out["error"], out
     assert stub.writes == [], "a refused charter still wrote"
@@ -197,18 +222,18 @@ def test_chartering_deducts_the_cost_and_returns_it(monkeypatch):
     stub = _TxnStub(credits=1_000_000)
     monkeypatch.setattr(corps, "Database", stub)
 
-    out = _run(corps.charter_company("Review Ltd", "mining", 2071, 3))
+    out = _run(corps.charter_company("Review Ltd", "mining", 2071, SID))
 
     assert out["corp_id"] == 12
     assert out["cost"] == corps.INDUSTRIES["mining"]["cost"]
     deducted = [args for sql, args in stub.writes if "credits = credits -" in sql]
-    assert deducted == [(out["cost"], 3)]
+    assert deducted == [(out["cost"], SID)]
 
 
 def test_an_unknown_industry_is_refused(monkeypatch):
     stub = _TxnStub(credits=1_000_000)
     monkeypatch.setattr(corps, "Database", stub)
-    out = _run(corps.charter_company("Review Ltd", "agriculture", None, 3))
+    out = _run(corps.charter_company("Review Ltd", "agriculture", None, SID))
     assert "Invalid industry" in out["error"], out
     assert stub.writes == []
 
@@ -226,7 +251,7 @@ def test_the_tick_names_an_industry_the_table_does_not_carry(monkeypatch):
     logged = []
     monkeypatch.setattr(corps, "info", lambda *a: logged.append(a[-1]))
 
-    out = _run(corps.run_tick(3))
+    out = _run(corps.run_tick(SID))
 
     assert out["active_contracts"] == 1
     assert any("'smuggling' is not in INDUSTRIES" in line for line in logged), logged
@@ -246,7 +271,7 @@ def test_the_tick_keeps_its_progress_when_no_industry_matches(monkeypatch):
     stub = _StubDB(contracts=contracts)
     monkeypatch.setattr(corps, "Database", stub)
 
-    out = _run(corps.run_tick(3))
+    out = _run(corps.run_tick(SID))
 
     assert out["completed"] == 1, out
     assert out["credits_gained"] == 2000

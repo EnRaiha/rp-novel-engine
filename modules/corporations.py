@@ -7,8 +7,32 @@ from __future__ import annotations
 import random
 from typing import Any
 from core.db import Database
-from core.config import Config
 from core.log import info, error
+from core.session import require_session
+
+
+def _writable_session(session_id: int | None) -> int:
+    """Resolve the session for one call and refuse a frozen campaign.
+
+    Sessions 3 and 5 are reference data; a writer that skipped this check mutated them.
+
+    @param session_id - caller's session; `None` resolves through `core.session.require_session`.
+    @returns the resolved session id.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    sid = require_session(session_id)
+    _refuse_frozen(sid)
+    return sid
+
+
+class _Abort(Exception):
+    """Roll the open transaction back and hand `payload` to the caller as the answer."""
+
+    def __init__(self, payload: dict):
+        super().__init__(payload.get("error", "aborted"))
+        self.payload = payload
 
 INDUSTRIES = {
     "mining": {"yields": "alloys", "cost": 100000, "risk": 0.1},
@@ -23,9 +47,14 @@ VALID_CONTRACT_TYPES = ("resource_extraction", "production_boost", "privateering
 
 async def charter_company(name: str, industry: str, ceo_id: int = None,
                           session_id: int = None) -> dict:
-    """Found a new company. Deducts founding cost from player treasury."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    """Found a new company. Deducts founding cost from player treasury.
+
+    The debit is a guarded UPDATE (`credits >= cost`) in the same transaction as the company insert.
+
+    @param session_id - campaign; `None` resolves through `require_session`.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
     if not name:
         return {"error": "Company name required."}
     if industry not in INDUSTRIES:
@@ -35,15 +64,12 @@ async def charter_company(name: str, industry: str, ceo_id: int = None,
 
     # Transaction: deduct credits AND insert company atomically.
     async with Database.transaction() as conn:
-        res = await conn.fetchrow(
-            "SELECT credits FROM maya_rp.resources WHERE session_id=$1 FOR UPDATE",
-            session_id)
-        if not res or (res["credits"] or 0) < cost:
-            return {"error": f"Insufficient funds. Need {cost:,}C"}
-
-        await conn.execute(
-            "UPDATE maya_rp.resources SET credits = credits - $1 WHERE session_id = $2",
+        debited = await conn.fetchrow(
+            "UPDATE maya_rp.resources SET credits = credits - $1 "
+            "WHERE session_id = $2 AND credits >= $1 RETURNING credits",
             cost, session_id)
+        if debited is None:
+            return {"error": f"Insufficient funds. Need {cost:,}C"}
 
         gd = await conn.fetchval(
             "SELECT COALESCE(game_day, 1) FROM maya_rp.sessions WHERE id=$1",
@@ -62,9 +88,12 @@ async def charter_company(name: str, industry: str, ceo_id: int = None,
 
 async def issue_directive(corp_id: int, contract_type: str, target_system: str = None,
                           duration_days: int = 30, session_id: int = None) -> dict:
-    """Issue a directive (contract) to a company."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    """Issue a directive (contract) to a company.
+
+    @param session_id - campaign; `None` resolves through `require_session`.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
     if contract_type not in VALID_CONTRACT_TYPES:
         return {"error": f"Invalid contract type. Valid: {list(VALID_CONTRACT_TYPES)}"}
     duration_days = max(1, int(duration_days or 30))
@@ -96,9 +125,18 @@ async def issue_directive(corp_id: int, contract_type: str, target_system: str =
 
 
 async def run_tick(session_id: int | None = None) -> dict[str, Any]:
-    """Corporation tick: process active contracts, generate yields, trigger events."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    """Corporation tick: process active contracts, generate yields, trigger events.
+
+    A completion claims the contract (`active` to `completed`) first, then pays, in one transaction.
+    The payout and the status used to be two statements, so an error between them paid the contract
+    again on the next tick. A NULL payout column reads as 0: `credits + NULL` is NULL and wiped the
+    treasury.
+
+    @param session_id - campaign; `None` resolves through `require_session`.
+    @returns tick counters, or `{error}` when a query raises.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
 
     try:
         contracts = await Database.fetch(
@@ -118,28 +156,39 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
 
         for con in contracts:
             days_left = con["days_remaining"] - 1
+            payout_c = con["payout_credits"] or 0
+            payout_a = con["payout_alloys"] or 0
             if days_left <= 0:
-                # Contract complete — pay out to player.
-                await Database.execute(
-                    "UPDATE maya_rp.resources SET credits = credits + $1, "
-                    "alloys = alloys + $2 WHERE session_id = $3",
-                    con["payout_credits"], con["payout_alloys"], session_id)
-                await Database.execute(
-                    "UPDATE maya_rp.corporate_contracts SET status = 'completed' "
-                    "WHERE id = $1", con["id"])
+                # Contract complete — claim it, then pay out to player, in one transaction.
+                async with Database.transaction() as conn:
+                    claimed = await conn.fetchval(
+                        "UPDATE maya_rp.corporate_contracts SET status = 'completed' "
+                        "WHERE id = $1 AND status = 'active' RETURNING id", con["id"])
+                    if claimed is None:
+                        continue
+                    paid = await conn.fetchval(
+                        "UPDATE maya_rp.resources SET credits = credits + $1, "
+                        "alloys = alloys + $2 WHERE session_id = $3 RETURNING credits",
+                        payout_c, payout_a, session_id)
+                    # Success boosts standing + efficiency.
+                    await conn.execute(
+                        "UPDATE maya_rp.corporations SET "
+                        "standing = LEAST(100, standing + 2), "
+                        "efficiency = LEAST(100, efficiency + 1) WHERE id = $1",
+                        con["corp_id"])
                 completed += 1
-                credits_gained += con["payout_credits"]
-                alloys_gained += con["payout_alloys"]
-
-                # Success boosts standing + efficiency.
-                await Database.execute(
-                    "UPDATE maya_rp.corporations SET "
-                    "standing = LEAST(100, standing + 2), "
-                    "efficiency = LEAST(100, efficiency + 1) WHERE id = $1",
-                    con["corp_id"])
+                if paid is None:
+                    info("corporations",
+                         f"Contract {con['id']} completed but session {session_id} has no resources row; "
+                         f"{payout_c:,}C not paid")
+                    events.append(f"{con['corp_name']} completed a {con['contract_type']} contract. "
+                                  f"No treasury row: payout not deposited.")
+                    continue
+                credits_gained += payout_c
+                alloys_gained += payout_a
                 events.append(
                     f"{con['corp_name']} completed a {con['contract_type']} contract. "
-                    f"+{con['payout_credits']:,}C deposited.")
+                    f"+{payout_c:,}C deposited.")
             else:
                 await Database.execute(
                     "UPDATE maya_rp.corporate_contracts SET days_remaining = $1 "
@@ -167,7 +216,7 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
                             con["corp_id"])
                         events.append(f"Labor dispute at {con['corp_name']}. Efficiency dropped.")
                     elif event_type == "breakthrough":
-                        bonus = int(con["payout_credits"] * 0.1)
+                        bonus = int(payout_c * 0.1)
                         await Database.execute(
                             "UPDATE maya_rp.resources SET credits = credits + $1 "
                             "WHERE session_id = $2", bonus, session_id)
@@ -220,8 +269,20 @@ async def sell_blueprint(session_id: int | None, project_id: int, buyer: str = "
     and what its usage line calls it. The body used to multiply `1 - markdown_pct`,
     so the documented `20` became `1 - 20 = -19`: the sale paid the buyer 19 times
     the blueprint's price and drained the player treasury by the same amount.
+
+    The buyer is charged first with a guarded UPDATE (`treasury >= price`); no row means the faction
+    does not exist in this session or cannot pay, and the sale aborts. The player was credited the
+    full price in every case, so an unknown buyer minted money and a poor buyer paid only what it
+    had. The charge, the credit, the ledger contract and the event share one transaction.
+
+    @param session_id - campaign; `None` resolves through `require_session`.
+    @param project_id - `research_projects.id`.
+    @param buyer - faction name in this session.
+    @param markdown_pct - discount for the redacted data, 0..100.
+    @returns the sale record, or `{error}` for a bad markdown, blueprint, buyer or treasury.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
     if not 0 <= markdown_pct <= 100:
         return {"error": f"markdown_pct is a percentage 0..100, got {markdown_pct}"}
     proj = await Database.fetchrow(
@@ -234,44 +295,48 @@ async def sell_blueprint(session_id: int | None, project_id: int, buyer: str = "
 
     price = int(proj["blueprint_price"] * (1 - markdown_pct / 100.0))  # redacted discount
 
-    # Buyer (faction) bayar → treasury naik. Both moves report whether the row existed:
-    # sessions without a resources row used to book the sale and pay nothing.
-    credited = await Database.fetchrow(
-        "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2 RETURNING credits",
-        price, session_id)
-    charged = await Database.fetchrow(
-        "UPDATE maya_rp.factions SET treasury=GREATEST(0, treasury-$1) "
-        "WHERE session_id=$2 AND name=$3 RETURNING treasury",
-        price, session_id, buyer)
-    if credited is None:
-        info("corporations",
-             f"Blueprint sale: no resources row for session {session_id}, {price:,}C not banked")
-    if charged is None:
-        info("corporations",
-             f"Blueprint sale: buyer {buyer!r} is not a faction in session {session_id}, "
-             f"{price:,}C not charged")
+    try:
+        async with Database.transaction() as conn:
+            charged = await conn.fetchrow(
+                "UPDATE maya_rp.factions SET treasury=treasury-$1 "
+                "WHERE session_id=$2 AND name=$3 AND treasury >= $1 RETURNING treasury",
+                price, session_id, buyer)
+            if charged is None:
+                info("corporations",
+                     f"Blueprint sale: buyer {buyer!r} is not a faction in session {session_id} "
+                     f"or holds less than {price:,}C; nothing moved")
+                raise _Abort({"error": f"Buyer {buyer!r} not found in session {session_id} "
+                                       f"or cannot pay {price:,}C"})
+            credited = await conn.fetchrow(
+                "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2 RETURNING credits",
+                price, session_id)
+            if credited is None:
+                info("corporations",
+                     f"Blueprint sale: no resources row for session {session_id}, {price:,}C not banked")
+                raise _Abort({"error": f"No treasury row for session {session_id}"})
 
-    # Ledger contract. The row is written with the BHI corporation when one exists;
-    # no session has ever chartered one, so the row arrives invisible to the tick
-    # join and the sale stays a record rather than a second payout.
-    ledger_corp = await Database.fetchval(
-        "SELECT id FROM maya_rp.corporations WHERE session_id=$1 AND name='BHI' LIMIT 1",
-        session_id)
-    cid = await Database.fetchval(
-        """INSERT INTO maya_rp.corporate_contracts (session_id, corp_id, contract_type, target_system,
-           payout_credits, duration_days, days_remaining, status)
-           VALUES ($1, $2, 'blueprint_sale', $3, $4, 30, 30, 'active') RETURNING id""",
-        session_id, ledger_corp, buyer, price)
-    if ledger_corp is None:
-        info("corporations",
-             f"Blueprint sale {proj['name']}: no BHI corporation in session {session_id}, "
-             f"contract {cid} is a ledger row the tick cannot see")
-    await Database.execute(
-        "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance, tags) "
-        "VALUES ($1, 'trade', $2, $3, 3, '[\"blueprint\",\"trade\"]'::jsonb)",
-        session_id, f"Blueprint Sold: {proj['name']}",
-        f"80% data redacted blueprint {proj['name']} dijual ke {buyer} untuk {price:,}C. "
-        f"Buyer perlu R&D sendiri untuk full spec.")
+            # Ledger contract. The row is written with the BHI corporation when one exists;
+            # no session has ever chartered one, so the row arrives invisible to the tick
+            # join and the sale stays a record rather than a second payout.
+            ledger_corp = await conn.fetchval(
+                "SELECT id FROM maya_rp.corporations WHERE session_id=$1 AND name='BHI' LIMIT 1",
+                session_id)
+            cid = await conn.fetchval(
+                """INSERT INTO maya_rp.corporate_contracts (session_id, corp_id, contract_type, target_system,
+                   payout_credits, duration_days, days_remaining, status)
+                   VALUES ($1, $2, 'blueprint_sale', $3, $4, 30, 30, 'active') RETURNING id""",
+                session_id, ledger_corp, buyer, price)
+            if ledger_corp is None:
+                info("corporations",
+                     f"Blueprint sale {proj['name']}: no BHI corporation in session {session_id}, "
+                     f"contract {cid} is a ledger row the tick cannot see")
+            await conn.execute(
+                "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance, tags) "
+                "VALUES ($1, 'trade', $2, $3, 3, '[\"blueprint\",\"trade\"]'::jsonb)",
+                session_id, f"Blueprint Sold: {proj['name']}",
+                f"80% data redacted blueprint {proj['name']} dijual ke {buyer} untuk {price:,}C. "
+                f"Buyer perlu R&D sendiri untuk full spec.")
+    except _Abort as stop:
+        return stop.payload
     return {"sold": proj["name"], "buyer": buyer, "price": price, "contract_id": cid,
-            "markdown_pct": markdown_pct, "banked": credited is not None,
-            "charged_buyer": charged is not None}
+            "markdown_pct": markdown_pct, "banked": True, "charged_buyer": True}

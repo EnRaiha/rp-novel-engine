@@ -20,13 +20,19 @@ validation refuses a name outside the list; `talent_shortage` counts active crew
 against active ships and excludes the two yard types; the level threshold is
 level × 100; and every skill write upserts on (crew_id, skill_name).
 
-No database: every test drives a fake Database.
+No database: every test drives a fake Database; its `transaction()` yields the fake itself. Every call uses
+a scratch session id, because the frozen guard refuses sessions 3 and 5.
 """
 from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
 
 import pytest
 
 import modules.crew_career as cc
+
+SID = 900 + os.getpid() % 100
 
 
 class FakeDB:
@@ -53,6 +59,10 @@ class FakeDB:
         self.calls.append(("execute", " ".join(sql.split()), args))
         return self.execute_tag
 
+    @asynccontextmanager
+    async def transaction(self):
+        yield self
+
     def sql(self, kind=None):
         return [c[1] for c in self.calls if kind is None or c[0] == kind]
 
@@ -62,7 +72,7 @@ class FakeDB:
 
 
 def _install(monkeypatch, fake):
-    for name in ("fetchrow", "fetchval", "fetch", "execute"):
+    for name in ("fetchrow", "fetchval", "fetch", "execute", "transaction"):
         monkeypatch.setattr("modules.crew_career.Database." + name, getattr(fake, name))
     return fake
 
@@ -75,11 +85,11 @@ CREW = {"xp": 250, "level": 1, "role": "gunner"}
 async def test_an_award_for_another_campaigns_crew_is_not_logged(monkeypatch):
     seen = []
     monkeypatch.setattr("modules.crew_career.info", lambda mod, msg: seen.append(msg))
-    fake = _install(monkeypatch, FakeDB(execute_tag="UPDATE 0"))
+    fake = _install(monkeypatch, FakeDB(fetchrow=None))
 
-    out = await cc.award(77, 50, "battle", 5)
+    out = await cc.award(77, 50, "battle", SID)
 
-    assert out["leveled"] is False and "not in session 5" in out["error"]
+    assert out["leveled"] is False and f"not in session {SID}" in out["error"]
     assert not fake.args_for("INSERT INTO maya_rp.crew_xp_log", "execute"), "a receipt was written anyway"
     assert any("NOT awarded" in m for m in seen), seen
 
@@ -87,37 +97,31 @@ async def test_an_award_for_another_campaigns_crew_is_not_logged(monkeypatch):
 async def test_an_award_that_lands_is_logged(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=CREW, execute_tag="UPDATE 1"))
 
-    out = await cc.award(77, 50, "battle", 5)
+    out = await cc.award(77, 50, "battle", SID)
 
-    assert out["leveled"] is True             # 250 + 50 = 300 ≥ level 1 × 100
+    assert out["leveled"] is True             # the row the award returns holds 250 XP, over level 1 × 100
     logged = fake.args_for("INSERT INTO maya_rp.crew_xp_log", "execute")[0]
-    assert logged == (77, 5, 50, "battle")
+    assert logged == (77, SID, 50, "battle")
 
 
-async def test_the_follow_up_read_and_the_level_up_carry_the_session(monkeypatch):
+async def test_the_award_returns_the_row_and_the_level_up_carries_the_session(monkeypatch):
+    """The XP write is `UPDATE ... RETURNING`: no separate read is left to race a second award."""
     fake = _install(monkeypatch, FakeDB(fetchrow=CREW, execute_tag="UPDATE 1"))
 
-    await cc.award(77, 50, "battle", 5)
+    await cc.award(77, 50, "battle", SID)
 
-    read = fake.sql("fetchrow")[0]
-    assert "id=$1 AND session_id=$2" in read
-    assert fake.args_for("crew_roster", "fetchrow")[0] == (77, 5)
+    write = [s for s in fake.sql("fetchrow") if "UPDATE maya_rp.crew_roster" in s][0]
+    assert "id=$2 AND session_id=$3" in write and "RETURNING xp, level, role" in write
+    assert fake.args_for("crew_roster", "fetchrow")[0] == (50, 77, SID)
+    assert not [s for s in fake.sql("fetchrow") if s.startswith("SELECT")], "a read-then-write is back"
     level = fake.args_for("SET level=$1,rank=$2", "execute")[0]
-    assert level == (2, "Specialist", 100, 77, 5)
-
-
-async def test_a_missing_crew_after_the_award_is_named(monkeypatch):
-    _install(monkeypatch, FakeDB(fetchrow=None, execute_tag="UPDATE 1"))
-
-    out = await cc.award(77, 50, "battle", 5)
-
-    assert out["leveled"] is False and "vanished" in out["error"]
+    assert level == (2, "Specialist", 100, 77, SID)
 
 
 async def test_a_crew_below_its_threshold_does_not_level(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow={"xp": 90, "level": 1, "role": "gunner"}))
 
-    assert await cc.award(77, 5, "drill", 5) == {"leveled": False}
+    assert await cc.award(77, 5, "drill", SID) == {"leveled": False}
     assert not fake.args_for("SET level=$1,rank=$2", "execute")
 
 
@@ -126,25 +130,25 @@ async def test_a_crew_below_its_threshold_does_not_level(monkeypatch):
 async def test_assigning_a_specialization_names_an_unknown_crew(monkeypatch):
     _install(monkeypatch, FakeDB(execute_tag="UPDATE 0"))
 
-    out = await cc.assign_specialization(77, "artisan", 5)
+    out = await cc.assign_specialization(77, "artisan", SID)
 
-    assert "not in session 5" in out["error"], out
+    assert f"not in session {SID}" in out["error"], out
 
 
 async def test_assigning_a_specialization_reports_the_crew(monkeypatch):
     fake = _install(monkeypatch, FakeDB(execute_tag="UPDATE 1"))
 
-    out = await cc.assign_specialization(77, "artisan", 5)
+    out = await cc.assign_specialization(77, "artisan", SID)
 
     assert out == {"crew_id": 77, "specialization": "artisan"}
-    assert fake.args_for("SET specialization=$1", "execute")[0] == ("artisan", 77, 5)
+    assert fake.args_for("SET specialization=$1", "execute")[0] == ("artisan", 77, SID)
 
 
 @pytest.mark.parametrize("spec", ["wizard", "", "Artisan"])
 async def test_an_unknown_specialization_is_refused(monkeypatch, spec):
     fake = _install(monkeypatch, FakeDB())
 
-    out = await cc.assign_specialization(77, spec, 5)
+    out = await cc.assign_specialization(77, spec, SID)
 
     assert "Specialization mesti salah satu" in out["error"]
     assert not fake.sql("execute")
@@ -156,35 +160,35 @@ async def test_promotion_writes_the_level_with_the_session(monkeypatch):
     crew = {"id": 77, "xp": 300, "level": 2, "rank": "Specialist", "specialization": "artisan"}
     fake = _install(monkeypatch, FakeDB(fetchrow=crew))
 
-    out = await cc.promote_crew(77, 5)
+    out = await cc.promote_crew(77, SID)
 
     assert out["leveled"] is True and out["new_rank"] == "Veteran"
     assert out["skills"] == ["weapons", "hull"]
     update = fake.args_for("promotion_source='novel_promotion'", "execute")[0]
-    assert update == (3, "Veteran", 200, 77, 5)
+    assert update == (3, "Veteran", 200, 77, SID)
 
 
 async def test_a_promotion_with_insufficient_xp_says_how_much_is_missing(monkeypatch):
     crew = {"id": 77, "xp": 50, "level": 2, "rank": "Specialist", "specialization": None}
     _install(monkeypatch, FakeDB(fetchrow=crew))
 
-    assert await cc.promote_crew(77, 5) == {"leveled": False, "need": 150}
+    assert await cc.promote_crew(77, SID) == {"leveled": False, "need": 150}
 
 
 async def test_a_missing_crew_is_answered(monkeypatch):
     _install(monkeypatch, FakeDB(fetchrow=None))
 
-    assert await cc.promote_crew(77, 5) == {"error": "Crew not found"}
+    assert await cc.promote_crew(77, SID) == {"error": "Crew not found"}
 
 
 async def test_the_tick_no_longer_reads_a_day_it_never_uses(monkeypatch):
     fake = _install(monkeypatch, FakeDB())
 
-    out = await cc.run_tick(5)
+    out = await cc.run_tick(SID)
 
     assert out == {"processed": True}
     assert not fake.sql("fetchval"), "the dead game-day read is back"
-    assert fake.args_for("crew_roster", "execute")[0] == (5,)
+    assert fake.args_for("crew_roster", "execute")[0] == (SID,)
 
 
 # ── Contract the module claims ──────────────────────────────────────────

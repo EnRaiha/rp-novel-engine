@@ -10,11 +10,44 @@ from __future__ import annotations
 import random
 from core.db import Database
 from core.log import info
+from core.session import require_session
+
+
+def _writable_session(session_id: int | None) -> int:
+    """Resolve the session for one call and refuse a frozen campaign.
+
+    Sessions 3 and 5 are reference data; a writer that skipped this check mutated them.
+
+    @param session_id - caller's session; `None` resolves through `core.session.require_session`.
+    @returns the resolved session id.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    sid = require_session(session_id)
+    _refuse_frozen(sid)
+    return sid
+
+
+class _Abort(Exception):
+    """Roll the open transaction back and hand `payload` to the caller as the answer."""
+
+    def __init__(self, payload: dict):
+        super().__init__(payload.get("error", "aborted"))
+        self.payload = payload
 
 
 async def challenge(session_id: int, player_ship_id: int, opponent: dict, stakes: dict,
                     venue: str = "Open Space") -> dict:
-    """Daftarkan duel formal. opponent: {name, tier, hull, power}. stakes: {type, value}."""
+    """Daftarkan duel formal. opponent: {name, tier, hull, power}. stakes: {type, value}.
+
+    A `favor` stake may omit `value`; it is stored as 0. The insert read `stakes["value"]` and raised
+    KeyError for the `{"type": "favor"}` shape the type check just accepted.
+
+    @param session_id - campaign; `None` resolves through `require_session`.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
     stakes_type = stakes.get("type")
     if stakes_type not in ("credits", "favor"):
         return {"error": f"Unknown stakes type {stakes_type!r}: use 'credits' or 'favor'"}
@@ -25,41 +58,67 @@ async def challenge(session_id: int, player_ship_id: int, opponent: dict, stakes
             return {"error": f"stakes value {stakes.get('value')!r} is not a whole number"}
         if value < 0:
             return {"error": f"stakes value cannot be negative, got {value}"}
+    else:
+        value = stakes.get("value") or 0
     duel_id = await Database.fetchval(
         """INSERT INTO maya_rp.duels (session_id, player_ship_id, opponent_name, opponent_tier,
                                       opponent_hull, opponent_power, stakes_type, stakes_value, venue, status)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending') RETURNING id""",
         session_id, player_ship_id, opponent["name"], opponent["tier"], opponent["hull"],
-        opponent["power"], stakes["type"], str(stakes["value"]), venue,
+        opponent["power"], stakes_type, str(value), venue,
     )
     info("duel", f"Challenge issued: {opponent['name']} (T{opponent['tier']}, power {opponent['power']})")
     return {"duel_id": duel_id, "status": "pending", "message": f"Challenge issued to {opponent['name']}."}
 
 
 async def resolve(session_id: int, duel_id: int) -> dict:
-    """Resolve duel: roll vs win_chance (math power_ratio), stakes transfer, damage applied."""
-    d = await Database.fetchrow(
-        "SELECT * FROM maya_rp.duels WHERE id=$1 AND session_id=$2 AND status='pending'",
+    """Resolve duel: roll vs win_chance (math power_ratio), stakes transfer, damage applied.
+
+    The first statement claims the duel (`pending` to `resolved`, `RETURNING *`). Two concurrent
+    resolves of one duel both read `pending` before either wrote, so both rolled, both paid the stake
+    and both damaged the hull. The claim, the hull write, the stake transfer and the event rows share
+    one transaction, so an error after the claim restores `pending`.
+
+    A NULL `ships.power_rating`, `ships.hull` or `duels.opponent_power` reads as 0 instead of raising
+    TypeError on the ratio or the hull range.
+
+    @param session_id - campaign; `None` resolves through `require_session`.
+    @param duel_id - `duels.id`.
+    @returns the outcome dict, or `{error}` when the duel is gone, already resolved, or the ship is out.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
+    try:
+        async with Database.transaction() as conn:
+            return await _resolve_claimed(conn, session_id, duel_id)
+    except _Abort as stop:
+        return stop.payload
+
+
+async def _resolve_claimed(conn, session_id: int, duel_id: int) -> dict:
+    d = await conn.fetchrow(
+        "UPDATE maya_rp.duels SET status='resolved', resolved_at=NOW() "
+        "WHERE id=$1 AND session_id=$2 AND status='pending' RETURNING *",
         duel_id, session_id,
     )
     if not d:
-        return {"error": "Duel tidak dijumpai atau sudah selesai"}
+        raise _Abort({"error": "Duel tidak dijumpai atau sudah selesai"})
 
-    ship = await Database.fetchrow(
-        "SELECT * FROM maya_rp.ships WHERE id=$1 AND session_id=$2", d["player_ship_id"], session_id,
+    ship = await conn.fetchrow(
+        "SELECT * FROM maya_rp.ships WHERE id=$1 AND session_id=$2 FOR UPDATE", d["player_ship_id"], session_id,
     )
     if not ship or ship["status"] == "destroyed":
-        return {"error": "Kapal pemain tidak aktif atau musnah"}
+        raise _Abort({"error": "Kapal pemain tidak aktif atau musnah"})
 
     # Tier Integrity: math, bukan vibe
-    pp = ship["power_rating"]
-    ep = d["opponent_power"]
+    pp = ship["power_rating"] or 0
+    ep = d["opponent_power"] or 0
     power_ratio = pp / max(1, ep)
     win_chance = max(5, min(95, 50 + (power_ratio - 1) * 40))
     roll = random.randint(1, 100)
     win = roll <= win_chance
 
-    hull = ship["hull"]
+    hull = ship["hull"] or 0
     hull_current = ship["hull_current"] if ship["hull_current"] is not None else hull
 
     if win:
@@ -85,7 +144,7 @@ async def resolve(session_id: int, duel_id: int) -> dict:
         status = "damaged"
     else:
         status = "active"
-    await Database.execute(
+    await conn.execute(
         "UPDATE maya_rp.ships SET hull_current=$1, status=$2 WHERE id=$3 AND session_id=$4",
         new_hull, status, ship["id"], session_id,
     )
@@ -95,12 +154,12 @@ async def resolve(session_id: int, duel_id: int) -> dict:
     if d["stakes_type"] == "credits":
         amount = int(d["stakes_value"] or 0)
         if win:
-            paid = await Database.fetchrow(
+            paid = await conn.fetchrow(
                 "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2 "
                 "RETURNING credits", amount, session_id)
             stakes_msg = f"Menang {amount:,} credits."
         else:
-            paid = await Database.fetchrow(
+            paid = await conn.fetchrow(
                 "UPDATE maya_rp.resources SET credits=GREATEST(0, credits-$1) WHERE session_id=$2 "
                 "RETURNING credits", amount, session_id)
             stakes_msg = f"Hilang {amount:,} credits."
@@ -112,9 +171,8 @@ async def resolve(session_id: int, duel_id: int) -> dict:
     elif d["stakes_type"] == "favor":
         stakes_msg = f"Favor {'menang' if win else 'hilang'} dalam duel."
 
-    await Database.execute(
-        "UPDATE maya_rp.duels SET status='resolved', result=$1, resolved_at=NOW() "
-        "WHERE id=$2 AND session_id=$3",
+    await conn.execute(
+        "UPDATE maya_rp.duels SET result=$1 WHERE id=$2 AND session_id=$3",
         result, duel_id, session_id,
     )
 
@@ -123,12 +181,12 @@ async def resolve(session_id: int, duel_id: int) -> dict:
             f"{d['opponent_name']} (T{d['opponent_tier']}, power {ep:,}). "
             f"{'MENANG' if win else 'KALAH'} — {result.replace('_', ' ').title()}. "
             f"Roll {roll} vs {win_chance:.0f}%. Hull: {new_hull:,}/{hull:,}. {stakes_msg}")
-    await Database.execute(
+    await conn.execute(
         "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance) "
         "VALUES ($1, 'duel', $2, $3, 4)",
         session_id, f"Duel: {ship['name']} vs {d['opponent_name']}", desc,
     )
-    await Database.execute(
+    await conn.execute(
         "INSERT INTO maya_rp.news_articles (session_id, tick_number, headline, body, category, faction_bias, importance, read, game_day) "
         "VALUES ($1, 1, $2, $3, 'military', 0, 3, false, (SELECT game_day FROM maya_rp.sessions WHERE id=$1))",
         session_id, f"DUEL: {ship['name']} vs {d['opponent_name']}", desc,
@@ -153,5 +211,7 @@ async def cmd(sid: int, action: str, params: dict) -> dict:
     return {"error": f"Unknown action '{action}' (available: challenge, resolve, list)"}
 
 
-async def run_tick(session_id: int = None) -> dict:
+async def run_tick(session_id: int | None = None) -> dict:
+    """No-op tick. @raises core.ooc.FrozenSession - the campaign is frozen."""
+    _writable_session(session_id)
     return {"status": "duel_ready"}

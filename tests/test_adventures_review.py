@@ -20,9 +20,14 @@ No database: every test drives a fake Database.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import modules.adventures as adv
+
+#: Scratch session: the frozen guard refuses sessions 3 and 5, and `resolve` and `run_tick` write.
+SID = 900 + os.getpid() % 100
 
 
 class FakeDB:
@@ -92,7 +97,7 @@ async def test_an_unknown_outcome_is_refused(monkeypatch, outcome):
     fake = _install(monkeypatch, FakeDB())
 
     with pytest.raises(ValueError, match="outcome must be one of"):
-        await adv.resolve("pirate", outcome, 5)
+        await adv.resolve("pirate", outcome, SID)
 
     assert not fake.calls
 
@@ -100,7 +105,7 @@ async def test_an_unknown_outcome_is_refused(monkeypatch, outcome):
 async def test_a_failure_pays_nothing_and_echoes_the_type(monkeypatch):
     fake = _install(monkeypatch, FakeDB())
 
-    out = await adv.resolve("derelict", "failure", 5)
+    out = await adv.resolve("derelict", "failure", SID)
 
     assert out == {"reward": 0, "outcome": "failure", "adventure_type": "derelict"}
     assert not fake.sql("execute")
@@ -112,18 +117,18 @@ async def test_a_success_pays_and_names_the_encounter(monkeypatch):
     fake = _install(monkeypatch, FakeDB())
     monkeypatch.setattr(adv.random, "randint", lambda a, b: b)
 
-    out = await adv.resolve("artifact", "success", 5)
+    out = await adv.resolve("artifact", "success", SID)
 
     assert out == {"reward": 5000, "outcome": "success", "adventure_type": "artifact"}
-    assert fake.args_for("credits=credits+$1", "execute")[0] == (5000, 5)
+    assert fake.args_for("credits=credits+$1", "execute")[0] == (5000, SID)
 
 
 async def test_the_reward_does_not_vary_by_encounter_type(monkeypatch):
     _install(monkeypatch, FakeDB())
     monkeypatch.setattr(adv.random, "randint", lambda a, b: a)
 
-    merchant = await adv.resolve("merchant", "success", 5)
-    crack = await adv.resolve("planet_crack", "success", 5)
+    merchant = await adv.resolve("merchant", "success", SID)
+    crack = await adv.resolve("planet_crack", "success", SID)
 
     assert merchant["reward"] == crack["reward"] == 500
 
@@ -134,7 +139,7 @@ async def test_a_session_without_a_treasury_is_not_told_it_was_paid(monkeypatch)
     _install(monkeypatch, FakeDB(execute_tag="UPDATE 0"))
     monkeypatch.setattr(adv.random, "randint", lambda a, b: b)
 
-    out = await adv.resolve("pirate", "success", 5)
+    out = await adv.resolve("pirate", "success", SID)
 
     assert out["reward"] == 0 and "No treasury row" in out["error"]
     assert any("NOT paid" in m for m in seen), seen
@@ -146,4 +151,4 @@ def test_contract_the_encounter_list_is_unique():
 
 
 async def test_contract_run_tick_is_a_stub():
-    assert await adv.run_tick(5) == {"status": "adventures_ready"}
+    assert await adv.run_tick(SID) == {"status": "adventures_ready"}

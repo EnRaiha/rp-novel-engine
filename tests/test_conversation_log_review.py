@@ -19,9 +19,14 @@ No database: every test drives a fake Database.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import modules.conversation_log as conv
+
+#: Scratch session: `log` writes, and the frozen guard refuses sessions 3 and 5.
+SID = 900 + os.getpid() % 100
 
 
 class FakeDB:
@@ -70,10 +75,10 @@ def test_keywords_of_a_missing_topic_are_empty_not_a_crash(topic):
 async def test_log_stores_the_keywords_for_the_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchval=2244))
 
-    await conv.log(11, "the brass key and the vault", "tense", "guarded", 5)
+    await conv.log(11, "the brass key and the vault", "tense", "guarded", SID)
 
     insert = fake.args_for("INSERT INTO maya_rp.conversation_log", "execute")[0]
-    assert insert[0] == 5 and insert[1] == 11
+    assert insert[0] == SID and insert[1] == 11
     assert insert[3] == ["brass", "vault"]
     assert insert[6] == 2244
 
@@ -83,7 +88,7 @@ async def test_log_refuses_a_missing_topic(monkeypatch, topic):
     fake = _install(monkeypatch, FakeDB())
 
     with pytest.raises(ValueError, match="topic must be a non-empty string"):
-        await conv.log(11, topic)
+        await conv.log(11, topic, session_id=SID)
 
     assert not fake.sql("execute")
 

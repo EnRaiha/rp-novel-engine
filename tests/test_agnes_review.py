@@ -38,8 +38,9 @@ async def test_a_bad_prompt_is_refused_by_name(prompt):
         await agnes.query(prompt)
 
 
-async def test_the_session_defaults_to_the_engine_session(monkeypatch):
-    monkeypatch.setattr("modules.agnes.Config.SESSION_ID", 77)
+async def test_the_session_defaults_to_the_resolved_session(monkeypatch):
+    """The default comes from `require_session` (RP_SESSION), not from the import-time `Config.SESSION_ID`."""
+    monkeypatch.setenv("RP_SESSION", "77")
 
     out = await agnes.query("status")
 
@@ -63,6 +64,6 @@ def test_the_prompt_is_echoed_to_the_declared_length():
 
 
 async def test_contract_run_tick_reports_ready_without_touching_the_world(monkeypatch):
-    monkeypatch.setattr("modules.agnes.Config.SESSION_ID", 77)
+    monkeypatch.setenv("RP_SESSION", "77")
 
     assert await agnes.run_tick() == {"status": "agnes_ready"}

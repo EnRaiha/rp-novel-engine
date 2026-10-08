@@ -19,7 +19,7 @@ from modules import encounters, narrative_seeds  # noqa: E402
 SESSION = 5
 
 
-async def _seed(session_id=SESSION, status="planted", days=30):
+async def _seed(session_id=SESSION, status="planted", days=100_000):
     return await Database.fetchval(
         "INSERT INTO maya_rp.narrative_seeds "
         "(session_id, seed_type, content, planted_at_game_day, status, payoff_game_day) "

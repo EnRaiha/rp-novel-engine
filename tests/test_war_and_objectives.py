@@ -6,14 +6,36 @@ rule and the mutiny scene generator.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import pytest_asyncio  # noqa: E402
+
 from core.db import Database  # noqa: E402
 from modules import objectives, siege, social, tactics  # noqa: E402
+
+
+@pytest_asyncio.fixture
+async def campaign_row():
+    """The scratch campaign's `maya_rp.sessions` row, 900 + pid % 100, the slot `scratch_session` hands out.
+
+    A test asks for this fixture BEFORE `scratch_session`: pytest tears down in reverse order, so
+    `scratch_session` clears every child row first and the row is removed last, after nothing references it.
+    Sessions 3 and 5 are frozen reference data and are never written.
+    """
+    sid = 900 + os.getpid() % 100
+    await Database.init()
+    await Database.execute(
+        "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'rp-engine test scratch','active')"
+        " ON CONFLICT (id) DO NOTHING", sid)
+    yield sid
+    await Database.init()
+    await Database.execute("DELETE FROM maya_rp.sessions WHERE id=$1", sid)
+    await Database.close()
 
 
 class TestTheExchange:
@@ -31,15 +53,17 @@ class TestTheExchange:
 
 
 class TestTheSiege:
-    async def test_a_siege_can_be_started_and_listed(self):
+    async def test_a_siege_can_be_started_and_listed(self, campaign_row, scratch_session):
+        """The siege is started and listed in a scratch campaign; session 5 is frozen reference data."""
+        sid = scratch_session
         await Database.init()
-        made = await siege.start_siege("Red Proof Keep", 5)
+        made = await siege.start_siege("Red Proof Keep", sid)
         try:
-            assert made is not None
-            rows = await siege.list_sieges(5)
+            assert made is not None, "start_siege answered nothing"
+            rows = await siege.list_sieges(sid)
             assert isinstance(rows, list), rows
         finally:
-            await Database.execute("DELETE FROM maya_rp.sieges WHERE session_id=5")
+            await Database.execute("DELETE FROM maya_rp.sieges WHERE session_id=$1", sid)
             await Database.close()
 
 

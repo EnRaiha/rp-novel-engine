@@ -6,14 +6,36 @@ function returns a dict and `or {}` turned False into an empty one.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import pytest_asyncio  # noqa: E402
+
 from core.db import Database  # noqa: E402
 from modules import ship_building  # noqa: E402
+
+
+@pytest_asyncio.fixture
+async def campaign_row():
+    """The scratch campaign's `maya_rp.sessions` row, 900 + pid % 100, the slot `scratch_session` hands out.
+
+    A test asks for this fixture BEFORE `scratch_session`: pytest tears down in reverse order, so
+    `scratch_session` clears every child row first and the row is removed last, after nothing references it.
+    Sessions 3 and 5 are frozen reference data and are never written.
+    """
+    sid = 900 + os.getpid() % 100
+    await Database.init()
+    await Database.execute(
+        "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'rp-engine test scratch','active')"
+        " ON CONFLICT (id) DO NOTHING", sid)
+    yield sid
+    await Database.init()
+    await Database.execute("DELETE FROM maya_rp.sessions WHERE id=$1", sid)
+    await Database.close()
 
 
 class TestTheCapacityAnswer:
@@ -33,9 +55,11 @@ class TestTheReports:
         assert out, "an empty report is not an answer"
         await Database.close()
 
-    async def test_assigning_crew_to_a_ship_that_does_not_exist_is_answered(self):
+    async def test_assigning_crew_to_a_ship_that_does_not_exist_is_answered(self, campaign_row, scratch_session):
+        """A scratch campaign takes the write; session 5 is frozen reference data."""
+        sid = scratch_session
         await Database.init()
-        out = await ship_building.assign_crew_to_ship(5, 999_999, 10)
+        out = await ship_building.assign_crew_to_ship(sid, 999_999, 10)
         assert isinstance(out, dict), out
         assert out.get("error") or out.get("status"), out
         await Database.close()

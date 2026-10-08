@@ -5,47 +5,76 @@ inner life (memories, npc_autonomy) and one carries the fleet's fuel (fleet_econ
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import pytest_asyncio  # noqa: E402
+
 from core.db import Database  # noqa: E402
 from modules import archaeology, fleet_economy, narrative_seeds  # noqa: E402
 
 
+@pytest_asyncio.fixture
+async def campaign_row():
+    """The scratch campaign's `maya_rp.sessions` row, 900 + pid % 100, the slot `scratch_session` hands out.
+
+    A test asks for this fixture BEFORE `scratch_session`: pytest tears down in reverse order, so
+    `scratch_session` clears every child row first and the row is removed last, after nothing references it.
+    Sessions 3 and 5 are frozen reference data and are never written.
+    """
+    sid = 900 + os.getpid() % 100
+    await Database.init()
+    await Database.execute(
+        "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'rp-engine test scratch','active')"
+        " ON CONFLICT (id) DO NOTHING", sid)
+    yield sid
+    await Database.init()
+    await Database.execute("DELETE FROM maya_rp.sessions WHERE id=$1", sid)
+    await Database.close()
+
+
 class TestTheDig:
-    async def test_sites_are_seeded_and_one_can_be_excavated(self):
+    async def test_sites_are_seeded_and_one_can_be_excavated(self, campaign_row, scratch_session):
+        """Sites are seeded into a scratch campaign and one is dug; session 5 is frozen reference data."""
+        sid = scratch_session
         await Database.init()
-        sites = await archaeology.seed_sites(5, 2)
+        sites = await archaeology.seed_sites(sid, 2)
         try:
             assert len(sites) == 2, sites
-            dug = await archaeology.excavate(sites[0]["id"], 5)
+            dug = await archaeology.excavate(sites[0]["id"], sid)
             assert dug is not None
         finally:
-            await Database.execute("DELETE FROM maya_rp.dig_sites WHERE session_id=5")
+            await Database.execute("DELETE FROM maya_rp.artifacts WHERE session_id=$1", sid)
+            await Database.execute("DELETE FROM maya_rp.dig_sites WHERE session_id=$1", sid)
             await Database.close()
 
-    async def test_seeding_zero_sites_creates_none(self):
+    async def test_seeding_zero_sites_creates_none(self, campaign_row, scratch_session):
+        """Seeding nothing returns an empty list, in a scratch campaign."""
+        sid = scratch_session
         await Database.init()
-        assert await archaeology.seed_sites(5, 0) == []
+        assert await archaeology.seed_sites(sid, 0) == []
         await Database.close()
 
 
 class TestTheSeeds:
-    async def test_a_planted_seed_appears_in_the_foreshadow_plan(self):
+    async def test_a_planted_seed_appears_in_the_foreshadow_plan(self, campaign_row, scratch_session):
+        """The seed is planted in a scratch campaign, not the live arc."""
+        sid = scratch_session
         await Database.init()
-        before = len(await narrative_seeds.get_foreshadow_ops(5))
+        before = len(await narrative_seeds.get_foreshadow_ops(sid))
         planted = await narrative_seeds.plant_seed(
-            "red proof", "a door that opens later", None, None, None, 5)
+            "red proof", "a door that opens later", None, None, None, sid)
         try:
             assert planted is None, (
                 "plant_seed writes and returns nothing; the test checks that, not a return value")
-            after = len(await narrative_seeds.get_foreshadow_ops(5))
+            after = len(await narrative_seeds.get_foreshadow_ops(sid))
             assert after >= before, (before, after)
         finally:
-            await Database.execute("DELETE FROM maya_rp.narrative_seeds WHERE session_id=5")
+            await Database.execute("DELETE FROM maya_rp.narrative_seeds WHERE session_id=$1", sid)
             await Database.close()
 
 

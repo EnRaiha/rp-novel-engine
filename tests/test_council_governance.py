@@ -6,14 +6,52 @@ them; the briefing takes three lists.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
+
 from core.db import Database  # noqa: E402
 from modules import council  # noqa: E402
+
+#: Scratch sessions. The writers refuse the frozen sessions 3 and 5, so every row this file makes lives in
+#: a session of its own (900-999), with a second one standing in for "another campaign".
+SESSION = 900 + os.getpid() % 100
+OTHER = 900 + (os.getpid() + 50) % 100
+
+#: Children first: foreign keys run from these tables to `characters`, `cabinet_hierarchy`, `sessions`.
+_TABLES = (
+    "cabinet_decrees", "cabinet_hierarchy", "character_relationships", "characters", "conspiracies",
+    "crew_roster", "events", "intel_network", "morale_history", "social_events", "territory",
+)
+
+
+async def _wipe() -> None:
+    for sid in (SESSION, OTHER):
+        for table in _TABLES:
+            await Database.execute(f"DELETE FROM maya_rp.{table} WHERE session_id = $1", sid)
+        await Database.execute("DELETE FROM maya_rp.sessions WHERE id = $1", sid)
+
+
+@pytest_asyncio.fixture
+async def scratch():
+    """Both scratch sessions exist for the test; every row of them is removed after, in foreign-key order."""
+    await Database.init()
+    await _wipe()
+    for sid in (SESSION, OTHER):
+        await Database.execute(
+            "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1, 'scratch', 'active')"
+            " ON CONFLICT (id) DO NOTHING", sid)
+    try:
+        yield
+    finally:
+        await _wipe()
+        await Database.close()
 
 
 class TestTheCrisis:
@@ -47,16 +85,14 @@ class TestTheBriefing:
 
 
 class TestTheDecree:
-    async def test_a_decree_without_a_consul_is_refused(self):
-        """Session 5 has no cabinet, so the decree route answers rather than crashing."""
-        await Database.init()
-        out = await council.issue_decree(5, "tax")
+    async def test_a_decree_without_a_consul_is_refused(self, scratch):
+        """A session with no cabinet gets an answer from the decree route, not a crash."""
+        out = await council.issue_decree(SESSION, "tax")
         assert out.get("issued") is False, out
         assert "Grand Consul" in out.get("reason", ""), out
-        await Database.close()
 
 
 class TestTheMeeting:
     def test_a_meeting_answers_with_a_shape(self):
-        out = council.convene_meeting("emergency", {"session_id": 5})
+        out = council.convene_meeting("emergency", {"session_id": SESSION})
         assert isinstance(out, dict), out

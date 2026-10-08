@@ -20,19 +20,40 @@ from core.db import Database  # noqa: E402
 from modules import social  # noqa: E402
 
 
-class TestTheTickSurfacesWhatItKnows:
-    async def test_the_tick_returns_the_tension_narrative_and_pending_events(self):
-        await Database.init()
-        out = await social.run_tick(5)
-        assert "tension" in out and isinstance(out["tension"], str) and out["tension"], out
-        assert "pending_events" in out and isinstance(out["pending_events"], list), out
-        await Database.close()
+async def _open_scratch(session_id: int) -> None:
+    """Create the `sessions` row a scratch slot needs. `run_tick`, `calculate_mutiny_risk` and
+    `update_morale` write, and session 5 is frozen, so these tests run in a scratch session."""
+    await Database.init()
+    await Database.execute(
+        "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'social wiring scratch','active')"
+        " ON CONFLICT (id) DO NOTHING", session_id)
 
-    async def test_the_mutiny_report_carries_the_network_ringleaders(self):
-        await Database.init()
-        out = await social.calculate_mutiny_risk(5)
-        assert "network_ringleaders" in out, out
-        await Database.close()
+
+async def _close_scratch(session_id: int) -> None:
+    for table in ("morale_history", "crew_roster", "social_events"):
+        await Database.execute(f"DELETE FROM maya_rp.{table} WHERE session_id=$1", session_id)
+    await Database.execute("DELETE FROM maya_rp.sessions WHERE id=$1", session_id)
+    await Database.close()
+
+
+class TestTheTickSurfacesWhatItKnows:
+    async def test_the_tick_returns_the_tension_narrative_and_pending_events(self, scratch_session):
+        await _open_scratch(scratch_session)
+        try:
+            out = await social.run_tick(scratch_session)
+            assert "tension" in out and isinstance(out["tension"], str) and out["tension"], out
+            assert "pending_events" in out and isinstance(out["pending_events"], list), out
+        finally:
+            await _close_scratch(scratch_session)
+
+    async def test_the_mutiny_report_carries_the_network_ringleaders(self, scratch_session):
+        """The call named session 5, which is frozen: the mutiny report rewrites loyalty flags."""
+        await _open_scratch(scratch_session)
+        try:
+            out = await social.calculate_mutiny_risk(scratch_session)
+            assert "network_ringleaders" in out, out
+        finally:
+            await _close_scratch(scratch_session)
 
 
 class TestMoraleCannotGoNegative:
@@ -67,18 +88,18 @@ class TestMoraleCannotGoNegative:
             await Database.execute("DELETE FROM maya_rp.crew_roster WHERE id=$1", row["id"])
             await Database.close()
 
-    async def test_social_update_morale_also_clamps(self):
-        """Session 5 has no crew, and `_get_fleet_morale` returns its default 50 when the roster is
-        empty, so the test has to own a row or it proves nothing about the clamp."""
-        await Database.init()
+    async def test_social_update_morale_also_clamps(self, scratch_session):
+        """The session has no crew, and `_get_fleet_morale` returns its default 50 when the roster is
+        empty, so the test has to own a row or it proves nothing about the clamp. It runs in a scratch
+        session because `update_morale` refuses frozen session 5."""
+        await _open_scratch(scratch_session)
         row = await Database.fetchrow(
             "INSERT INTO maya_rp.crew_roster (session_id, name, morale)"
-            " VALUES (5, 'red proof clamp', 40) RETURNING id")
+            " VALUES ($1, 'red proof clamp', 40) RETURNING id", scratch_session)
         try:
-            await social.update_morale(5, -1000, "red proof")
+            await social.update_morale(scratch_session, -1000, "red proof")
             after = await Database.fetchval(
                 "SELECT morale FROM maya_rp.crew_roster WHERE id=$1", row["id"])
             assert after == 0, f"morale is {after} after a huge negative delta"
         finally:
-            await Database.execute("DELETE FROM maya_rp.crew_roster WHERE id=$1", row["id"])
-            await Database.close()
+            await _close_scratch(scratch_session)

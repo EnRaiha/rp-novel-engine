@@ -7,7 +7,9 @@ margin to the treasury. The act determines both risk and reward.
 DB-free: pure helpers only (danger, margin, outcome resolution).
 """
 import math
+import os
 import random
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -326,29 +328,47 @@ async def test_register_gate_setia_fleet_at_internal_cost(monkeypatch):
     is SMALLER than the public price (20% = 5,000C); the public price stays
     standardized at 25,000C via economy.gate_toll_income()."""
     import modules.voyage as voyage
-    executed = []
+    charged = []
+    inserted = []
+
+    class FakeConn:
+        async def fetchval(self, sql, *args):
+            if "UPDATE maya_rp.resources" in sql and "COALESCE(credits, 0) - $1" in sql:
+                charged.append(args)
+                return 1_000_000      # RETURNING credits: the debit found a row with funds
+            if "INSERT INTO maya_rp.voyages" in sql:
+                inserted.append(args)
+                return 42
+            return None
+
+        async def execute(self, sql, *args):
+            return "OK"
+
+        async def fetch(self, sql, *args):
+            return []
+
+        async def fetchrow(self, sql, *args):
+            return None
+
+    @asynccontextmanager
+    async def transaction():
+        yield FakeConn()
+
     async def fetchval(sql, *args):
-        if "INSERT INTO maya_rp.voyages" in sql:
-            return 42
-        if "game_day" in sql:
-            return 100
-        return None
+        return 100 if "game_day" in sql else None
     async def fetchrow(sql, *args):
         return None   # compute_travel path: coords only
-    async def execute(sql, *args):
-        executed.append(sql)
-    async def fetch(sql, *args):
-        return []
     monkeypatch.setattr(voyage.Database, "fetchval", fetchval)
     monkeypatch.setattr(voyage.Database, "fetchrow", fetchrow)
-    monkeypatch.setattr(voyage.Database, "execute", execute)
-    monkeypatch.setattr(voyage.Database, "fetch", fetch)
+    monkeypatch.setattr(voyage.Database, "transaction", transaction)
     monkeypatch.setattr(voyage, "gate_crossing", _fake_gate_crossing_public)
     r = await voyage.register("Free Gate Test", "20,250,3", "25,12,2",
-                              ship_count=10, fleet_tag="TEST")
+                              ship_count=10, fleet_tag="TEST", session_id=900 + os.getpid() % 100)
     assert r["lane_type"] == "gate"
     # internal cost is SMALLER than the public price
     assert r["toll_paid"] == 25000 * 0.20           # 5,000C internal share
     assert r["toll_paid"] < 25000
     # treasury cost is booked (Setia fleet free to use, treasury pays smaller)
-    assert any("credits=credits-" in s for s in executed)
+    assert r["toll_charged"] is True, r
+    assert [a[0] for a in charged] == [5000], f"the treasury debit was not the internal share: {charged}"
+    assert len(inserted) == 1, "the voyage row was not inserted in the same transaction"

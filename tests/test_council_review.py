@@ -5,6 +5,7 @@ session 3, and every row this file creates in session 5 is removed in a `finally
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -12,11 +13,44 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
 
 from core.db import Database  # noqa: E402
 from modules import council  # noqa: E402
 
-SESSION = 5
+#: Scratch sessions. The writers refuse the frozen sessions 3 and 5, so every row this file makes lives in
+#: a session of its own (900-999), with a second one standing in for "another campaign".
+SESSION = 900 + os.getpid() % 100
+OTHER = 900 + (os.getpid() + 50) % 100
+
+#: Children first: foreign keys run from these tables to `characters`, `cabinet_hierarchy`, `sessions`.
+_TABLES = (
+    "cabinet_decrees", "cabinet_hierarchy", "character_relationships", "characters", "conspiracies",
+    "crew_roster", "events", "intel_network", "morale_history", "social_events", "territory",
+)
+
+
+async def _wipe() -> None:
+    for sid in (SESSION, OTHER):
+        for table in _TABLES:
+            await Database.execute(f"DELETE FROM maya_rp.{table} WHERE session_id = $1", sid)
+        await Database.execute("DELETE FROM maya_rp.sessions WHERE id = $1", sid)
+
+
+@pytest_asyncio.fixture
+async def scratch():
+    """Both scratch sessions exist for the test; every row of them is removed after, in foreign-key order."""
+    await Database.init()
+    await _wipe()
+    for sid in (SESSION, OTHER):
+        await Database.execute(
+            "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1, 'scratch', 'active')"
+            " ON CONFLICT (id) DO NOTHING", sid)
+    try:
+        yield
+    finally:
+        await _wipe()
+        await Database.close()
 
 
 async def _conspiracy(**over):
@@ -64,13 +98,13 @@ async def _territory(**over):
 
 
 class TestTheThwart:
-    async def test_a_plot_from_another_campaign_is_not_thwarted(self, monkeypatch):
+    async def test_a_plot_from_another_campaign_is_not_thwarted(self, scratch, monkeypatch):
         """The update ran by id alone, so any session could thwart any session's plot."""
         await Database.init()
         row = await _conspiracy()
         try:
             monkeypatch.setattr(council.random, "random", lambda: 0.0)
-            out = await council.thwart_plot(row["id"], "arrest_asset", session_id=3)
+            out = await council.thwart_plot(row["id"], "arrest_asset", session_id=OTHER)
             assert out.get("success") is False, out
             assert "not found" in out.get("error", ""), out
             status = await Database.fetchval(
@@ -80,7 +114,7 @@ class TestTheThwart:
             await Database.execute("DELETE FROM maya_rp.conspiracies WHERE id = $1", row["id"])
             await Database.close()
 
-    async def test_a_conspiracy_that_does_not_exist_is_refused(self, monkeypatch):
+    async def test_a_conspiracy_that_does_not_exist_is_refused(self, scratch, monkeypatch):
         """An id that resolved to nothing was answered with a success roll against no row."""
         await Database.init()
         try:
@@ -91,7 +125,7 @@ class TestTheThwart:
         finally:
             await Database.close()
 
-    async def test_a_thwarted_plot_is_written(self, monkeypatch):
+    async def test_a_thwarted_plot_is_written(self, scratch, monkeypatch):
         await Database.init()
         row = await _conspiracy()
         try:
@@ -110,7 +144,7 @@ class TestTheThwart:
             await Database.execute("DELETE FROM maya_rp.conspiracies WHERE id = $1", row["id"])
             await Database.close()
 
-    async def test_an_unknown_method_names_the_value_and_the_alternatives(self):
+    async def test_an_unknown_method_names_the_value_and_the_alternatives(self, scratch):
         await Database.init()
         try:
             out = await council.thwart_plot(1, "bribe-them", session_id=SESSION)
@@ -140,7 +174,7 @@ class TestTheAgendaTable:
 
 
 class TestTheTick:
-    async def test_a_failing_tick_is_logged_as_a_fault(self, monkeypatch):
+    async def test_a_failing_tick_is_logged_as_a_fault(self, scratch, monkeypatch):
         seen = []
 
         async def boom(session_id):
@@ -154,7 +188,7 @@ class TestTheTick:
 
 
 class TestThePerformanceLedger:
-    async def test_a_performance_only_change_is_written(self):
+    async def test_a_performance_only_change_is_written(self, scratch):
         """The write was gated on `risk` alone while the same statement wrote `perf` too."""
         await Database.init()
         row = await _territory(revocation_risk=5, title_performance=0, crisis_level=0,
@@ -168,7 +202,7 @@ class TestThePerformanceLedger:
             await Database.execute("DELETE FROM maya_rp.territory WHERE id = $1", row["id"])
             await Database.close()
 
-    async def test_a_territory_with_no_governor_gains_no_performance(self):
+    async def test_a_territory_with_no_governor_gains_no_performance(self, scratch):
         await Database.init()
         row = await _territory(governor_name=None, revocation_risk=0, title_performance=0)
         try:
@@ -185,7 +219,7 @@ class TestThePerformanceLedger:
 
 
 class TestTheAgent:
-    async def test_an_invalid_role_names_the_value_and_the_alternatives(self):
+    async def test_an_invalid_role_names_the_value_and_the_alternatives(self, scratch):
         await Database.init()
         try:
             out = await council.assign_agent(SESSION, 1, "spymaster")

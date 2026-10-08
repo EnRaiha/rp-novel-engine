@@ -17,9 +17,9 @@ import json
 from typing import Any
 
 from core.db import Database
-from core.config import Config
 from core.log import error, info
 from core import ooc
+from core.session import require_session
 
 
 # ─── Constants ───────────────────────────────────────────────────
@@ -157,6 +157,36 @@ SUSPICION_PROBE_LINES = {
 }
 
 
+# ─── Session resolution ──────────────────────────────────────────
+
+def _sid(session_id: int | None) -> int:
+    """Resolve the session for one call.
+
+    `Config.SESSION_ID` is fixed at import, so a long-lived tick kept writing to the session that was
+    current at start. An explicit id (0 included) is used as given.
+
+    @param session_id - caller's id, or None for the active arc.
+    @returns the session id.
+    @raises RuntimeError when nothing resolves.
+    """
+    return session_id if session_id is not None else require_session(None)
+
+
+def _writable_sid(session_id: int | None) -> int:
+    """Resolve the session and refuse a frozen one.
+
+    Sessions 3 and 5 are reference data. Every social writer (bonds, loyalty flags, morale, events,
+    the tick) wrote into them with no check, the door `core.ooc` keeps shut for its own writers.
+
+    @param session_id - caller's id, or None for the active arc.
+    @returns the session id.
+    @raises core.ooc.FrozenSession when the session is frozen and maintenance is not armed.
+    """
+    sid = _sid(session_id)
+    ooc._refuse_frozen(sid)
+    return sid
+
+
 # ─── Relationship Helpers ────────────────────────────────────────
 
 def _normalize_ids(a: int, b: int) -> tuple[int, int]:
@@ -176,41 +206,56 @@ async def get_relationship(session_id: int, char_a: int, char_b: int) -> dict | 
 
 
 async def shift_bond(
-    session_id: int, char_a: int, char_b: int,
+    session_id: int | None, char_a: int, char_b: int,
     delta: int, reason: str = "",
 ) -> dict[str, Any] | None:
     """
     Shift bond between two crew members.
     Ported from CrewRelationships.shiftBond().
+
+    The bond lives in -50..50. The conflict branch clamped, but the first insert wrote `delta` as
+    given, so a first shift of +80 stored a bond of 80 that no later shift could bring back inside
+    the range. The insert value is clamped and the type update commits with the bond.
+
+    @param session_id - session owning the pair; None resolves the active arc.
+    @param char_a - one character id.
+    @param char_b - the other character id.
+    @param delta - signed bond change.
+    @param reason - free text, unused by the write.
+    @returns {"relationship": row, "type": str, "bond": int}, or None when the write failed.
+    @raises core.ooc.FrozenSession when the session is frozen.
     """
+    session_id = _writable_sid(session_id)
     a, b = _normalize_ids(char_a, char_b)
     try:
-        # UPSERT
-        row = await Database.fetchrow(
-            "INSERT INTO maya_rp.character_relationships "
-            "(session_id, char_a_id, char_b_id, score, relationship_type, last_interaction) "
-            "VALUES ($1, $2, $3, $4, 'neutral', NOW()) "
-            "ON CONFLICT (session_id, char_a_id, char_b_id) DO UPDATE SET "
-            "  score = GREATEST(-50, LEAST(50, maya_rp.character_relationships.score + $4)), "
-            "  last_interaction = NOW() "
-            "RETURNING *",
-            session_id, a, b, delta,
-        )
-        if not row:
-            return None
-        row = dict(row)
-        bond = row["score"]
-        rtype = "neutral"
-        if bond > 20: rtype = "ally"
-        elif bond > 5: rtype = "friend"
-        elif bond < -20: rtype = "enemy"
-        elif bond < -5: rtype = "rival"
+        async with Database.transaction() as conn:
+            # UPSERT
+            row = await conn.fetchrow(
+                "INSERT INTO maya_rp.character_relationships "
+                "(session_id, char_a_id, char_b_id, score, relationship_type, last_interaction) "
+                "VALUES ($1, $2, $3, $4, 'neutral', NOW()) "
+                "ON CONFLICT (session_id, char_a_id, char_b_id) DO UPDATE SET "
+                "  score = GREATEST(-50, LEAST(50, maya_rp.character_relationships.score + $5)), "
+                "  last_interaction = NOW() "
+                "RETURNING *",
+                session_id, a, b, max(-50, min(50, delta)), delta,
+            )
+            if not row:
+                return None
+            row = dict(row)
+            bond = row["score"]
+            rtype = "neutral"
+            if bond > 20: rtype = "ally"
+            elif bond > 5: rtype = "friend"
+            elif bond < -20: rtype = "enemy"
+            elif bond < -5: rtype = "rival"
 
-        await Database.execute(
-            "UPDATE maya_rp.character_relationships SET relationship_type = $1 "
-            "WHERE session_id = $4 AND char_a_id = $2 AND char_b_id = $3",
-            rtype, a, b, session_id,
-        )
+            await conn.execute(
+                "UPDATE maya_rp.character_relationships SET relationship_type = $1 "
+                "WHERE session_id = $4 AND char_a_id = $2 AND char_b_id = $3",
+                rtype, a, b, session_id,
+            )
+            row["relationship_type"] = rtype
         return {"relationship": row, "type": rtype, "bond": bond}
     except Exception as e:
         error("social", f"shiftBond failed for {a}/{b}: {e}")
@@ -274,8 +319,10 @@ def calculate_loyalty(
     elif lf == "wavering": score -= 0.15
     elif lf == "disloyal": score -= 0.3
 
-    score += (crew_member.get("morale", 50) - 50) * 0.002
-    score += (fleet_morale - 50) * 0.001
+    # `crew_roster.morale` is nullable and the row carries the key with value None, so `.get("morale", 50)`
+    # returned None and `None - 50` raised TypeError, which aborted the whole loyalty test and the tick.
+    score += (_morale_value(crew_member.get("morale")) - 50) * 0.002
+    score += (_morale_value(fleet_morale) - 50) * 0.001
 
     traits = _traits_list(crew_member.get("personality_traits"))
     if "devoted" in traits: score += 0.2
@@ -328,9 +375,12 @@ async def test_crew_loyalty(
     """
     Test loyalty of all crew, update DB.
     Ported from LoyaltyEngine.testCrewLoyalty().
+
+    @param session_id - session to test; None resolves the active arc.
+    @returns one result per crew member.
+    @raises core.ooc.FrozenSession when the session is frozen.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_sid(session_id)
 
     crew_rows = await Database.fetch(
         "SELECT id, name, role, morale, loyalty_flag, personality_traits, faction_alignment "
@@ -352,8 +402,8 @@ async def test_crew_loyalty(
 
         if changed:
             await Database.execute(
-                "UPDATE maya_rp.crew_roster SET loyalty_flag = $1 WHERE id = $2",
-                new_flag, c["id"],
+                "UPDATE maya_rp.crew_roster SET loyalty_flag = $1 WHERE id = $2 AND session_id = $3",
+                new_flag, c["id"], session_id,
             )
 
         results.append({
@@ -373,9 +423,14 @@ async def calculate_mutiny_risk(
     """
     Calculate mutiny risk for the fleet.
     Ported from LoyaltyEngine.calculateMutinyRisk().
+
+    It runs `test_crew_loyalty`, which rewrites loyalty flags, so it is a writer.
+
+    @param session_id - session to assess; None resolves the active arc.
+    @returns the risk report.
+    @raises core.ooc.FrozenSession when the session is frozen.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_sid(session_id)
 
     crew = await test_crew_loyalty(session_id)
     total = len(crew)
@@ -533,38 +588,46 @@ async def _get_fleet_morale(session_id: int) -> int:
 
 
 async def update_morale(
-    session_id: int,
+    session_id: int | None,
     delta: int,
     reason: str = "",
 ) -> int:
     """
     Update fleet-wide morale.
     Ported from MoraleTracker.applyEvent() applied to all crew.
+
+    The rows are locked first, then one statement adds `delta` to every row in SQL. The old code read
+    each morale, computed an absolute value in Python and wrote it back, so two concurrent calls of +5
+    both read 50 and both wrote 55: one delta was lost. The history row commits with the update.
+
+    @param session_id - session to update; None resolves the active arc.
+    @param delta - signed morale change, applied then clamped to 0..100 per crew member.
+    @param reason - cause text for morale_history.
+    @returns the fleet average morale after the update.
+    @raises core.ooc.FrozenSession when the session is frozen.
     """
-    rows = await Database.fetch(
-        "SELECT id, name, morale FROM maya_rp.crew_roster WHERE session_id = $1", session_id
-    )
-    before_sum = after_sum = 0
-    for r in rows:
-        before = _morale_value(r["morale"])
-        new_morale = max(0, min(100, before + delta))
-        before_sum += before
-        after_sum += new_morale
-        await Database.execute(
-            "UPDATE maya_rp.crew_roster SET morale = $1 WHERE id = $2",
-            new_morale, r["id"],
-        )
-    if rows:
-        # morale_history is fleet/ship graded: (ship_id, fleet_wide,
-        # morale_before, morale_after, cause). The old per-crew INSERT named
-        # columns that do not exist (character_id/morale_level/reason) — it
-        # failed on every call, and this one fleet-wide row also avoids writing
-        # 4,000+ history rows per morale event.
-        await Database.execute(
-            "INSERT INTO maya_rp.morale_history (session_id, fleet_wide, morale_before, morale_after, cause) "
-            "VALUES ($1, true, $2, $3, $4)",
-            session_id, round(before_sum / len(rows)), round(after_sum / len(rows)), reason,
-        )
+    session_id = _writable_sid(session_id)
+    async with Database.transaction() as conn:
+        locked = await conn.fetch(
+            "SELECT COALESCE(morale, 50) AS prior FROM maya_rp.crew_roster"
+            " WHERE session_id = $1 ORDER BY id FOR UPDATE", session_id)
+        updated = await conn.fetch(
+            "UPDATE maya_rp.crew_roster SET morale = GREATEST(0, LEAST(100, COALESCE(morale, 50) + $2))"
+            " WHERE session_id = $1 RETURNING morale", session_id, delta)
+        if updated:
+            # morale_history is fleet/ship graded: (ship_id, fleet_wide,
+            # morale_before, morale_after, cause). The old per-crew INSERT named
+            # columns that do not exist (character_id/morale_level/reason) — it
+            # failed on every call, and this one fleet-wide row also avoids writing
+            # 4,000+ history rows per morale event.
+            await conn.execute(
+                "INSERT INTO maya_rp.morale_history (session_id, fleet_wide, morale_before, morale_after, cause) "
+                "VALUES ($1, true, $2, $3, $4)",
+                session_id,
+                round(sum(r["prior"] for r in locked) / len(locked)),
+                round(sum(r["morale"] for r in updated) / len(updated)),
+                reason,
+            )
 
     fleet = await _get_fleet_morale(session_id)
     info("social", f"Morale: {'+' if delta > 0 else ''}{delta} fleet={fleet}")
@@ -633,14 +696,21 @@ def _observer_probe(reading: dict, participants: list[dict]) -> dict | None:
 
 
 async def generate_social_event(
-    session_id: int,
+    session_id: int | None,
     event_type: str,
     companions: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Generate a social event with participants and dialogue script.
     Ported from SocialEvents.getParticipants() + getDialogueScript().
+
+    @param session_id - session to write the event into; None resolves the active arc.
+    @param event_type - key of SOCIAL_EVENT_TYPES.
+    @param companions - companion names in the scene.
+    @returns the event with participants and beats, or {"error", "available"} for an unknown type.
+    @raises core.ooc.FrozenSession when the session is frozen.
     """
+    session_id = _writable_sid(session_id)
     if companions is None:
         companions = []
 
@@ -680,19 +750,16 @@ async def generate_social_event(
             chosen.add(c["name"])
     participants.extend(npc_participants)
 
-    # Companion voice line
-    # companion_line is assigned only when a companion has a line, and c_name
-    # only exists inside the loop — the check below used to read both unbound.
-    companion_line = None
-    c_name = None
-    for c_name in companions:
-        cl = companions if companions else []
-        if c_name in ("Nethara", "Melano", "Valia"):
-            companion_line = {
-                "Nethara": "!This crew needs to see strength. Or compassion. Decide which.",
-                "Melano": "...I remember the last time this happened. It did not end well.",
-                "Valia": "*The emotional weight in this room... it bends the light.*",
-            }.get(c_name)
+    # Companion voice line: the first companion with a line speaks. The loop kept overwriting the line
+    # and left `c_name` on the LAST companion, so with ["Nethara", "Kai"] the beat carried Nethara's
+    # words under Kai's name.
+    companion_lines = {
+        "Nethara": "!This crew needs to see strength. Or compassion. Decide which.",
+        "Melano": "...I remember the last time this happened. It did not end well.",
+        "Valia": "*The emotional weight in this room... it bends the light.*",
+    }
+    c_name = next((n for n in companions if n in companion_lines), None)
+    companion_line = companion_lines.get(c_name)
 
     # Dialogue beats
     beats = [
@@ -789,9 +856,11 @@ def _select_event_npcs(event_type: str, crew: list[dict]) -> list[dict]:
 async def run_tick(session_id: int | None = None) -> dict[str, Any]:
     """
     Social module tick: test loyalty, calculate mutiny risk, log summary.
+
+    @param session_id - session to tick; None resolves the active arc.
+    @raises core.ooc.FrozenSession when the session is frozen.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_sid(session_id)
 
     try:
         mutiny = await calculate_mutiny_risk(session_id)

@@ -1,10 +1,11 @@
 """Social module review: what reading `modules/social.py` in full turned up.
 
-Seven fixes. Each test fails against the module as it stood before. Nothing here writes to session 3,
-and every row this file creates in session 5 is removed in a `finally`.
+Seven fixes. Each test fails against the module as it stood before. Every row this file creates lives in a scratch
+session and is removed in teardown. Sessions 3 and 5 are frozen and never touched.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -12,17 +13,49 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
 
 from core.db import Database  # noqa: E402
 from modules import social  # noqa: E402
 
-SESSION = 5
-#: Two real characters in session 5. `character_relationships` has foreign keys on both.
-CHAR_A, CHAR_B = 2071, 2072
+#: A scratch session (900-999). The writers refuse the frozen sessions 3 and 5.
+SESSION = 900 + os.getpid() % 100
+
+#: Children first: foreign keys run from these tables to `characters` and `sessions`.
+_TABLES = ("character_relationships", "characters", "crew_roster", "morale_history", "social_events")
 CREW_MARK = "review crew"
 
 
-async def _relationship(char_a=CHAR_A, char_b=CHAR_B, score=10):
+async def _wipe() -> None:
+    for table in _TABLES:
+        await Database.execute(f"DELETE FROM maya_rp.{table} WHERE session_id = $1", SESSION)
+    await Database.execute("DELETE FROM maya_rp.sessions WHERE id = $1", SESSION)
+
+
+@pytest_asyncio.fixture
+async def scratch():
+    """The scratch session exists for the test; every row of it is removed after, in foreign-key order."""
+    await Database.init()
+    await _wipe()
+    await Database.execute(
+        "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1, 'scratch', 'active')"
+        " ON CONFLICT (id) DO NOTHING", SESSION)
+    try:
+        yield
+    finally:
+        await _wipe()
+        await Database.close()
+
+
+async def _characters() -> tuple[int, int]:
+    """Two characters of the scratch session. `character_relationships` has foreign keys on both."""
+    ids = [await Database.fetchval(
+        "INSERT INTO maya_rp.characters (session_id, name) VALUES ($1, $2) RETURNING id",
+        SESSION, f"review char {n}") for n in "ab"]
+    return ids[0], ids[1]
+
+
+async def _relationship(char_a, char_b, score=10):
     await Database.execute(
         "INSERT INTO maya_rp.character_relationships "
         "(id, session_id, char_a_id, char_b_id, score, relationship_type, last_interaction) "
@@ -93,34 +126,23 @@ class TestTheClassifierAndItsTable:
 
 
 class TestTheRingleaderDivision:
-    async def test_an_empty_relationship_table_does_not_divide_by_zero(self):
+    async def test_an_empty_relationship_table_does_not_divide_by_zero(self, scratch):
         """`max(..., default=1)` still returned 0 when every member had no network at all."""
-        await Database.init()
-        try:
-            out = await social.get_ringleaders(SESSION, [
-                {"id": 999001, "loyalty_flag": "disloyal"},
-                {"id": 999002, "loyalty_flag": "wavering"},
-            ])
-            assert out == [], out
-        finally:
-            await Database.close()
+        out = await social.get_ringleaders(SESSION, [
+            {"id": 999001, "loyalty_flag": "disloyal"},
+            {"id": 999002, "loyalty_flag": "wavering"},
+        ])
+        assert out == [], out
 
-    async def test_an_influential_malcontent_is_returned(self):
-        await Database.init()
-        await _relationship()
-        try:
-            out = await social.get_ringleaders(SESSION, [
-                {"id": CHAR_A, "loyalty_flag": "disloyal"},
-                {"id": CHAR_B, "loyalty_flag": "neutral"},
-            ])
-            assert [r["crew_id"] for r in out] == [CHAR_A], out
-            assert out[0]["risk"] == 100, out
-        finally:
-            await Database.execute(
-                "DELETE FROM maya_rp.character_relationships "
-                "WHERE session_id = $1 AND char_a_id = $2 AND char_b_id = $3",
-                SESSION, CHAR_A, CHAR_B)
-            await Database.close()
+    async def test_an_influential_malcontent_is_returned(self, scratch):
+        char_a, char_b = await _characters()
+        await _relationship(char_a, char_b)
+        out = await social.get_ringleaders(SESSION, [
+            {"id": char_a, "loyalty_flag": "disloyal"},
+            {"id": char_b, "loyalty_flag": "neutral"},
+        ])
+        assert [r["crew_id"] for r in out] == [char_a], out
+        assert out[0]["risk"] == 100, out
 
 
 class TestTheMoraleFloor:
@@ -131,22 +153,16 @@ class TestTheMoraleFloor:
         monkeypatch.setattr(social.Database, "fetch", fake_fetch)
         assert await social._get_fleet_morale(SESSION) == 50
 
-    async def test_update_morale_does_not_rescue_a_zero(self, monkeypatch):
-        calls = []
-
-        async def fake_fetch(query, *args):
-            return [{"id": 1, "name": "zero hero", "morale": 0}]
-
-        async def fake_execute(query, *args):
-            calls.append((query, args))
-            return "UPDATE 1"
-
-        monkeypatch.setattr(social.Database, "fetch", fake_fetch)
-        monkeypatch.setattr(social.Database, "execute", fake_execute)
+    async def test_update_morale_does_not_rescue_a_zero(self, scratch):
+        """A member at morale 0 gets the delta added to 0, never to the 50 that stands in for NULL."""
+        await Database.execute(
+            "INSERT INTO maya_rp.crew_roster (id, session_id, name, morale) VALUES "
+            "((SELECT COALESCE(MAX(id), 0) + 1 FROM maya_rp.crew_roster), $1, 'zero hero', 0)", SESSION)
         fleet = await social.update_morale(SESSION, 5)
-        updates = [args for query, args in calls if query.startswith("UPDATE")]
-        assert updates == [(5, 1)], updates
-        assert fleet == 0, fleet
+        morale = await Database.fetchval(
+            "SELECT morale FROM maya_rp.crew_roster WHERE session_id = $1 AND name = 'zero hero'", SESSION)
+        assert morale == 5, f"a zero was read as fifty: {morale}"
+        assert fleet == 5, fleet
 
 
 class TestTheUnknownIsNamed:
@@ -158,14 +174,12 @@ class TestTheUnknownIsNamed:
     def test_a_known_event_config_is_returned(self):
         assert social.get_social_event_config("trial") == social.SOCIAL_EVENT_TYPES["trial"]
 
-    async def test_generate_social_event_refuses_an_unknown_type(self):
-        await Database.init()
+    async def test_generate_social_event_refuses_an_unknown_type(self, scratch):
         try:
             out = await social.generate_social_event(SESSION, "feast")
             assert "feast" in out.get("error", ""), out
         finally:
             await _drop_events("feast")
-            await Database.close()
 
     def test_an_unknown_morale_event_is_named_not_silent(self):
         out = social.apply_morale_event(50, "great_speech")
@@ -182,9 +196,8 @@ class TestTheUnknownIsNamed:
 
 
 class TestTheMinimumAttendance:
-    async def test_a_rally_gathers_its_minimum(self):
+    async def test_a_rally_gathers_its_minimum(self, scratch):
         """`config["min"]` was read into `needed` and dropped, so a rally of thirty gathered ten."""
-        await Database.init()
         await _crew(35)
         try:
             out = await social.generate_social_event(SESSION, "rally")
@@ -193,10 +206,8 @@ class TestTheMinimumAttendance:
         finally:
             await _drop_events("rally")
             await _drop_crew()
-            await Database.close()
 
-    async def test_a_banquet_still_keeps_its_own_shape(self):
-        await Database.init()
+    async def test_a_banquet_still_keeps_its_own_shape(self, scratch):
         await _crew(12)
         try:
             out = await social.generate_social_event(SESSION, "banquet", ["Nethara"])
@@ -206,4 +217,3 @@ class TestTheMinimumAttendance:
         finally:
             await _drop_events("banquet")
             await _drop_crew()
-            await Database.close()

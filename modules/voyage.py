@@ -15,9 +15,11 @@ from __future__ import annotations
 import math
 import random
 from typing import Any
+
+import asyncpg
 from core.db import Database
-from core.config import Config
-from core.log import info
+from core.log import error, info
+from core.session import require_session
 from modules.economy_physics import HOURS_PER_DAY, HOURS_PER_UNIT
 
 # One owner for the lane law: `economy_physics` derives it from all 4,704
@@ -43,6 +45,48 @@ WORMHOLE_COLLAPSE_PCT = 30        # decaying wormhole: d100 <= 30 → collapse
 BLACK_HOLE_SLINGSHOT_DC = 0.75    # d100 roll vs hazard*100: >= pass → clean
 
 
+def _sid(session_id: int | None) -> int:
+    """Resolve the session for one call.
+
+    `Config.SESSION_ID` is fixed at import, so a long-lived tick kept writing to the session that was
+    current at start. An explicit id (0 included) is used as given.
+
+    @param session_id - caller's id, or None for the active arc.
+    @returns the session id.
+    @raises RuntimeError when nothing resolves.
+    """
+    return session_id if session_id is not None else require_session(None)
+
+
+def _writable_sid(session_id: int | None) -> int:
+    """Resolve the session and refuse a frozen one.
+
+    Sessions 3 and 5 are reference data. `register` booked tolls and `advance` booked losses and
+    profit into them with no check, the door `core.ooc` keeps shut for its own writers.
+
+    @param session_id - caller's id, or None for the active arc.
+    @returns the session id.
+    @raises core.ooc.FrozenSession when the session is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    sid = _sid(session_id)
+    _refuse_frozen(sid)
+    return sid
+
+
+def _like(text: str) -> str:
+    """Build a contains-pattern for `ILIKE ... ESCAPE '\\'` from user text.
+
+    A name of `%` matched every row, so `wormhole_jump("%")` booked a transit through whichever
+    hole had the lowest id.
+
+    @param text - user text; `\\`, `%` and `_` are matched literally.
+    @returns `%text%` with the wildcards escaped.
+    """
+    return "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
 def _num(value, default: float) -> float:
     """Read a numeric column, falling back only when the column is NULL.
 
@@ -54,8 +98,7 @@ def _num(value, default: float) -> float:
 
 async def wormhole_status(session_id: int | None = None) -> list[dict]:
     """List all wormholes with their pair endpoints and health."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _sid(session_id)
     return await Database.fetch(
         """SELECT w.id, w.name, w.stability, w.travel_multiplier, w.status, w.discovered,
                   e.name AS entry_name, x.name AS exit_name,
@@ -73,8 +116,7 @@ async def wormhole_jump(name: str, session_id: int | None = None) -> dict:
     Returns the jump plan (entry/exit sectors, travel_days = euclidean ×
     travel_multiplier) or raises ValueError for unknown/collapsed holes.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _sid(session_id)
     row = await Database.fetchrow(
         """SELECT w.id, w.name, w.stability, w.travel_multiplier, w.status,
                   e.name AS entry_name, e.x_coord AS ex, e.y_coord AS ey, e.z_coord AS ez,
@@ -82,9 +124,9 @@ async def wormhole_jump(name: str, session_id: int | None = None) -> dict:
            FROM maya_rp.wormholes w
            JOIN maya_rp.sectors e ON e.id = w.entry_sector_id
            JOIN maya_rp.sectors x ON x.id = w.exit_sector_id
-           WHERE w.session_id=$1 AND w.name ILIKE $2
+           WHERE w.session_id=$1 AND w.name ILIKE $2 ESCAPE '\\'
            ORDER BY w.id LIMIT 1""",
-        session_id, f"%{name}%")
+        session_id, _like(name))
     if not row:
         raise ValueError(f"No wormhole named {name!r}")
     if row["status"] == "collapsed":
@@ -103,60 +145,70 @@ async def wormhole_decay(session_id: int | None = None) -> dict:
 
     Stable holes stay open (Aether Nexus hub keeps its pair fed). Returns
     changes so the orchestrator can narrate collapses.
+
+    A collapse and its event commit together: a raise between the two statements left a collapsed
+    hole with no event, so the novel never heard the hole had popped.
+
+    @param session_id - session to decay; None resolves the active arc.
+    @returns {"collapsed": [name], "decayed": [(name, stability)]}.
+    @raises core.ooc.FrozenSession when the session is frozen.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_sid(session_id)
     rows = await Database.fetch(
         """SELECT id, name, stability, decay_per_tick, status
            FROM maya_rp.wormholes WHERE session_id=$1 AND status IN ('stable','decaying')""",
         session_id)
     collapsed, decayed = [], []
-    for r in rows:
-        if r["status"] == "stable":
-            continue  # hub-fed: no decay
-        new_stab = float(r["stability"] or 0.5) - float(r["decay_per_tick"] or 0.01)
-        new_stab = max(0.0, new_stab)
-        if new_stab <= 0:
-            await Database.execute(
-                "UPDATE maya_rp.wormholes SET stability=0, status='collapsed' WHERE id=$1",
-                r["id"])
-            collapsed.append(r["name"])
-            await Database.execute(
-                """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
-                   VALUES ($1, 'wormhole_collapse', $2, $3, 5)""",
-                session_id,
-                f"Wormhole collapse — {r['name']}",
-                f"The wormhole {r['name']} ran out of exotic matter and collapsed. "
-                f"Ships inside would be lost — check transits.",
-            )
-        else:
-            await Database.execute(
-                "UPDATE maya_rp.wormholes SET stability=$1 WHERE id=$2", new_stab, r["id"])
-            decayed.append((r["name"], new_stab))
+    async with Database.transaction() as conn:
+        for r in rows:
+            if r["status"] == "stable":
+                continue  # hub-fed: no decay
+            # `stability or 0.5` read a real 0 as missing, so a hole at stability 0 climbed back to
+            # 0.49 instead of collapsing.
+            new_stab = _num(r["stability"], 0.5) - _num(r["decay_per_tick"], 0.01)
+            new_stab = max(0.0, new_stab)
+            if new_stab <= 0:
+                await conn.execute(
+                    "UPDATE maya_rp.wormholes SET stability=0, status='collapsed' WHERE id=$1",
+                    r["id"])
+                collapsed.append(r["name"])
+                await conn.execute(
+                    """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
+                       VALUES ($1, 'wormhole_collapse', $2, $3, 5)""",
+                    session_id,
+                    f"Wormhole collapse — {r['name']}",
+                    f"The wormhole {r['name']} ran out of exotic matter and collapsed. "
+                    f"Ships inside would be lost — check transits.",
+                )
+            else:
+                await conn.execute(
+                    "UPDATE maya_rp.wormholes SET stability=$1 WHERE id=$2", new_stab, r["id"])
+                decayed.append((r["name"], new_stab))
     if collapsed or decayed:
         info("voyage", f"Wormhole decay: {len(decayed)} decaying, {len(collapsed)} collapsed")
     return {"collapsed": collapsed, "decayed": decayed}
 
 
 async def black_hole_slingshot(bh_name: str, session_id: int | None = None,
-                               rng: random.Random | None = None) -> dict:
+                               rng: random.Random | None = None, conn=None) -> dict:
     """Slingshot past a black hole (Oberth effect): travel ×multiplier,
     but roll d100 vs hazard*100 — fail pulls toward the event horizon.
 
     Returns the plan; a fail result must be resolved by the caller
     (ships lost / voyage destroyed).
+
+    @param conn - connection of the caller's open transaction; the pool when None.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _sid(session_id)
     r = rng or random
-    row = await Database.fetchrow(
+    row = await (conn if conn is not None else Database).fetchrow(
         """SELECT b.id, b.name, b.hazard_level, b.slingshot_multiplier,
                   b.time_dilation_ratio, s.name AS sector, s.x_coord, s.y_coord, s.z_coord
            FROM maya_rp.black_holes b
            JOIN maya_rp.sectors s ON s.id = b.sector_id
-           WHERE b.session_id=$1 AND b.name ILIKE $2
+           WHERE b.session_id=$1 AND b.name ILIKE $2 ESCAPE '\\'
            ORDER BY b.id LIMIT 1""",
-        session_id, f"%{bh_name}%")
+        session_id, _like(bh_name))
     if not row:
         raise ValueError(f"No black hole named {bh_name!r}")
     hazard = _num(row["hazard_level"], BLACK_HOLE_SLINGSHOT_DC)
@@ -172,8 +224,7 @@ async def black_hole_slingshot(bh_name: str, session_id: int | None = None,
 
 async def white_hole_events(session_id: int | None = None) -> list[dict]:
     """White holes are exit-only: list what has emerged (mystery feed)."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _sid(session_id)
     return await Database.fetch(
         """SELECT w.name, w.status, w.mystery_pct, s.name AS sector,
                   COALESCE(b.name,'—') AS linked_bh
@@ -367,8 +418,7 @@ async def compute_travel(
     An explicit distance of 0 is a distance, not a missing argument: `if distance_ly:`
     let 0 fall through to the coordinate branch and raised when no coords were given.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _sid(session_id)
 
     if distance_ly is not None:
         if distance_ly < 0:
@@ -409,26 +459,24 @@ async def compute_travel(
     if origin and destination:
         async def _sector_id(name: str):
             return await Database.fetchval(
-                "SELECT id FROM maya_rp.sectors WHERE session_id=$1 AND name ILIKE $2 "
+                "SELECT id FROM maya_rp.sectors WHERE session_id=$1 AND name ILIKE $2 ESCAPE '\\' "
                 "ORDER BY id LIMIT 1",
-                session_id, f"%{str(name).split('-')[0]}%")
+                session_id, _like(str(name).split('-')[0]))
 
         o_id, d_id = await _sector_id(origin), await _sector_id(destination)
-        row = None
-        if o_id and d_id:
-            row = await Database.fetchrow(
-                """SELECT distance, travel_time_hours FROM maya_rp.sector_connections
-                   WHERE session_id=$1
-                     AND ((from_sector_id=$2 AND to_sector_id=$3)
-                       OR (from_sector_id=$3 AND to_sector_id=$2))
-                   ORDER BY id LIMIT 1""",
-                session_id, o_id, d_id)
-        if row is None and (o_id or d_id):
-            row = await Database.fetchrow(
-                """SELECT distance, travel_time_hours FROM maya_rp.sector_connections
-                   WHERE session_id=$1 AND (from_sector_id=$2 OR to_sector_id=$2)
-                   ORDER BY id LIMIT 1""",
-                session_id, o_id or d_id)
+        # One unresolved end used to fall back to "any lane touching the other end", so a typo in
+        # the destination booked the travel time of an arbitrary lane out of the origin.
+        unresolved = [n for n, i in ((origin, o_id), (destination, d_id)) if not i]
+        if unresolved:
+            raise ValueError(f"Cannot compute travel: no sector matches {unresolved!r} "
+                             f"in session {session_id}.")
+        row = await Database.fetchrow(
+            """SELECT distance, travel_time_hours FROM maya_rp.sector_connections
+               WHERE session_id=$1
+                 AND ((from_sector_id=$2 AND to_sector_id=$3)
+                   OR (from_sector_id=$3 AND to_sector_id=$2))
+               ORDER BY id LIMIT 1""",
+            session_id, o_id, d_id)
         if row and row["travel_time_hours"]:
             return {"travel_hours": row["travel_time_hours"],
                     "travel_days": row["travel_time_hours"] / HOURS_PER_DAY,
@@ -445,8 +493,7 @@ async def gate_crossing(z1, z2, session_id: int | None = None) -> dict:
     routes (flagged hidden). Raises ValueError when no passage exists —
     'the map has few connections' is enforced here.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _sid(session_id)
     rows = await Database.fetch(
         """SELECT sc.id, fs.name AS from_name, fs.z_coord AS fz,
                   ts.name AS to_name, ts.z_coord AS tz,
@@ -472,14 +519,39 @@ async def gate_crossing(z1, z2, session_id: int | None = None) -> dict:
             "pirate_density": float(r.get("pirate_density") or 0.0)}
 
 
-async def _charge_treasury(sql: str, *args) -> bool:
-    """Run a treasury UPDATE and report whether it touched a row.
+async def _debit_treasury(conn, amount: int, session_id: int) -> bool:
+    """Take `amount` from the treasury in one guarded statement, on the caller's connection.
 
-    asyncpg returns the status tag ('UPDATE 1', 'UPDATE 0'). A session with no
-    resources row would otherwise book a toll or a profit that never moved.
+    The balance check and the debit are the same statement, so two concurrent debits cannot both pass
+    a stale read and take credits below 0.
+
+    @param conn - connection of the open transaction.
+    @param amount - credits to take.
+    @param session_id - session whose resources row pays.
+    @returns True when debited; False when the row is missing or holds fewer credits.
     """
-    tag = await Database.execute(sql, *args)
-    return not (isinstance(tag, str) and tag.split()[-1:] == ["0"])
+    left = await conn.fetchval(
+        "UPDATE maya_rp.resources SET credits = COALESCE(credits, 0) - $1 "
+        "WHERE session_id = $2 AND COALESCE(credits, 0) >= $1 RETURNING credits",
+        amount, session_id)
+    return left is not None
+
+
+async def _credit_treasury(conn, amount: int, session_id: int) -> bool:
+    """Add `amount` to the treasury on the caller's connection.
+
+    A session with no resources row books a profit that never moved, so the caller learns it here.
+
+    @param conn - connection of the open transaction.
+    @param amount - credits to add.
+    @param session_id - session whose resources row is paid.
+    @returns True when a row was credited; False when the session has no resources row.
+    """
+    total = await conn.fetchval(
+        "UPDATE maya_rp.resources SET credits = COALESCE(credits, 0) + $1 "
+        "WHERE session_id = $2 RETURNING credits",
+        amount, session_id)
+    return total is not None
 
 
 async def register(
@@ -515,9 +587,17 @@ async def register(
                          dilation_days booked). Slingshot roll happens on
                          arrival (event-horizon risk).
       hidden-thread    → Izzat risk model v2 (act/guide/prep/equip/knowledge).
+
+    The toll debit and the voyage row commit together. The toll was charged first and the INSERT
+    second, so a duplicate (session, name, depart_day) hit the unique index after the debit and the
+    credits were gone with no voyage. The debit is a guarded statement: it never takes credits below 0.
+
+    @param session_id - session to book into; None resolves the active arc.
+    @returns the booked voyage: id, arrive_day, lane_type, toll_paid, toll_charged and the rest.
+    @raises core.ooc.FrozenSession when the session is frozen.
+    @raises ValueError on a duplicate voyage, an unresolved destination, or credits below the toll.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_sid(session_id)
 
     # ── Input validation (checklist: quantities checked before they are used) ──
     # A negative prep level RAISED the danger instead of lowering it, and a
@@ -608,35 +688,44 @@ async def register(
         internal_gate_cost = int((t.get("toll_credits") or 0) * GATE_INTERNAL_COST_SHARE)
     toll_paid = internal_gate_cost
     toll_charged = False
-    if lane_type == "gate" and toll_paid > 0:
-        # treasury absorbs the internal cost (Setia fleet free, treasury pays).
-        # No resources row = no money moved: report the toll as uncharged
-        # rather than booking a cost the treasury never paid.
-        toll_charged = await _charge_treasury(
-            "UPDATE maya_rp.resources SET credits=credits-$1 WHERE session_id=$2",
-            toll_paid, session_id)
-        if not toll_charged:
-            info("voyage", f"{voyage_name}: session {session_id} has no resources row — "
-                           f"{toll_paid:,}C internal gate toll NOT charged")
-            toll_paid = 0
+    try:
+        async with Database.transaction() as conn:
+            if lane_type == "gate" and toll_paid > 0:
+                # treasury absorbs the internal cost (Setia fleet free, treasury pays).
+                # No resources row = no money moved: report the toll as uncharged
+                # rather than booking a cost the treasury never paid.
+                toll_charged = await _debit_treasury(conn, toll_paid, session_id)
+                if not toll_charged:
+                    if await conn.fetchval(
+                            "SELECT 1 FROM maya_rp.resources WHERE session_id=$1", session_id):
+                        raise ValueError(
+                            f"{voyage_name}: treasury of session {session_id} holds fewer than "
+                            f"{toll_paid:,}C for the internal gate toll")
+                    info("voyage", f"{voyage_name}: session {session_id} has no resources row — "
+                                   f"{toll_paid:,}C internal gate toll NOT charged")
+                    toll_paid = 0
 
-    vid = await Database.fetchval(
-        """INSERT INTO maya_rp.voyages
-           (session_id, voyage_name, origin, destination, distance_units, distance_ly,
-            travel_hours, travel_days, depart_day, arrive_day, status, fleet_tag, ship_count, notes,
-            via_hidden, act, guide, prep_level, equip_level, knowledge_level,
-            cargo_heat, cargo_value, danger_pct,
-            transit_kind, transit_name, dilation_days,
-            lane_type, toll_paid)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'in_transit',$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
-           RETURNING id""",
-        session_id, voyage_name, origin, destination, t.get("distance_units"), t.get("distance_ly"),
-        t["travel_hours"], travel_days, gd, arrive_day, fleet_tag, ship_count, notes,
-        via_hidden, act, guide, prep_level, equip_level, knowledge_level,
-        cargo_heat, cargo_value, danger_pct,
-        transit_kind, transit_name, dilation_days,
-        lane_type, toll_paid,
-    )
+            vid = await conn.fetchval(
+                """INSERT INTO maya_rp.voyages
+                   (session_id, voyage_name, origin, destination, distance_units, distance_ly,
+                    travel_hours, travel_days, depart_day, arrive_day, status, fleet_tag, ship_count, notes,
+                    via_hidden, act, guide, prep_level, equip_level, knowledge_level,
+                    cargo_heat, cargo_value, danger_pct,
+                    transit_kind, transit_name, dilation_days,
+                    lane_type, toll_paid)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'in_transit',$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+                   RETURNING id""",
+                session_id, voyage_name, origin, destination, t.get("distance_units"), t.get("distance_ly"),
+                t["travel_hours"], travel_days, gd, arrive_day, fleet_tag, ship_count, notes,
+                via_hidden, act, guide, prep_level, equip_level, knowledge_level,
+                cargo_heat, cargo_value, danger_pct,
+                transit_kind, transit_name, dilation_days,
+                lane_type, toll_paid,
+            )
+    except asyncpg.UniqueViolationError as e:
+        # The transaction rolled back, so the toll debit above did not happen.
+        raise ValueError(f"voyage {voyage_name!r} is already registered for day {gd} "
+                         f"in session {session_id}") from e
 
     info("voyage", f"{voyage_name}: {origin or '?'} → {destination or '?'} "
                    f"({t.get('distance_units')}u / {t.get('distance_ly')}ly) = "
@@ -673,6 +762,279 @@ def hidden_thread_loss(
     return max(minimum, int((ship_count or 0) * r.uniform(lo, hi)))
 
 
+async def _resolve_arrival(conn, session_id: int, a) -> dict:
+    """Resolve one arrived voyage on the caller's transaction.
+
+    Every statement runs on `conn`, so a raise anywhere rolls back the arrival claim and the effects
+    together and the voyage stays `in_transit`.
+
+    @param conn - connection of the open per-voyage transaction.
+    @param session_id - session owning the voyage.
+    @param a - the voyage row.
+    @returns counter deltas: interdictions, clean_runs, profit_credits, collapses, slingshot_fails,
+        unbooked_credits, and lost (the voyage name when a wormhole collapse took it, else None).
+    """
+    out = {"interdictions": 0, "clean_runs": 0, "profit_credits": 0, "collapses": 0,
+           "slingshot_fails": 0, "unbooked_credits": 0, "lost": None}
+    # ── PIRATE ENCOUNTER on standard lanes (2026-08-15 Izzat canon) ──
+    # Gates are garrisoned (5% — the fair toll buys safety); open lanes
+    # are riskier: standard 15%, hazardous 30%, unstable 45%. Hidden
+    # threads, void, wormhole and slingshot have their own models below.
+    lane = (a["lane_type"] or "standard")
+    if lane in ("standard", "hazardous", "unstable"):
+        density = {"standard": 0.15, "hazardous": 0.30, "unstable": 0.45}.get(lane, 0.15)
+        prowl = random.randint(1, 100)
+        await conn.execute(
+            "UPDATE maya_rp.voyages SET risk_roll=$1 WHERE id=$2", prowl, a["id"])
+        if prowl <= int(density * 100):
+            lost = hidden_thread_loss(a["ship_count"] or 0)
+            await conn.execute(
+                """UPDATE maya_rp.voyages SET interdicted=TRUE, loss_ships=$1 WHERE id=$2""",
+                lost, a["id"])
+            await conn.execute(
+                """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
+                   VALUES ($1, 'pirate_encounter', $2, $3, 3)""",
+                session_id,
+                f"Pirate encounter — {a['voyage_name']}",
+                f"{a['voyage_name']} was hit by pirates on a {lane} lane on day "
+                f"{a['arrive_day']}: {lost} ship(s) lost near {a['destination']} "
+                f"(roll {prowl} ≤ {int(density*100)}% — the {lane} lane is open ground, "
+                f"tag {a['fleet_tag'] or '—'}).",
+            )
+            info("voyage", f"PIRATES: {a['voyage_name']} lost {lost} "
+                           f"on {lane} lane (roll {prowl})")
+            return out
+    # ── WORMHOLE transit: collapse risk on arrival ──
+    if a["transit_kind"] == "wormhole":
+        collapse_roll = random.randint(1, 100)
+        await conn.execute(
+            "UPDATE maya_rp.voyages SET collapse_roll=$1 WHERE id=$2",
+            collapse_roll, a["id"])
+        # decaying holes pop; stable hub-fed ones don't. The name search is
+        # session-scoped: a same-named hole in another campaign must not
+        # decide whether THIS session's ships survive the crossing.
+        # A voyage with no transit_name built the pattern `%%`, which matched the lowest-id hole.
+        stab = None
+        if a["transit_name"]:
+            stab = await conn.fetchval(
+                "SELECT stability FROM maya_rp.wormholes "
+                "WHERE session_id=$1 AND name ILIKE $2 ESCAPE '\\' ORDER BY id LIMIT 1",
+                session_id, _like(a["transit_name"]))
+        if stab is None:
+            stab = 1.0
+        if float(stab) < 0.99 and collapse_roll <= WORMHOLE_COLLAPSE_PCT:
+            out["collapses"] += 1
+            lost = a["ship_count"] or 0
+            out["lost"] = a["voyage_name"]
+            # The event text claims the ships are gone. Book it: the voyage
+            # ends 'lost' with the hulls counted, not 'arrived' at full
+            # strength with the loss living only in prose.
+            await conn.execute(
+                """UPDATE maya_rp.voyages
+                   SET status='lost', loss_ships=$1 WHERE id=$2""",
+                lost, a["id"])
+            await conn.execute(
+                """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
+                   VALUES ($1, 'wormhole_collapse', $2, $3, 5)""",
+                session_id,
+                f"WORMHOLE COLLAPSED — {a['voyage_name']}",
+                f"{a['voyage_name']} was inside {a['transit_name']} when it popped "
+                f"on day {a['arrive_day']}: {lost or '?'} ship(s) lost to "
+                f"the exotic-matter cascade near {a['destination']} "
+                f"(collapse roll {collapse_roll} ≤ {WORMHOLE_COLLAPSE_PCT}).",
+            )
+            info("voyage", f"WORMHOLE COLLAPSE: {a['voyage_name']} "
+                           f"({a['transit_name']}, roll {collapse_roll}, "
+                           f"{lost} ship(s) lost)")
+            return out
+        await conn.execute(
+            """INSERT INTO maya_rp.events (session_id, event_type, title, description)
+               VALUES ($1, 'wormhole_arrival', $2, $3)""",
+            session_id,
+            f"Wormhole arrival — {a['voyage_name']}",
+            f"{a['voyage_name']} emerged from {a['transit_name']} on day "
+            f"{a['arrive_day']} at {a['destination']} — the A↔B pair held. "
+            f"(collapse roll {collapse_roll}, tag {a['fleet_tag'] or '—'}).",
+        )
+        return out
+    # ── SLINGSHOT transit: event-horizon risk resolved on arrival ──
+    if a["transit_kind"] == "slingshot":
+        b = await black_hole_slingshot(a["transit_name"] or "", session_id, conn=conn)
+        if not b["ok"]:
+            out["slingshot_fails"] += 1
+            lost = hidden_thread_loss(a["ship_count"] or 0, rng=random.Random(b["roll"]))
+            await conn.execute(
+                """UPDATE maya_rp.voyages SET interdicted=TRUE, loss_ships=$1 WHERE id=$2""",
+                lost, a["id"])
+            await conn.execute(
+                """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
+                   VALUES ($1, 'event_horizon', $2, $3, 5)""",
+                session_id,
+                f"EVENT HORIZON — {a['voyage_name']}",
+                f"{a['voyage_name']} slingshot {a['transit_name']} went wrong: the "
+                f"gravity gradient bit — {lost} ship(s) pulled past the event "
+                f"horizon on day {a['arrive_day']} (roll {b['roll']} < "
+                f"{b['pass_dc']} hazard). They may yet emerge from a white hole...",
+            )
+            info("voyage", f"EVENT HORIZON: {a['voyage_name']} lost {lost} "
+                           f"(roll {b['roll']} < {b['pass_dc']})")
+            return out
+        await conn.execute(
+            """INSERT INTO maya_rp.events (session_id, event_type, title, description)
+               VALUES ($1, 'slingshot_arrival', $2, $3)""",
+            session_id,
+            f"Slingshot arrival — {a['voyage_name']}",
+            f"{a['voyage_name']} rode the Oberth boost past {a['transit_name']} and "
+            f"arrived on day {a['arrive_day']} at {a['destination']} "
+            f"(+{a['dilation_days']}d time dilation, roll {b['roll']} ≥ {b['pass_dc']}).",
+        )
+        return out
+    # ── VOID CROSSING: hazard roll on arrival (2026-08-15) ──
+    if a["transit_kind"] == "void":
+        # risk was persisted at register (danger_pct = void risk, cut by ward)
+        risk = a["danger_pct"] if a["danger_pct"] is not None else 20
+        roll = random.randint(1, 100)
+        await conn.execute(
+            "UPDATE maya_rp.voyages SET risk_roll=$1 WHERE id=$2", roll, a["id"])
+        if roll <= risk:
+            lost = hidden_thread_loss(a["ship_count"] or 0)
+            await conn.execute(
+                """UPDATE maya_rp.voyages SET interdicted=TRUE, loss_ships=$1 WHERE id=$2""",
+                lost, a["id"])
+            await conn.execute(
+                """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
+                   VALUES ($1, 'void_hazard', $2, $3, 4)""",
+                session_id,
+                f"VOID HAZARD — {a['voyage_name']}",
+                f"{a['voyage_name']} crossed the void but the dark between the "
+                f"nebulas bit on day {a['arrive_day']}: {lost} ship(s) lost to "
+                f"void radiation / turbulence near {a['destination']} "
+                f"(roll {roll} ≤ {risk}% void risk).",
+            )
+            info("voyage", f"VOID HAZARD: {a['voyage_name']} lost {lost} "
+                           f"(roll {roll} ≤ {risk}%)")
+            return out
+        await conn.execute(
+            """INSERT INTO maya_rp.events (session_id, event_type, title, description)
+               VALUES ($1, 'void_arrival', $2, $3)""",
+            session_id,
+            f"Void crossing — {a['voyage_name']}",
+            f"{a['voyage_name']} crossed the void between the nebulas and "
+            f"emerged on day {a['arrive_day']} at {a['destination']} — "
+            f"Void Drive held, no ships lost (roll {roll} > {risk}%).",
+        )
+        return out
+    if a["via_hidden"]:
+        roll = random.randint(1, 100)
+        await conn.execute(
+            "UPDATE maya_rp.voyages SET risk_roll=$1 WHERE id=$2", roll, a["id"])
+        danger = a["danger_pct"] if a["danger_pct"] is not None else hidden_thread_danger(
+            act=a["act"] or "sneak", has_guide=bool(a["guide"]),
+            prep_level=a["prep_level"] or 0, equip_level=a["equip_level"] or 0,
+            knowledge_level=a["knowledge_level"] or 0, cargo_heat=a["cargo_heat"] or 0)
+        act = a["act"] or "sneak"
+        if roll > danger:
+            # ── CLEAN RUN — the positive side pays out ──
+            out["clean_runs"] += 1
+            margin = hidden_thread_margin(
+                act=act, has_guide=bool(a["guide"]),
+                prep_level=a["prep_level"] or 0, equip_level=a["equip_level"] or 0,
+                knowledge_level=a["knowledge_level"] or 0, cargo_heat=a["cargo_heat"] or 0)
+            profit = int((a["cargo_value"] or 0) * margin)
+            credited = False
+            if profit > 0:
+                credited = await _credit_treasury(conn, profit, session_id)
+                if not credited:
+                    out["unbooked_credits"] += profit
+                    info("voyage", f"{a['voyage_name']}: +{profit:,}C earned but "
+                                   f"session {session_id} has no resources row — "
+                                   f"NOT credited")
+            await conn.execute(
+                """UPDATE maya_rp.voyages SET reward_credits=$1 WHERE id=$2""",
+                profit if credited else 0, a["id"])
+            await conn.execute(
+                """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
+                   VALUES ($1, 'smuggle_profit', $2, $3, 2)""",
+                session_id,
+                f"Clean run — {a['voyage_name']}",
+                f"{a['voyage_name']} slipped through a hidden thread and landed on day "
+                f"{a['arrive_day']}: cargo sold at {margin*100:.0f}% margin, "
+                + (f"{profit:,}C credited." if credited else
+                   f"{profit:,}C NOT credited — no treasury row for this session.")
+                + f" (roll {roll} > danger {danger}%, {act} run, "
+                  f"tag {a['fleet_tag'] or '—'}).",
+            )
+            if credited:
+                out["profit_credits"] += profit
+            info("voyage", f"CLEAN: {a['voyage_name']} +{profit:,}C "
+                           f"{'booked' if credited else 'UNBOOKED'} (roll {roll} > {danger}%)")
+            return out
+        # ── DETECTED — the act determines the outcome ──
+        out["interdictions"] += 1
+        res = hidden_thread_outcome(
+            act=act, has_guide=bool(a["guide"]),
+            prep_level=a["prep_level"] or 0, equip_level=a["equip_level"] or 0,
+            knowledge_level=a["knowledge_level"] or 0,
+            ship_count=a["ship_count"] or 0)
+        lost = res["loss"]
+        # The event below narrates `lost` hulls for every outcome, but the row was written only when
+        # the run was chased, so a slip or a bribe that cost ships left loss_ships NULL.
+        await conn.execute(
+            """UPDATE maya_rp.voyages SET interdicted=$1, loss_ships=$2 WHERE id=$3""",
+            bool(res["chased"]), lost, a["id"])
+        title = f"INTERDICTED — {a['voyage_name']}"
+        desc = (
+            f"{a['voyage_name']} ran a hidden thread but was caught on day "
+            f"{a['arrive_day']}: {lost} ship(s) lost near {a['destination']} "
+            f"(roll {roll} ≤ {danger}%, {act} run, tag {a['fleet_tag'] or '—'})."
+        )
+        if res["outcome"] == "slipped_away":
+            title = f"Slipped away — {a['voyage_name']}"
+            desc = (
+                f"{a['voyage_name']} was spotted on the hidden thread but slipped "
+                f"away on day {a['arrive_day']}: {lost} ship(s) grazed, cargo "
+                f"{HIDDEN_THREAD_SLIPPED_PROFIT*100:.0f}% intact "
+                f"(roll {roll} ≤ {danger}%, {act} run, gear won the day)."
+            )
+        elif res["outcome"] == "chased_down":
+            desc = (
+                f"{a['voyage_name']} ran — and ran straight into a chase on day "
+                f"{a['arrive_day']}: {lost} ship(s) lost near {a['destination']} "
+                f"(roll {roll} ≤ {danger}%, run act is reckless — tag {a['fleet_tag'] or '—'})."
+            )
+        elif res["outcome"] == "engaged":
+            desc = (
+                f"{a['voyage_name']} fought through a hidden-thread ambush on day "
+                f"{a['arrive_day']}: {lost} ship(s) lost, pursuers driven off "
+                f"(roll {roll} ≤ {danger}%, guard act, tag {a['fleet_tag'] or '—'})."
+            )
+        elif res["outcome"] == "bought_out":
+            title = f"Bought out — {a['voyage_name']}"
+            desc = (
+                f"{a['voyage_name']} bought its way through a hidden-thread "
+                f"roadblock on day {a['arrive_day']}: {lost} ship(s) lost to the "
+                f"payoff, cargo intact (roll {roll} ≤ {danger}%, bribe act, "
+                f"tag {a['fleet_tag'] or '—'})."
+            )
+        await conn.execute(
+            """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
+               VALUES ($1, 'interdiction', $2, $3, 4)""",
+            session_id, title, desc)
+        info("voyage", f"{res['outcome'].upper()}: {a['voyage_name']} "
+                       f"lost {lost} ships (roll {roll} ≤ {danger}%)")
+        return out
+    await conn.execute(
+        """INSERT INTO maya_rp.events (session_id, event_type, title, description)
+           VALUES ($1, 'arrival', $2, $3)""",
+        session_id,
+        f"Arrival — {a['voyage_name']}",
+        f"{a['voyage_name']} arrived at {a['destination']} on day {a['arrive_day']} "
+        f"({a['ship_count']} ships, {a['lane_type'] or 'standard'} lane, "
+        f"tag {a['fleet_tag'] or '—'}).",
+    )
+    return out
+
+
 async def advance(session_id: int | None = None) -> dict:
     """Tick hook: mark voyages arrived when arrive_day <= game_day. Log each arrival.
 
@@ -682,300 +1044,68 @@ async def advance(session_id: int | None = None) -> dict:
       2. roll > danger → CLEAN: cargo sold at margin, profit → treasury
       3. roll <= danger → DETECTED → the act determines: sneak may slip away;
          run gets chased (30-50% loss); guard fights; bribe buys out.
+
+    Each voyage resolves in its own transaction. The old code marked every due voyage `arrived` in
+    one statement and then resolved them one by one in autocommit, so a raise on voyage 2 (a slingshot
+    to a black hole that does not exist) left voyages 2..n `arrived` with no event, no loss and no
+    profit, and nothing ever resolved them. Now a raising voyage stays `in_transit`, the others still
+    resolve, and the raise is reported under "failed".
+
+    @param session_id - session to advance; None resolves the active arc.
+    @returns counters plus "arrived" (names resolved) and "failed" ([{"voyage", "error"}]).
+    @raises core.ooc.FrozenSession when the session is frozen.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_sid(session_id)
     gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id) or 1
-    arrived = await Database.fetch(
-        """UPDATE maya_rp.voyages
-           SET status='arrived', arrived_at=NOW()
-           WHERE session_id=$1 AND status='in_transit' AND arrive_day <= $2
-           RETURNING id, voyage_name, origin, destination, arrive_day, fleet_tag, ship_count,
+    due = await Database.fetch(
+        """SELECT id, voyage_name, origin, destination, arrive_day, fleet_tag, ship_count,
                      via_hidden, act, guide, prep_level, equip_level, knowledge_level,
                      cargo_heat, cargo_value, danger_pct,
                      transit_kind, transit_name, dilation_days, collapse_roll,
-                     lane_type""",
+                     lane_type
+           FROM maya_rp.voyages
+           WHERE session_id=$1 AND status='in_transit' AND arrive_day <= $2
+           ORDER BY id""",
         session_id, gd,
     )
-    arrivals = 0
-    interdictions = 0
-    clean_runs = 0
-    profit_total = 0
-    collapses = 0
-    slingshot_fails = 0
+    totals = {"interdictions": 0, "clean_runs": 0, "profit_credits": 0, "collapses": 0,
+              "slingshot_fails": 0, "unbooked_credits": 0}
     lost_voyages: list[str] = []
-    unbooked_credits = 0
-    for a in arrived:
-        arrivals += 1
-        # ── PIRATE ENCOUNTER on standard lanes (2026-08-15 Izzat canon) ──
-        # Gates are garrisoned (5% — the fair toll buys safety); open lanes
-        # are riskier: standard 15%, hazardous 30%, unstable 45%. Hidden
-        # threads, void, wormhole and slingshot have their own models below.
-        lane = (a["lane_type"] or "standard")
-        if lane in ("standard", "hazardous", "unstable"):
-            density = {"standard": 0.15, "hazardous": 0.30, "unstable": 0.45}.get(lane, 0.15)
-            prowl = random.randint(1, 100)
-            await Database.execute(
-                "UPDATE maya_rp.voyages SET risk_roll=$1 WHERE id=$2", prowl, a["id"])
-            if prowl <= int(density * 100):
-                lost = hidden_thread_loss(a["ship_count"] or 0)
-                await Database.execute(
-                    """UPDATE maya_rp.voyages SET interdicted=TRUE, loss_ships=$1 WHERE id=$2""",
-                    lost, a["id"])
-                await Database.execute(
-                    """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
-                       VALUES ($1, 'pirate_encounter', $2, $3, 3)""",
-                    session_id,
-                    f"Pirate encounter — {a['voyage_name']}",
-                    f"{a['voyage_name']} was hit by pirates on a {lane} lane on day "
-                    f"{a['arrive_day']}: {lost} ship(s) lost near {a['destination']} "
-                    f"(roll {prowl} ≤ {int(density*100)}% — the {lane} lane is open ground, "
-                    f"tag {a['fleet_tag'] or '—'}).",
-                )
-                info("voyage", f"PIRATES: {a['voyage_name']} lost {lost} "
-                               f"on {lane} lane (roll {prowl})")
-                continue
-        # ── WORMHOLE transit: collapse risk on arrival ──
-        if a["transit_kind"] == "wormhole":
-            collapse_roll = random.randint(1, 100)
-            await Database.execute(
-                "UPDATE maya_rp.voyages SET collapse_roll=$1 WHERE id=$2",
-                collapse_roll, a["id"])
-            # decaying holes pop; stable hub-fed ones don't. The name search is
-            # session-scoped: a same-named hole in another campaign must not
-            # decide whether THIS session's ships survive the crossing.
-            stab = await Database.fetchval(
-                "SELECT stability FROM maya_rp.wormholes "
-                "WHERE session_id=$1 AND name ILIKE $2 ORDER BY id LIMIT 1",
-                session_id, f"%{a['transit_name'] or ''}%")
-            if stab is None:
-                stab = 1.0
-            if float(stab) < 0.99 and collapse_roll <= WORMHOLE_COLLAPSE_PCT:
-                collapses += 1
-                lost = a["ship_count"] or 0
-                lost_voyages.append(a["voyage_name"])
-                # The event text claims the ships are gone. Book it: the voyage
-                # ends 'lost' with the hulls counted, not 'arrived' at full
-                # strength with the loss living only in prose.
-                await Database.execute(
-                    """UPDATE maya_rp.voyages
-                       SET status='lost', loss_ships=$1 WHERE id=$2""",
-                    lost, a["id"])
-                await Database.execute(
-                    """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
-                       VALUES ($1, 'wormhole_collapse', $2, $3, 5)""",
-                    session_id,
-                    f"WORMHOLE COLLAPSED — {a['voyage_name']}",
-                    f"{a['voyage_name']} was inside {a['transit_name']} when it popped "
-                    f"on day {a['arrive_day']}: {lost or '?'} ship(s) lost to "
-                    f"the exotic-matter cascade near {a['destination']} "
-                    f"(collapse roll {collapse_roll} ≤ {WORMHOLE_COLLAPSE_PCT}).",
-                )
-                info("voyage", f"WORMHOLE COLLAPSE: {a['voyage_name']} "
-                               f"({a['transit_name']}, roll {collapse_roll}, "
-                               f"{lost} ship(s) lost)")
-                continue
-            await Database.execute(
-                """INSERT INTO maya_rp.events (session_id, event_type, title, description)
-                   VALUES ($1, 'wormhole_arrival', $2, $3)""",
-                session_id,
-                f"Wormhole arrival — {a['voyage_name']}",
-                f"{a['voyage_name']} emerged from {a['transit_name']} on day "
-                f"{a['arrive_day']} at {a['destination']} — the A↔B pair held. "
-                f"(collapse roll {collapse_roll}, tag {a['fleet_tag'] or '—'}).",
-            )
+    arrived: list[str] = []
+    failed: list[dict] = []
+    for a in due:
+        try:
+            async with Database.transaction() as conn:
+                claimed = await conn.fetchval(
+                    "UPDATE maya_rp.voyages SET status='arrived', arrived_at=NOW() "
+                    "WHERE id=$1 AND session_id=$2 AND status='in_transit' RETURNING id",
+                    a["id"], session_id)
+                if claimed is None:
+                    continue  # another tick resolved it first
+                out = await _resolve_arrival(conn, session_id, a)
+        except Exception as e:  # noqa: BLE001 - one bad voyage must not strand the rest
+            error("voyage", f"{a['voyage_name']} (id {a['id']}) not resolved, stays in_transit: {e}")
+            failed.append({"voyage": a["voyage_name"], "error": str(e)})
             continue
-        # ── SLINGSHOT transit: event-horizon risk resolved on arrival ──
-        if a["transit_kind"] == "slingshot":
-            b = await black_hole_slingshot(a["transit_name"] or "", session_id)
-            if not b["ok"]:
-                slingshot_fails += 1
-                lost = hidden_thread_loss(a["ship_count"] or 0, rng=random.Random(b["roll"]))
-                await Database.execute(
-                    """UPDATE maya_rp.voyages SET interdicted=TRUE, loss_ships=$1 WHERE id=$2""",
-                    lost, a["id"])
-                await Database.execute(
-                    """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
-                       VALUES ($1, 'event_horizon', $2, $3, 5)""",
-                    session_id,
-                    f"EVENT HORIZON — {a['voyage_name']}",
-                    f"{a['voyage_name']} slingshot {a['transit_name']} went wrong: the "
-                    f"gravity gradient bit — {lost} ship(s) pulled past the event "
-                    f"horizon on day {a['arrive_day']} (roll {b['roll']} < "
-                    f"{b['pass_dc']} hazard). They may yet emerge from a white hole...",
-                )
-                info("voyage", f"EVENT HORIZON: {a['voyage_name']} lost {lost} "
-                               f"(roll {b['roll']} < {b['pass_dc']})")
-                continue
-            await Database.execute(
-                """INSERT INTO maya_rp.events (session_id, event_type, title, description)
-                   VALUES ($1, 'slingshot_arrival', $2, $3)""",
-                session_id,
-                f"Slingshot arrival — {a['voyage_name']}",
-                f"{a['voyage_name']} rode the Oberth boost past {a['transit_name']} and "
-                f"arrived on day {a['arrive_day']} at {a['destination']} "
-                f"(+{a['dilation_days']}d time dilation, roll {b['roll']} ≥ {b['pass_dc']}).",
-            )
-            continue
-        # ── VOID CROSSING: hazard roll on arrival (2026-08-15) ──
-        if a["transit_kind"] == "void":
-            # risk was persisted at register (danger_pct = void risk, cut by ward)
-            risk = a["danger_pct"] if a["danger_pct"] is not None else 20
-            roll = random.randint(1, 100)
-            await Database.execute(
-                "UPDATE maya_rp.voyages SET risk_roll=$1 WHERE id=$2", roll, a["id"])
-            if roll <= risk:
-                lost = hidden_thread_loss(a["ship_count"] or 0)
-                await Database.execute(
-                    """UPDATE maya_rp.voyages SET interdicted=TRUE, loss_ships=$1 WHERE id=$2""",
-                    lost, a["id"])
-                await Database.execute(
-                    """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
-                       VALUES ($1, 'void_hazard', $2, $3, 4)""",
-                    session_id,
-                    f"VOID HAZARD — {a['voyage_name']}",
-                    f"{a['voyage_name']} crossed the void but the dark between the "
-                    f"nebulas bit on day {a['arrive_day']}: {lost} ship(s) lost to "
-                    f"void radiation / turbulence near {a['destination']} "
-                    f"(roll {roll} ≤ {risk}% void risk).",
-                )
-                info("voyage", f"VOID HAZARD: {a['voyage_name']} lost {lost} "
-                               f"(roll {roll} ≤ {risk}%)")
-                continue
-            await Database.execute(
-                """INSERT INTO maya_rp.events (session_id, event_type, title, description)
-                   VALUES ($1, 'void_arrival', $2, $3)""",
-                session_id,
-                f"Void crossing — {a['voyage_name']}",
-                f"{a['voyage_name']} crossed the void between the nebulas and "
-                f"emerged on day {a['arrive_day']} at {a['destination']} — "
-                f"Void Drive held, no ships lost (roll {roll} > {risk}%).",
-            )
-            continue
-        if a["via_hidden"]:
-            roll = random.randint(1, 100)
-            await Database.execute(
-                "UPDATE maya_rp.voyages SET risk_roll=$1 WHERE id=$2", roll, a["id"])
-            danger = a["danger_pct"] if a["danger_pct"] is not None else hidden_thread_danger(
-                act=a["act"] or "sneak", has_guide=bool(a["guide"]),
-                prep_level=a["prep_level"] or 0, equip_level=a["equip_level"] or 0,
-                knowledge_level=a["knowledge_level"] or 0, cargo_heat=a["cargo_heat"] or 0)
-            act = a["act"] or "sneak"
-            if roll > danger:
-                # ── CLEAN RUN — the positive side pays out ──
-                clean_runs += 1
-                margin = hidden_thread_margin(
-                    act=act, has_guide=bool(a["guide"]),
-                    prep_level=a["prep_level"] or 0, equip_level=a["equip_level"] or 0,
-                    knowledge_level=a["knowledge_level"] or 0, cargo_heat=a["cargo_heat"] or 0)
-                profit = int((a["cargo_value"] or 0) * margin)
-                credited = False
-                if profit > 0:
-                    credited = await _charge_treasury(
-                        "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2",
-                        profit, session_id)
-                    if not credited:
-                        unbooked_credits += profit
-                        info("voyage", f"{a['voyage_name']}: +{profit:,}C earned but "
-                                       f"session {session_id} has no resources row — "
-                                       f"NOT credited")
-                await Database.execute(
-                    """UPDATE maya_rp.voyages SET reward_credits=$1 WHERE id=$2""",
-                    profit, a["id"])
-                await Database.execute(
-                    """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
-                       VALUES ($1, 'smuggle_profit', $2, $3, 2)""",
-                    session_id,
-                    f"Clean run — {a['voyage_name']}",
-                    f"{a['voyage_name']} slipped through a hidden thread and landed on day "
-                    f"{a['arrive_day']}: cargo sold at {margin*100:.0f}% margin, "
-                    + (f"{profit:,}C credited." if credited else
-                       f"{profit:,}C NOT credited — no treasury row for this session.")
-                    + f" (roll {roll} > danger {danger}%, {act} run, "
-                      f"tag {a['fleet_tag'] or '—'}).",
-                )
-                if credited:
-                    profit_total += profit
-                info("voyage", f"CLEAN: {a['voyage_name']} +{profit:,}C "
-                               f"{'booked' if credited else 'UNBOOKED'} (roll {roll} > {danger}%)")
-                continue
-            # ── DETECTED — the act determines the outcome ──
-            interdictions += 1
-            res = hidden_thread_outcome(
-                act=act, has_guide=bool(a["guide"]),
-                prep_level=a["prep_level"] or 0, equip_level=a["equip_level"] or 0,
-                knowledge_level=a["knowledge_level"] or 0,
-                ship_count=a["ship_count"] or 0)
-            lost = res["loss"]
-            if res["chased"]:
-                await Database.execute(
-                    """UPDATE maya_rp.voyages SET interdicted=TRUE, loss_ships=$1 WHERE id=$2""",
-                    lost, a["id"])
-            title = f"INTERDICTED — {a['voyage_name']}"
-            desc = (
-                f"{a['voyage_name']} ran a hidden thread but was caught on day "
-                f"{a['arrive_day']}: {lost} ship(s) lost near {a['destination']} "
-                f"(roll {roll} ≤ {danger}%, {act} run, tag {a['fleet_tag'] or '—'})."
-            )
-            if res["outcome"] == "slipped_away":
-                title = f"Slipped away — {a['voyage_name']}"
-                desc = (
-                    f"{a['voyage_name']} was spotted on the hidden thread but slipped "
-                    f"away on day {a['arrive_day']}: {lost} ship(s) grazed, cargo "
-                    f"{HIDDEN_THREAD_SLIPPED_PROFIT*100:.0f}% intact "
-                    f"(roll {roll} ≤ {danger}%, {act} run, gear won the day)."
-                )
-            elif res["outcome"] == "chased_down":
-                desc = (
-                    f"{a['voyage_name']} ran — and ran straight into a chase on day "
-                    f"{a['arrive_day']}: {lost} ship(s) lost near {a['destination']} "
-                    f"(roll {roll} ≤ {danger}%, run act is reckless — tag {a['fleet_tag'] or '—'})."
-                )
-            elif res["outcome"] == "engaged":
-                desc = (
-                    f"{a['voyage_name']} fought through a hidden-thread ambush on day "
-                    f"{a['arrive_day']}: {lost} ship(s) lost, pursuers driven off "
-                    f"(roll {roll} ≤ {danger}%, guard act, tag {a['fleet_tag'] or '—'})."
-                )
-            elif res["outcome"] == "bought_out":
-                title = f"Bought out — {a['voyage_name']}"
-                desc = (
-                    f"{a['voyage_name']} bought its way through a hidden-thread "
-                    f"roadblock on day {a['arrive_day']}: {lost} ship(s) lost to the "
-                    f"payoff, cargo intact (roll {roll} ≤ {danger}%, bribe act, "
-                    f"tag {a['fleet_tag'] or '—'})."
-                )
-            await Database.execute(
-                """INSERT INTO maya_rp.events (session_id, event_type, title, description, importance)
-                   VALUES ($1, 'interdiction', $2, $3, 4)""",
-                session_id, title, desc)
-            info("voyage", f"{res['outcome'].upper()}: {a['voyage_name']} "
-                           f"lost {lost} ships (roll {roll} ≤ {danger}%)")
-            continue
-        await Database.execute(
-            """INSERT INTO maya_rp.events (session_id, event_type, title, description)
-               VALUES ($1, 'arrival', $2, $3)""",
-            session_id,
-            f"Arrival — {a['voyage_name']}",
-            f"{a['voyage_name']} arrived at {a['destination']} on day {a['arrive_day']} "
-            f"({a['ship_count']} ships, {a['lane_type'] or 'standard'} lane, "
-            f"tag {a['fleet_tag'] or '—'}).",
-        )
+        arrived.append(a["voyage_name"])
+        if out.pop("lost"):
+            lost_voyages.append(a["voyage_name"])
+        for k, v in out.items():
+            totals[k] += v
     if arrived:
         info("voyage", f"{len(arrived)} voyage(s) arrived at day {gd} "
-                       f"({interdictions} interdicted, {clean_runs} clean, "
-                       f"{collapses} wormhole collapses, {slingshot_fails} slingshot fails, "
-                       f"+{profit_total:,}C profit)")
-    return {"arrivals": arrivals, "interdictions": interdictions, "clean_runs": clean_runs,
-            "profit_credits": profit_total, "collapses": collapses,
-            "slingshot_fails": slingshot_fails,
-            "lost": lost_voyages, "unbooked_credits": unbooked_credits,
-            "arrived": [a["voyage_name"] for a in arrived]}
+                       f"({totals['interdictions']} interdicted, {totals['clean_runs']} clean, "
+                       f"{totals['collapses']} wormhole collapses, {totals['slingshot_fails']} slingshot fails, "
+                       f"+{totals['profit_credits']:,}C profit)")
+    return {"arrivals": len(arrived), "interdictions": totals["interdictions"],
+            "clean_runs": totals["clean_runs"], "profit_credits": totals["profit_credits"],
+            "collapses": totals["collapses"], "slingshot_fails": totals["slingshot_fails"],
+            "lost": lost_voyages, "unbooked_credits": totals["unbooked_credits"],
+            "arrived": arrived, "failed": failed}
 
 
 async def status(session_id: int | None = None) -> list[dict]:
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _sid(session_id)
     return await Database.fetch(
         """SELECT id, voyage_name, origin, destination, travel_days, depart_day,
                   arrive_day, status, fleet_tag, ship_count, via_hidden, act,
@@ -989,8 +1119,7 @@ async def status(session_id: int | None = None) -> list[dict]:
 
 
 async def run_tick(session_id: int | None = None) -> dict:
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_sid(session_id)
     try:
         return await advance(session_id)
     except Exception as e:

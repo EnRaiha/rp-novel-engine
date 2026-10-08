@@ -20,10 +20,13 @@ Defects covered, in the order they appear in the file:
 9. `register` booked a gate toll, and `advance` a clean-run profit, without
    checking that the session has a resources row.
 
-Every test drives a fake Database: nothing here writes to the live campaign.
+Every test drives a fake Database: nothing here writes to the live campaign. The writers refuse the
+frozen sessions 3 and 5, so each call names a scratch id that no row backs.
 """
 import math
+import os
 import random
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -38,18 +41,28 @@ from modules.voyage import (BLACK_HOLE_SLINGSHOT_DC, GRID_HOURS_PER_UNIT,
                             register, white_hole_events, wormhole_status)
 
 
+#: A scratch session id. It is never 3 or 5, and the fake database means no row exists for it.
+SCRATCH = 900 + os.getpid() % 100
+
+
 class FakeDB:
     """Records every statement; answers by SQL substring.
 
-    `execute` returns a real asyncpg status tag, which is what tells the module
-    whether a treasury UPDATE touched a row.
+    The writers run on the connection that `Database.transaction()` yields, so `transaction()` yields
+    a `_Conn` that records into the same call list as the pool methods. `treasury` says whether the
+    session has a `resources` row: the guarded debit and credit `RETURNING credits` answer a value when
+    it does and None when it does not. The per-voyage arrival claim always answers the voyage id.
     """
 
-    def __init__(self, fetchval=None, fetch=None, execute_tag="UPDATE 1"):
+    def __init__(self, fetchval=None, fetch=None, treasury=True):
         self.fetchval_rules = fetchval or {}
         self.fetch_rows = fetch if fetch is not None else []
-        self.execute_tag = execute_tag
+        self.treasury = treasury
         self.calls = []
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield _Conn(self)
 
     def _record(self, kind, sql, args):
         self.calls.append((kind, " ".join(sql.split()), args))
@@ -74,7 +87,7 @@ class FakeDB:
 
     async def execute(self, sql, *args):
         self._record("execute", sql, args)
-        return self.execute_tag
+        return "OK"
 
     def sql(self, kind=None):
         return [c[1] for c in self.calls if kind is None or c[0] == kind]
@@ -83,7 +96,38 @@ class FakeDB:
         return [c[2] for c in self.calls if needle in c[1]]
 
 
+class _Conn:
+    """The connection a fake transaction yields. It records like the pool methods and adds the answers
+    a real connection gives to the guarded treasury statements and the arrival claim."""
+
+    def __init__(self, fake):
+        self._fake = fake
+
+    async def fetchval(self, sql, *args):
+        norm = " ".join(sql.split())
+        if "UPDATE maya_rp.resources" in norm:
+            self._fake._record("fetchval", sql, args)
+            return 1_000_000 if self._fake.treasury else None
+        if "SELECT 1 FROM maya_rp.resources" in norm:
+            self._fake._record("fetchval", sql, args)
+            return 1 if self._fake.treasury else None
+        if "SET status='arrived'" in norm:
+            self._fake._record("fetchval", sql, args)
+            return args[0]
+        return await self._fake.fetchval(sql, *args)
+
+    async def fetchrow(self, sql, *args):
+        return await self._fake.fetchrow(sql, *args)
+
+    async def fetch(self, sql, *args):
+        return await self._fake.fetch(sql, *args)
+
+    async def execute(self, sql, *args):
+        return await self._fake.execute(sql, *args)
+
+
 def _install(monkeypatch, fake) -> FakeDB:
+    monkeypatch.setattr(voyage.Database, "transaction", fake.transaction)
     for name in ("fetchval", "fetchrow", "fetch", "execute"):
         monkeypatch.setattr(voyage.Database, name, getattr(fake, name))
     return fake
@@ -115,12 +159,12 @@ async def test_advance_wormhole_stability_read_is_session_scoped(monkeypatch):
     _install(monkeypatch, fake)
     monkeypatch.setattr(voyage.random, "randint", lambda a, b: 99)
 
-    await advance(session_id=5)
+    await advance(session_id=SCRATCH)
 
     reads = [s for s in fake.sql("fetchval") if "maya_rp.wormholes" in s]
     assert len(reads) == 1, reads
     assert "session_id=$1" in reads[0]
-    assert fake.args_for("maya_rp.wormholes")[0][0] == 5
+    assert fake.args_for("maya_rp.wormholes")[0][0] == SCRATCH
 
 
 # ── 2. A collapse books the hulls it narrates ────────────────────────────
@@ -131,7 +175,7 @@ async def test_advance_books_wormhole_collapse_loss(monkeypatch):
     _install(monkeypatch, fake)
     monkeypatch.setattr(voyage.random, "randint", lambda a, b: 10)  # ≤ 30% → collapse
 
-    res = await advance(session_id=5)
+    res = await advance(session_id=SCRATCH)
 
     assert res["collapses"] == 1
     assert res["lost"] == ["Ghostgate Run"]
@@ -149,7 +193,7 @@ async def test_advance_unknown_stability_does_not_collapse(monkeypatch):
     _install(monkeypatch, fake)
     monkeypatch.setattr(voyage.random, "randint", lambda a, b: 10)
 
-    res = await advance(session_id=5)
+    res = await advance(session_id=SCRATCH)
 
     assert res["collapses"] == 0
     assert any("wormhole_arrival" in s for s in fake.sql("execute"))
@@ -250,7 +294,7 @@ async def test_compute_travel_rejects_negative_distance(kw):
 ])
 async def test_register_rejects_bad_input(monkeypatch, kw, match):
     _install(monkeypatch, FakeDB())
-    params = {"voyage_name": "Bad Run", "distance_units": 10, "depart_day": 1}
+    params = {"voyage_name": "Bad Run", "distance_units": 10, "depart_day": 1, "session_id": SCRATCH}
     params.update(kw)
     with pytest.raises(ValueError, match=match):
         await register(**params)
@@ -259,12 +303,12 @@ async def test_register_rejects_bad_input(monkeypatch, kw, match):
 # ── 9. Money movement reports what it did ────────────────────────────────
 
 async def test_register_uncharged_toll_when_session_has_no_resources_row(monkeypatch):
-    fake = FakeDB(fetchval={"INSERT INTO maya_rp.voyages": 42}, execute_tag="UPDATE 0")
+    fake = FakeDB(fetchval={"INSERT INTO maya_rp.voyages": 42}, treasury=False)
     _install(monkeypatch, fake)
     monkeypatch.setattr(voyage, "gate_crossing", _fake_gate)
 
     r = await register("No Treasury", "20,250,3", "25,12,2",
-                       distance_units=None, ship_count=4, session_id=5)
+                       distance_units=None, ship_count=4, session_id=SCRATCH)
 
     assert r["lane_type"] == "gate"
     assert r["toll_charged"] is False
@@ -272,30 +316,33 @@ async def test_register_uncharged_toll_when_session_has_no_resources_row(monkeyp
 
 
 async def test_register_books_toll_when_the_row_exists(monkeypatch):
-    fake = FakeDB(fetchval={"INSERT INTO maya_rp.voyages": 42}, execute_tag="UPDATE 1")
+    fake = FakeDB(fetchval={"INSERT INTO maya_rp.voyages": 42}, treasury=True)
     _install(monkeypatch, fake)
     monkeypatch.setattr(voyage, "gate_crossing", _fake_gate)
 
-    r = await register("Real Treasury", "20,250,3", "25,12,2", ship_count=4, session_id=3)
+    r = await register("Real Treasury", "20,250,3", "25,12,2", ship_count=4, session_id=SCRATCH)
 
     assert r["toll_charged"] is True
     assert r["toll_paid"] == int(25000 * voyage.GATE_INTERNAL_COST_SHARE) == 5000
+    debits = fake.args_for("COALESCE(credits, 0) - $1")
+    assert debits == [(5000, SCRATCH)], f"the toll was not charged to the scratch treasury: {debits}"
 
 
 async def test_clean_run_does_not_claim_unbooked_profit(monkeypatch):
     row = dict(VOYAGE_ROW, via_hidden=True, lane_type="hidden_thread",
                transit_kind="regular", transit_name=None, act="sneak",
                cargo_value=1000, danger_pct=50)
-    fake = FakeDB(fetchval={"maya_rp.sessions": 100}, fetch=[row], execute_tag="UPDATE 0")
+    fake = FakeDB(fetchval={"maya_rp.sessions": 100}, fetch=[row], treasury=False)
     _install(monkeypatch, fake)
     monkeypatch.setattr(voyage.random, "randint", lambda a, b: 90)     # 90 > 50 → clean
     monkeypatch.setattr(voyage.random, "uniform", lambda a, b: 0.30)   # +0.10 sneak = 0.40
 
-    res = await advance(session_id=5)
+    res = await advance(session_id=SCRATCH)
 
     assert res["clean_runs"] == 1
     assert res["profit_credits"] == 0            # nothing moved, so nothing is claimed
     assert res["unbooked_credits"] == 400
+    assert fake.args_for("COALESCE(credits, 0) + $1") == [(400, SCRATCH)]   # the credit was attempted, found no row
     event = [c[2] for c in fake.calls
              if c[0] == "execute" and "smuggle_profit" in c[1]]
     assert event and "NOT credited" in event[0][2]
@@ -305,15 +352,16 @@ async def test_clean_run_credits_when_the_row_exists(monkeypatch):
     row = dict(VOYAGE_ROW, via_hidden=True, lane_type="hidden_thread",
                transit_kind="regular", transit_name=None, act="sneak",
                cargo_value=1000, danger_pct=50)
-    fake = FakeDB(fetchval={"maya_rp.sessions": 100}, fetch=[row], execute_tag="UPDATE 1")
+    fake = FakeDB(fetchval={"maya_rp.sessions": 100}, fetch=[row], treasury=True)
     _install(monkeypatch, fake)
     monkeypatch.setattr(voyage.random, "randint", lambda a, b: 90)
     monkeypatch.setattr(voyage.random, "uniform", lambda a, b: 0.30)
 
-    res = await advance(session_id=5)
+    res = await advance(session_id=SCRATCH)
 
     assert res["profit_credits"] == 400
     assert res["unbooked_credits"] == 0
+    assert fake.args_for("COALESCE(credits, 0) + $1") == [(400, SCRATCH)], "the profit was not credited to the treasury"
 
 
 # ── Module contract ──────────────────────────────────────────────────────
@@ -327,7 +375,7 @@ async def test_contract_register_books_arrival_from_travel_days(monkeypatch):
     _install(monkeypatch, fake)
 
     r = await register("Contract Run", distance_units=48, depart_day=10,
-                       fleet_tag="TEST", ship_count=3, session_id=3)
+                       fleet_tag="TEST", ship_count=3, session_id=SCRATCH)
 
     assert r["travel_days"] == pytest.approx(48 * GRID_HOURS_PER_UNIT / 24.0)
     assert r["arrive_day"] == 10 + int(math.ceil(r["travel_days"])) == 58
@@ -344,11 +392,14 @@ async def test_contract_advance_marks_due_voyages_and_reports_names(monkeypatch)
     _install(monkeypatch, fake)
     monkeypatch.setattr(voyage.random, "randint", lambda a, b: 100)  # no pirate in 100
 
-    res = await advance(session_id=3)
+    res = await advance(session_id=SCRATCH)
 
-    due = [s for s in fake.sql("fetch") if "SET status='arrived'" in s]
-    assert due and "session_id=$1" in due[0] and "arrive_day <= $2" in due[0]
-    assert fake.args_for("SET status='arrived'")[0] == (3, 100)
+    due = [s for s in fake.sql("fetch") if "status='in_transit'" in s]
+    assert due and "session_id=$1" in due[0] and "arrive_day <= $2" in due[0], due
+    assert fake.args_for("status='in_transit' AND arrive_day <= $2")[0] == (SCRATCH, 100)
+    # each due voyage is claimed on the transaction's connection: id 7 of the scratch session
+    claim = fake.args_for("SET status='arrived'")
+    assert claim == [(7, SCRATCH)], claim
     assert res["arrivals"] == 1 and res["arrived"] == ["Ghostgate Run"]
     assert res["lost"] == []
 

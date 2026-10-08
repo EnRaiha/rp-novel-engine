@@ -10,14 +10,52 @@ conspiracy, its phase and the network quality now.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
+
 from core.db import Database  # noqa: E402
 from modules import council  # noqa: E402
+
+#: Scratch sessions. The writers refuse the frozen sessions 3 and 5, so every row this file makes lives in
+#: a session of its own (900-999), with a second one standing in for "another campaign".
+SESSION = 900 + os.getpid() % 100
+OTHER = 900 + (os.getpid() + 50) % 100
+
+#: Children first: foreign keys run from these tables to `characters`, `cabinet_hierarchy`, `sessions`.
+_TABLES = (
+    "cabinet_decrees", "cabinet_hierarchy", "character_relationships", "characters", "conspiracies",
+    "crew_roster", "events", "intel_network", "morale_history", "social_events", "territory",
+)
+
+
+async def _wipe() -> None:
+    for sid in (SESSION, OTHER):
+        for table in _TABLES:
+            await Database.execute(f"DELETE FROM maya_rp.{table} WHERE session_id = $1", sid)
+        await Database.execute("DELETE FROM maya_rp.sessions WHERE id = $1", sid)
+
+
+@pytest_asyncio.fixture
+async def scratch():
+    """Both scratch sessions exist for the test; every row of them is removed after, in foreign-key order."""
+    await Database.init()
+    await _wipe()
+    for sid in (SESSION, OTHER):
+        await Database.execute(
+            "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1, 'scratch', 'active')"
+            " ON CONFLICT (id) DO NOTHING", sid)
+    try:
+        yield
+    finally:
+        await _wipe()
+        await Database.close()
 
 
 async def _conspiracy(session_id: int, difficulty: int = 5):
@@ -28,37 +66,31 @@ async def _conspiracy(session_id: int, difficulty: int = 5):
 
 
 class TestTheScanRepeats:
-    async def test_the_same_state_is_detected_the_same_way(self):
-        await Database.init()
-        rows = [await _conspiracy(5, d) for d in (1, 3, 5, 7, 9)]
+    async def test_the_same_state_is_detected_the_same_way(self, scratch):
+        rows = [await _conspiracy(SESSION, d) for d in (1, 3, 5, 7, 9)]
         try:
-            first = [r["conspiracy_id"] for r in await council.scan_for_plots(5, 60)]
-            second = [r["conspiracy_id"] for r in await council.scan_for_plots(5, 60)]
+            first = [r["conspiracy_id"] for r in await council.scan_for_plots(SESSION, 60)]
+            second = [r["conspiracy_id"] for r in await council.scan_for_plots(SESSION, 60)]
             assert first == second, f"the scan is not reproducible: {first} then {second}"
         finally:
             for row in rows:
                 await Database.execute("DELETE FROM maya_rp.conspiracies WHERE id=$1", row["id"])
-            await Database.close()
 
-    async def test_a_better_network_detects_at_least_as_much(self):
-        await Database.init()
-        row = await _conspiracy(5, 3)
+    async def test_a_better_network_detects_at_least_as_much(self, scratch):
+        row = await _conspiracy(SESSION, 3)
         try:
-            weak = len(await council.scan_for_plots(5, 10))
-            strong = len(await council.scan_for_plots(5, 100))
+            weak = len(await council.scan_for_plots(SESSION, 10))
+            strong = len(await council.scan_for_plots(SESSION, 100))
             assert strong >= weak, f"a stronger network found less: {strong} < {weak}"
         finally:
             await Database.execute("DELETE FROM maya_rp.conspiracies WHERE id=$1", row["id"])
-            await Database.close()
 
-    async def test_another_campaign_sees_none_of_them(self):
-        await Database.init()
-        row = await _conspiracy(3, 1)
+    async def test_another_campaign_sees_none_of_them(self, scratch):
+        row = await _conspiracy(OTHER, 1)
         try:
-            assert await council.scan_for_plots(5, 100) == [], "the scan leaks across campaigns"
+            assert await council.scan_for_plots(SESSION, 100) == [], "the scan leaks across campaigns"
         finally:
             await Database.execute("DELETE FROM maya_rp.conspiracies WHERE id=$1", row["id"])
-            await Database.close()
 
 
 class TestThePureHelpersTheCliUses:
@@ -71,16 +103,11 @@ class TestThePureHelpersTheCliUses:
     def test_cohesion_of_no_seats_is_zero(self):
         assert council.get_cohesion([]) == 0
 
-    def test_an_invalid_agent_role_is_refused(self):
-        import asyncio
 
-        async def check():
-            await Database.init()
-            try:
-                return await council.assign_agent(5, 1, "nonsense")
-            finally:
-                await Database.close()
-        assert "Invalid role" in asyncio.run(check()).get("error", "")
+class TestTheAgentRole:
+    async def test_an_invalid_agent_role_is_refused(self, scratch):
+        out = await council.assign_agent(SESSION, 1, "nonsense")
+        assert "Invalid role" in out.get("error", ""), out
 
 
 class TestTheThreeThatReadTheSeats:

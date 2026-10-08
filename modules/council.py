@@ -22,9 +22,9 @@ from datetime import datetime
 from typing import Any
 
 from core.db import Database
-from core.config import Config
 from core.log import error, info
 from core import ooc
+from core.session import require_session
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -256,11 +256,44 @@ THWART_METHODS = {
 
 
 # ═══════════════════════════════════════════════════════════════
+# SESSION RESOLUTION
+# ═══════════════════════════════════════════════════════════════
+
+def _sid(session_id: int | None) -> int:
+    """Resolve the session for one call.
+
+    `Config.SESSION_ID` is fixed at import, so a long-lived tick kept writing to the session that was
+    current at start. An explicit id (0 included) is used as given.
+
+    @param session_id - caller's id, or None for the active arc.
+    @returns the session id.
+    @raises RuntimeError when nothing resolves.
+    """
+    return session_id if session_id is not None else require_session(None)
+
+
+def _writable_sid(session_id: int | None) -> int:
+    """Resolve the session and refuse a frozen one.
+
+    Sessions 3 and 5 are reference data. Every council writer (decrees, thwarts, agents, title
+    revocation, the tick) wrote into them with no check, the door `core.ooc` keeps shut for its own
+    writers.
+
+    @param session_id - caller's id, or None for the active arc.
+    @returns the session id.
+    @raises core.ooc.FrozenSession when the session is frozen and maintenance is not armed.
+    """
+    sid = _sid(session_id)
+    ooc._refuse_frozen(sid)
+    return sid
+
+
+# ═══════════════════════════════════════════════════════════════
 # CABINET MANAGER
 # ═══════════════════════════════════════════════════════════════
 
 async def get_cabinet_seats(session_id: int | None = None) -> list[dict]:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = _sid(session_id)
     rows = await Database.fetch(
         "SELECT * FROM maya_rp.cabinet_hierarchy WHERE session_id = $1 AND active = true ORDER BY tier, id",
         session_id,
@@ -461,7 +494,7 @@ def generate_mystery_hooks(territories: list[dict] | None = None) -> list[dict]:
 
 async def scan_for_plots(session_id: int | None = None, network_quality: int = 0) -> list[dict]:
     """Scan for active conspiracies. Ported from CounterEspionage.scanForPlots()."""
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = _sid(session_id)
     rows = await Database.fetch(
         "SELECT id, plot_type, target, current_phase, difficulty, details "
         "FROM maya_rp.conspiracies WHERE session_id = $1 AND status = 'active'",
@@ -470,12 +503,18 @@ async def scan_for_plots(session_id: int | None = None, network_quality: int = 0
     detected = []
     for row in rows:
         p = dict(row)
-        detect = (network_quality / 100) * (1 - p["difficulty"] / 10) if network_quality > 0 else 0.1
+        # A network of quality 0 caught a plot 10% of the time and quality 1 caught it 0.3%, so
+        # staffing the first agent made the cabinet blinder. The 10% floor now holds at every quality
+        # and the network adds its share of the remaining 90%, scaled down by plot difficulty.
+        quality = max(0, min(100, network_quality))
+        detect = 0.1 + 0.9 * (quality / 100) * (1 - min(10, p["difficulty"]) / 10)
         # `random.random()` decided this, so scanning the same state twice gave two different answers
-        # and the novel could not reproduce a scan. A digest of the conspiracy and the network quality
-        # keeps the uncertainty while making the same state always report the same way.
+        # and the novel could not reproduce a scan. A digest of the conspiracy keeps the uncertainty
+        # while making the same state always report the same way. The network quality stays out of the
+        # digest: a better network must catch every plot a worse one caught, and a roll that moved
+        # with quality let a stronger network miss a plot a weaker one found.
         roll = (int.from_bytes(hashlib.blake2s(
-            f"{session_id}|{p['id']}|{p['current_phase']}|{network_quality}".encode(),
+            f"{session_id}|{p['id']}|{p['current_phase']}".encode(),
             digest_size=4).digest(), "big") % 10_000) / 10_000
         if roll < detect:
             detected.append({
@@ -487,8 +526,16 @@ async def scan_for_plots(session_id: int | None = None, network_quality: int = 0
     return detected
 
 
-async def assign_agent(session_id: int, crew_id: int, role: str) -> dict:
-    """Assign counter-intel agent. Ported from CounterEspionage.assignAgent()."""
+async def assign_agent(session_id: int | None, crew_id: int, role: str) -> dict:
+    """Assign counter-intel agent. Ported from CounterEspionage.assignAgent().
+
+    @param session_id - session owning the network; None resolves the active arc.
+    @param crew_id - assigned crew member.
+    @param role - watcher, networker or interrogator.
+    @returns {"assigned": True, ...} or {"error": ...}.
+    @raises core.ooc.FrozenSession when the session is frozen.
+    """
+    session_id = _writable_sid(session_id)
     valid = ["watcher", "networker", "interrogator"]
     if role not in valid:
         return {"error": f"Invalid role '{role}'", "available": valid}
@@ -516,26 +563,43 @@ async def thwart_plot(conspiracy_id: int, method: str, session_id: int | None = 
 
     The update ran by id alone, so any campaign could attempt to thwart another campaign's plot, and
     a conspiracy id that does not exist was answered with a success roll against nothing.
+
+    Only an `active` plot can be thwarted. The update set `status = 'active'` on a failed roll with no
+    status guard, so a failed second attempt re-activated a plot the first attempt had thwarted. A
+    failed roll now writes nothing, and the success write is guarded on `status = 'active'`.
+
+    @param conspiracy_id - plot to thwart.
+    @param method - key of THWART_METHODS.
+    @param session_id - session owning the plot; None resolves the active arc.
+    @returns the roll result, or {"success": False, "error": ...} for an unknown, foreign or resolved plot.
+    @raises core.ooc.FrozenSession when the session is frozen.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_sid(session_id)
     m = THWART_METHODS.get(method)
     if not m:
         return {"error": f"Invalid method '{method}'", "available": sorted(THWART_METHODS)}
     try:
         row = await Database.fetchrow(
-            "SELECT id FROM maya_rp.conspiracies WHERE id = $1 AND session_id = $2",
+            "SELECT id, status FROM maya_rp.conspiracies WHERE id = $1 AND session_id = $2",
             conspiracy_id, session_id,
         )
         if not row:
             return {"success": False,
                     "error": f"conspiracy {conspiracy_id} not found in session {session_id}"}
+        if row["status"] != "active":
+            return {"success": False,
+                    "error": f"conspiracy {conspiracy_id} is {row['status']}, not active"}
         success = random.random() < m["success"]
-        status = "thwarted" if success else "active"
-        await Database.execute(
-            "UPDATE maya_rp.conspiracies SET status = $1, details = jsonb_set(coalesce(details, '{}'), '{thwarted_by}', $2::jsonb) WHERE id = $3 AND session_id = $4",
-            status, json.dumps({"method": method}), conspiracy_id, session_id,
-        )
+        if success:
+            claimed = await Database.fetchval(
+                "UPDATE maya_rp.conspiracies SET status = 'thwarted', "
+                "details = jsonb_set(coalesce(details, '{}'), '{thwarted_by}', $1::jsonb) "
+                "WHERE id = $2 AND session_id = $3 AND status = 'active' RETURNING id",
+                json.dumps({"method": method}), conspiracy_id, session_id,
+            )
+            if claimed is None:
+                return {"success": False,
+                        "error": f"conspiracy {conspiracy_id} was resolved by another call"}
         return {
             "success": success, "exposure_risk": m["exposure"], "moral_cost": m["moral"],
             "narrative": f"Plot {'successfully disrupted' if success else f'failed. {method} ineffective.'}",
@@ -569,9 +633,26 @@ def convene_meeting(meeting_type: str = "regular", context: dict | None = None) 
 
 
 async def issue_decree(
-    session_id: int, decree_type: str, details: dict | None = None, cabinet: list | None = None,
+    session_id: int | None, decree_type: str, details: dict | None = None, cabinet: list | None = None,
 ) -> dict:
-    """Issue a decree to a minister. Ported from GovernanceEvents.issueDecree()."""
+    """Issue a decree to a minister. Ported from GovernanceEvents.issueDecree().
+
+    The Grand Consul issues the decree, so the minister's `laid_back` mode and portfolio action list
+    do not gate it. `can_do(minister, decree_type)` ran without the `consumer_decree` context and
+    substring-matched the decree type against `PORTFOLIO_ACTIONS`, so every `laid_back` minister (the
+    column default) refused every decree, and the types `military`, `economic`, `social`, `education`,
+    `emergency` and `directive` matched no action word. Routing is exact instead: the decree type picks
+    the portfolio through `DECREE_TO_PORTFOLIO`, or `details["target_portfolio"]` overrides it. Fleet
+    power limits still apply through `can_do`.
+
+    @param session_id - session issuing the decree; None resolves the active arc.
+    @param decree_type - key of DECREE_TO_PORTFOLIO (the `cabinet_decrees.decree_type` CHECK values).
+    @param details - optional title, description, priority, secrecy, target_portfolio, fleet_power.
+    @param cabinet - seats; read from the session when None.
+    @returns {"issued": True, ...} or {"issued": False, "reason": ...}.
+    @raises core.ooc.FrozenSession when the session is frozen.
+    """
+    session_id = _writable_sid(session_id)
     if details is None: details = {}
     if cabinet is None:
         cabinet = await get_cabinet_seats(session_id)
@@ -580,12 +661,19 @@ async def issue_decree(
     if not consul:
         return {"issued": False, "reason": "No active Grand Consul."}
 
-    target = details.get("target_portfolio", DECREE_TO_PORTFOLIO.get(decree_type, "intel"))
+    if decree_type not in DECREE_TO_PORTFOLIO:
+        return {"issued": False,
+                "reason": f"Unknown decree type '{decree_type}'.",
+                "available": sorted(DECREE_TO_PORTFOLIO)}
+
+    target = details.get("target_portfolio", DECREE_TO_PORTFOLIO[decree_type])
     minister = next((s for s in cabinet if s["portfolio"] == target and s.get("active")), None)
     if not minister:
         return {"issued": False, "reason": f"No active minister for '{target}'."}
 
-    route_check = can_do(minister, decree_type)
+    route_check = can_do(minister, decree_type, {
+        "consumer_decree": True, "decree_type": decree_type,
+        "fleet_power": details.get("fleet_power", 0)})
     if not route_check.get("allowed"):
         return {"issued": False, "reason": route_check.get("reason"), "suggestion": route_check.get("suggestion")}
 
@@ -737,7 +825,18 @@ def shadow_exposure_risk(shadow_presence: int, cabinet_control: int) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def can_do(seat: dict, action: str, context: dict | None = None) -> dict:
-    """Check if seat can perform action. Ported from RoleManager.canDo()."""
+    """Check if seat can perform action. Ported from RoleManager.canDo().
+
+    `context["decree_type"]` marks `action` as a decree type rather than an action verb. The caller
+    (`issue_decree`) has already routed the decree to the seat's portfolio by exact lookup, so the tier
+    and portfolio word lists, which substring-match verbs like "war" and "scout", are skipped. Without
+    it `"war" in "award"` blocked a Tier-2 award decree and `"military"` matched no portfolio verb.
+
+    @param seat - cabinet seat row.
+    @param action - action verb, or a decree type when `context["decree_type"]` is set.
+    @param context - optional: consumer_decree, decree_type, scouting_below_tier, fleet_power.
+    @returns {"allowed": bool, "reason": str, "suggestion": ...}.
+    """
     if context is None: context = {}
     if not seat or not seat.get("active"):
         return {"allowed": False, "reason": "Seat inactive or not found", "suggestion": None}
@@ -752,13 +851,14 @@ def can_do(seat: dict, action: str, context: dict | None = None) -> dict:
                     "suggestion": "delegate_to", "delegateTo": "Intel Lead"}
         return {"allowed": True, "reason": "Sovereign authority. No limits.", "suggestion": None}
 
-    blocked = TIER_BLOCKED_ACTIONS.get(seat["tier"], [])
+    routed_decree = context.get("decree_type") is not None
+    blocked = [] if routed_decree else TIER_BLOCKED_ACTIONS.get(seat["tier"], [])
     if any(a in action.lower() for a in blocked):
         return {"allowed": False, "reason": f"Action exceeds Tier {seat['tier']} ({TIER_LABELS.get(seat['tier'],'?')})",
                 "suggestion": f"Route to tier {seat['tier']-1}+ seat"}
 
     portfolio_actions = PORTFOLIO_ACTIONS.get(seat.get("portfolio", ""), [])
-    if portfolio_actions and not any(a in action.lower() for a in portfolio_actions):
+    if portfolio_actions and not routed_decree and not any(a in action.lower() for a in portfolio_actions):
         return {"allowed": False, "reason": f"'{action}' not in {seat['holder']}'s portfolio ({seat.get('portfolio','?')})",
                 "suggestion": _find_portfolio_match(action)}
 
@@ -842,8 +942,12 @@ def suspicion_notice(reading: dict) -> str | None:
 # ═══════════════════════════════════════════════════════════════
 
 async def run_tick(session_id: int | None = None) -> dict[str, Any]:
-    """Council module tick: validate cabinet, check cohesion, log summary."""
-    if session_id is None: session_id = Config.SESSION_ID
+    """Council module tick: validate cabinet, check cohesion, log summary.
+
+    @param session_id - session to tick; None resolves the active arc.
+    @raises core.ooc.FrozenSession when the session is frozen.
+    """
+    session_id = _writable_sid(session_id)
     try:
         seats = await get_cabinet_seats(session_id)
         valid = validate_cabinet(seats)
@@ -870,9 +974,12 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
 async def check_title_revocation(session_id: int | None = None) -> dict:
     """Scan territories untuk revocation risk.
     Risk naik bila: crisis_level > 5, takde governor, development rendah.
-    Risk turun bila: performance bagus (dev naik, crisis sifar)."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    Risk turun bila: performance bagus (dev naik, crisis sifar).
+
+    @param session_id - session to scan; None resolves the active arc.
+    @raises core.ooc.FrozenSession when the session is frozen.
+    """
+    session_id = _writable_sid(session_id)
     territories = await Database.fetch(
         "SELECT id, system_name, crisis_level, development_level, governor_name, "
         "revocation_risk, title_performance FROM maya_rp.territory WHERE session_id=$1",
@@ -914,24 +1021,37 @@ async def check_title_revocation(session_id: int | None = None) -> dict:
             "revocation_ready": [f for f in flagged if f["risk"] >= 15]}
 
 
-async def revoke_title(session_id: int, system_name: str, reason: str = "") -> dict:
-    """Cabut title governor — Imperial authority. Kos reputasi moral (ruthless but fair)."""
-    t = await Database.fetchrow(
-        "SELECT id, system_name, governor_name FROM maya_rp.territory WHERE session_id=$1 AND system_name=$2",
-        session_id, system_name,
-    )
-    if not t or not t["governor_name"]:
-        return {"error": "Territory tak wujud atau takde governor"}
-    gov = t["governor_name"]
-    await Database.execute(
-        "UPDATE maya_rp.territory SET governor_name=NULL, revocation_risk=0, title_performance=0 WHERE id=$1",
-        t["id"],
-    )
-    await Database.execute(
-        "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance) "
-        "VALUES ($1, 'decree', $2, $3, 4)",
-        session_id, f"TITLE REVOKED: {system_name}",
-        f"Governor {gov} dibuang dari {system_name}. {'Alasan: ' + reason if reason else 'Gagal deliver performance.'} "
-        f"Imperial authority ditegakkan — ruthless but fair.",
-    )
+async def revoke_title(session_id: int | None, system_name: str, reason: str = "") -> dict:
+    """Cabut title governor — Imperial authority. Kos reputasi moral (ruthless but fair).
+
+    The governor removal and its event commit together, and the removal is claimed with
+    `governor_name IS NOT NULL`, so two concurrent calls log one revocation, not two.
+
+    @param session_id - session owning the territory; None resolves the active arc.
+    @param system_name - exact territory name.
+    @param reason - optional reason for the event text.
+    @returns {"revoked", "governor", "reason"} or {"error": ...}.
+    @raises core.ooc.FrozenSession when the session is frozen.
+    """
+    session_id = _writable_sid(session_id)
+    async with Database.transaction() as conn:
+        t = await conn.fetchrow(
+            "SELECT id, system_name, governor_name FROM maya_rp.territory "
+            "WHERE session_id=$1 AND system_name=$2 FOR UPDATE",
+            session_id, system_name,
+        )
+        if not t or not t["governor_name"]:
+            return {"error": "Territory tak wujud atau takde governor"}
+        gov = t["governor_name"]
+        await conn.execute(
+            "UPDATE maya_rp.territory SET governor_name=NULL, revocation_risk=0, title_performance=0 WHERE id=$1",
+            t["id"],
+        )
+        await conn.execute(
+            "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance) "
+            "VALUES ($1, 'decree', $2, $3, 4)",
+            session_id, f"TITLE REVOKED: {system_name}",
+            f"Governor {gov} dibuang dari {system_name}. {'Alasan: ' + reason if reason else 'Gagal deliver performance.'} "
+            f"Imperial authority ditegakkan — ruthless but fair.",
+        )
     return {"revoked": system_name, "governor": gov, "reason": reason or "underperformance"}

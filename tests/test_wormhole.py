@@ -11,12 +11,18 @@ DB-free where possible: pure math (travel days, dilation, collapse boundary)
 + monkeypatched DB for the async resolvers.
 """
 import math
+import os
 import random
+from contextlib import asynccontextmanager
 
 import pytest
 
 from modules.voyage import (GRID_HOURS_PER_UNIT, WORMHOLE_COLLAPSE_PCT,
                             wormhole_jump, wormhole_decay, black_hole_slingshot)
+
+
+#: A scratch id, never a frozen session. The fakes below stand in for the database, so no row exists.
+SCRATCH = 900 + os.getpid() % 100
 
 
 # ── Wormhole math ────────────────────────────────────────────────────────
@@ -66,30 +72,43 @@ async def test_wormhole_jump_unknown_raises(monkeypatch):
 
 
 async def test_wormhole_decay_collapses_at_zero(monkeypatch):
+    """A decaying hole at zero collapses and logs an event, a stable hole keeps its stability, and a
+    healthy decaying hole loses only its decay. Every write goes through one transaction."""
     rows = [
         {"id": 1, "name": "Hub Pair", "stability": 1.0, "decay_per_tick": 0.01, "status": "stable"},
         {"id": 2, "name": "Rusty Hole", "stability": 0.02, "decay_per_tick": 0.03, "status": "decaying"},
         {"id": 3, "name": "Healthy Decay", "stability": 0.5, "decay_per_tick": 0.01, "status": "decaying"},
     ]
     executed = []
+    pool_writes = []
+
+    class FakeConn:
+        async def execute(self, sql, *args):
+            executed.append((sql, args))
+
+    @asynccontextmanager
+    async def transaction():
+        yield FakeConn()
+
     async def fetch(sql, *args):
         return rows
-    async def execute(sql, *args):
-        executed.append((sql, args))
-    async def insert_event(sql, *args):
-        executed.append(("event", args[1]))
+
+    async def pool_execute(sql, *args):
+        pool_writes.append(sql)
+
     monkeypatch.setattr("modules.voyage.Database.fetch", fetch)
-    monkeypatch.setattr("modules.voyage.Database.execute", execute)
-    monkeypatch.setattr("modules.voyage.Database.fetchval", lambda sql, *a: 0)
-    r = await wormhole_decay()
-    assert "Rusty Hole" in r["collapsed"]      # 0.02-0.03 → 0 → collapse
-    assert "Hub Pair" not in r["collapsed"]    # stable = hub-fed, no decay
+    monkeypatch.setattr("modules.voyage.Database.execute", pool_execute)
+    monkeypatch.setattr("modules.voyage.Database.transaction", transaction)
+    r = await wormhole_decay(SCRATCH)
+    assert "Rusty Hole" in r["collapsed"], r      # 0.02-0.03 → 0 → collapse
+    assert "Hub Pair" not in r["collapsed"], r    # stable = hub-fed, no decay
+    assert pool_writes == [], f"a write left the transaction: {pool_writes}"
     names = [e[1][1] for e in executed if "INSERT INTO maya_rp.events" in e[0]]
-    assert any("Rusty Hole" in n for n in names)
+    assert any("Rusty Hole" in n for n in names), names
     # Healthy Decay decays to 0.49 without collapsing (Rusty Hole's collapse
     # update also contains 'SET stability', so count only the decay form)
     decay_updates = [e for e in executed if "SET stability=$1" in e[0]]
-    assert len(decay_updates) == 1
+    assert len(decay_updates) == 1, decay_updates
     assert decay_updates[0][1][0] == pytest.approx(0.49)   # args = (new_stab, id)
 
 

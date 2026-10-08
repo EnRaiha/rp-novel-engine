@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from core.db import Database
 from core.config import Config
+from core.session import require_session
 from core.log import info
 
 # The blocked terms are snake_case keys, so the haystack is closed up before the
@@ -50,5 +51,5 @@ def check_generation(text: str) -> dict:
     return {"allowed": True, "reason": "Passes generation guardrails"}
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     return {"status": "guardrails_ready"}

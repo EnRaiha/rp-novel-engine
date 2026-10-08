@@ -88,12 +88,18 @@ def _save_roster(roster: dict) -> None:
 
 # ─── Character resolution ────────────────────────────────────────────────
 
-async def _load_characters() -> list[dict]:
+async def _load_characters(session_id: int | None = None) -> list[dict]:
+    """Characters of one campaign.
+
+    @param session_id - session key; defaults to the session resolved for this call.
+    @returns character rows, highest bond first.
+    """
+    sid = session_id if session_id is not None else _call_session()
     return [dict(r) for r in await Database.fetch(
         "SELECT id, name, role, bond, status, scene_location, is_spouse, house_name "
         "FROM maya_rp.characters WHERE session_id=$1 AND status IN ('active','married',"
         "'maternity_leave','friendly','hidden') ORDER BY COALESCE(bond,0) DESC, name",
-        Config.SESSION_ID)]
+        sid)]
 
 
 def _fmt_char(c: dict, aliases: dict) -> str:
@@ -227,9 +233,9 @@ def _call_session() -> int:
     bridge once and serves the plugin for the life of the process. Reading Config.SESSION_ID would freeze
     the answer at worker start, which is the drift `core.session.stale_process_default` exists to name.
     """
-    from core.session import resolve_session
+    from core.session import require_session
 
-    return int(resolve_session(None) or Config.SESSION_ID)
+    return require_session()
 
 async def resolve_loc(query: str, session_id: int | None = None) -> dict:
     # Scoped by session, and NULL kept visible: 625 sectors belong to session 3, session 5 has none, and
@@ -266,7 +272,7 @@ async def resolve_loc(query: str, session_id: int | None = None) -> dict:
                 terr = {r["system_name"]: dict(r) for r in await Database.fetch(
                     "SELECT system_name, population, development_level, governor_name, status "
                     "FROM maya_rp.territory WHERE session_id=$1 AND system_name = ANY($2::text[])",
-                    Config.SESSION_ID, names)}
+                    sid, names)}
                 for n in nearest:
                     n.update(terr.get(n["system_name"], {}))
                 return {"ok": True, "kind": "coords", "query": (x, y),
@@ -282,7 +288,7 @@ async def resolve_loc(query: str, session_id: int | None = None) -> dict:
         "SELECT system_name, controlling_faction, population, development_level, "
         "governor_name, status, crisis_level FROM maya_rp.territory "
         "WHERE session_id=$1 AND LOWER(system_name) LIKE $2 "
-        "ORDER BY population DESC LIMIT 10", Config.SESSION_ID, f"%{q}%")]
+        "ORDER BY population DESC LIMIT 10", sid, f"%{q}%")]
     sect = [dict(r) for r in await Database.fetch(
         "SELECT name, x_coord, y_coord, z_coord, controlled_by, star_type, hazard_level, hidden "
         "FROM maya_rp.sectors WHERE LOWER(name) LIKE $1 AND (session_id=$2 OR session_id IS NULL)"
@@ -290,14 +296,14 @@ async def resolve_loc(query: str, session_id: int | None = None) -> dict:
     if terr or sect:
         return {"ok": True, "kind": "name", "territories": terr, "sectors": sect}
     names = [r["system_name"] for r in await Database.fetch(
-        "SELECT system_name FROM maya_rp.territory WHERE session_id=$1", Config.SESSION_ID)]
+        "SELECT system_name FROM maya_rp.territory WHERE session_id=$1", sid)]
     close = difflib.get_close_matches(q, [_norm(n) for n in names], n=5, cutoff=0.6)
     if close:
         terr = [dict(r) for r in await Database.fetch(
             "SELECT system_name, controlling_faction, population, development_level, "
             "governor_name, status, crisis_level FROM maya_rp.territory "
             "WHERE session_id=$1 AND LOWER(system_name) = ANY($2::text[]) LIMIT 10",
-            Config.SESSION_ID, close)]
+            sid, close)]
         return {"ok": True, "kind": "fuzzy", "territories": terr,
                 "note": f"typo? matched {close}"}
     return {"ok": False, "error": f"no territory/sector matches '{query}'"}
@@ -305,25 +311,26 @@ async def resolve_loc(query: str, session_id: int | None = None) -> dict:
 
 # ─── Ship ────────────────────────────────────────────────────────────────
 
-async def resolve_ship(query: str) -> dict:
+async def resolve_ship(query: str, session_id: int | None = None) -> dict:
+    sid = session_id if session_id is not None else _call_session()
     q = _norm(query)
     rows = [dict(r) for r in await Database.fetch(
         "SELECT name, ship_type, sub_class, tier, hull, hull_current, power_rating, "
         "location, status, veteran_kills FROM maya_rp.ships "
         "WHERE session_id=$1 AND (LOWER(name) LIKE $2 "
         "OR LOWER(COALESCE(sub_class,'')) LIKE $2 OR LOWER(COALESCE(ship_type,'')) LIKE $2) "
-        "ORDER BY power_rating DESC LIMIT 10", Config.SESSION_ID, f"%{q}%")]
+        "ORDER BY power_rating DESC LIMIT 10", sid, f"%{q}%")]
     if rows:
         return {"ok": True, "kind": "exact-ish", "ships": rows}
     names = [r["name"] for r in await Database.fetch(
-        "SELECT name FROM maya_rp.ships WHERE session_id=$1", Config.SESSION_ID)]
+        "SELECT name FROM maya_rp.ships WHERE session_id=$1", sid)]
     close = difflib.get_close_matches(q, [_norm(n) for n in names], n=5, cutoff=0.6)
     if close:
         rows = [dict(r) for r in await Database.fetch(
             "SELECT name, ship_type, sub_class, tier, hull, hull_current, power_rating, "
             "location, status, veteran_kills FROM maya_rp.ships "
             "WHERE session_id=$1 AND LOWER(name) = ANY($2::text[]) "
-            "ORDER BY power_rating DESC", Config.SESSION_ID, close)]
+            "ORDER BY power_rating DESC", sid, close)]
         return {"ok": True, "kind": "fuzzy", "ships": rows,
                 "note": f"typo? matched {close}"}
     return {"ok": False, "error": f"no ship matches '{query}'"}

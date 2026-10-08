@@ -106,7 +106,7 @@ def test_the_generation_gate_tolerates_empty_text():
 # ── Module contract ──────────────────────────────────────────────────────
 
 async def test_contract_run_tick_answers_ready_for_the_engine_session(monkeypatch):
-    monkeypatch.setattr("modules.guardrails.Config.SESSION_ID", 77)
+    monkeypatch.setenv("RP_SESSION", "77")
 
     assert await guardrails.run_tick() == {"status": "guardrails_ready"}
 

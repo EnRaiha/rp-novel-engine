@@ -4,11 +4,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from core.db import Database
 from core.config import Config
+from core.session import require_session
 from core.log import error
 from core.utils import comma
 
 async def generate_open(session_id: int = None) -> str:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     parts = ["## SESSION OPEN\n"]
     le = await Database.fetchrow("SELECT title, happened_at FROM maya_rp.events WHERE session_id=$1 ORDER BY id DESC LIMIT 1", session_id)
     if le:
@@ -52,7 +53,7 @@ async def generate_open(session_id: int = None) -> str:
     return "\n".join(parts)
 
 async def generate_close(session_id: int = None) -> str:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     parts = ["---\n## Session Summary\n"]
     evs = await Database.fetch("SELECT title, importance FROM maya_rp.events WHERE session_id=$1 ORDER BY id DESC LIMIT 5", session_id)
     if evs:

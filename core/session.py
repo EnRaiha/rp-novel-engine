@@ -153,6 +153,25 @@ def resolve_session(explicit=None) -> int | None:
     )
 
 
+def require_session(explicit=None) -> int:
+    """Resolve the session for one call, refusing maintenance's "no session".
+
+    `Config.SESSION_ID` is fixed at import, so a long-lived process (the kilo bridge serves the DSH
+    plugin for hours, the map server, the tick) kept answering for the session that was current at
+    start. Callers that fell back with `resolve_session(None) or Config.SESSION_ID` reintroduced the
+    same stale id exactly when maintenance returns None. A reader that needs one session must fail
+    loudly there instead.
+
+    @param explicit - session id from the caller; wins over RP_SESSION and the active arc.
+    @returns the resolved session id.
+    @raises RuntimeError when nothing resolves, or when maintenance is armed and resolves no session.
+    """
+    sid = resolve_session(explicit)
+    if sid is None:
+        raise RuntimeError("maintenance mode resolves no session; pass session_id explicitly")
+    return sid
+
+
 def mode_label() -> str:
     try:
         from core import maintenance

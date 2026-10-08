@@ -105,9 +105,6 @@ async def tick_header(msg: str):
     info("orchestrator", msg)
 
 async def run_full_tick(session_id: int = None, verbose: bool = True):
-    if session_id is None:
-        session_id = Config.SESSION_ID
-
     # GM MAYA maintenance stops the tick. Measured on 2026-10-03: `gm_maint status` reported the mode and
     # four modules read it, but this entry point never asked, so the tick kept writing to the live session
     # while the brake the operator reached for was armed. It opened a `fuel_zero` collapse arc (Dead in the
@@ -119,6 +116,12 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
         if verbose:
             print("  RP ENGINE TICK SKIPPED — GM MAYA maintenance is armed")
         return
+
+    # Resolved per tick, after the maintenance brake: a process that outlives an arc change must
+    # not keep ticking the session it started on, and maintenance resolves no session at all.
+    from core.session import require_session
+
+    session_id = require_session(session_id)
 
     if _tick_lock.locked():
         print("Tick already in progress. Aborting.")

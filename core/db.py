@@ -170,18 +170,36 @@ class Database:
     @classmethod
     async def status(cls) -> dict:
         """Quick health check — connection + table count + session row."""
+        # Resolved per call: Config.SESSION_ID is fixed at import and a long-lived process would
+        # report the session it started on. An unresolved session is reported, not raised, so the
+        # health check still says whether the database is up.
+        from core.session import resolve_session
+
+        sid = None
+        error = None
+        try:
+            sid = resolve_session(None)
+            if sid is None:
+                error = "maintenance mode resolves no session"
+        except RuntimeError as exc:
+            error = str(exc)
         pool = await cls._ensure_pool()
         async with pool.acquire() as conn:
             tables = await conn.fetchval(
                 "SELECT COUNT(*) FROM information_schema.tables "
                 "WHERE table_schema='maya_rp' AND table_type='BASE TABLE'"
             )
-            session = await conn.fetchrow(
-                "SELECT id, name, status, game_day FROM maya_rp.sessions WHERE id=$1",
-                Config.SESSION_ID,
-            )
-            return {
+            session = None
+            if sid is not None:
+                session = await conn.fetchrow(
+                    "SELECT id, name, status, game_day FROM maya_rp.sessions WHERE id=$1",
+                    sid,
+                )
+            out = {
                 "connected": True,
                 "tables": tables,
                 "session": dict(session) if session else None,
             }
+            if error:
+                out["error"] = error
+            return out

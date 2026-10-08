@@ -302,7 +302,9 @@ async def build_context(
     @param traits - persona traits used for the due-beat list.
     @returns the story brief, the blocks, and the rendered text.
     """
-    sid = int(session_id if session_id is not None else Config.SESSION_ID)
+    from core.session import require_session
+
+    sid = require_session(session_id)
     from core import ooc
 
     stage = (await ooc.state(sid))["arc_stage"]

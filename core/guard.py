@@ -48,7 +48,13 @@ async def _ensure(session_id: int):
 
 async def check(text: str, session_id: int = None) -> list[dict]:
     """Scan text for contradictions. Returns list of issues or empty."""
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None:
+        # Per call, not the import-time Config.SESSION_ID: a long-lived process kept scanning the
+        # session current at start. Maintenance resolves no session, and a guessed one is not scanned.
+        from core.session import resolve_session
+        session_id = resolve_session(None)
+        if session_id is None:
+            return []
     await _ensure(session_id)
     lower = text.lower()
     issues = []
@@ -92,7 +98,11 @@ async def check(text: str, session_id: int = None) -> list[dict]:
     return issues
 
 async def get_quick_facts(name: str, session_id: int = None) -> dict | None:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None:
+        from core.session import resolve_session
+        session_id = resolve_session(None)
+        if session_id is None:
+            return None
     await _ensure(session_id)
     for c in _cache.values():
         if c["name"].lower() == name.lower():

@@ -94,6 +94,10 @@ class StateManager:
     async def save_checkpoint(cls, session_id: int | None = None, label: str = "") -> str:
         """Save a story checkpoint into one of three slots."""
         session_id = _resolve_session(session_id)
+        # A frozen campaign is reference-only. This wrote a checkpoint row and file for any
+        # session; the guard is the same one the OOC and campaign writers use.
+        from core.ooc import _refuse_frozen
+        _refuse_frozen(session_id)
         cfg = Config.get()
         md = await cls.export_md(session_id)
         rows = await Database.fetch(
@@ -107,8 +111,15 @@ class StateManager:
         # was used, so every save after the third claimed slot 1 again — measured
         # 395 rows numbered 1 against one each of 2 and 3 for session 3.
         num = min(free) if free else min(last_used, key=lambda n: (last_used[n] is not None, last_used[n]))
-        fp = Path(cfg.BACKUP_DIR) / f"checkpoint_{num}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+        # BACKUP_DIR was never created, so the first save on a clean host raised
+        # FileNotFoundError. Microseconds in the name: at one-second resolution two saves in the
+        # same second wrote the same path and the second overwrote the first's file, leaving two
+        # rows pointing at one file.
+        backup_dir = Path(cfg.BACKUP_DIR)
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        fp = backup_dir / f"checkpoint_{num}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.md"
         fp.write_text(md, encoding="utf-8")
+        # `ON CONFLICT DO NOTHING` is inert: story_checkpoints has no unique key to conflict on.
         await Database.execute(
             "INSERT INTO story_checkpoints (session_id, checkpoint_number, label, md_file_path) VALUES ($1, $2, $3, $4) "
             "ON CONFLICT DO NOTHING",

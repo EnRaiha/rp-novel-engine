@@ -131,14 +131,14 @@ class TestTheSession:
 
     async def test_save_checkpoint_writes_to_the_resolved_session(self, monkeypatch, tmp_path):
         monkeypatch.setattr(Config, "BACKUP_DIR", str(tmp_path))
-        fake = _install(monkeypatch, FakeDatabase(), resolved=5)
+        fake = _install(monkeypatch, FakeDatabase(), resolved=905)
 
         path = await state_mod.StateManager.save_checkpoint(label="arc")
 
-        assert fake.session_ids and set(fake.session_ids) == {5}
+        assert fake.session_ids and set(fake.session_ids) == {905}
         assert fake.executed, "no checkpoint row was written"
         _, args = fake.executed[0]
-        assert args[0] == 5, "the checkpoint row belongs to the resolved session"
+        assert args[0] == 905, "the checkpoint row belongs to the resolved session"
         assert args[2] == "arc"
         assert pathlib.Path(path).parent == tmp_path
         assert pathlib.Path(path).read_text(encoding="utf-8")
@@ -151,7 +151,7 @@ class TestTheSlots:
         monkeypatch.setattr(Config, "BACKUP_DIR", str(tmp_path))
         fake = _install(monkeypatch, FakeDatabase(slots=[{"checkpoint_number": 1, "last_used": D3}]))
 
-        path = await state_mod.StateManager.save_checkpoint(5)
+        path = await state_mod.StateManager.save_checkpoint(905)
 
         assert pathlib.Path(path).name.startswith("checkpoint_2_")
         assert fake.executed[0][1][1] == 2
@@ -165,7 +165,7 @@ class TestTheSlots:
         ]
         fake = _install(monkeypatch, FakeDatabase(slots=slots))
 
-        path = await state_mod.StateManager.save_checkpoint(5)
+        path = await state_mod.StateManager.save_checkpoint(905)
 
         assert pathlib.Path(path).name.startswith("checkpoint_2_"), "the least recently used slot is reused"
         assert fake.executed[0][1][1] == 2
@@ -179,7 +179,7 @@ class TestTheSlots:
         ]
         _install(monkeypatch, FakeDatabase(slots=slots))
 
-        path = await state_mod.StateManager.save_checkpoint(5)
+        path = await state_mod.StateManager.save_checkpoint(905)
 
         assert pathlib.Path(path).name.startswith("checkpoint_2_")
 
@@ -187,7 +187,7 @@ class TestTheSlots:
         monkeypatch.setattr(Config, "BACKUP_DIR", str(tmp_path))
         fake = _install(monkeypatch, FakeDatabase(slots=[{"checkpoint_number": 1, "last_used": D1}]))
 
-        await state_mod.StateManager.save_checkpoint(5)
+        await state_mod.StateManager.save_checkpoint(905)
 
         assert any("GROUP BY checkpoint_number" in sql for sql in fake.fetched_sql), \
             "the slot choice reads grouped rows, not every row of the campaign"

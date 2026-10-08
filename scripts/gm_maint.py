@@ -25,6 +25,14 @@ def _int_or_switch(v):
     return v if v in ("on", "off") else int(v)
 
 
+def _frozen_label():
+    """The frozen list for display; an unreadable list is named, never a traceback."""
+    try:
+        return sorted(s.frozen()) or "—"
+    except PermissionError as exc:
+        return f"UNREADABLE ({exc}); every write is refused until it is repaired"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("verb", choices=["arm", "disarm", "status", "session", "mode", "arc", "freeze", "play"])
@@ -52,7 +60,7 @@ def main(argv=None):
     elif a.verb == "status":
         print("mode:", s.mode_label())
         print("arc:", s.active_arc())
-        print("frozen:", sorted(s.frozen()) or "—")
+        print("frozen:", _frozen_label())
         print(m.status())
     elif a.verb == "mode":
         print(s.mode_label())
@@ -63,7 +71,7 @@ def main(argv=None):
     elif a.verb == "freeze":
         if a.values:
             s.set_frozen(a.values)
-        print("frozen:", sorted(s.frozen()) or "—")
+        print("frozen:", _frozen_label())
     else:
         try:
             print("session:", s.resolve_session(a.session))

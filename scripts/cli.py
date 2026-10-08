@@ -3256,7 +3256,12 @@ async def cmd_ooc():
         print(f"  roleplay pts   {row['roleplay_points']}")
         print(f"  audits         {row['audits']}   findings {row['findings']}")
         print(f"  debuff         {row['debuff'] or '—'}")
-        if session_policy.is_frozen(session):
+        try:
+            frozen_now = session_policy.is_frozen(session)
+        except PermissionError as exc:  # the frozen list is unreadable: say so, writes are refused
+            print(f"  frozen         UNKNOWN ({exc}); writes are refused until it is repaired")
+            frozen_now = False
+        if frozen_now:
             print("  frozen         reference only; GM MAYA maintenance to write")
         if penalty:
             print(f"  active effect  {penalty[1]}")

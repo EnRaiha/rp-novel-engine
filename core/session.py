@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import pathlib
 import sys
+import tempfile
 
 STATE_DIR = pathlib.Path(os.environ.get("RP_MAINT_DIR", pathlib.Path.home() / ".config" / "rp-engine"))
 ACTIVE_ARC = STATE_DIR / "active_arc"
@@ -89,13 +90,42 @@ def active_arc() -> int | None:
         return None
 
 
+def _atomic_write(target: pathlib.Path, text: str) -> None:
+    """Write `text` to `target` through a uniquely named temp file in the same directory.
+
+    A fixed `<name>.tmp` was shared by every writer: two concurrent switches truncated each
+    other's temp file, and the loser's `replace` raised FileNotFoundError or published the
+    other writer's half-written text. `mkstemp` gives each writer its own file; `os.replace`
+    stays atomic because the temp file sits on the same filesystem.
+
+    @param target - final path; its parent must exist.
+    @param text - full new content.
+    @returns None
+    """
+    fd, name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, target)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+
+
 def set_active_arc(session_id: int) -> int:
     """Point the engine at one campaign. This is the only arc switch."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = ACTIVE_ARC.with_suffix(".tmp")
-    tmp.write_text(f"{int(session_id)}\n")
-    tmp.replace(ACTIVE_ARC)
+    _atomic_write(ACTIVE_ARC, f"{int(session_id)}\n")
     return int(session_id)
+
+
+class FrozenListUnreadable(PermissionError):
+    """`frozen_sessions` exists and cannot be read, so no campaign can be called writable."""
 
 
 def frozen() -> set[int]:
@@ -103,11 +133,25 @@ def frozen() -> set[int]:
 
     A typo used to disappear: the campaign it named stayed writable while the file
     read as if that campaign were protected.
+
+    Only a missing file means nobody is frozen. Any other read failure (permissions, bad
+    encoding, a directory in the file's place) used to return `set()`, so the guard failed
+    open: every session read as writable and a write reached frozen session 3. It now warns
+    and raises FrozenListUnreadable; `is_frozen` turns that into a refusal for writers.
+
+    @returns the frozen session ids; empty when the file is absent.
+    @raises FrozenListUnreadable when the file exists and cannot be read.
     """
     try:
         raw = FROZEN.read_text()
-    except Exception:
+    except FileNotFoundError:
         return set()
+    except Exception as exc:  # noqa: BLE001 - re-raised as the typed refusal
+        _warn(f"frozen_sessions unreadable, refusing writes: {type(exc).__name__}: {exc}")
+        raise FrozenListUnreadable(
+            f"frozen list {FROZEN} is unreadable ({type(exc).__name__}: {exc}); "
+            "writes are refused until it is repaired or GM MAYA maintenance is armed"
+        ) from exc
     ids: set[int] = set()
     for part in raw.replace(",", " ").split():
         try:
@@ -119,19 +163,30 @@ def frozen() -> set[int]:
 
 
 def is_frozen(session_id) -> bool:
+    """Whether a write into `session_id` must be refused as reference-only.
+
+    @param session_id - session id; a non-number is never frozen.
+    @returns True when frozen.
+    @raises FrozenListUnreadable when the list cannot be read and maintenance is not armed.
+        Maintenance armed answers False: the operator is the one repairing the list.
+    """
     try:
-        return int(session_id) in frozen()
+        sid = int(session_id)
     except (TypeError, ValueError):
         return False
+    try:
+        return sid in frozen()
+    except FrozenListUnreadable:
+        if _maintenance_active():
+            return False
+        raise
 
 
 def set_frozen(session_ids) -> set[int]:
     """Replace the frozen list; a frozen campaign is reference, never a target."""
     ids = {int(item) for item in session_ids}
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = FROZEN.with_suffix(".tmp")
-    tmp.write_text("".join(f"{item}\n" for item in sorted(ids)))
-    tmp.replace(FROZEN)
+    _atomic_write(FROZEN, "".join(f"{item}\n" for item in sorted(ids)))
     return ids
 
 
@@ -203,6 +258,9 @@ def stale_process_default(current: int | None = None) -> str | None:
         return None
     if resolved is None or process_default == int(resolved):
         return None
-    frozen_note = " (and it is frozen)" if process_default in frozen() else ""
+    try:
+        frozen_note = " (and it is frozen)" if process_default in frozen() else ""
+    except FrozenListUnreadable:
+        frozen_note = " (frozen list unreadable)"
     return (f"warning: this process defaults to session {process_default}{frozen_note}, "
             f"but the engine now resolves to session {resolved}. Pass the session explicitly.")

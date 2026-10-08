@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import tempfile
 import time
 
 PHRASE = "GM MAYA"
@@ -37,18 +38,40 @@ def _read() -> dict:
     say why. The failure is carried out in the dict now instead of swallowed here.
     """
     try:
-        return json.loads(STATE_FILE.read_text())
+        data = json.loads(STATE_FILE.read_text())
     except FileNotFoundError:
         return {}
     except Exception as e:  # noqa: BLE001 - carried out to the caller, not swallowed
         return {"_unreadable": f"{type(e).__name__}: {e}"}
+    if not isinstance(data, dict):
+        # `[]` or `null` parsed cleanly and `.get` then raised AttributeError out of `active()`,
+        # which the register guard and the session resolver call every turn.
+        return {"_unreadable": f"state is {type(data).__name__}, expected an object"}
+    return data
 
 
 def _write(d: dict) -> None:
+    """Replace the state file atomically through a uniquely named temp file.
+
+    A fixed `maintenance.tmp` let two writers truncate each other's temp file before `replace`.
+
+    @param d - full record to persist.
+    @returns None
+    """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(d, indent=2) + "\n")
-    tmp.replace(STATE_FILE)
+    fd, name = tempfile.mkstemp(dir=STATE_FILE.parent, prefix=f".{STATE_FILE.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(d, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, STATE_FILE)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
 
 
 def _pid_alive(pid: int) -> bool:
@@ -120,6 +143,15 @@ def play_is_live() -> bool:
 
 
 def status() -> dict:
+    """Current maintenance state. Read-only: it never writes the file.
+
+    Expiry is computed on read. The old write-back (`active=False` on expiry) ran between its
+    own `_read` and `_write` with no lock, so an operator `arm()` landing in that gap was
+    overwritten with `active: False`. `arm()` and `disarm()` own every write; an expired record
+    stays on disk until the next `arm()` replaces it.
+
+    @returns the record when armed; `{"active": False}` plus `expired` or `unreadable` details otherwise.
+    """
     d = _read()
     if d.get("_unreadable"):
         # Not "not armed". The record could not be read at all, and the difference is the whole
@@ -135,9 +167,6 @@ def status() -> dict:
         return {"active": False, "unreadable": True,
                 "error": f"expires_at is not a number: {d.get('expires_at')!r}"}
     if expires_at < time.time():
-        d["active"] = False
-        d["expired_at"] = time.time()
-        _write(d)
         return {"active": False, "expired": True}
     return d
 

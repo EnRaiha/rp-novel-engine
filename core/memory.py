@@ -4,7 +4,7 @@ from __future__ import annotations
 import httpx
 from typing import Any
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 from core.log import info, warn
 
 from core.embed import RP_EMBED_MODEL
@@ -53,7 +53,7 @@ async def store_event(event_id: int, title: str, description: str, session_id: i
     nothing.
     """
     if session_id is None:
-        session_id = Config.SESSION_ID
+        session_id = require_session(None)
     text = f"{title}. {description}"
     try:
         vec = await _embed(text)
@@ -72,7 +72,7 @@ async def store_event(event_id: int, title: str, description: str, session_id: i
 
 async def recall(query: str, limit: int = 5, session_id: int = None) -> list[dict]:
     """Find semantically similar past events. 'Nethara getting hurt' finds the right scene."""
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     try:
         qv = await _embed(query)
         rows = await Database.fetch(

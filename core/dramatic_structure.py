@@ -4,7 +4,7 @@ from __future__ import annotations
 import random
 from typing import Any
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 from core.log import info
 
 PHASES = {"setup":{"sessions":(1,3),"tension":(1,3),"intro":["threat","key_npc","stakes"],"avoid":["climax","major_death"],"instruction":"INTRODUCE. Plant seeds. Make stakes clear.","feel":"The calm before. Something is coming."},
@@ -16,7 +16,7 @@ PHASES = {"setup":{"sessions":(1,3),"tension":(1,3),"intro":["threat","key_npc",
 PHASE_ORDER = list(PHASES.keys())
 
 async def get_current_arc(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     arc = await Database.fetchrow("SELECT id,title,theme,phase,sessions_in_phase,total_sessions,central_conflict,stakes_description FROM maya_rp.story_arcs WHERE session_id=$1 AND status='active' ORDER BY id DESC LIMIT 1", session_id)
     if not arc:
         threats = await Database.fetch("SELECT hook_type as title,status FROM maya_rp.narrative_hooks WHERE session_id=$1 AND status='active'", session_id)
@@ -33,7 +33,7 @@ async def get_current_arc(session_id: int = None) -> dict:
     return {"arc_id":arc["id"],"title":arc["title"],"theme":arc["theme"],"phase":arc["phase"],"phase_config":pc,"sessions_in_phase":arc["sessions_in_phase"],"total_sessions":arc["total_sessions"],"conflict":arc["central_conflict"],"stakes":arc["stakes_description"],"instruction":pc["instruction"],"feel":pc["feel"],"should_introduce":pc["intro"],"should_avoid":pc["avoid"]}
 
 async def advance_phase(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     arc = await Database.fetchrow("SELECT id,phase,sessions_in_phase FROM maya_rp.story_arcs WHERE session_id=$1 AND status='active' ORDER BY id DESC LIMIT 1", session_id)
     if not arc: return {"error":"No active arc"}
     # `PHASE_ORDER.index` raised ValueError on a phase this table does not hold, while
@@ -51,7 +51,7 @@ async def advance_phase(session_id: int = None) -> dict:
     return {"old_phase":arc["phase"],"new_phase":np}
 
 async def session_start(session_id: int = None) -> dict | None:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     arc = await get_current_arc(session_id)
     # `PHASES[arc["phase"]]` raised KeyError for the same unknown value that `get_current_arc` had
     # already resolved to `setup` in `phase_config`, so the third reading agreed with the first.

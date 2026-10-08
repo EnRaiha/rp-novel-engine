@@ -99,6 +99,9 @@ class _FakeClf:
 SURVIVAL_ACTIONS = {"den_surrenders": 0, "hostage_trade": 1, "pirate_crew_captured": 2,
                     "pirate_king_captured": 3, "pirate_queen_captured": 4,
                     "queen_offers_alliance": 5, "relic_offer": 6, "tender_of_alliance": 7}
+#: The feature maps a shipped model carries: a model without them gets the rule fallback, not constants.
+POLICY_MAPS = {"src_map": {"ai_policy": 0}, "pol_map": {"STANDARD UNIFORMITY": 0, "THE STANDARD": 1},
+               "cond_map": {"boarding": 0}}
 #: The shipped `pirate_policy_tree.pkl`: an encoded label space that a subset was trained on.
 POLICY_ACTIONS = {"bullet": 0, "bullet_or_ransom": 1, "check_first": 2, "clear_all": 3,
                   "confirm_first": 4, "convert": 5, "debt_bound": 6, "level": 7}
@@ -139,7 +142,7 @@ class TestTheModelsOwnLabelSpace:
         monkeypatch.setattr(dm, "_has_sklearn", lambda: True)
         monkeypatch.setattr(dm, "_log", lambda *a: None)
         _prime(monkeypatch, "pirate_survival_free.pkl",
-               {"clf": _FakeClf(["DEATH", "LIVE"], [0.5, 0.5])})
+               {"clf": _FakeClf(["DEATH", "LIVE"], [0.5, 0.5]), "action_map": SURVIVAL_ACTIONS})
         monkeypatch.setitem(dm.SURVIVAL_BIAS, "free", {"LIVE": 3.0})
         fate = dm.predict_pirate_survival("free", 0, 0.5, "hostage_trade")
         assert fate["class"] == "LIVE"
@@ -151,7 +154,7 @@ class TestTheModelsOwnLabelSpace:
         monkeypatch.setattr(dm, "_log", lambda *a: None)
         _prime(monkeypatch, "pirate_policy_free.pkl", None)
         _prime(monkeypatch, "pirate_policy_tree.pkl",
-               {"clf": _FakeClf([0, 1], [0.4, 0.6]), "act_map": POLICY_ACTIONS})
+               {"clf": _FakeClf([0, 1], [0.4, 0.6]), "act_map": POLICY_ACTIONS, **POLICY_MAPS})
         out = dm.predict_pirate_policy(
             "free", "ai_policy", "STANDARD UNIFORMITY", "boarding", "check_first")
         assert out["class"] == "bullet_or_ransom"
@@ -163,7 +166,8 @@ class TestTheModelsOwnLabelSpace:
         monkeypatch.setattr(dm, "_log", lambda *a: None)
         _prime(monkeypatch, "pirate_policy_free.pkl",
                {"clf": _FakeClf([0, 1], [0.9, 0.1]),
-                "labels": ["bullet", "bullet_or_ransom"]})
+                "labels": ["bullet", "bullet_or_ransom"],
+                "act_map": POLICY_ACTIONS, **POLICY_MAPS})
         out = dm.predict_pirate_policy(
             "free", "ai_policy", "THE STANDARD", "boarding", "bullet")
         assert out["class"] == "bullet", "a bare index is not an answer"

@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 from core.log import error, info, warn
 
 MODES = {
@@ -53,7 +53,7 @@ class PacingDirector:
 
     @staticmethod
     async def get_mode(session_id: int = None) -> dict:
-        if session_id is None: session_id = Config.SESSION_ID
+        if session_id is None: session_id = require_session(None)
         await PacingDirector.ensure(session_id)
         row = await Database.fetchrow("SELECT * FROM maya_rp.narrative_pacing WHERE session_id=$1", session_id)
         mode = row["mode"] if row else "downtime"
@@ -81,7 +81,7 @@ class PacingDirector:
 
     @staticmethod
     async def transition(new_mode: str, reason: str, session_id: int = None):
-        if session_id is None: session_id = Config.SESSION_ID
+        if session_id is None: session_id = require_session(None)
         if new_mode not in MODES:
             warn("pacing", f"refusing unknown pacing mode '{new_mode}' for session {session_id}")
             return
@@ -97,21 +97,54 @@ class PacingDirector:
         info("pacing", f"Mode \u2192 {new_mode} — {reason}")
 
     @staticmethod
+    async def _condition_holds(mode: str, session_id: int) -> bool:
+        """Whether any CHECK_QUERIES entry for `mode` is still positive for the session.
+
+        @param mode - pacing mode name.
+        @param session_id - campaign to test.
+        @returns True when a query for the mode counts at least one row.
+        """
+        for q in CHECK_QUERIES.get(mode, []):
+            v = await Database.fetchval(q, session_id)
+            if v and v > 0:
+                return True
+        return False
+
+    @staticmethod
     async def check_transitions(session_id: int = None) -> str | None:
-        if session_id is None: session_id = Config.SESSION_ID
+        """Mode the tick should move to, or None to stay.
+
+        The old loop skipped only `target == cm` and never asked whether the current mode's own
+        condition still held. With an active siege and an active hook, combat saw crisis positive
+        and moved, crisis then saw combat positive and moved back: the pair flapped every tick and
+        reset `scenes_in_mode` each time. Nothing ever returned to downtime either, because
+        downtime has no query and was skipped.
+
+        A held mode yields only to a candidate that ranks above it in PRIORITY. A mode that came
+        from a query and no longer holds decays to downtime when no other query matches. Modes
+        with no query (social, intimate, horror, downtime) are set by hand and never decay.
+
+        @param session_id - campaign to check; None resolves per call.
+        @returns the target mode, or None when the mode stays.
+        """
+        if session_id is None: session_id = require_session(None)
         pm = await PacingDirector.get_mode(session_id)
         cm = pm["mode"]
-        for target in PRIORITY:
+        held = cm in CHECK_QUERIES and await PacingDirector._condition_holds(cm, session_id)
+        # Candidates are tried in rank order; a held mode only listens to those ranked above it.
+        ceiling = PRIORITY.index(cm) if held and cm in PRIORITY else len(PRIORITY)
+        for target in PRIORITY[:ceiling]:
             if target == cm or target == "horror": continue
             if target == "downtime": continue
-            for q in CHECK_QUERIES.get(target, []):
-                v = await Database.fetchval(q, session_id)
-                if v and v > 0: return target
+            if await PacingDirector._condition_holds(target, session_id):
+                return target
+        if cm in CHECK_QUERIES and not held:
+            return "downtime"
         return None
 
     @staticmethod
     async def adjust_tension(delta: int, reason: str = "", session_id: int = None):
-        if session_id is None: session_id = Config.SESSION_ID
+        if session_id is None: session_id = require_session(None)
         # Without the row the UPDATE matched nothing and the read below crashed on
         # None. Every other entry point calls ensure() first.
         await PacingDirector.ensure(session_id)
@@ -123,13 +156,13 @@ class PacingDirector:
 
     @staticmethod
     async def increment(session_id: int = None):
-        if session_id is None: session_id = Config.SESSION_ID
+        if session_id is None: session_id = require_session(None)
         await PacingDirector.ensure(session_id)
         await Database.execute("UPDATE maya_rp.narrative_pacing SET scenes_in_mode = scenes_in_mode + 1 WHERE session_id=$1", session_id)
 
     @staticmethod
     async def run_tick(session_id: int = None) -> dict:
-        if session_id is None: session_id = Config.SESSION_ID
+        if session_id is None: session_id = require_session(None)
         try:
             await PacingDirector.ensure(session_id)
             r = await PacingDirector.get_mode(session_id)

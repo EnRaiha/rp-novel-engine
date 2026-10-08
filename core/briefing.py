@@ -6,12 +6,13 @@ from pathlib import Path
 from typing import Any
 from core.db import Database
 from core.config import Config
+from core.session import require_session
 from core.log import info
 
 async def generate_briefing(session_id: int = None) -> dict[str, Any]:
     """Generate a compact, LLM-optimized briefing packet."""
     if session_id is None:
-        session_id = Config.SESSION_ID
+        session_id = require_session(None)
 
     await Database.init()
     briefing = {}
@@ -53,7 +54,7 @@ async def generate_briefing(session_id: int = None) -> dict[str, Any]:
         {"name": r["name"], "bond": r["bond"], "role": r["role"]}
         for r in await Database.fetch(
             "SELECT c.name, c.bond, c.role FROM maya_rp.characters c "
-            "WHERE c.session_id=$1 AND c.status='active' "
+            "WHERE c.session_id=$1 AND c.status='active' AND c.presence='present' "
             "ORDER BY c.bond DESC LIMIT 10",
             session_id)]
 
@@ -87,11 +88,12 @@ async def generate_briefing(session_id: int = None) -> dict[str, Any]:
             "SELECT title, description FROM maya_rp.events WHERE session_id=$1 "
             "ORDER BY id DESC LIMIT 3", session_id)]
 
-    # 7. Pending player choices
+    # 7. Pending player choices. LIMIT 20: the query had none, so a campaign that never resolved its
+    # choices grew the briefing without bound and blew its token budget.
     briefing["pending_choices"] = [
         {"id": r["id"], "title": r.get("situation", "Choice"), "description": ""}
         for r in await Database.fetch(
-            "SELECT id, situation, options FROM maya_rp.choices WHERE session_id=$1 AND picked IS NULL",
+            "SELECT id, situation, options FROM maya_rp.choices WHERE session_id=$1 AND picked IS NULL ORDER BY id DESC LIMIT 20",
             session_id)]
 
     # 8. Unexpired character memories (overdue callbacks)
@@ -166,7 +168,7 @@ def briefing_to_prompt(briefing: dict) -> str:
 async def cmd_briefing(session_id: int = None):
     """CLI command: generate and print briefing."""
     if session_id is None:
-        session_id = Config.SESSION_ID
+        session_id = require_session(None)
     await Database.init()
     briefing = await generate_briefing(session_id)
     print(briefing_to_prompt(briefing))

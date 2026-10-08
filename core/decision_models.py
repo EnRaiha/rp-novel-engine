@@ -25,7 +25,7 @@ from __future__ import annotations
 import os, pickle, random, json
 from datetime import datetime, timezone
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 from core.log import info, error
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
@@ -203,18 +203,59 @@ def pirate_event_features(pirate: dict) -> list:
     ]
 
 
-def policy_features(src: str, policy: str, cond: str, act: str) -> list:
-    """['src_idx','pol_idx','cond_idx','act_idx'] for pirate_policy_tree."""
-    m = _load("pirate_policy.pkl") or {}
+_WARNED_MAPS: set[str] = set()
+
+
+def _warn_once(key: str, msg: str) -> None:
+    """Log `msg` at error level the first time `key` is seen in this process."""
+    if key in _WARNED_MAPS:
+        return
+    _WARNED_MAPS.add(key)
+    try:
+        error("decision_models", msg)
+    except Exception:  # deliberate: logging must never raise into its caller
+        pass
+
+
+def _maps_present(model: dict, kind: str, keys: tuple) -> bool:
+    """Whether the model carries every non-empty feature map `kind` needs.
+
+    The feature functions read `pirate_policy.pkl` / `pirate_survival.pkl`, which do not exist; the
+    maps live inside `pirate_policy_tree.pkl` / `pirate_survival_tree.pkl`. Every lookup took the
+    `len(map)` default, so the classifier saw constants, returned one class whatever the input, and
+    the result was labelled `ml:<group>` so the rule fallback never ran.
+
+    @param model - loaded model dict.
+    @param kind - "policy" or "survival", for the one-time warning.
+    @param keys - map names the feature vector needs.
+    @returns True when all maps are non-empty dicts; otherwise warns once and returns False.
+    """
+    missing = [k for k in keys if not (isinstance(model.get(k), dict) and model.get(k))]
+    if missing:
+        _warn_once(f"maps:{kind}", f"{kind} model has no feature map(s) {missing}; "
+                                   "using the rule fallback, not constant features")
+        return False
+    return True
+
+
+def policy_features(src: str, policy: str, cond: str, act: str, model: dict | None = None) -> list:
+    """['src_idx','pol_idx','cond_idx','act_idx'] for pirate_policy_tree.
+
+    @param model - loaded policy model carrying the maps; defaults to pirate_policy_tree.pkl.
+    """
+    m = model if model is not None else (_load("pirate_policy_tree.pkl") or {})
     sm = m.get("src_map", {}); pm = m.get("pol_map", {})
     cm = m.get("cond_map", {}); am = m.get("act_map", {})
     return [float(sm.get(src, len(sm))), float(pm.get(policy, len(pm))),
             float(cm.get(cond, len(cm))), float(am.get(act, len(am)))]
 
 
-def survival_features(virgin: int, live_chance: float, action: str) -> list:
-    """['virgin','live_chance','action_idx'] for pirate_survival_tree."""
-    m = _load("pirate_survival.pkl") or {}
+def survival_features(virgin: int, live_chance: float, action: str, model: dict | None = None) -> list:
+    """['virgin','live_chance','action_idx'] for pirate_survival_tree.
+
+    @param model - loaded survival model carrying `action_map`; defaults to pirate_survival_tree.pkl.
+    """
+    m = model if model is not None else (_load("pirate_survival_tree.pkl") or {})
     am = m.get("action_map", {})
     return [float(virgin), float(live_chance), float(am.get(action, len(am)))]
 
@@ -238,10 +279,10 @@ def predict_pirate_policy(group: str, src: str, policy: str, cond: str, act: str
     """Predict pirate policy decision {class, probs, source}."""
     group = _group_key(group)
     m = _model_for(group, "policy")
-    if m and _has_sklearn():
+    if m and _has_sklearn() and _maps_present(m, "policy", ("src_map", "pol_map", "cond_map", "act_map")):
         try:
             clf = m.get("clf")
-            feats = [policy_features(src, policy, cond, act)]
+            feats = [policy_features(src, policy, cond, act, m)]
             probs = clf.predict_proba(feats)[0]
             labels = _label_map(m)
             by_index = {index: label for label, index in labels.items()}
@@ -267,10 +308,10 @@ def predict_pirate_survival(group: str, virgin: int, live_chance: float, action:
     """Predict pirate survival-action outcome {class, probs, source}."""
     group = _group_key(group)
     m = _model_for(group, "survival")
-    if m and _has_sklearn():
+    if m and _has_sklearn() and _maps_present(m, "survival", ("action_map",)):
         try:
             clf = m.get("clf")
-            probs = clf.predict_proba([survival_features(virgin, live_chance, action)])[0]
+            probs = clf.predict_proba([survival_features(virgin, live_chance, action, m)])[0]
             labels = _label_map(m)
             by_index = {index: label for label, index in labels.items()}
             for label, mult in _bias_for(SURVIVAL_BIAS.get(group, {}), labels, len(probs)).items():
@@ -302,7 +343,7 @@ async def detect_pirate_group(faction_id: int, session_id: int | None = None) ->
     4. default: free
     Persists the detected group back to factions.pirate_group.
     """
-    sid = session_id or Config.SESSION_ID
+    sid = session_id if session_id is not None else require_session(None)
     try:
         row = await Database.fetchrow(
             "SELECT pirate_group FROM maya_rp.factions WHERE id=$1 AND session_id=$2",
@@ -335,7 +376,7 @@ async def log_decision(faction_id: int, model_name: str, inputs: dict,
                        predicted: str, probs: list | None = None,
                        group: str | None = None, session_id: int | None = None) -> None:
     """Append a row to ai_decision_log (retraining corpus). Never raises."""
-    sid = session_id or Config.SESSION_ID
+    sid = session_id if session_id is not None else require_session(None)
     try:
         name = await Database.fetchval(
             "SELECT name FROM maya_rp.factions WHERE id=$1 AND session_id=$2", faction_id, sid) or "unknown"

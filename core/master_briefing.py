@@ -3,11 +3,11 @@
 from __future__ import annotations
 from typing import Any
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 from core.log import error, info, warn
 
 async def generate(session_id: int = None) -> str:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     await Database.init()
     # Clear global caches to prevent event loop conflicts
     import core.guard as g
@@ -169,6 +169,8 @@ async def generate(session_id: int = None) -> str:
 
 async def _generate_ui_dashboard(session_id: int) -> str:
     """【 SYSTEM DASHBOARD 】— angka sebenar dari engine, format novel UI."""
+    # A NULL resource column made the f-string format raise TypeError, and the except below replaced
+    # the whole dashboard with "(unavailable)" for one NULL fuel. NULL reads as 0.
     try:
         res = await Database.fetchrow(
             "SELECT credits, alloys, fuel, population FROM maya_rp.resources WHERE session_id=$1", session_id)
@@ -184,8 +186,8 @@ async def _generate_ui_dashboard(session_id: int) -> str:
 
         lines = ["【 SYSTEM DASHBOARD 】"]
         if res:
-            lines.append(f"▌ Coffers : {res['credits']:,} Cr | {res['alloys']:,} Al | {res['fuel']:,} Fuel")
-            lines.append(f"▌ Empire  : {res['population']:,} Souls")
+            lines.append(f"▌ Coffers : {(res['credits'] or 0):,} Cr | {(res['alloys'] or 0):,} Al | {(res['fuel'] or 0):,} Fuel")
+            lines.append(f"▌ Empire  : {(res['population'] or 0):,} Souls")
         if fleet:
             lines.append(f"▌ Fleet   : {fleet['count']} Ships (Avg Tier: T{fleet['avg_tier']:.1f})")
         lines.append(f"▌ Crew    : {crew_unassigned} Unassigned | {undercrewed} Undercrewed")

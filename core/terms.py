@@ -27,7 +27,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from core.config import Config
+from core.session import require_session
 from core.db import Database
 from core.log import info
 
@@ -68,9 +68,19 @@ def paragraphs(text: str) -> list[tuple[int, str]]:
     """Non-empty paragraphs with the offset they start at. Pure."""
     out: list[tuple[int, str]] = []
     for match in re.finditer(r"(?:^|\n)([^\n](?:[^\n]|\n(?!\n))*)", text or ""):
-        body = match.group(1).strip()
-        if body:
-            out.append((match.start(1), body))
+        start = match.start(1)
+        body = match.group(1)
+        # A heading directly above its text (no blank line) joined the paragraph, which then began
+        # with '#' and `_kind` dropped it: a real obligation vanished. Leading heading lines are
+        # their own paragraphs.
+        while body.lstrip().startswith("#") and "\n" in body:
+            head, body = body.split("\n", 1)
+            start += len(head) + 1
+            if head.strip():
+                out.append((start - len(head) - 1 + (len(head) - len(head.lstrip())), head.strip()))
+        stripped = body.strip()
+        if stripped:
+            out.append((start + (len(body) - len(body.lstrip())), stripped))
     return out
 
 
@@ -133,7 +143,7 @@ async def record(session_id: int | None = None, turn_id: int | None = None,
     where the database is available, and set to None when it does not resolve.
     """
     if session_id is None:
-        session_id = Config.SESSION_ID
+        session_id = require_session(None)
     terms = extract(text)
     roster = {r["name"] for r in await Database.fetch(
         "SELECT name FROM maya_rp.characters WHERE session_id=$1", session_id)}
@@ -164,7 +174,7 @@ async def record(session_id: int | None = None, turn_id: int | None = None,
 async def open_terms(session_id: int | None = None) -> list[dict]:
     """Every open term for a session, oldest first. This is what gets injected."""
     if session_id is None:
-        session_id = Config.SESSION_ID
+        session_id = require_session(None)
     return [dict(r) for r in await Database.fetch(
         "SELECT id, turn_id, speaker, kind, quote FROM maya_rp.terms"
         " WHERE session_id=$1 AND status='open' ORDER BY id", session_id)]

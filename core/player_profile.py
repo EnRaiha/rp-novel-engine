@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 from core.log import info
 
 ACTION_CATS = {"combat":["attack","fight","fire","shoot","strike","charge","engage","destroy","kill"],
@@ -30,7 +30,7 @@ STYLE_ADVICE = {
 }
 
 async def record(text: str, session_id: int = None):
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     lower = text.lower()
     hits = []
     for cat, kws in ACTION_CATS.items():
@@ -44,7 +44,7 @@ async def record(text: str, session_id: int = None):
         await Database.execute("INSERT INTO maya_rp.player_action_log (session_id,action_category,count,raw_input) VALUES ($1,$2,$3,$4)", session_id, cat, c, text[:200])
 
 async def get_profile(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     rows = await Database.fetch("SELECT action_category,SUM(count) as total FROM maya_rp.player_action_log WHERE session_id=$1 GROUP BY action_category ORDER BY total DESC", session_id)
     recorded = sum(r["total"] for r in rows)
     total = recorded or 1   # the divisor only: with no rows there is nothing to divide

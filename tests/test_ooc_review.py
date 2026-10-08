@@ -533,9 +533,13 @@ class TestAWriterThatFailsPartwayLeavesNothingBehind:
         assert (await self._row(scratch_session))["roleplay_points"] == 1
 
     async def test_an_exemption_that_cannot_be_stored_does_not_move_the_balance(self, scratch_session):
-        """A negative price passes the balance check and credits the points, then the insert is refused.
+        """A lifetime the interval cannot hold fails the insert after the debit, and the debit rolls back.
 
-        `ooc_exemptions.cost_rpp` is `CHECK (cost_rpp > 0)`, so the insert is the statement that fails.
+        The price is legal, so the balance check passes and `roleplay_points` is debited; only
+        then does `now() + ('999999999999' || ' hours')::interval` overflow (SQLSTATE 22015) at
+        the exemption INSERT. Before the transaction wrapped both writes, the points were gone
+        with no exemption to show for them. (A negative price used to be the injection here,
+        but it is now refused up front, see the next test.)
         """
         await ooc.state(scratch_session)
         await Database.execute(
@@ -543,9 +547,32 @@ class TestAWriterThatFailsPartwayLeavesNothingBehind:
             scratch_session)
         rule = await Database.fetchrow("SELECT id FROM maya_rp.ooc_rules ORDER BY id LIMIT 1")
         assert rule is not None, "migration 114 seeds a rule, so there is always one to name"
-        with pytest.raises(asyncpg.exceptions.CheckViolationError):
-            await ooc.buy_exemption(scratch_session, rule["id"], "review_action", cost_rpp=-5)
+        with pytest.raises(asyncpg.exceptions.IntervalFieldOverflowError):
+            await ooc.buy_exemption(scratch_session, rule["id"], "review_action", cost_rpp=5,
+                                    permanent=False, ttl_hours=999_999_999_999)
         assert (await self._row(scratch_session))["roleplay_points"] == 99, \
             "the balance moved although the exemption was never stored"
         assert await Database.fetchval(
             "SELECT count(*) FROM maya_rp.ooc_exemptions WHERE session_id=$1", scratch_session) == 0
+
+    @pytest.mark.parametrize("price", [-5, 0])
+    async def test_a_price_that_is_not_positive_is_refused_before_any_points_move(
+            self, scratch_session, price):
+        """A negative `cost_rpp` passed the balance check and `roleplay_points - price` minted points.
+
+        The CHECK (cost_rpp > 0) on the table refused the insert, but the guard belongs before
+        the debit: a price of zero or less is a caller bug, not a purchase.
+        """
+        await ooc.state(scratch_session)
+        await Database.execute(
+            "UPDATE maya_rp.ooc_system_state SET roleplay_points=99 WHERE session_id=$1",
+            scratch_session)
+        rule = await Database.fetchrow("SELECT id FROM maya_rp.ooc_rules ORDER BY id LIMIT 1")
+        assert rule is not None, "migration 114 seeds a rule, so there is always one to name"
+        with pytest.raises(ValueError, match="positive price"):
+            await ooc.buy_exemption(scratch_session, rule["id"], "review_action", cost_rpp=price)
+        assert (await self._row(scratch_session))["roleplay_points"] == 99, \
+            f"a price of {price} moved the balance"
+        assert await Database.fetchval(
+            "SELECT count(*) FROM maya_rp.ooc_exemptions WHERE session_id=$1", scratch_session) == 0, \
+            f"a price of {price} left an exemption row"

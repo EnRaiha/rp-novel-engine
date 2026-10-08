@@ -1243,6 +1243,31 @@ class TestMaintenanceStandDown:
             0,
         )
 
+    async def test_maintenance_does_not_relax_the_observers_suspicion(self, scratch_session, armed):
+        """A clean turn under maintenance still ran `_suspicion_turn`, so a held meter of 20 relaxed to 19.
+
+        Maintenance stands the register down: the turn is recorded as skipped and nothing is
+        judged, so the observer must neither relax nor be corrected on it.
+        """
+        from core import ooc
+
+        await Database.execute(
+            "INSERT INTO maya_rp.ooc_suspicion (session_id, observer_id, suspicion, last_reason)"
+            " VALUES ($1,$2,20,'earlier lapse')",
+            SCRATCH_SESSION,
+            scratch_session["observer"],
+        )
+        result = await ooc.audit("The order stands.", SCRATCH_SESSION, traits=("general",), turn_ref="maint-s")
+        assert result["skip_reason"] == "maintenance", result
+        assert result["suspicion_delta"] == 0, \
+            "maintenance relaxed the observer's suspicion on a turn that was never judged"
+        stored = await Database.fetchval(
+            "SELECT suspicion FROM maya_rp.ooc_suspicion WHERE session_id=$1 AND observer_id=$2",
+            SCRATCH_SESSION,
+            scratch_session["observer"],
+        )
+        assert stored == 20, f"the stored suspicion moved to {stored} under maintenance"
+
     async def test_a_frozen_campaign_refuses_the_write(self, scratch_session, tmp_path, monkeypatch):
         from core import session as session_policy
         from core import ooc

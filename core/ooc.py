@@ -591,7 +591,9 @@ async def audit(
             "state": current,
         }
 
-    micro, micro_reason = await _suspicion_turn(sid, findings, stage)
+    # Maintenance stands the register down, so the observer neither relaxes nor
+    # corrects on a turn that was never judged.
+    micro, micro_reason = (0, None) if standing_down else await _suspicion_turn(sid, findings, stage)
     magic_suspicion = 0 if standing_down else int(magic["suspicion"])
     if magic_suspicion:
         micro += magic_suspicion
@@ -1069,6 +1071,8 @@ async def buy_exemption(
     @param permanent - whether the purchase never expires.
     @param ttl_hours - lifetime in hours when not permanent.
     @returns the purchase, or a refusal when the points are not there.
+    @raises ValueError - rule_id or action_key missing, a temporary purchase without
+        ttl_hours, or a price that is zero or negative.
     """
     if not rule_id or not action_key:
         raise ValueError("buy_exemption needs rule_id and action_key")
@@ -1093,6 +1097,14 @@ async def buy_exemption(
     if rule is None:
         return {"ok": False, "reason": "unknown_rule", "rule_id": rule_id}
     price = int(cost_rpp) if cost_rpp is not None else int(rule["delta"]) * 2
+    # A negative price passes the balance check below (`points < price` is false) and
+    # `roleplay_points - price` then credits the buyer: the purchase mints points. The
+    # table's CHECK (cost_rpp > 0) only refused the insert after the debit had run.
+    if price <= 0:
+        raise ValueError(
+            f"buy_exemption needs a positive price, got {price}; pass cost_rpp > 0 "
+            "or leave it unset to use the rule's price"
+        )
     current = await state(sid)
     if int(current["roleplay_points"]) < price:
         return {

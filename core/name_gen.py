@@ -160,20 +160,34 @@ class NameGenerator:
         family = rng.choice(PATRONYM_FATHERS)
         return f"{first} {family}"
 
-    async def _exists(self, name: str) -> bool:
-        """Check name against characters + crew_roster + slaves, and this generator's own output."""
+    async def _exists(self, name: str, prefix: str = "") -> bool:
+        """Check name against characters + crew_roster + slaves, and this generator's own output.
+
+        Exact, case-insensitive match on the full name and on the bare name (prefix stripped). The
+        old `name ILIKE '%<name>%'` was a substring match over unescaped text: "Amir" was rejected
+        because "Samir Khan" exists (exhausting the attempts), "TKG Ahmad Abdullah" missed canon
+        "Ahmad Abdullah" (SAME NAME, DIFFERENT PERSON), and `%`/`_` in a family name were wildcards.
+
+        @param name: candidate, with any role prefix, e.g. "TKG Ahmad Abdullah".
+        @param prefix: the role tag carried by `name`, e.g. "TKG"; its bare form is checked too.
+        @returns: True when the name is taken.
+        """
         if name in self._seen:
             return True
         if self.conn is None:
             return False
+        candidates = [name]
+        if prefix and name.startswith(prefix + " "):
+            candidates.append(name[len(prefix) + 1:])
         row = await self.conn.fetchrow(
             """SELECT 1 FROM (
-                 SELECT name FROM maya_rp.characters WHERE name ILIKE $1
+                 SELECT name FROM maya_rp.characters
                  UNION ALL
-                 SELECT name FROM maya_rp.crew_roster WHERE name ILIKE $1
+                 SELECT name FROM maya_rp.crew_roster
                  UNION ALL
-                 SELECT name FROM maya_rp.slaves WHERE name ILIKE $1
-               ) t LIMIT 1""", f"%{name}%")
+                 SELECT name FROM maya_rp.slaves
+               ) t WHERE lower(name) = ANY($1::text[]) LIMIT 1""",
+            [c.lower() for c in candidates])
         return row is not None
 
     async def unique_name(self, culture="mixed", prefix="", max_attempts=30, family_rate=0.85,
@@ -240,7 +254,7 @@ class NameGenerator:
         rng = random.Random()
         for attempt in range(max_attempts):
             full = _full(_base())
-            if not await self._exists(full):
+            if not await self._exists(full, prefix):
                 self._seen.add(full)
                 return full
         # Exhausted: append a roman numeral. Every numeral is CHECKED — the old
@@ -249,7 +263,7 @@ class NameGenerator:
         rng.shuffle(roman)
         for numeral in roman:
             full = _full(_base(numeral))
-            if not await self._exists(full):
+            if not await self._exists(full, prefix):
                 self._seen.add(full)
                 return full
         raise RuntimeError(

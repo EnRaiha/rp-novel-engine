@@ -66,9 +66,18 @@ RESOLVERS: dict[str, str] = {
 }
 
 
+#: Action types whose `amount` is a credit price and so must not exceed the treasury.
+CREDIT_AMOUNT_ACTIONS = ("trade", "build")
+
+
 # ─── Guardrail: does the player actually have this? ──────────────────────
 async def validate_intent(session_id: int, intent: PlayerIntent) -> tuple[bool, str, dict]:
-    """CPU-side validation against engine state. Returns (ok, error, context)."""
+    """CPU-side validation against engine state.
+
+    @param session_id: RP session whose state is checked.
+    @param intent: parsed player intent.
+    @returns: (ok, error, context).
+    """
     ctx: dict = {"session_id": session_id}
 
     # 1. inventory check (item_used)
@@ -86,23 +95,29 @@ async def validate_intent(session_id: int, intent: PlayerIntent) -> tuple[bool, 
             return False, f"You do not have '{intent.item_used}'.", ctx
 
     # 2. target existence
+    # `strpos(lower(..), lower($2)) > 0`, not `ILIKE '%'||target||'%'`: the target is LLM output, and
+    # `%` or `_` in it is a wildcard that matched every row, so target "%" passed this guardrail for
+    # any nonexistent entity. strpos keeps the substring semantics with no pattern syntax.
     if intent.target and intent.action_type in ("attack", "talk", "use_item", "trade", "diplomacy"):
         terr = await Database.fetchval(
-            "SELECT id FROM maya_rp.territory WHERE session_id=$1 AND system_name ILIKE $2",
-            session_id, f"%{intent.target}%")
+            "SELECT id FROM maya_rp.territory WHERE session_id=$1 AND strpos(lower(system_name), lower($2)) > 0",
+            session_id, intent.target)
         fac = await Database.fetchval(
-            "SELECT id FROM maya_rp.factions WHERE session_id=$1 AND name ILIKE $2",
-            session_id, f"%{intent.target}%")
+            "SELECT id FROM maya_rp.factions WHERE session_id=$1 AND strpos(lower(name), lower($2)) > 0",
+            session_id, intent.target)
         if not (terr or fac):
             # target may be a character or ship
             ent = await Database.fetchval(
-                "SELECT COUNT(*) FROM maya_rp.characters WHERE session_id=$1 AND name ILIKE $2",
-                session_id, f"%{intent.target}%")
+                "SELECT COUNT(*) FROM maya_rp.characters WHERE session_id=$1 AND strpos(lower(name), lower($2)) > 0",
+                session_id, intent.target)
             if not ent:
                 return False, f"Target '{intent.target}' not found in the sector.", ctx
 
     # 3. amount sanity
-    if intent.amount is not None:
+    # `amount` is credits, ships or days depending on the action (see PlayerIntent.amount). Only a
+    # trade or build amount is a credit price; checking it for `move 500` against 300 credits
+    # rejected a legal order for lack of money the order never spends.
+    if intent.amount is not None and intent.action_type in CREDIT_AMOUNT_ACTIONS:
         creds = await Database.fetchval(
             "SELECT credits FROM maya_rp.resources WHERE session_id=$1", session_id) or 0
         if intent.amount > creds:

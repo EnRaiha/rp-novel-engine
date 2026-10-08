@@ -27,8 +27,11 @@ from typing import AsyncGenerator, Any
 from core.db import Database
 from core.log import info, warn
 
-# Cosine-similarity threshold equivalent to the old PG cosine-distance 0.35
-SEMANTIC_MIN_COSINE = 0.65
+# Cosine floor for a tier-2 swap. 0.65 (the old PG cosine-distance 0.35) rewrote ordinary prose,
+# names and short labels into templates; 0.8 keeps only near-paraphrases of a stored tag.
+SEMANTIC_MIN_COSINE = 0.8
+# Lines opening with these are markdown structure (heading, bullet, list, quote), never hints.
+HINT_STRUCTURAL_PREFIXES = ("#", "-", "*", ">")
 # Pre-filter bounds for hint-like lines
 HINT_MIN_LEN = 8
 HINT_MAX_LEN = 60
@@ -132,6 +135,8 @@ class StreamInterceptor:
             return False
         if stripped[-1] in HINT_TERMINAL_PUNCT:
             return False
+        if stripped.startswith(HINT_STRUCTURAL_PREFIXES):
+            return False  # markdown structure: a heading or bullet is the author's, not a hint
         if stripped.startswith(('"', "'", "The ", "A ", "She ", "He ", "They ")):
             return False  # dialogue/prose-openers, not hints
         return True
@@ -222,7 +227,14 @@ class StreamInterceptor:
     # ── stream processing ────────────────────────────────────────
 
     async def process_stream(self, token_generator: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
-        """Consume an async token stream, expanding completed lines."""
+        """Consume an async token stream, expanding completed lines.
+
+        @param token_generator: async iterator of text tokens.
+        @returns: async iterator of expanded text chunks.
+        """
+        # A stream that aborted mid-line left its partial line in the buffer; the next stream
+        # would have prefixed it to its own first line.
+        self.line_buffer = ""
         await self.load_cache()
 
         async for token in token_generator:
@@ -255,7 +267,10 @@ class StreamInterceptor:
             self.stats["semantic_attempts"] += 1
             swap = await self._semantic_swap(stripped)
             if swap is not None:
-                yield swap
+                # The swap replaces the stripped text only. Dropping the line's "\n" glued the
+                # next paragraph onto the template; the indentation is kept for the same reason.
+                indent = line[:len(line) - len(line.lstrip())].replace("\n", "")
+                yield indent + swap + ("\n" if line.endswith("\n") else "")
                 return
 
         yield line

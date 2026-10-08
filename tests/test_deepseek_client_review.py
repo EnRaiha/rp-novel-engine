@@ -93,17 +93,19 @@ class TestTheRetryPolicy:
     async def test_a_connect_error_that_repeats_is_not_retried_forever(self, keyed):
         with patch("core.deepseek_client._post_once") as post:
             post.side_effect = [httpx.ConnectError("down"), httpx.ConnectError("still down")]
-            with pytest.raises(httpx.ConnectError):
+            with pytest.raises(ds.DeepSeekError) as raised:
                 await ds.generate("prompt")
 
+        assert isinstance(raised.value.__cause__, httpx.ConnectError), "the provider error carries its cause"
         assert post.call_count == 2
 
     async def test_a_read_timeout_is_not_retried(self, keyed):
         with patch("core.deepseek_client._post_once") as post:
             post.side_effect = httpx.ReadTimeout("too slow")
-            with pytest.raises(httpx.ReadTimeout):
+            with pytest.raises(ds.DeepSeekError) as raised:
                 await ds.generate("prompt")
 
+        assert isinstance(raised.value.__cause__, httpx.ReadTimeout), "the provider error carries its cause"
         assert post.call_count == 1, "the request may have reached the model; a retry duplicates prose"
 
     async def test_the_retryable_set_is_the_pre_token_class(self):

@@ -45,12 +45,13 @@ class FakeConn:
         self.always_exists = always_exists
         self.probes: list[str] = []
 
-    async def fetchrow(self, sql, pattern):
-        self.probes.append(pattern)
+    async def fetchrow(self, sql, names):
+        """`names` is the list of full and bare candidates; the match is exact and case-insensitive."""
+        self.probes.append(names)
         if self.always_exists:
             return {"exists": 1}
-        needle = pattern.strip("%")
-        return {"exists": 1} if any(needle in t for t in self.taken) else None
+        wanted = {n.lower() for n in names}
+        return {"exists": 1} if any(t.lower() in wanted for t in self.taken) else None
 
 
 async def test_culture_reaches_the_composer():

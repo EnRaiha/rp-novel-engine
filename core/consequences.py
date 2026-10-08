@@ -114,62 +114,118 @@ async def plant(seed: dict) -> int:
 async def process_due(session_id: int = None) -> list[dict]:
     """Process all due consequences for this tick.
 
+    Each seed is claimed, fired and updated in ONE transaction. The old loop read the
+    planted seeds, fired every due effect through its own autocommit, and wrote
+    `effects_jsonb`/`status` afterwards. Two overlapping ticks both read the seed and both
+    fired the same due effect (a stat landed twice). An exception in effect N aborted the
+    loop before the seed update, so effects 0..N-1 had landed and fired again next tick. A
+    `_fire` that returned False was never added to `remaining`, so a transient miss was
+    dropped for good and the seed went exhausted.
+
+    The claim is `FOR UPDATE SKIP LOCKED`: a concurrent tick skips a seed another tick holds
+    and the status re-check under the lock skips one already exhausted. An effect that raises
+    rolls back its seed's whole transaction (nothing half-fires) and is logged; other seeds
+    still run. An effect that returns False stays in `remaining` and is retried next tick.
+
+    @param session_id - session to tick; unset resolves the arc as it stands now.
     @returns one record per effect that landed, each naming the cause behind it.
     """
     sid = _session(session_id)
     current = await _current_tick(sid)
 
-    seeds = await Database.fetch(
-        "SELECT id, trigger_type, cause_description, effects_jsonb, planted_at_tick, "
-        "can_be_prevented, prevention_action "
-        "FROM maya_rp.consequence_seeds WHERE session_id=$1 AND status='planted'",
-        sid)
+    ids = [r["id"] for r in await Database.fetch(
+        "SELECT id FROM maya_rp.consequence_seeds WHERE session_id=$1 AND status='planted' ORDER BY id",
+        sid)]
 
-    fired = []
-    for seed in seeds:
-        effects = seed["effects_jsonb"]
-        if isinstance(effects, str):
-            effects = json.loads(effects)
-        remaining = []
-        for eff in effects:
-            ticks_since = current - seed["planted_at_tick"]
-            # 0 is the default for a row written before the delay was made explicit.
-            if ticks_since >= eff.get("delay_ticks", 0):
-                if await _fire(eff, seed, sid):
-                    fired.append({"effect": eff, "cause": seed["cause_description"]})
-                else:
-                    error("consequences", f"seed {seed['id']} effect '{eff.get('type')}' landed nothing; dropped")
-            else:
-                remaining.append(eff)
-
-        if not remaining:
-            await Database.execute(
-                "UPDATE maya_rp.consequence_seeds SET status='exhausted' WHERE id=$1",
-                seed["id"])
-        else:
-            await Database.execute(
-                "UPDATE maya_rp.consequence_seeds SET effects_jsonb=$1 WHERE id=$2",
-                json.dumps(remaining), seed["id"])
+    fired: list[dict] = []
+    for seed_id in ids:
+        try:
+            fired.extend(await _process_seed(seed_id, sid, current))
+        except Exception as e:  # noqa: BLE001 - one seed's failure must not stop the others
+            error("consequences", f"seed {seed_id} rolled back, nothing of it fired: {e}")
 
     if fired:
         info("consequences", f"Fired {len(fired)} consequence(s)")
     return fired
 
 
-async def _fire(effect: dict, seed: dict, session_id: int) -> bool:
+async def _process_seed(seed_id: int, sid: int, current: int) -> list[dict]:
+    """Claim one seed, fire its due effects and persist the rest, in one transaction.
+
+    @returns the effects that landed; empty when another tick holds or finished the seed.
+    @raises whatever an effect raised, after the transaction rolled back.
+    """
+    async with Database.transaction() as conn:
+        seed = await conn.fetchrow(
+            "SELECT id, trigger_type, cause_description, effects_jsonb, planted_at_tick, "
+            "can_be_prevented, prevention_action "
+            "FROM maya_rp.consequence_seeds WHERE id=$1 AND session_id=$2 AND status='planted' "
+            "FOR UPDATE SKIP LOCKED",
+            seed_id, sid)
+        if seed is None:
+            return []
+        effects = seed["effects_jsonb"]
+        if isinstance(effects, str):
+            effects = json.loads(effects)
+        fired = []
+        remaining = []
+        ticks_since = current - (seed["planted_at_tick"] or 0)
+        for eff in effects:
+            # 0 is the default for a row written before the delay was made explicit.
+            if ticks_since >= eff.get("delay_ticks", 0):
+                if await _fire(eff, seed, sid, conn):
+                    fired.append({"effect": eff, "cause": seed["cause_description"]})
+                elif _can_never_land(eff):
+                    # A retry of a type or action that does not exist loops forever; `_fire` already named it.
+                    error("consequences", f"seed {seed['id']} effect '{eff.get('type')}' can never land; dropped")
+                else:
+                    error("consequences", f"seed {seed['id']} effect '{eff.get('type')}' landed nothing; kept for the next tick")
+                    remaining.append(eff)
+            else:
+                remaining.append(eff)
+
+        if not remaining:
+            await conn.execute(
+                "UPDATE maya_rp.consequence_seeds SET status='exhausted' WHERE id=$1", seed["id"])
+        else:
+            await conn.execute(
+                "UPDATE maya_rp.consequence_seeds SET effects_jsonb=$1 WHERE id=$2",
+                json.dumps(remaining), seed["id"])
+        return fired
+
+
+def _can_never_land(effect: dict) -> bool:
+    """Whether a failed effect fails for what it is, not for the state it met.
+
+    @returns True for an unknown type or an unimplemented faction action; False for a missing row,
+        which can land once the row exists.
+    """
+    kind = effect.get("type")
+    if kind not in EFFECT_TYPES:
+        return True
+    return kind == "faction_reaction" and effect.get("action", "") != "increase_aggression"
+
+
+async def _fire(effect: dict, seed: dict, session_id: int, conn=None) -> bool:
     """Fire a single effect.
 
+    @param conn - the transaction connection `process_due` holds the seed lock on. Every
+        statement goes through it, so a rollback undoes the effect. None falls back to the pool
+        for a caller outside a transaction.
     @returns True when the effect changed something. False means the effect asked
-    for a type, a column or a faction that does not exist, and the caller drops it
-    with a log line rather than counting it as a consequence that happened.
+    for a type, a column or a faction that does not exist; the caller keeps it for the next
+    tick rather than counting it as a consequence that happened.
+    @raises any database error, so the seed's transaction rolls back whole. A swallowed error
+    inside a transaction leaves it aborted, and the next statement fails anyway.
     """
+    run = conn.execute if conn is not None else Database.execute
     kind = effect.get("type")
 
     if kind == "event":
         # `trigger` is the key `plant` takes; the column is `trigger_type`, and
         # this read used the wrong one, so every event effect raised KeyError out
         # of the whole tick. The event path had never landed one.
-        await Database.execute(
+        await run(
             "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
             "VALUES ($1, NOW(), 'consequence', $2, $3, $4, $5)",
             session_id,
@@ -191,14 +247,10 @@ async def _fire(effect: dict, seed: dict, session_id: int) -> bool:
             error("consequences", f"stat effect names '{col}', which is not a resources column; using aggregate_morale")
             col = "aggregate_morale"
         delta = effect.get("delta", 0)
-        try:
-            status = await Database.execute(
-                f"UPDATE maya_rp.resources SET {col} = GREATEST(0, COALESCE({col},0) + $1) "
-                f"WHERE session_id=$2",
-                delta, session_id)
-        except Exception as e:
-            error("consequences", f"stat consequence {col} failed: {e}")
-            return False
+        status = await run(
+            f"UPDATE maya_rp.resources SET {col} = GREATEST(0, COALESCE({col},0) + $1) "
+            f"WHERE session_id=$2",
+            delta, session_id)
         if _affected(status) == 0:
             # The update matching nothing is how a session pays a cost it never had:
             # no resources row, no deduction, and no word about it.
@@ -213,7 +265,7 @@ async def _fire(effect: dict, seed: dict, session_id: int) -> bool:
         if action != "increase_aggression":
             error("consequences", f"faction_reaction '{action}' is not implemented; effect dropped")
             return False
-        status = await Database.execute(
+        status = await run(
             "UPDATE maya_rp.factions SET pirate_fleet_power = COALESCE(pirate_fleet_power,0) + $1, "
             "pirate_aggressiveness = LEAST(1.0, COALESCE(pirate_aggressiveness,0) + 0.1) "
             "WHERE session_id=$2 AND LOWER(name) LIKE LOWER($3)",

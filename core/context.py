@@ -188,11 +188,18 @@ async def scene_state(session_id: int) -> dict[str, Any]:
     session = await Database.fetchrow(
         "SELECT name, game_day, summary, status FROM maya_rp.sessions WHERE id=$1", int(session_id)
     )
+    # The tracker writes the scene location to `player_context.location` and never sets
+    # `presence`, so the character mode below read an empty set and the block carried no
+    # location after every declaration. The scene's own row wins; the mode is the fallback
+    # for a session that never declared one.
     location = await Database.fetchval(
-        "SELECT mode() WITHIN GROUP (ORDER BY scene_location) FROM maya_rp.characters"
-        " WHERE session_id=$1 AND presence='present' AND scene_location IS NOT NULL",
-        int(session_id),
-    )
+        "SELECT location FROM maya_rp.player_context WHERE session_id=$1", int(session_id))
+    if not location:
+        location = await Database.fetchval(
+            "SELECT mode() WITHIN GROUP (ORDER BY scene_location) FROM maya_rp.characters"
+            " WHERE session_id=$1 AND presence='present' AND scene_location IS NOT NULL",
+            int(session_id),
+        )
     slugs = [r["name"] for r in await Database.fetch(
         "SELECT name FROM maya_rp.location_catalog ORDER BY name")]
     return {

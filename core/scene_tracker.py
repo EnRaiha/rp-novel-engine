@@ -29,9 +29,9 @@ import difflib
 import re
 from typing import Any
 
-from core.config import Config
 from core.db import Database
 from core.log import info, warn
+from core.session import require_session
 
 BLOCK = re.compile(r"^[ \t]*\[SCENE\][ \t]*(?P<body>[^\n]*)$", re.M)
 FIELDS = ("lokasi", "masuk", "keluar", "masa")
@@ -101,8 +101,9 @@ async def resolve(session_id: int | None, decl: dict[str, Any]) -> dict[str, Any
     not hold cannot be placed, and creating one from a turn would put a person into the campaign
     because of a typo.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    # `Config.SESSION_ID` is fixed at import; a long-lived process kept resolving against the
+    # session that was current at start. An explicit id wins as given.
+    session_id = require_session(session_id)
     corrections: list[dict[str, str]] = []
     resolved: dict[str, Any] = {"masuk": [], "keluar": [], "lokasi": None, "masa": None}
 
@@ -168,20 +169,33 @@ async def resolve(session_id: int | None, decl: dict[str, Any]) -> dict[str, Any
 
 
 async def apply_declaration(session_id: int | None, resolved: dict[str, Any]) -> dict[str, Any]:
-    """Write a resolved declaration. Returns what moved, with a read-back per write."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    """Write a resolved declaration in one transaction. Returns what moved, with a read-back per write.
+
+    Every statement goes through the yielded connection, so a failure midway leaves neither a
+    moved scene with unmoved characters nor the reverse. The scene location and the entrants
+    used to commit one autocommit at a time.
+
+    `masuk` without `lokasi` leaves the entrant's `scene_location` as it was. The update bound
+    `lokasi` unconditionally, so `masuk=Ersya` alone wrote NULL over the location of the person
+    who had just entered. Skipping is the smaller correct move: the declaration named nobody's
+    place, so it changes nobody's place.
+
+    @param session_id - explicit id wins; None resolves the arc now.
+    @param resolved - the `resolved` half of `resolve()`.
+    @returns {"location", "entered", "left"}.
+    """
+    session_id = require_session(session_id)
     moved: dict[str, Any] = {"location": None, "entered": [], "left": []}
 
     lokasi = resolved.get("lokasi")
-    if lokasi:
-        await Database.execute(
-            "INSERT INTO maya_rp.player_context (session_id, location, updated_at) VALUES ($1, $2, NOW())"
-            " ON CONFLICT (session_id) DO UPDATE SET location=$2, updated_at=NOW()",
-            session_id, lokasi)
-        read_back = await Database.fetchval(
-            "SELECT location FROM maya_rp.player_context WHERE session_id=$1", session_id)
-        moved["location"] = read_back
+    async with Database.transaction() as conn:
+        if lokasi:
+            await conn.execute(
+                "INSERT INTO maya_rp.player_context (session_id, location, updated_at) VALUES ($1, $2, NOW())"
+                " ON CONFLICT (session_id) DO UPDATE SET location=$2, updated_at=NOW()",
+                session_id, lokasi)
+            moved["location"] = await conn.fetchval(
+                "SELECT location FROM maya_rp.player_context WHERE session_id=$1", session_id)
 
     # NO PLAYER-CHARACTER MOVE HAPPENS HERE, AND A FIRST ATTEMPT AT ONE WAS REVERTED.
     #
@@ -197,17 +211,18 @@ async def apply_declaration(session_id: int | None, resolved: dict[str, Any]) ->
     # declaration names and nothing else. A declaration that wants the player's own row moved lists
     # him in `masuk` like anybody else.
 
-    for name in resolved.get("masuk") or []:
-        await Database.execute(
-            "UPDATE maya_rp.characters SET scene_location=$1 WHERE session_id=$2 AND name=$3",
-            lokasi, session_id, name)
-        moved["entered"].append(name)
+        for name in resolved.get("masuk") or []:
+            if lokasi:
+                await conn.execute(
+                    "UPDATE maya_rp.characters SET scene_location=$1 WHERE session_id=$2 AND name=$3",
+                    lokasi, session_id, name)
+            moved["entered"].append(name)
 
-    for name in resolved.get("keluar") or []:
-        await Database.execute(
-            "UPDATE maya_rp.characters SET scene_location=NULL WHERE session_id=$1 AND name=$2",
-            session_id, name)
-        moved["left"].append(name)
+        for name in resolved.get("keluar") or []:
+            await conn.execute(
+                "UPDATE maya_rp.characters SET scene_location=NULL WHERE session_id=$1 AND name=$2",
+                session_id, name)
+            moved["left"].append(name)
 
     return moved
 

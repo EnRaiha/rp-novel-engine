@@ -21,6 +21,7 @@ from __future__ import annotations
 import fcntl
 import os
 import pathlib
+import tempfile
 import time
 
 import pytest
@@ -32,6 +33,11 @@ import pytest_asyncio
 #: the suite self-contained, so a red line means a real defect and every reviewer's line counts the same
 #: things. Tests that need a real key should skip on a placeholder rather than fail.
 os.environ.setdefault("DEEPSEEK_API_KEY", "test-key")
+
+#: `mirror_state_file` writes to the harness plugin's live store by default. Every audit in the suite mirrors
+#: its scratch session there, and the plugin picked the newest entry as the campaign, so it followed a test
+#: id instead of the arc. A temp path for the whole run keeps scratch sessions out of the live file.
+os.environ["OOC_STATE_FILE"] = os.path.join(tempfile.mkdtemp(prefix="rp-engine-pytest-"), "tkg-state.json")
 
 LOCK_PATH = pathlib.Path(os.environ.get("RP_TEST_LOCK", "/tmp/rp-engine-pytest.lock"))
 

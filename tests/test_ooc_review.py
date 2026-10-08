@@ -28,6 +28,7 @@ import json
 import os
 import pathlib
 import sys
+import tempfile
 
 import asyncpg
 import pytest
@@ -576,3 +577,12 @@ class TestAWriterThatFailsPartwayLeavesNothingBehind:
         assert await Database.fetchval(
             "SELECT count(*) FROM maya_rp.ooc_exemptions WHERE session_id=$1", scratch_session) == 0, \
             f"a price of {price} left an exemption row"
+
+
+class TestTheSuiteNeverMirrorsIntoTheLiveStateFile:
+    """The plugin reads `~/.dsh/ooc/tkg-state.json`; scratch sessions written there hid the live arc."""
+
+    def test_the_state_file_is_a_temp_path_for_the_whole_run(self):
+        path = ooc.state_file_path()
+        assert path != pathlib.Path("~/.dsh/ooc/tkg-state.json").expanduser(), "the suite would write the live store"
+        assert pathlib.Path(tempfile.gettempdir()) in path.parents, f"{path} is outside the temp directory"

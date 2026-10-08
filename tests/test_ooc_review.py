@@ -29,6 +29,7 @@ import os
 import pathlib
 import sys
 
+import asyncpg
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -447,3 +448,69 @@ class TestTheLedgerNamesEveryRuleThatFired:
         monkeypatch.setattr(ooc, "audit_text", lambda text, rules, layer: [self._finding(third)])
         returned = await ooc.audit("prose to audit", scratch_session, turn_ref="review")
         assert returned["suspicion_delta"] == 0, "the row named no rule, so nothing was shown corrected"
+
+
+class TestAWriterThatFailsPartwayLeavesNothingBehind:
+    """`audit`, `complete_milestone` and `buy_exemption` each write more than one row.
+
+    The rows belong to one transaction only when every statement runs on the connection that
+    transaction holds. A statement issued through the pool takes another connection and commits on
+    its own, so a failure in a later statement cannot undo the earlier ones. Each test makes the
+    later statement fail on a real constraint, so no schema change is needed, and then reads the
+    rows the earlier statement touched.
+    """
+
+    @staticmethod
+    async def _row(session_id: int):
+        return await Database.fetchrow(
+            "SELECT deviation, roleplay_points, audits, findings"
+            " FROM maya_rp.ooc_system_state WHERE session_id=$1", session_id)
+
+    async def test_an_audit_whose_ledger_row_is_refused_leaves_the_state_alone(
+        self, scratch_session, monkeypatch
+    ):
+        """The ledger row names a rule that is not in `ooc_rules`, so its foreign key refuses it."""
+        await ooc.state(scratch_session)
+        before = dict(await self._row(scratch_session))
+        unknown = ooc.OocFinding(rule_id="review-no-such-rule", kind="prose",
+                                 layer=ooc.LAYER_DIALOGUE, match="matched prose", delta=1)
+        monkeypatch.setattr(ooc, "audit_text", lambda text, rules, layer: [unknown])
+        with pytest.raises(asyncpg.exceptions.ForeignKeyViolationError):
+            await ooc.audit("prose to audit", scratch_session, turn_ref="review")
+        assert dict(await self._row(scratch_session)) == before, \
+            "the state update outlived the audit row that was refused"
+
+    async def test_a_beat_whose_payment_overflows_is_not_marked_complete(self, scratch_session):
+        """The reward added to the balance leaves the integer range, so the state update raises."""
+        await ooc.state(scratch_session)
+        await Database.execute(
+            "UPDATE maya_rp.ooc_system_state SET roleplay_points=1 WHERE session_id=$1",
+            scratch_session)
+        await Database.execute(
+            "INSERT INTO maya_rp.ooc_milestones (session_id, name, stage, rpp_reward)"
+            " VALUES ($1,'review-atomic-beat','lockdown',2147483647)", scratch_session)
+        with pytest.raises(asyncpg.exceptions.NumericValueOutOfRangeError):
+            await ooc.complete_milestone(scratch_session, "review-atomic-beat", evidence=True)
+        completed_at = await Database.fetchval(
+            "SELECT completed_at FROM maya_rp.ooc_milestones WHERE session_id=$1 AND name=$2",
+            scratch_session, "review-atomic-beat")
+        assert completed_at is None, "the beat stayed marked complete although its payment failed"
+        assert (await self._row(scratch_session))["roleplay_points"] == 1
+
+    async def test_an_exemption_that_cannot_be_stored_does_not_move_the_balance(self, scratch_session):
+        """A negative price passes the balance check and credits the points, then the insert is refused.
+
+        `ooc_exemptions.cost_rpp` is `CHECK (cost_rpp > 0)`, so the insert is the statement that fails.
+        """
+        await ooc.state(scratch_session)
+        await Database.execute(
+            "UPDATE maya_rp.ooc_system_state SET roleplay_points=99 WHERE session_id=$1",
+            scratch_session)
+        rule = await Database.fetchrow("SELECT id FROM maya_rp.ooc_rules ORDER BY id LIMIT 1")
+        assert rule is not None, "migration 114 seeds a rule, so there is always one to name"
+        with pytest.raises(asyncpg.exceptions.CheckViolationError):
+            await ooc.buy_exemption(scratch_session, rule["id"], "review_action", cost_rpp=-5)
+        assert (await self._row(scratch_session))["roleplay_points"] == 99, \
+            "the balance moved although the exemption was never stored"
+        assert await Database.fetchval(
+            "SELECT count(*) FROM maya_rp.ooc_exemptions WHERE session_id=$1", scratch_session) == 0

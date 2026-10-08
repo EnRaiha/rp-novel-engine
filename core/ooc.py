@@ -609,8 +609,10 @@ async def audit(
     else:
         disposition, skip_reason = "no_match", None
 
-    async with Database.transaction():
-        row = await Database.fetchrow(
+    # Statements run on the transaction connection so a later failure rolls back the earlier writes.
+    observers = await observer_ids(sid) if micro else []
+    async with Database.transaction() as conn:
+        row = await conn.fetchrow(
             "UPDATE maya_rp.ooc_system_state SET deviation=$2, roleplay_points=roleplay_points+$3,"
             " audits=audits+1, findings=findings+$4, debuff=$5, updated_at=now()"
             " WHERE session_id=$1 RETURNING session_id, arc_stage, deviation, roleplay_points, audits, findings,"
@@ -621,7 +623,7 @@ async def audit(
             len(findings),
             debuff[0] if debuff else None,
         )
-        event = await Database.fetchrow(
+        event = await conn.fetchrow(
             "INSERT INTO maya_rp.ooc_audit_events (session_id, rule_id, layer, disposition, skip_reason,"
             " match_sha256, match_len, delta, deviation_after, suspicion_delta, turn_ref)"
             " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id, created_at",
@@ -639,23 +641,22 @@ async def audit(
             micro,
             turn_ref,
         )
-        if micro:
-            for observer in await observer_ids(sid):
-                await Database.execute(
-                    "INSERT INTO maya_rp.ooc_suspicion"
-                    " (session_id, observer_id, suspicion, last_reason, last_event_id, updated_at)"
-                    " VALUES ($1,$2,LEAST(100,GREATEST(0,$3)),$4,$5,now())"
-                    " ON CONFLICT (session_id, observer_id) DO UPDATE SET"
-                    " suspicion=LEAST(100,GREATEST(0,maya_rp.ooc_suspicion.suspicion+$3)),"
-                    " last_reason=COALESCE($4, maya_rp.ooc_suspicion.last_reason),"
-                    " last_event_id=COALESCE($5, maya_rp.ooc_suspicion.last_event_id),"
-                    " updated_at=now()",
-                    sid,
-                    observer,
-                    micro,
-                    micro_reason,
-                    event["id"] if event else None,
-                )
+        for observer in observers:
+            await conn.execute(
+                "INSERT INTO maya_rp.ooc_suspicion"
+                " (session_id, observer_id, suspicion, last_reason, last_event_id, updated_at)"
+                " VALUES ($1,$2,LEAST(100,GREATEST(0,$3)),$4,$5,now())"
+                " ON CONFLICT (session_id, observer_id) DO UPDATE SET"
+                " suspicion=LEAST(100,GREATEST(0,maya_rp.ooc_suspicion.suspicion+$3)),"
+                " last_reason=COALESCE($4, maya_rp.ooc_suspicion.last_reason),"
+                " last_event_id=COALESCE($5, maya_rp.ooc_suspicion.last_event_id),"
+                " updated_at=now()",
+                sid,
+                observer,
+                micro,
+                micro_reason,
+                event["id"] if event else None,
+            )
     result: dict[str, Any] = {
         "ok": True,
         "session_id": sid,
@@ -915,8 +916,9 @@ async def complete_milestone(
     elif not (evidence or await evidence_from_actions(sid, evidence_actions)):
         return {"ok": False, "reason": "no_action_evidence", "name": name}
 
-    async with Database.transaction():
-        row = await Database.fetchrow(
+    # Both writes run on the transaction connection, so the points are paid only if the beat is marked.
+    async with Database.transaction() as conn:
+        row = await conn.fetchrow(
             "UPDATE maya_rp.ooc_milestones SET completed_at=now()"
             " WHERE session_id=$1 AND name=$2 AND completed_at IS NULL RETURNING id, rpp_reward",
             sid,
@@ -924,7 +926,7 @@ async def complete_milestone(
         )
         if row is None:
             return {"ok": False, "reason": "already_completed", "name": name}
-        state_row = await Database.fetchrow(
+        state_row = await conn.fetchrow(
             "UPDATE maya_rp.ooc_system_state SET roleplay_points=roleplay_points+$2, updated_at=now()"
             " WHERE session_id=$1"
             " RETURNING session_id, arc_stage, deviation, roleplay_points, audits, findings, debuff",
@@ -1096,8 +1098,9 @@ async def buy_exemption(
             "required": price,
             "roleplay_points": int(current["roleplay_points"]),
         }
-    async with Database.transaction():
-        state_row = await Database.fetchrow(
+    # Both writes run on the transaction connection, so the points are spent only if the exemption is stored.
+    async with Database.transaction() as conn:
+        state_row = await conn.fetchrow(
             "UPDATE maya_rp.ooc_system_state SET roleplay_points=roleplay_points-$2, updated_at=now()"
             " WHERE session_id=$1 AND roleplay_points >= $2"
             " RETURNING session_id, roleplay_points",
@@ -1106,7 +1109,7 @@ async def buy_exemption(
         )
         if state_row is None:
             return {"ok": False, "reason": "insufficient_rpp", "required": price}
-        granted = await Database.fetchrow(
+        granted = await conn.fetchrow(
             "INSERT INTO maya_rp.ooc_exemptions"
             " (session_id, rule_id, action_key, condition, cost_rpp, permanent, expires_at)"
             " VALUES ($1,$2,$3,$4,$5,$6, CASE WHEN $6 THEN NULL ELSE now() + ($7 || ' hours')::interval END)"

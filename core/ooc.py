@@ -29,7 +29,6 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from core.config import Config
 from core.db import Database
 from core.log import error
 from modules.magic_cost import declared_acts, price_acts
@@ -502,7 +501,7 @@ async def audit(
     @param action_evidence - true when a tool call in the same turn supports the intent.
     @param context - scene facts (`scene`, `location`) an exemption condition is tested against.
     @param turn_ref - session/turn anchor for the audit row.
-    @param suspicion_delta - observer suspicion this turn moves (0 until D6).
+    @param suspicion_delta - observer suspicion this turn moves (a nonzero host value replaces the D6 micro-consistency step).
     @param magic_acts - the magic acts the Host declares for this turn, by canon key
         (`modules/magic_cost.ACT_TABLE`). The engine cannot detect magic in prose, so the
         declaration is the Host's assertion; an undeclared turn prices at zero.

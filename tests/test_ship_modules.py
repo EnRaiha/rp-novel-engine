@@ -6,11 +6,36 @@ A ship needs a VOID DRIVE; Nebular Ward cuts the risk; travel is fast
 
 DB-free: pure math + monkeypatched Database for the async resolvers.
 """
+import contextlib
+import os
+
 import pytest
 
+import modules.ship_modules as sm
 from modules.ship_modules import (VOID_HOURS_PER_UNIT, VOID_BASE_RISK_PCT,
                                   install_module, list_modules,
                                   fleet_void_capable, void_crossing_cost)
+
+
+# Scratch session: sessions 3 and 5 are frozen reference data and install_module refuses them.
+SID = 900 + os.getpid() % 100
+
+
+class _Conn:
+    """Transaction connection: forwards to the module's patched Database calls."""
+
+    async def fetchrow(self, sql, *args):
+        return await sm.Database.fetchrow(sql, *args)
+
+    async def fetchval(self, sql, *args):
+        return await sm.Database.fetchval(sql, *args)
+
+
+def _with_transaction(monkeypatch):
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield _Conn()
+    monkeypatch.setattr("modules.ship_modules.Database.transaction", transaction)
 
 
 def test_void_hours_faster_than_standard():
@@ -55,7 +80,7 @@ async def test_install_module_tier_gate(monkeypatch):
                 "tier_min": 4, "tier_max": 8, "effect_value": 1}
     monkeypatch.setattr("modules.ship_modules.Database.fetchrow", fetchrow)
     with pytest.raises(ValueError, match="tier"):
-        await install_module(1, "Void Drive")   # tier 1 corvette can't fit T4 module
+        await install_module(1, "Void Drive", session_id=SID)   # tier 1 corvette can't fit T4 module
 
 
 async def test_install_module_no_slots(monkeypatch):
@@ -69,49 +94,51 @@ async def test_install_module_no_slots(monkeypatch):
         return 0
     monkeypatch.setattr("modules.ship_modules.Database.fetchrow", fetchrow)
     monkeypatch.setattr("modules.ship_modules.Database.fetchval", fetchval)
+    _with_transaction(monkeypatch)
     with pytest.raises(ValueError, match="no free module slots"):
-        await install_module(2, "Nebular Ward")
+        await install_module(2, "Nebular Ward", session_id=SID)
 
 
 async def test_install_module_duplicate_blocked(monkeypatch):
-    # ship lookup → module lookup → duplicate check returns a row
-    calls = {"n": 0}
+    # ship lookup, module lookup, then the in-transaction lock and the duplicate check
     async def fetchrow(sql, *args):
-        calls["n"] += 1
-        if calls["n"] == 1:   # ship
+        if "ship_classes" in sql:
             return {"id": 3, "name": "Warship", "tier": 6,
                     "sub_class": "Cruiser", "module_slots": 4}
-        if calls["n"] == 2:   # module
-            return {"id": 45, "name": "Void Drive", "category": "void",
-                    "tier_min": 4, "tier_max": 8, "effect_value": 1}
-        return {"id": 7}      # duplicate exists
+        if "FOR UPDATE" in sql:
+            return {"id": 3}
+        if "FROM maya_rp.ship_modules" in sql:
+            return {"id": 7}      # duplicate exists
+        return {"id": 45, "name": "Void Drive", "category": "void",
+                "tier_min": 4, "tier_max": 8, "effect_value": 1}
     async def fetchval(sql, *args):
         return 1             # 1 slot used
     monkeypatch.setattr("modules.ship_modules.Database.fetchrow", fetchrow)
     monkeypatch.setattr("modules.ship_modules.Database.fetchval", fetchval)
+    _with_transaction(monkeypatch)
     with pytest.raises(ValueError, match="already fitted"):
-        await install_module(3, "Void Drive")
+        await install_module(3, "Void Drive", session_id=SID)
 
 
 async def test_install_module_success(monkeypatch):
-    calls = {"n": 0, "val": []}
     async def fetchrow(sql, *args):
-        calls["n"] += 1
-        if calls["n"] == 1:   # ship
+        if "ship_classes" in sql:
             return {"id": 4, "name": "Maw-1", "tier": 10,
                     "sub_class": "Dreadnought", "module_slots": 4}
-        if calls["n"] == 2:   # module
-            return {"id": 45, "name": "Void Drive", "category": "void",
-                    "tier_min": 4, "tier_max": 12, "effect_value": 1}
-        return None           # no duplicate
+        if "FOR UPDATE" in sql:
+            return {"id": 4}
+        if "FROM maya_rp.ship_modules" in sql:
+            return None           # no duplicate
+        return {"id": 45, "name": "Void Drive", "category": "void",
+                "tier_min": 4, "tier_max": 12, "effect_value": 1}
     async def fetchval(sql, *args):
-        calls["val"].append(sql)
         if "count" in sql:
             return 1          # 1 slot used
         return 10             # insert RETURNING id
     monkeypatch.setattr("modules.ship_modules.Database.fetchrow", fetchrow)
     monkeypatch.setattr("modules.ship_modules.Database.fetchval", fetchval)
-    r = await install_module(4, "Void Drive")
+    _with_transaction(monkeypatch)
+    r = await install_module(4, "Void Drive", session_id=SID)
     assert r["module"] == "Void Drive"
     assert r["ship"] == "Maw-1"
     assert r["slot"] == 2

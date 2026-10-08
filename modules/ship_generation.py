@@ -4,7 +4,6 @@ from __future__ import annotations
 import random, math
 from typing import Any
 from core.db import Database
-from core.config import Config
 from core.log import info
 
 def tier_mult(tier: int, scale: float = 1.15) -> float:
@@ -68,9 +67,31 @@ async def get_modules(tier: int) -> list[dict]:
 
 TYPE_MULTIPLIERS = {"HRO": 1.15, "MYT": 1.50, "CRP": 0.50, "CSM": 1.30, "SPC": 1.10}
 
+def _writable_session(session_id: int | None) -> int:
+    """Resolve the session for one call and refuse a frozen campaign.
+
+    Sessions 3 and 5 are reference data. `Config.SESSION_ID` is fixed at import, so a long-lived
+    process resolved a stale id and the tick ran against the frozen arc.
+
+    @param session_id - caller's session; `None` resolves through `core.session.require_session`.
+    @returns the resolved session id.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+    from core.session import require_session
+
+    sid = require_session(session_id)
+    _refuse_frozen(sid)
+    return sid
+
+
 async def generate_ship(class_name: str, tier: int, ship_type: str, name: str | None = None,
                          session_id: int | None = None) -> dict[str, Any]:
-    if session_id is None: session_id = Config.SESSION_ID
+    """Roll one ship. Reads the catalogue only and writes nothing.
+
+    `session_id` is accepted for caller symmetry and unused: the catalogue tables carry no session.
+    It no longer falls back to `Config.SESSION_ID`, which was fixed at import and never read.
+    """
     sc = await get_class(class_name)
     if not sc:
         return {"error": f"Ship class '{class_name}' not found"}
@@ -111,8 +132,16 @@ async def generate_ship(class_name: str, tier: int, ship_type: str, name: str | 
     }
 
 def roll_weapons(slot_specs: list[tuple[str, int]], weapon_pool: list[dict]) -> list[dict]:
+    """Fill each weapon slot spec from the pool.
+
+    @param slot_specs - `[(size, count), ...]` from `parse_slots`.
+    @param weapon_pool - weapons legal at the ship's tier.
+    @returns one armament per mount. `slot_index` is unique across the whole ship: it restarted at
+        0 for every size group, so a "2XH 2H" ship carried two mounts at index 0 and two at index 1.
+    """
     weapon_list = list(weapon_pool)
     armaments = []
+    slot_index = 0
     for size, count in slot_specs:
         pool = [w for w in weapon_list if w.get("slot_size") == size]
         if not pool:
@@ -125,17 +154,24 @@ def roll_weapons(slot_specs: list[tuple[str, int]], weapon_pool: list[dict]) -> 
                 indices = list(range(len(pool)))
             idx = random.choice(indices)
             w = pool[idx]
-            armaments.append({"slot_index": i, "slot_size": size, "weapon_id": w["id"],
+            armaments.append({"slot_index": slot_index, "slot_size": size, "weapon_id": w["id"],
                               "weapon_name": w["name"], "kind": w["kind"],
                               "damage": w["damage"], "range_m": w.get("range_m", 0)})
             indices.remove(idx)
+            slot_index += 1
     return armaments
 
 def roll_modules(module_slots: int, module_pool: list[dict]) -> list[dict]:
+    """Pick up to `module_slots` modules, best grade first, one per category before repeats.
+
+    @returns distinct modules. The second pass walked the whole pool again and re-added the modules
+        the first pass had picked, so one ship carried the same module two or three times.
+    """
     if not module_pool:
         return []
     pool = sorted(module_pool, key=lambda m: (-m["grade"], m["name"]))
     picked = []
+    taken = set()
     cats = set()
     for m in pool:
         if len(picked) >= module_slots: break
@@ -145,15 +181,18 @@ def roll_modules(module_slots: int, module_pool: list[dict]) -> list[dict]:
                        "grade": m["grade"], "cost_alloys": m.get("cost_alloys", 0),
                        "cost_credits": m.get("cost_credits", 0)})
         cats.add(m["category"])
+        taken.add(m["id"])
     if len(picked) < module_slots:
         for m in pool:
             if len(picked) >= module_slots: break
+            if m["id"] in taken: continue
             if m["category"] in cats and random.random() < 1/3: continue
             if m["category"] not in cats: continue
             picked.append({"module_id": m["id"], "name": m["name"], "category": m["category"],
                            "effect_type": m["effect_type"], "effect_value": m.get("effect_value", 0.0),
                            "grade": m["grade"], "cost_alloys": m.get("cost_alloys", 0),
                            "cost_credits": m.get("cost_credits", 0)})
+            taken.add(m["id"])
     return picked
 
 async def generate_batch(class_name: str, tier: int, ship_type: str, count: int,
@@ -168,5 +207,9 @@ async def generate_batch(class_name: str, tier: int, ship_type: str, count: int,
     return ships
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    """No-op tick. Resolves the session and refuses a frozen campaign.
+
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
     return {"status": "ship_generation_ready"}

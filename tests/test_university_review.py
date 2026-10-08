@@ -5,7 +5,9 @@ Every database call is stubbed. No graduation is recorded.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import pathlib
 import sys
 
@@ -15,6 +17,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.university as uni  # noqa: E402
+
+# Scratch session: sessions 3 and 5 are frozen reference data and the writers refuse them.
+SID = 900 + os.getpid() % 100
 
 
 def _run(coro):
@@ -33,6 +38,11 @@ class _StubDB:
         self.finished = finished
         self.reads = []
         self.writes = []
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        """The stub is its own connection: statements inside a transaction land in the same record."""
+        yield self
 
     async def fetchval(self, sql, *args):
         self.reads.append((sql, args))
@@ -69,7 +79,7 @@ def test_the_tick_reports_the_campus_numbers(monkeypatch):
     stub = _StubDB(game_day=2250)          # 2250 % 30 == 0
     monkeypatch.setattr(uni, "Database", stub)
 
-    out = _run(uni.run_tick(session_id=3))
+    out = _run(uni.run_tick(session_id=SID))
 
     assert out == {"total": 10, "finished": 6, "campuses": 4, "labs": 1,
                    "research_rate": 2.5, "graduated": 7}, out
@@ -82,7 +92,7 @@ def test_the_second_tick_on_the_same_day_graduates_nothing(monkeypatch):
     logged = []
     monkeypatch.setattr(uni, "info", lambda *a: logged.append(a[-1]))
 
-    out = _run(uni.run_tick(session_id=3))
+    out = _run(uni.run_tick(session_id=SID))
 
     assert out["graduated"] == 0, out
     assert any("already recorded" in line for line in logged), logged
@@ -94,13 +104,13 @@ def test_the_graduation_records_the_day_it_belonged_to(monkeypatch):
     stub = _StubDB(game_day=2250)
     monkeypatch.setattr(uni, "Database", stub)
 
-    _run(uni.run_tick(session_id=3))
+    _run(uni.run_tick(session_id=SID))
 
     marker = [(sql, args) for sql, args in stub.reads if "tags @>" in sql]
     assert marker and json.loads(marker[0][1][1]) == ["day:2250"], marker
     event = [args for sql, args in stub.writes if "INSERT INTO maya_rp.events" in sql][0]
     assert json.loads(event[3]) == ["science", "university", "day:2250"], event
-    assert event[0] == 3
+    assert event[0] == SID
 
 
 def test_a_session_without_a_resources_row_is_told(monkeypatch):
@@ -109,17 +119,17 @@ def test_a_session_without_a_resources_row_is_told(monkeypatch):
     logged = []
     monkeypatch.setattr(uni, "info", lambda *a: logged.append(a[-1]))
 
-    out = _run(uni.run_tick(session_id=5))
+    out = _run(uni.run_tick(session_id=SID))
 
     assert out["graduated"] == 7
-    assert any("No resources row for session 5" in line for line in logged), logged
+    assert any(f"No resources row for session {SID}" in line for line in logged), logged
 
 
 def test_a_day_that_is_not_a_cycle_day_graduates_nothing(monkeypatch):
     stub = _StubDB(game_day=2249)
     monkeypatch.setattr(uni, "Database", stub)
 
-    out = _run(uni.run_tick(session_id=3))
+    out = _run(uni.run_tick(session_id=SID))
 
     assert out["graduated"] == 0
     assert stub.writes == []
@@ -128,7 +138,7 @@ def test_a_day_that_is_not_a_cycle_day_graduates_nothing(monkeypatch):
 def test_no_campuses_means_no_graduation(monkeypatch):
     stub = _StubDB(campuses=0, game_day=2250)
     monkeypatch.setattr(uni, "Database", stub)
-    out = _run(uni.run_tick(session_id=3))
+    out = _run(uni.run_tick(session_id=SID))
     assert out["graduated"] == 0
     assert stub.writes == []
 
@@ -139,7 +149,7 @@ def test_the_tick_returns_an_error_instead_of_raising(monkeypatch):
             raise RuntimeError("connection reset")
     monkeypatch.setattr(uni, "Database", _Boom())
     logged = []
-    monkeypatch.setattr(uni, "info", lambda *a: logged.append(a[-1]))
-    out = _run(uni.run_tick(session_id=3))
+    monkeypatch.setattr(uni, "error", lambda *a: logged.append(a[-1]))
+    out = _run(uni.run_tick(session_id=SID))
     assert "connection reset" in out["error"]
     assert any("connection reset" in line for line in logged)

@@ -21,9 +21,14 @@ through a fake.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import modules.tactics as tactics
+
+# Scratch session: sessions 3 and 5 are frozen reference data and the writers refuse them.
+SID = 900 + os.getpid() % 100
 
 
 class FakeDB:
@@ -149,7 +154,7 @@ def test_contract_roll_terrain_returns_a_named_table_row():
 async def test_contract_run_tick_reports_the_campaign_power(monkeypatch):
     _install(monkeypatch, FakeDB(fetch=SHIPS))
 
-    out = await tactics.run_tick(5)
+    out = await tactics.run_tick(SID)
 
     assert out["ship_count"] == 2 and out["fleet_power"] == 49
 
@@ -165,7 +170,7 @@ async def test_contract_run_tick_reports_a_crash_as_an_error(monkeypatch):
     _install(monkeypatch, FakeDB())
     monkeypatch.setattr("modules.tactics.Database.fetch", boom)
 
-    out = await tactics.run_tick(5)
+    out = await tactics.run_tick(SID)
 
     assert "no hulls" in out["error"]
     assert any("no hulls" in m for m in seen), seen

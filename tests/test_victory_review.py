@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
 import pathlib
 import sys
 
@@ -11,6 +13,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.victory as victory  # noqa: E402
+
+# Scratch session: sessions 3 and 5 are frozen reference data and the writers refuse them.
+SID = 900 + os.getpid() % 100
 
 
 def _run(coro):
@@ -29,6 +34,11 @@ class _StubDB:
         self.unlocked = unlocked
         self.reads = []
         self.writes = []
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        """The stub is its own connection: statements inside a transaction land in the same record."""
+        yield self
 
     async def fetch(self, sql, *args):
         self.reads.append((sql, args))
@@ -61,12 +71,12 @@ def test_every_scoped_axis_query_names_the_session(monkeypatch):
 
     stub = _StubDB()
     monkeypatch.setattr(victory, "Database", stub)
-    _run(victory.run_tick(session_id=5))
+    _run(victory.run_tick(session_id=SID))
 
     for sql, args in stub.reads + stub.writes:
         if re.search(r"\b(territory|factions|resources)\b", sql) and "research_projects" not in sql:
             assert "session_id" in sql, sql
-            assert 5 in args, (sql, args)
+            assert SID in args, (sql, args)
 
 
 def test_the_axes_land_in_the_return(monkeypatch):
@@ -76,9 +86,9 @@ def test_the_axes_land_in_the_return(monkeypatch):
     logged = []
     monkeypatch.setattr(victory, "info", lambda *a: logged.append(a[-1]))
 
-    out = _run(victory.run_tick(session_id=3))
+    out = _run(victory.run_tick(session_id=SID))
 
-    assert out["session_id"] == 3
+    assert out["session_id"] == SID
     assert out["victory"]["military"] == 50.0     # 10 / 4 * 20
     assert out["victory"]["economic"] == 50.0     # 50M / 100M * 100
     assert out["victory"]["diplomatic"] == 50.0   # 2 / 4 * 100
@@ -91,7 +101,7 @@ def test_the_axes_land_in_the_return(monkeypatch):
 def test_the_tracking_update_is_written_for_each_axis(monkeypatch):
     stub = _StubDB()
     monkeypatch.setattr(victory, "Database", stub)
-    _run(victory.run_tick(session_id=3))
+    _run(victory.run_tick(session_id=SID))
     progress = [(sql, args) for sql, args in stub.writes if "SET progress=$1" in sql]
     assert len(progress) == 6, progress
     assert all("session_id=$3" in sql for sql, _ in progress)
@@ -102,16 +112,16 @@ def test_the_tracking_update_is_written_for_each_axis(monkeypatch):
 def test_a_completed_axis_is_marked_once(monkeypatch):
     stub = _StubDB(factions=1, territory=100, credits=100_000_000, allied=1)
     monkeypatch.setattr(victory, "Database", stub)
-    _run(victory.run_tick(session_id=3))
+    _run(victory.run_tick(session_id=SID))
     completed = [sql for sql, _ in stub.writes if "completed=true" in sql]
     assert completed, "an axis at 100 was never marked complete"
     assert all("completed=false" in sql for sql in completed)
 
 
 def test_the_tick_resolves_its_session(monkeypatch):
-    from core.config import Config
-
+    """`None` resolves through `require_session`, here from RP_SESSION."""
+    monkeypatch.setenv("RP_SESSION", str(SID))
     stub = _StubDB()
     monkeypatch.setattr(victory, "Database", stub)
     out = _run(victory.run_tick())
-    assert out["session_id"] == Config.SESSION_ID
+    assert out["session_id"] == SID

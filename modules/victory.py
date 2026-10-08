@@ -2,7 +2,6 @@
 import json
 from datetime import datetime, timezone
 from core.db import Database
-from core.config import Config
 from core.log import info
 
 async def run_tick(session_id: int = None):
@@ -12,9 +11,19 @@ async def run_tick(session_id: int = None):
     carry session_id, and research_projects is a galaxy-wide catalogue. The old
     queries had no filter at all, so the score counted every campaign's territory
     and every campaign's allies.
+
+    The tracking writes commit together: a failure halfway left some axes updated and the
+    rest stale, and `completed` set on an axis whose progress write was lost.
+
+    @param session_id - campaign; `None` resolves through `require_session`.
+    @returns `{session_id, victory: {axis: pct}, score}`.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    from core.ooc import _refuse_frozen
+    from core.session import require_session
+
+    session_id = require_session(session_id)
+    _refuse_frozen(session_id)
     factions = await Database.fetch(
         "SELECT COUNT(*) AS c FROM factions WHERE session_id=$1 AND name NOT IN ('Setia Empire')",
         session_id)
@@ -36,18 +45,19 @@ async def run_tick(session_id: int = None):
     score = (mil + eco + dip + tec + cul) / 5
 
     track = {}
-    for vt, p in [("military", mil), ("economic", eco), ("diplomatic", dip), ("technological", tec), ("cultural", cul), ("score", score)]:
-        await Database.execute(
-            "UPDATE victory_tracking SET progress=$1 WHERE faction_id="
-            "(SELECT id FROM factions WHERE session_id=$3 AND name='Setia Empire') AND victory_type=$2",
-            p, vt, session_id)
-        if p >= 100:
-            await Database.execute(
-                "UPDATE victory_tracking SET completed=true, completed_at=$1 WHERE faction_id="
-                "(SELECT id FROM factions WHERE session_id=$3 AND name='Setia Empire') "
-                "AND victory_type=$2 AND completed=false",
-                datetime.now(timezone.utc).replace(tzinfo=None), vt, session_id)
-        track[vt] = round(p, 1)
+    async with Database.transaction() as conn:
+        for vt, p in [("military", mil), ("economic", eco), ("diplomatic", dip), ("technological", tec), ("cultural", cul), ("score", score)]:
+            await conn.execute(
+                "UPDATE victory_tracking SET progress=$1 WHERE faction_id="
+                "(SELECT id FROM factions WHERE session_id=$3 AND name='Setia Empire') AND victory_type=$2",
+                p, vt, session_id)
+            if p >= 100:
+                await conn.execute(
+                    "UPDATE victory_tracking SET completed=true, completed_at=$1 WHERE faction_id="
+                    "(SELECT id FROM factions WHERE session_id=$3 AND name='Setia Empire') "
+                    "AND victory_type=$2 AND completed=false",
+                    datetime.now(timezone.utc).replace(tzinfo=None), vt, session_id)
+            track[vt] = round(p, 1)
 
     # A bare print() left the caller with nothing; the tick returns the axes now.
     info("victory", "Victory: " + " ".join(f"{k}:{v:.0f}%" for k, v in track.items()))

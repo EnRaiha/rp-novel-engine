@@ -5,6 +5,7 @@ Every database call is stubbed. No secret row is planted.
 from __future__ import annotations
 
 import asyncio
+import os
 import pathlib
 import sys
 
@@ -14,6 +15,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.secrets as secrets  # noqa: E402
+
+# Scratch session: sessions 3 and 5 are frozen reference data and the writers refuse them.
+SID = 900 + os.getpid() % 100
 
 
 def _run(coro):
@@ -36,6 +40,9 @@ class _StubDB:
         if "INSERT INTO maya_rp.secrets" in sql:
             self.writes.append((sql, args))
             return 42
+        if "UPDATE maya_rp.secrets" in sql:
+            self.writes.append((sql, args))
+            return args[2]
         if "game_day" in sql:
             return self.game_day
         if "COUNT(*)" in sql:
@@ -69,7 +76,7 @@ def test_planting_a_secret_does_not_raise(monkeypatch):
     stub = _StubDB()
     monkeypatch.setattr(secrets, "Database", stub)
 
-    secret_id = _run(secrets.plant("guilt", 2071, "Rika ignored a warning", session_id=5))
+    secret_id = _run(secrets.plant("guilt", 2071, "Rika ignored a warning", session_id=SID))
 
     assert secret_id == 42
     assert stub.writes, "nothing was planted"
@@ -81,7 +88,7 @@ def test_the_plant_line_names_the_holder(monkeypatch):
     logged = []
     monkeypatch.setattr(secrets, "info", lambda *a: logged.append(a))
 
-    _run(secrets.plant("guilt", 2071, "content", session_id=5))
+    _run(secrets.plant("guilt", 2071, "content", session_id=SID))
 
     assert logged == [("secrets", "Planted: guilt for holder 2071")], logged
 
@@ -98,7 +105,7 @@ def test_the_seed_walks_its_ten_characters(monkeypatch):
     monkeypatch.setattr(stub, "fetch", fetch)
     monkeypatch.setattr(secrets, "Database", stub)
 
-    _run(secrets.seed_initial(session_id=5))
+    _run(secrets.seed_initial(session_id=SID))
 
     assert stub.writes, "the seed planted nothing"
 
@@ -113,11 +120,11 @@ def test_a_discovered_secret_names_the_holder_inside_the_session(monkeypatch):
                    names={2071: "Rika Voss"})
     monkeypatch.setattr(secrets, "Database", stub)
 
-    out = _run(secrets.check_discovery("a deep and honest conversation about the bond", 5))
+    out = _run(secrets.check_discovery("a deep and honest conversation about the bond", SID))
 
     assert out and out[0]["holder"] == "Rika Voss", out
     lookups = [(sql, args) for sql, args in stub.reads if "SELECT name FROM maya_rp.characters" in sql]
-    assert lookups and "session_id=$2" in lookups[0][0] and lookups[0][1][1] == 5
+    assert lookups and "session_id=$2" in lookups[0][0] and lookups[0][1][1] == SID
 
 
 def test_an_auto_reveal_day_reveals_the_secret(monkeypatch):
@@ -127,7 +134,7 @@ def test_an_auto_reveal_day_reveals_the_secret(monkeypatch):
                    names={2071: "Izzat"})
     monkeypatch.setattr(secrets, "Database", stub)
 
-    out = _run(secrets.check_discovery("nothing relevant here at all", 5))
+    out = _run(secrets.check_discovery("nothing relevant here at all", SID))
 
     assert out and out[0]["secret_id"] == 7, out
     revealed = [sql for sql, _ in stub.writes if "status='revealed'" in sql]
@@ -138,7 +145,7 @@ def test_the_tick_reveals_only_what_is_due(monkeypatch):
     stub = _StubDB(active=[{"id": 9, "content": "x"}])
     monkeypatch.setattr(secrets, "Database", stub)
 
-    out = _run(secrets.run_tick(session_id=5))
+    out = _run(secrets.run_tick(session_id=SID))
 
     assert out == {"auto_revealed": 1}
     (sql, args), = stub.writes
@@ -149,7 +156,7 @@ def test_the_tick_reveals_only_what_is_due(monkeypatch):
 def test_the_tick_reads_inside_its_session(monkeypatch):
     stub = _StubDB()
     monkeypatch.setattr(secrets, "Database", stub)
-    _run(secrets.run_tick(session_id=5))
+    _run(secrets.run_tick(session_id=SID))
     for sql, args in stub.reads:
         if "FROM maya_rp.secrets" in sql:
-            assert "session_id=$1" in sql and args[0] == 5, (sql, args)
+            assert "session_id=$1" in sql and args[0] == SID, (sql, args)

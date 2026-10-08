@@ -4,8 +4,8 @@ from __future__ import annotations
 import json, random
 from typing import Any
 from core.db import Database
-from core.config import Config
 from core.log import info
+from core.session import require_session
 
 VOCAB = {"trust":{"combat":["rely on ally","cover fire","trust instinct"],"romance":["vulnerability","being known","trust after betrayal"],"political":["alliance reliability","verify before trusting"],"exploration":["follow the guide","the map could be wrong"]},
          "sacrifice":{"combat":["hold the line","take the hit","protect the retreat"],"romance":["give up something loved","cost of duty"],"political":["trade territory","lose vote for integrity"],"exploration":["expedition that doesn't return","destroy something ancient"]},
@@ -16,7 +16,7 @@ VOCAB = {"trust":{"combat":["rely on ally","cover fire","trust instinct"],"roman
 KW = {"trust":["trust","loyalty","betray","ally","reliable"],"sacrifice":["sacrifice","lose","give up","cost","volunteer"],"identity":["identity","who am i","become","mask","true self"],"power":["power","control","authority","command","dominate"],"loss":["loss","death","gone","destroyed","empty"],"freedom":["freedom","escape","prison","chains","liberty"]}
 
 async def detect(session_id: int = None) -> list[dict]:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     recent = await Database.fetch("SELECT title,description,tags FROM maya_rp.events WHERE session_id=$1 AND happened_at>NOW()-INTERVAL'7 days'", session_id)
     scores = {}
     for event in recent:
@@ -54,7 +54,14 @@ async def get_instruction(session_id: int = None) -> str:
     return "\n".join(lines)
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    """Detect the active themes and store them for the campaign.
+
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    session_id = require_session(session_id)
+    _refuse_frozen(session_id)
     themes = await detect(session_id)
-    await Database.execute("INSERT INTO maya_rp.theme_state(session_id,themes_jsonb,detected_at) VALUES($1,$2,NOW()) ON CONFLICT(session_id)DO UPDATE SET themes_jsonb=$2,detected_at=NOW()", session_id,json.dumps(themes))
+    await Database.execute("INSERT INTO maya_rp.theme_state(session_id,themes_jsonb,detected_at) VALUES($1,$2::jsonb,NOW()) ON CONFLICT(session_id)DO UPDATE SET themes_jsonb=$2::jsonb,detected_at=NOW()", session_id,json.dumps(themes))
     return {"active":[t["theme"] for t in themes]}

@@ -17,19 +17,42 @@ Key API:
 from __future__ import annotations
 
 from core.db import Database
-from core.config import Config
 from core.log import info
+from core.session import require_session
 
 VOID_HOURS_PER_UNIT = 12.0          # void crossing is FAST: 12h/u vs 24h/u standard
 VOID_BASE_RISK_PCT = 20             # d100 <= 20 base void hazard per crossing
 VOID_WARD_REDUCTION = 20            # Nebular Ward grade-scaled reduction (pct points)
 
 
+def _like(text: str) -> str:
+    """Escape LIKE wildcards so a name matches itself. Pair with `ESCAPE '\\'`.
+
+    A module or fleet name carrying `_` or `%` matched other rows: "Void_Drive" also matched
+    "Void Drive" and "%" matched everything.
+    """
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 async def install_module(ship_id: int, module_name: str,
                          session_id: int | None = None) -> dict:
-    """Fit a module into a free slot on a ship. Validates tier range + slots."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    """Fit a module into a free slot on a ship. Validates tier range + slots.
+
+    The slot count, the duplicate test and the insert run in one transaction under a lock on the
+    ship row. They were separate pool statements, so two installs together both saw a free slot.
+    The duplicate test compares module ids; it was a second ILIKE on the module name.
+
+    @param ship_id - ship to fit.
+    @param module_name - substring of `modules.name`; wildcards are escaped.
+    @param session_id - campaign; `None` resolves through `require_session`.
+    @returns `{id, ship, module, category, slot}`.
+    @raises ValueError - unknown ship or module, ambiguous name, tier range, no free slot, duplicate.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    session_id = require_session(session_id)
+    _refuse_frozen(session_id)
     ship = await Database.fetchrow(
         """SELECT s.id, s.name, s.tier, s.sub_class,
                   COALESCE(sc.module_slots, 0) AS module_slots
@@ -41,17 +64,17 @@ async def install_module(ship_id: int, module_name: str,
         raise ValueError(f"No ship id={ship_id}")
     # The name is a pattern, so 'drive' matches both Void Drive and Quiet Drive
     # Nullifier and fetchrow silently took whichever row the plan returned first.
-    pattern = f"%{module_name}%"
+    pattern = f"%{_like(module_name)}%"
     matches = await Database.fetchval(
-        "SELECT count(*) FROM maya_rp.modules WHERE name ILIKE $1", pattern) or 0
+        "SELECT count(*) FROM maya_rp.modules WHERE name ILIKE $1 ESCAPE '\\'", pattern) or 0
     if matches > 1:
         names = await Database.fetch(
-            "SELECT name FROM maya_rp.modules WHERE name ILIKE $1 ORDER BY id", pattern)
+            "SELECT name FROM maya_rp.modules WHERE name ILIKE $1 ESCAPE '\\' ORDER BY id", pattern)
         raise ValueError(
             f"{module_name!r} matches {matches} modules: "
             + ", ".join(r["name"] for r in names))
     mod = await Database.fetchrow(
-        """SELECT * FROM maya_rp.modules WHERE name ILIKE $1""", pattern)
+        """SELECT * FROM maya_rp.modules WHERE name ILIKE $1 ESCAPE '\\'""", pattern)
     if not mod:
         raise ValueError(f"No module named {module_name!r}")
     tier = ship["tier"] or 0
@@ -59,23 +82,26 @@ async def install_module(ship_id: int, module_name: str,
         raise ValueError(
             f"Module {mod['name']} needs tier {mod['tier_min']}–{mod['tier_max']}, "
             f"ship {ship['name']} is tier {tier}")
-    used = await Database.fetchval(
-        "SELECT count(*) FROM maya_rp.ship_modules WHERE ship_id=$1", ship_id)
-    if used >= (ship["module_slots"] or 0):
-        raise ValueError(
-            f"Ship {ship['name']} has no free module slots "
-            f"({used}/{ship['module_slots'] or 0} used)")
-    dup = await Database.fetchrow(
-        """SELECT sm.id FROM maya_rp.ship_modules sm
-           JOIN maya_rp.modules m ON m.id = sm.module_id
-           WHERE sm.ship_id=$1 AND m.name ILIKE $2""",
-        ship_id, f"%{mod['name']}%")
-    if dup:
-        raise ValueError(f"{mod['name']} is already fitted on {ship['name']}")
-    mid = await Database.fetchval(
-        """INSERT INTO maya_rp.ship_modules (ship_id, module_id, slot_index)
-           VALUES ($1, $2, $3) RETURNING id""",
-        ship_id, mod["id"], used + 1)
+    async with Database.transaction() as conn:
+        locked = await conn.fetchrow(
+            "SELECT id FROM maya_rp.ships WHERE id=$1 AND session_id=$2 FOR UPDATE", ship_id, session_id)
+        if not locked:
+            raise ValueError(f"No ship id={ship_id}")
+        used = await conn.fetchval(
+            "SELECT count(*) FROM maya_rp.ship_modules WHERE ship_id=$1", ship_id)
+        if used >= (ship["module_slots"] or 0):
+            raise ValueError(
+                f"Ship {ship['name']} has no free module slots "
+                f"({used}/{ship['module_slots'] or 0} used)")
+        dup = await conn.fetchrow(
+            "SELECT id FROM maya_rp.ship_modules WHERE ship_id=$1 AND module_id=$2",
+            ship_id, mod["id"])
+        if dup:
+            raise ValueError(f"{mod['name']} is already fitted on {ship['name']}")
+        mid = await conn.fetchval(
+            """INSERT INTO maya_rp.ship_modules (ship_id, module_id, slot_index)
+               VALUES ($1, $2, $3) RETURNING id""",
+            ship_id, mod["id"], used + 1)
     info("ship_modules", f"Installed {mod['name']} on {ship['name']} "
                          f"(slot {used + 1}/{ship['module_slots'] or 0})")
     return {"id": mid, "ship": ship["name"], "module": mod["name"],
@@ -88,8 +114,7 @@ async def list_modules(ship_id: int, session_id: int | None = None) -> list[dict
     `maya_rp.ship_modules` carries no session_id, so the scope comes through
     ships: a ship id from another campaign lists nothing.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     return await Database.fetch(
         """SELECT m.name, m.category, m.effect_type, m.effect_value, m.grade,
                   m.special_rules, sm.slot_index
@@ -110,8 +135,7 @@ async def fleet_void_capable(fleet_name: str | None,
     """
     if not fleet_name:
         return {"capable": False, "ships": 0, "drive_ships": 0, "drive_names": []}
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     rows = await Database.fetch(
         """SELECT s.id, s.name, s.sub_class, s.tier,
                   (EXISTS (SELECT 1 FROM maya_rp.ship_modules sm
@@ -120,9 +144,9 @@ async def fleet_void_capable(fleet_name: str | None,
            FROM maya_rp.fleets f
            JOIN maya_rp.fleet_members fm ON fm.fleet_id = f.id
            JOIN maya_rp.ships s ON s.id = fm.ship_id
-           WHERE f.session_id=$1 AND f.name ILIKE $2
+           WHERE f.session_id=$1 AND f.name ILIKE $2 ESCAPE '\\'
            ORDER BY s.id""",
-        session_id, f"%{fleet_name}%")
+        session_id, f"%{_like(fleet_name)}%")
     drive_ships = [r for r in rows if r["has_drive"]]
     return {"capable": bool(drive_ships), "ships": len(rows),
             "drive_ships": len(drive_ships),
@@ -138,8 +162,7 @@ async def void_crossing_cost(z1, z2, fleet_name: str | None,
     drive ship (each grade adds reduction). Returns the plan; the caller
     rolls the actual crossing in advance().
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     cap = await fleet_void_capable(fleet_name, session_id)
     if not cap["capable"]:
         raise ValueError(
@@ -153,8 +176,8 @@ async def void_crossing_cost(z1, z2, fleet_name: str | None,
            JOIN maya_rp.ships s ON s.id=sm.ship_id
            JOIN maya_rp.fleet_members fm ON fm.ship_id=s.id
            JOIN maya_rp.fleets f ON f.id=fm.fleet_id
-           WHERE f.session_id=$1 AND f.name ILIKE $2 AND m.effect_type='void_resist'""",
-        session_id, f"%{fleet_name}%")
+           WHERE f.session_id=$1 AND f.name ILIKE $2 ESCAPE '\\' AND m.effect_type='void_resist'""",
+        session_id, f"%{_like(fleet_name)}%")
     ward = sum(int(r["effect_value"] or 0) for r in ward_rows)
     risk = max(5, VOID_BASE_RISK_PCT - ward)
     return {"capable": True, "z1": z1, "z2": z2,

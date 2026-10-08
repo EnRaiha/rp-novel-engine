@@ -4,8 +4,22 @@ from __future__ import annotations
 import random
 from typing import Any
 from core.db import Database
-from core.config import Config
 from core.log import info, error
+from core.session import require_session
+
+def _writable_session(session_id: int | None) -> int:
+    """Resolve the session for one call and refuse a frozen campaign.
+
+    @param session_id - caller's session; `None` resolves through `core.session.require_session`.
+    @returns the resolved session id.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    sid = require_session(session_id)
+    _refuse_frozen(sid)
+    return sid
+
 
 async def _game_day(session_id: int) -> int:
     """The session's day, or 1. The COALESCE is inside the SQL, so a session that
@@ -15,8 +29,14 @@ async def _game_day(session_id: int) -> int:
 
 
 async def propagate(event_type: str, details: dict, session_id: int = None) -> list[dict]:
-    """Queue the reactions one event provokes. Unknown event types provoke none."""
-    if session_id is None: session_id = Config.SESSION_ID
+    """Queue the reactions one event provokes. Unknown event types provoke none.
+
+    The reaction rows commit together: a failing insert halfway left the first reactions queued
+    and the rest lost.
+
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
     gd = await _game_day(session_id)
     reactions = []
     if event_type=="territory_conquered":
@@ -36,12 +56,14 @@ async def propagate(event_type: str, details: dict, session_id: int = None) -> l
     elif event_type=="major_treaty":
         fac = details.get("ally_faction","?")
         reactions.append({"rt":"diplomatic","desc":f"Treaty with {fac} sends ripples. Other factions reassess.","sf":"all","delay":random.randint(2,5)})
-    for r in reactions:
-        await Database.execute("INSERT INTO maya_rp.world_reactions(session_id,event_type,reaction_type,description,source_faction,surfaces_at_game_day,surfaced) VALUES($1,$2,$3,$4,$5,$6,false)", session_id,event_type,r["rt"],r["desc"],r["sf"],gd+r["delay"])
+    if reactions:
+        async with Database.transaction() as conn:
+            for r in reactions:
+                await conn.execute("INSERT INTO maya_rp.world_reactions(session_id,event_type,reaction_type,description,source_faction,surfaces_at_game_day,surfaced) VALUES($1,$2,$3,$4,$5,$6,false)", session_id,event_type,r["rt"],r["desc"],r["sf"],gd+r["delay"])
     return reactions
 
 async def get_due(session_id: int = None) -> list[dict]:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     gd = await _game_day(session_id)
     rows = await Database.fetch("SELECT id,reaction_type,description,source_faction FROM maya_rp.world_reactions WHERE session_id=$1 AND surfaced=false AND surfaces_at_game_day<=$2 ORDER BY surfaces_at_game_day ASC LIMIT 3", session_id,gd)
     return [dict(r) for r in rows]
@@ -51,8 +73,10 @@ async def surface(reaction_id: int, session_id: int = None) -> bool:
 
     It returned None either way, so a caller could not tell a surfaced reaction
     from a miss.
+
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
     tag = await Database.execute(
         "UPDATE maya_rp.world_reactions SET surfaced=true WHERE id=$1 AND session_id=$2",
         reaction_id, session_id)
@@ -70,7 +94,9 @@ async def run_tick(session_id: int = None) -> dict:
     would leave the briefing with nothing to show. That the briefing never calls
     `surface` either is reported to the lead: with no caller, the same three
     reactions are due in every briefing.
+
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
     due = await get_due(session_id)
     return {"due_reactions":len(due)}

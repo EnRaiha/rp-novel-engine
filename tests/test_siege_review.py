@@ -1,11 +1,13 @@
 """Siege review: what reading `modules/siege.py` in full turned up.
 
-Two defects, one of them a cross-campaign write on a victory. Nothing here writes to session 3, and
-every row this file creates in session 5 is removed by the id it was given.
+Two defects, one of them a cross-campaign write on a victory. Sessions 3 and 5 are frozen reference
+data and are never written: the rows live in two scratch sessions (900 + pid % 100, and 50 above it),
+and every row this file creates is removed in the test's `finally`.
 """
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 
@@ -17,11 +19,19 @@ import pytest  # noqa: E402
 from core.db import Database  # noqa: E402
 from modules import siege  # noqa: E402
 
-SESSION = 5
+SESSION = 900 + os.getpid() % 100
+OTHER = 900 + (os.getpid() + 50) % 100
 SYSTEM = "review siege system"
 
 
+async def _ensure_session(session_id):
+    await Database.execute(
+        "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'Siege review scratch','active')"
+        " ON CONFLICT (id) DO NOTHING", session_id)
+
+
 async def _territory(session_id=SESSION, name=SYSTEM, faction="Iron Concord"):
+    await _ensure_session(session_id)
     return await Database.fetchval(
         "INSERT INTO maya_rp.territory (id, session_id, system_name, controlling_faction, status) "
         "VALUES ((SELECT COALESCE(MAX(id), 0) + 500000 FROM maya_rp.territory), $1, $2, $3, 'contested') "
@@ -31,6 +41,7 @@ async def _territory(session_id=SESSION, name=SYSTEM, faction="Iron Concord"):
 
 async def _siege(session_id=SESSION, system=SYSTEM, attacker=10 ** 9, defender=1000, damage=1900):
     """Damage is set just short of the capture threshold: victory needs 2x defender_power."""
+    await _ensure_session(session_id)
     return await Database.fetchval(
         "INSERT INTO maya_rp.sieges "
         "(session_id, target_system, target_faction, attacker_power, defender_power, phase, "
@@ -46,6 +57,11 @@ async def _drop(siege_id, territory_ids):
     await Database.execute(
         "DELETE FROM maya_rp.events WHERE session_id = $1 AND event_type = 'siege' "
         "AND description LIKE '%review siege system%'", SESSION)
+    for scratch in (SESSION, OTHER):
+        await Database.execute("DELETE FROM maya_rp.events WHERE session_id = $1", scratch)
+        await Database.execute("DELETE FROM maya_rp.sieges WHERE session_id = $1", scratch)
+        await Database.execute("DELETE FROM maya_rp.territory WHERE session_id = $1", scratch)
+        await Database.execute("DELETE FROM maya_rp.sessions WHERE id = $1", scratch)
 
 
 class TestTheSiegeBelongsToItsCampaign:
@@ -54,7 +70,7 @@ class TestTheSiegeBelongsToItsCampaign:
         await Database.init()
         sid = await _siege()
         try:
-            out = await siege.advance_siege(sid, 7)
+            out = await siege.advance_siege(sid, OTHER)
             assert "not found" in out.get("error", ""), out
             phase = await Database.fetchval("SELECT phase FROM maya_rp.sieges WHERE id = $1", sid)
             assert phase == 1, "another campaign's tick advanced this siege"
@@ -68,7 +84,7 @@ class TestTheVictory:
         """The capture was written by system name alone, across every campaign."""
         await Database.init()
         mine = await _territory()
-        theirs = await _territory(session_id=3, name=SYSTEM)
+        theirs = await _territory(session_id=OTHER, name=SYSTEM)
         sid = await _siege()
         try:
             out = await siege.advance_siege(sid, SESSION)
@@ -102,7 +118,7 @@ class TestTheTick:
     async def test_the_tick_advances_only_this_campaign(self):
         await Database.init()
         mine = await _territory()
-        theirs = await _territory(session_id=3, name=SYSTEM)
+        theirs = await _territory(session_id=OTHER, name=SYSTEM)
         sid = await _siege(attacker=1, defender=10 ** 9, damage=0)
         try:
             out = await siege.run_tick(SESSION)
@@ -140,7 +156,7 @@ class TestTheReads:
         sid = await _siege()
         try:
             assert [s["id"] for s in await siege.list_sieges(SESSION)] == [sid]
-            assert await siege.list_sieges(7) == []
+            assert await siege.list_sieges(OTHER) == []
         finally:
             await _drop(sid, [])
             await Database.close()

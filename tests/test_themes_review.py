@@ -19,10 +19,14 @@ No database: every test drives a fake Database.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
 import modules.themes as themes
+
+# Scratch session: sessions 3 and 5 are frozen reference data and the writers refuse them.
+SID = 900 + os.getpid() % 100
 
 
 class FakeDB:
@@ -159,11 +163,11 @@ async def test_run_tick_persists_the_detected_themes(monkeypatch):
     rows = [_event("trust trust trust loyalty", tags=[])]
     fake = _install(monkeypatch, FakeDB(fetch=rows))
 
-    out = await themes.run_tick(5)
+    out = await themes.run_tick(SID)
 
     assert out == {"active": ["trust"]}
     written = fake.args_for("INSERT INTO maya_rp.theme_state", "execute")[0]
-    assert written[0] == 5
+    assert written[0] == SID
     assert json.loads(written[1]) == [{"theme": "trust", "score": 2}]
 
 

@@ -2,8 +2,8 @@
 """Guardrails — Ported from Rust guardrail.rs. Content safety checks, moral boundaries."""
 from __future__ import annotations
 import re
+import unicodedata
 from core.db import Database
-from core.config import Config
 from core.session import require_session
 from core.log import info
 
@@ -16,15 +16,40 @@ BLOCKED_WORDS = ("mind_control", "permanent_harm", "irreversible_damage",
 _ACTION_GAP_RE = re.compile(r"[\s\-]+")
 
 
-def _normalize_action(action) -> str:
-    """Lowercase and close the gaps: spaces and hyphens become underscores.
+def _fold(text) -> str:
+    """NFKC-fold, drop invisible format characters, lowercase.
 
-    `check_generation` is NOT normalized. Its list is written in natural
-    spelling already ("underage", "non-consensual", "child abuse"), and closing
-    the gaps there would block innocent prose like "a minor in engineering"
-    with no retry on the caller's side.
+    Fullwidth letters ("ｕｎｄｅｒａｇｅ") and zero-width characters ("under\u200bage") walked past a
+    literal compare. NFKC maps the first to ASCII; category Cf holds the second.
+
+    @param text - any value; `None` reads as "".
+    @returns the folded string.
     """
-    return _ACTION_GAP_RE.sub("_", str(action if action is not None else "").lower())
+    raw = str(text if text is not None else "")
+    folded = unicodedata.normalize("NFKC", raw)
+    return "".join(c for c in folded if unicodedata.category(c) != "Cf").lower()
+
+
+def _normalize_action(action) -> str:
+    """Fold, then close the gaps: spaces and hyphens become underscores.
+
+    `check_generation` uses `_normalize_text` instead: closing the gaps with underscores there
+    would turn prose into snake_case keys.
+    """
+    return _ACTION_GAP_RE.sub("_", _fold(action))
+
+
+_TEXT_GAP_RE = re.compile(r"[\s\-_]+")
+
+
+def _normalize_text(text) -> str:
+    """Fold, then collapse runs of whitespace, hyphens and underscores to one space.
+
+    @param text - generated prose; `None` reads as "".
+    @returns text where "non-consensual", "non_consensual" and "non   consensual" are all
+        "non consensual".
+    """
+    return _TEXT_GAP_RE.sub(" ", _fold(text)).strip()
 
 
 async def check_action(action: str, context: dict | None = None) -> dict:
@@ -39,17 +64,45 @@ async def check_action(action: str, context: dict | None = None) -> dict:
             return {"allowed": False, "reason": f"Blocked by guardrail: {w}"}
     return {"allowed": True, "reason": "Passes all guardrails"}
 
+# Labels keep the original spelling: the reason string names the rule that matched.
 GEN_BLOCKED = ["underage", "minor_in_", "non-consensual", "child abuse"]
+
+# Patterns run on `_normalize_text` output, where every gap is one space. Each one is a superset
+# of the literal term it replaces: "non-consensual" alone missed "non consensual", "nonconsensual"
+# and "non_consensual", and "underage" missed "under-age" and "under age".
+_GEN_PATTERNS = (
+    ("underage", re.compile(r"underage|\bunder age\b")),
+    ("non-consensual", re.compile(r"non ?consensual")),
+    ("child abuse", re.compile(r"child ?abuse|\babus(?:e|ed|es|ing) (?:of )?(?:a |the |that |this )?child(?:ren)?\b")),
+)
+
+# "minor_in_" is a snake_case key. It only matches before the gaps are collapsed, and collapsing
+# turns it into "minor in", which is ordinary prose ("a minor in engineering"). It is checked on
+# the folded text with its underscores intact, so the block stays and the false positive does not appear.
+_GEN_RAW = (("minor_in_", "minor_in_"),)
+
 
 def check_generation(text: str) -> dict:
     """Gate local-model prose before it reaches the GM (qwen-abliterated
-    has no built-in guardrails). Returns {allowed, reason}."""
-    low = (text or "").lower()
-    for w in GEN_BLOCKED:
-        if w in low:
-            return {"allowed": False, "reason": f"Blocked by generation guardrail: {w}"}
+    has no built-in guardrails).
+
+    @param text - generated prose; `None` passes.
+    @returns `{allowed, reason}`; the reason names the rule that matched.
+    """
+    folded = _fold(text)
+    for label, literal in _GEN_RAW:
+        if literal in folded:
+            return {"allowed": False, "reason": f"Blocked by generation guardrail: {label}"}
+    low = _normalize_text(text)
+    for label, pattern in _GEN_PATTERNS:
+        if pattern.search(low):
+            return {"allowed": False, "reason": f"Blocked by generation guardrail: {label}"}
     return {"allowed": True, "reason": "Passes generation guardrails"}
 
 async def run_tick(session_id: int = None) -> dict:
+    """@raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed."""
+    from core.ooc import _refuse_frozen
+
     session_id = require_session(session_id)
+    _refuse_frozen(session_id)
     return {"status": "guardrails_ready"}

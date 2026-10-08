@@ -26,9 +26,37 @@ No database: every test drives a fake Database.
 """
 from __future__ import annotations
 
+import contextlib
+import os
+
 import pytest
 
 import modules.research as research
+
+# Scratch session: sessions 3 and 5 are frozen reference data and `run_tick` refuses them.
+SID = 900 + os.getpid() % 100
+
+
+class _Conn:
+    """The transaction connection. It forwards to the module's patched Database calls, so each
+    statement lands in the same record as a pool statement and tests keep one place to look."""
+
+    async def fetchrow(self, sql, *args):
+        return await research.Database.fetchrow(sql, *args)
+
+    async def fetch(self, sql, *args):
+        return await research.Database.fetch(sql, *args)
+
+    async def fetchval(self, sql, *args):
+        return await research.Database.fetchval(sql, *args)
+
+    async def execute(self, sql, *args):
+        return await research.Database.execute(sql, *args)
+
+
+@contextlib.asynccontextmanager
+async def _transaction():
+    yield _Conn()
 
 
 class FakeDB:
@@ -68,6 +96,7 @@ class FakeDB:
 def _install(monkeypatch, fake):
     for name in ("fetchrow", "fetch", "fetchval", "execute"):
         monkeypatch.setattr("modules.research.Database." + name, getattr(fake, name))
+    monkeypatch.setattr("modules.research.Database.transaction", _transaction)
     return fake
 
 
@@ -84,7 +113,7 @@ def _project(**over):
 async def test_the_tick_defaults_to_the_engine_session(monkeypatch):
     seen = []
     _install(monkeypatch, FakeDB())
-    monkeypatch.setattr("modules.research.Config.SESSION_ID", 77)
+    monkeypatch.setenv("RP_SESSION", "77")
 
     async def fetchrow(sql, *args):
         seen.append(args)
@@ -110,7 +139,7 @@ async def test_a_null_progress_starts_from_zero(monkeypatch):
 
     monkeypatch.setattr("modules.research.Database.fetchrow", fetchrow)
 
-    await research.run_tick(5)
+    await research.run_tick(SID)
 
     written = fake.args_for("SET progress_pct=$1", "execute")[0]
     assert written[0] == pytest.approx(10.0)      # 1 day of 10 → +10%
@@ -128,7 +157,7 @@ async def test_a_project_with_no_duration_is_named_not_divided(monkeypatch):
 
     monkeypatch.setattr("modules.research.Database.fetchrow", fetchrow)
 
-    await research.run_tick(5)      # must not raise ZeroDivisionError
+    await research.run_tick(SID)      # must not raise ZeroDivisionError
 
 
 # ── 3. The queue writes are scoped ──────────────────────────────────────
@@ -149,10 +178,10 @@ async def test_the_queue_writes_carry_the_session(monkeypatch):
     monkeypatch.setattr("modules.research.Database.fetchrow", fetchrow)
     monkeypatch.setattr("modules.research.calc_game_days", lambda when: 1.0)
 
-    await research.run_tick(5)
+    await research.run_tick(SID)
 
     started = fake.args_for("SET status='active'", "execute")
-    assert started and started[0] == (6, 5)
+    assert started and started[0] == (6, SID)
     assert all("session_id=$2" in s for s in fake.sql("execute") if "research_queue" in s)
 
 
@@ -172,12 +201,12 @@ async def test_a_completion_moves_the_queue_on_with_the_session(monkeypatch):
     monkeypatch.setattr("modules.research.Database.fetchrow", fetchrow)
     monkeypatch.setattr("modules.research.calc_game_days", lambda when: 1.0)
 
-    await research.run_tick(5)
+    await research.run_tick(SID)
 
     complete = fake.args_for("SET status='complete'", "execute")[0]
-    assert complete == (5, 5)
+    assert complete == (5, SID)
     nxt = fake.args_for("SET status='active' WHERE id=$1 AND session_id=$2", "execute")[0]
-    assert nxt == (12, 5)
+    assert nxt == (12, SID)
 
 
 # ── Contract around the costs ───────────────────────────────────────────
@@ -200,17 +229,21 @@ async def test_a_shortfall_charges_nothing(monkeypatch):
     monkeypatch.setattr("modules.research.Database.fetchrow", fetchrow)
     monkeypatch.setattr("modules.research.calc_game_days", lambda when: 1.0)
 
-    await research.run_tick(5)
+    await research.run_tick(SID)
 
     assert not fake.args_for("SET status='active'", "execute"), "a project started without paying"
-    assert not fake.args_for("ri.quantity-$1", "execute")
+    assert not fake.args_for("ri.quantity-$1")
 
 
 async def test_a_covered_cost_is_taken_from_the_pool(monkeypatch):
     pending = _project(resource_costs={"Titanium": 5})
     fake = _install(monkeypatch, FakeDB())
+    debits = []
 
     async def fetchrow(sql, *args):
+        if "ri.quantity-$1" in sql:
+            debits.append(args)
+            return {"resource_id": 1}
         if "last_tick_at" in sql:
             return {"last_tick_at": "x"}
         if "rq.status='active'" in sql:
@@ -224,6 +257,6 @@ async def test_a_covered_cost_is_taken_from_the_pool(monkeypatch):
     monkeypatch.setattr("modules.research.Database.fetchrow", fetchrow)
     monkeypatch.setattr("modules.research.calc_game_days", lambda when: 1.0)
 
-    await research.run_tick(5)
+    await research.run_tick(SID)
 
-    assert fake.args_for("ri.quantity-$1", "execute")[0] == (5, "Titanium")
+    assert debits == [(5, "Titanium")], "the guarded debit did not run on the pool's cost"

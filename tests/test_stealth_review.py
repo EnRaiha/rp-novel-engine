@@ -6,6 +6,8 @@ lane gains intel.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
 import pathlib
 import sys
 
@@ -15,6 +17,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.stealth as stealth  # noqa: E402
+
+# Scratch session: sessions 3 and 5 are frozen reference data and the writers refuse them.
+SID = 900 + os.getpid() % 100
 
 
 def _run(coro):
@@ -38,6 +43,11 @@ class _StubDB:
         self.writes = []
         self.lane_calls = []
 
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        """The stub is its own connection: statements inside a transaction land in the same record."""
+        yield self
+
     async def fetchval(self, sql, *args):
         self.reads.append((sql, args))
         if "count(*) FROM maya_rp.stealth_unit_types" in sql:
@@ -45,6 +55,9 @@ class _StubDB:
         return 0
 
     async def fetchrow(self, sql, *args):
+        if sql.lstrip().startswith("UPDATE maya_rp.resources"):
+            self.writes.append((sql, args))
+            return {"alloys": 1}
         self.reads.append((sql, args))
         if "UPDATE maya_rp.space_lanes" in sql:
             self.lane_calls.append(args)
@@ -76,7 +89,7 @@ def test_an_ambiguous_unit_type_is_refused(monkeypatch):
     stub = _StubDB(match_count=2, kinds=["Shadow Probe", "Pool Observation Probe"])
     monkeypatch.setattr(stealth, "Database", stub)
 
-    out = _run(stealth.build_spy("probe", "Review Spy", session_id=5))
+    out = _run(stealth.build_spy("probe", "Review Spy", session_id=SID))
 
     assert "matches 2 unit types" in out["error"], out
     assert "Pool Observation Probe" in out["error"]
@@ -87,19 +100,19 @@ def test_a_pinned_unit_type_builds_and_reports_the_cost(monkeypatch):
     stub = _StubDB(resources={"alloys": 10**6})
     monkeypatch.setattr(stealth, "Database", stub)
 
-    out = _run(stealth.build_spy("Shadow Probe", "Review Spy", session_id=5))
+    out = _run(stealth.build_spy("Shadow Probe", "Review Spy", session_id=SID))
 
     assert out == {"name": "Review Spy", "type": "Shadow Probe", "cloak": 3, "lanes": 2}
     spent = [args for sql, args in stub.writes if "alloys=alloys-$1" in sql]
-    assert spent == [(5000, 5)]
+    assert spent == [(5000, SID)]
     built = [args for sql, args in stub.writes if "INSERT INTO maya_rp.stealth_units" in sql]
-    assert built == [(5, 4, "Review Spy")]
+    assert built == [(SID, 4, "Review Spy")]
 
 
 def test_a_spy_nobody_can_afford_is_refused(monkeypatch):
     stub = _StubDB(resources=None)
     monkeypatch.setattr(stealth, "Database", stub)
-    out = _run(stealth.build_spy("Shadow Probe", "Review Spy", session_id=5))
+    out = _run(stealth.build_spy("Shadow Probe", "Review Spy", session_id=SID))
     assert "Need" in out["error"], out
     assert stub.writes == []
 
@@ -107,7 +120,7 @@ def test_a_spy_nobody_can_afford_is_refused(monkeypatch):
 def test_an_unknown_unit_type_is_refused(monkeypatch):
     stub = _StubDB(match_count=0, unit=None)
     monkeypatch.setattr(stealth, "Database", stub)
-    out = _run(stealth.build_spy("Dragon", "Review Spy", session_id=5))
+    out = _run(stealth.build_spy("Dragon", "Review Spy", session_id=SID))
     assert "Unknown unit type" in out["error"], out
 
 
@@ -123,12 +136,12 @@ def test_intel_that_lands_on_no_lane_is_reported(monkeypatch):
     logged = []
     monkeypatch.setattr(stealth, "info", lambda *a: logged.append(a[-1]))
 
-    out = _run(stealth.hack("Review Spy", "siphon", "Nowhere Lane", session_id=5))
+    out = _run(stealth.hack("Review Spy", "siphon", "Nowhere Lane", session_id=SID))
 
     assert out["outcome"] == "success" and out["intel_gained"] == 40, out
     assert out["lanes_touched"] == 0, out
-    assert any("no lane in session 5" in line for line in logged), logged
-    assert stub.lane_calls == [(40, 5, "Nowhere Lane")]
+    assert any(f"no lane in session {SID}" in line for line in logged), logged
+    assert stub.lane_calls == [(40, SID, "Nowhere Lane")]
 
 
 def test_intel_that_lands_reports_the_lane(monkeypatch):
@@ -138,7 +151,7 @@ def test_intel_that_lands_reports_the_lane(monkeypatch):
         return 40 if (a, b) == (20, 80) else 1 if (a, b) == (1, 100) else 0
     monkeypatch.setattr(stealth.random, "randint", rigged)
 
-    out = _run(stealth.hack("Review Spy", "siphon", "TKG Gate", session_id=5))
+    out = _run(stealth.hack("Review Spy", "siphon", "TKG Gate", session_id=SID))
 
     assert out["lanes_touched"] == 1, out
 
@@ -151,7 +164,7 @@ def test_a_failed_hack_banks_nothing(monkeypatch):
     monkeypatch.setattr(stealth, "Database", stub)
     monkeypatch.setattr(stealth.random, "randint", rigged)
 
-    out = _run(stealth.hack("Review Spy", "siphon", "TKG Gate", session_id=5))
+    out = _run(stealth.hack("Review Spy", "siphon", "TKG Gate", session_id=SID))
 
     assert out["outcome"] == "failure", out
     assert out["intel_gained"] == 0
@@ -161,8 +174,8 @@ def test_a_failed_hack_banks_nothing(monkeypatch):
 def test_a_spy_from_another_campaign_is_refused(monkeypatch):
     stub = _StubDB(spy=None)
     monkeypatch.setattr(stealth, "Database", stub)
-    assert "not found" in _run(stealth.hack("Review Spy", "siphon", "x", session_id=5))["error"]
-    assert "not found" in _run(stealth.deploy_spy("Review Spy", "lane-1", session_id=5))["error"]
+    assert "not found" in _run(stealth.hack("Review Spy", "siphon", "x", session_id=SID))["error"]
+    assert "not found" in _run(stealth.deploy_spy("Review Spy", "lane-1", session_id=SID))["error"]
     assert stub.writes == []
 
 
@@ -170,8 +183,8 @@ def test_the_anticloak_grid_clamps_its_level_and_charges_it(monkeypatch):
     stub = _StubDB(resources={"alloys": 10**6})
     monkeypatch.setattr(stealth, "Database", stub)
 
-    out = _run(stealth.build_anticloak("TKG", level=9, session_id=5))
+    out = _run(stealth.build_anticloak("TKG", level=9, session_id=SID))
 
     assert out["level"] == 5 and out["cost"] == 500000 and out["detection"] == 95
     spent = [args for sql, args in stub.writes if "alloys=alloys-$1" in sql]
-    assert spent == [(500000, 5)]
+    assert spent == [(500000, SID)]

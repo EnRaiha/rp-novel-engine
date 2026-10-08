@@ -4,7 +4,6 @@ from __future__ import annotations
 import random, math
 from typing import Any
 from core.db import Database
-from core.config import Config
 from core.log import info, error
 
 DAMAGE_TYPES = {
@@ -117,7 +116,19 @@ MILITARY_OPS = {
 }
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    """Report the campaign's fleet power.
+
+    A read failure is logged at error level and returned as `{"error"}`. The session and the freeze
+    check resolve before the `try`, so a frozen campaign raises instead of being reported as a tick error.
+
+    @param session_id - campaign; `None` resolves through `require_session`.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+    from core.session import require_session
+
+    session_id = require_session(session_id)
+    _refuse_frozen(session_id)
     try:
         fp = await calculate_fleet_power(session_id)
         info("tactics", f"Tick: fleet_power={fp['fleet_power']}, ships={fp['ship_count']}")

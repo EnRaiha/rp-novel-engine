@@ -5,6 +5,8 @@ Every database call is stubbed. Nothing here fits a module on a real ship.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
 import pathlib
 import sys
 
@@ -14,6 +16,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.ship_modules as sm  # noqa: E402
+
+# Scratch session: sessions 3 and 5 are frozen reference data and install_module refuses them.
+SID = 900 + os.getpid() % 100
 
 
 def _run(coro):
@@ -31,13 +36,20 @@ class _StubDB:
         self.reads = []
         self.writes = []
 
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        """The stub is its own connection: statements inside a transaction land in the same record."""
+        yield self
+
     async def fetchrow(self, sql, *args):
         self.reads.append((sql, args))
+        if "FROM maya_rp.ships" in sql and "FOR UPDATE" in sql:
+            return {"id": args[0]} if self.ship else None
         if "FROM maya_rp.ships" in sql:
             return self.ship
         if "FROM maya_rp.modules" in sql and "SELECT *" in sql:
             return self.module
-        if "ship_modules sm" in sql:
+        if "FROM maya_rp.ship_modules" in sql:
             return self.dup
         return None
 
@@ -74,7 +86,7 @@ def test_a_module_name_that_matches_several_is_refused(monkeypatch):
     monkeypatch.setattr(sm, "Database", stub)
 
     with pytest.raises(ValueError) as excinfo:
-        _run(sm.install_module(4, "drive", session_id=3))
+        _run(sm.install_module(4, "drive", session_id=SID))
 
     assert "matches 2 modules" in str(excinfo.value)
     assert "Void Drive" in str(excinfo.value) and "Quiet Drive Nullifier" in str(excinfo.value)
@@ -85,7 +97,7 @@ def test_one_match_installs_and_reports_the_slot(monkeypatch):
     stub = _StubDB(ship=SHIP, module=DRIVE, match_count=1, used=1)
     monkeypatch.setattr(sm, "Database", stub)
 
-    out = _run(sm.install_module(4, "Void Drive", session_id=3))
+    out = _run(sm.install_module(4, "Void Drive", session_id=SID))
 
     assert out == {"id": 77, "ship": "Maw-1", "module": "Void Drive",
                    "category": "void", "slot": 2}
@@ -97,14 +109,14 @@ def test_no_match_still_refuses_by_name(monkeypatch):
     stub = _StubDB(ship=SHIP, module=None, match_count=0)
     monkeypatch.setattr(sm, "Database", stub)
     with pytest.raises(ValueError, match="No module named"):
-        _run(sm.install_module(4, "Unobtainium", session_id=3))
+        _run(sm.install_module(4, "Unobtainium", session_id=SID))
 
 
 def test_a_ship_from_another_campaign_is_refused(monkeypatch):
     stub = _StubDB(ship=None, module=DRIVE)
     monkeypatch.setattr(sm, "Database", stub)
     with pytest.raises(ValueError, match="No ship id=4"):
-        _run(sm.install_module(4, "Void Drive", session_id=5))
+        _run(sm.install_module(4, "Void Drive", session_id=SID))
     assert stub.writes == []
 
 
@@ -121,13 +133,13 @@ def test_listing_fitted_modules_names_the_session(monkeypatch):
 
 
 def test_listing_defaults_to_the_resolved_session(monkeypatch):
-    from core.config import Config
-
+    """`None` resolves through `require_session`, here from RP_SESSION."""
+    monkeypatch.setenv("RP_SESSION", str(SID))
     stub = _StubDB()
     monkeypatch.setattr(sm, "Database", stub)
     _run(sm.list_modules(4))
     (_, args), = stub.reads
-    assert args == (4, Config.SESSION_ID)
+    assert args == (4, SID)
 
 
 # ── The void crossing keeps its declared arithmetic ─────────────────────

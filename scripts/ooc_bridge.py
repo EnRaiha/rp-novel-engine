@@ -66,7 +66,7 @@ from core.session import resolve_session
 CALLS = ("state", "turn", "canon", "portrait", "context", "persona", "inspect", "direct", "slaves")
 
 
-async def _adopt_state_file(request: dict) -> None:
+async def _adopt_state_file(request: dict, sid: int) -> None:
     """Mirror state to the file the caller's plugin reads (D7 phase 1).
 
     The plugin knows its own state path; the engine defaults to the TKG store, so
@@ -76,7 +76,7 @@ async def _adopt_state_file(request: dict) -> None:
     path = request.get("state_file")
     if isinstance(path, str) and path.strip():
         os.environ["OOC_STATE_FILE"] = path.strip()
-    await _write_context_mirror(_session(request), request)
+    await _write_context_mirror(sid, request)
 
 
 def _context_files(request: dict) -> tuple[str, str] | None:
@@ -178,8 +178,13 @@ async def handle(request: dict) -> dict:
     if call not in CALLS:
         return {"ok": False, "error": f"unknown call {call!r}; expected one of {', '.join(CALLS)}"}
     sid = _session(request)
+    # Maintenance mode resolves no session when nothing names one. Every call here is
+    # session-scoped; continuing with None fell through to the stale process default
+    # (`add_directive`), an unscoped query (`slaves`) or a TypeError (`portraits.queue`).
+    if sid is None:
+        return {"ok": False, "error": "maintenance mode resolves no session; pass session_id explicitly"}
 
-    await _adopt_state_file(request)
+    await _adopt_state_file(request, sid)
     if call == "state":
         return {"ok": True, "call": call, "state": await ooc.state(sid)}
 
@@ -326,7 +331,7 @@ async def handle(request: dict) -> dict:
             "hint": None if queued is None else f"python3 scripts/portrait_render.py --session {sid}",
         }
 
-    await _adopt_state_file(request)
+    await _adopt_state_file(request, sid)
     text = request.get("text")
     if not isinstance(text, str) or not text:
         return {"ok": False, "error": "turn needs a non-empty text"}
@@ -379,8 +384,9 @@ async def main() -> int:
         sys.stdout.write("\n")
         return 2
 
-    await Database.init()
     try:
+        # Inside the try: a refused connection must still end in one JSON line, not a traceback.
+        await Database.init()
         reply = await handle(request)
     except Exception as error:  # noqa: BLE001 — the seam reports, it never guesses
         reply = {"ok": False, "error": f"{type(error).__name__}: {error}"}

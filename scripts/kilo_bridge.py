@@ -45,11 +45,16 @@ def report_session_drift() -> str | None:
 
 async def handle(action: str, params: dict = None) -> dict:
     params = params or {}
-    await Database.init()
-    sid = resolve_session((params or {}).get("session"))
-    report_session_drift()
     result = {"action": action, "status": "error", "data": None}
+    # Init and session resolution sit inside the try: a refused connection or an unresolvable
+    # session (`resolve_session` raises) must answer in the error shape, not as a traceback.
     try:
+        await Database.init()
+        sid = resolve_session((params or {}).get("session"))
+        if sid is None:
+            # Maintenance resolves no session; every action below would query session NULL.
+            raise RuntimeError("maintenance mode resolves no session; pass session explicitly")
+        report_session_drift()
         if action == "briefing":
             from core.master_briefing import generate
 
@@ -922,8 +927,28 @@ async def handle(action: str, params: dict = None) -> dict:
         )
         result["data"] = str(e)
     finally:
-        await Database.close()
+        try:
+            await Database.close()
+        except Exception as close_error:  # noqa: BLE001 — a failed close must not mask the original error
+            warn("kilo_bridge", f"Database.close failed: {close_error}")
     return result
+
+
+def parse_params(raw: str) -> tuple[dict | None, str | None]:
+    """Parse the CLI params argument.
+
+    Malformed JSON used to run the action with `{}`, a silent wrong input.
+
+    @param raw - the argv JSON text.
+    @returns (params, None) on success, (None, error message) on failure.
+    """
+    try:
+        params = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid params JSON: {exc}"
+    if not isinstance(params, dict):
+        return None, "params must be a JSON object"
+    return params, None
 
 
 if __name__ == "__main__":
@@ -940,9 +965,9 @@ if __name__ == "__main__":
     action = sys.argv[1]
     params = {}
     if len(sys.argv) > 2:
-        try:
-            params = json.loads(sys.argv[2])
-        except json.JSONDecodeError:
-            pass
+        params, params_error = parse_params(sys.argv[2])
+        if params_error:
+            print(json.dumps({"action": action, "status": "error", "data": params_error}))
+            sys.exit(1)
     result = asyncio.run(handle(action, params))
     print(json.dumps(result, default=str))

@@ -1,15 +1,18 @@
-"""Module review tests for modules/slave_system.py (2026-10-03).
+"""Module review tests for modules/slave_system.py.
 
 The fake below holds one slave, one market row, one revolt and one territory, all
-belonging to session 3. It applies the session filter it is given, exactly as the
-database would, so a statement that names no session sees session 3 rows even
-while the caller asks as session 5. Nothing here touches the campaign.
+belonging to the scratch session OWNER. It applies the session filter it is given, exactly as the
+database would, so a statement that names no session sees OWNER rows even
+while the caller asks as OTHER. Both ids are scratch ids, never a frozen campaign.
+Nothing here touches the database.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import pathlib
 import sys
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -17,10 +20,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.slave_system as ss  # noqa: E402
-from core.config import Config  # noqa: E402
 
-OWNER = 3          # the session that owns every row the fake holds
-OTHER = 5          # the session the tests act as
+OWNER = 900 + os.getpid() % 100            # the session that owns every row the fake holds
+OTHER = 900 + (os.getpid() + 50) % 100     # the session the tests act as
 
 
 def _run(coro):
@@ -81,7 +83,17 @@ class _Fake:
 
     async def execute(self, sql, *args):
         self.writes.append((sql, args))
-        return "OK"
+        return "UPDATE 1"
+
+    @asynccontextmanager
+    async def transaction(self):
+        """Yields a conn that records into the same lists; an exception drops the transaction's writes."""
+        mark = len(self.writes)
+        try:
+            yield self
+        except BaseException:
+            del self.writes[mark:]
+            raise
 
     def statements_touching(self, *tables):
         out = []
@@ -143,10 +155,10 @@ def test_every_statement_the_tick_sends_names_its_session(monkeypatch):
         assert "session_id" in sql, sql
 
 
-def test_the_tick_resolves_its_session_instead_of_defaulting_to_the_frozen_one(fake):
+def test_the_tick_resolves_its_session_instead_of_defaulting_to_the_frozen_one(fake, monkeypatch):
+    monkeypatch.setenv("RP_SESSION", str(OWNER))
     out = _run(ss.run_tick())
-    assert out["session_id"] == Config.SESSION_ID
-    assert out["session_id"] is not None
+    assert out["session_id"] == OWNER, out
 
 
 def test_the_tick_reports_a_crash_instead_of_printing_it(monkeypatch):

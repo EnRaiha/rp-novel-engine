@@ -8,8 +8,10 @@ to invent a name blocked every other campaign from inventing it.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
+from contextlib import asynccontextmanager
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -17,51 +19,74 @@ sys.path.insert(0, str(ROOT))
 from core.db import Database  # noqa: E402
 from modules import weapon_design as wd  # noqa: E402
 
+SID = 900 + os.getpid() % 100
 
-async def _enough_credits(session_id: int, need: int = 50_000_000) -> bool:
-    """A row existing is not enough: another test in the same run may have left it at zero credits, and
-    `design_blueprint` refuses rather than topping it up. This checks the balance, not the presence."""
-    found = await Database.fetchval(
-        "SELECT credits FROM maya_rp.resources WHERE session_id=$1", session_id)
-    return found is not None and float(found) >= need
+
+@asynccontextmanager
+async def _rolled_back(monkeypatch):
+    """Run a test inside one transaction that is always rolled back.
+
+    `weapons`, `weapon_blueprints` and `weapon_upgrades` are global catalogue tables, so nothing a test
+    writes may commit. Every `Database` call and every module transaction goes through one connection.
+    The module's own `transaction()` becomes a savepoint on it. The scratch session and its `resources`
+    row are inserted inside the same transaction.
+    """
+    await Database.init()
+    pool = await Database._ensure_pool()
+    async with pool.acquire() as conn:
+        outer = conn.transaction()
+        await outer.start()
+        try:
+            @asynccontextmanager
+            async def savepoint():
+                async with conn.transaction():
+                    yield conn
+
+            async def fetchval(sql, *args):
+                return await conn.fetchval(sql, *args)
+
+            async def fetchrow(sql, *args):
+                return await conn.fetchrow(sql, *args)
+
+            async def fetch(sql, *args):
+                return await conn.fetch(sql, *args)
+
+            async def execute(sql, *args):
+                return await conn.execute(sql, *args)
+
+            monkeypatch.setattr(Database, "transaction", savepoint)
+            monkeypatch.setattr(Database, "fetchval", fetchval)
+            monkeypatch.setattr(Database, "fetchrow", fetchrow)
+            monkeypatch.setattr(Database, "fetch", fetch)
+            monkeypatch.setattr(Database, "execute", execute)
+            await conn.execute(
+                "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'weapon review scratch','active') "
+                "ON CONFLICT (id) DO NOTHING", SID)
+            yield conn
+        finally:
+            await outer.rollback()
+    await Database.close()
 
 
 class TestTheArmouryIsShared:
-    """`weapon_blueprints` has no session_id, so a name is global. My first version of this test asserted
-    the opposite and the schema said no."""
+    """`weapon_blueprints` has no session_id, so a name is global. The whole test runs in a transaction
+    that is rolled back, so the blueprint, the session and the treasury row never reach the database."""
 
-    async def test_the_same_name_twice_is_refused_anywhere(self):
-        await Database.init()
-        # What the arc's row held before this test raised its balance. `None` means the test created
-        # the row and may remove it; a row that was already there is put back, not deleted.
-        previous = await Database.fetchrow(
-            "SELECT credits FROM maya_rp.resources WHERE session_id=5")
-        try:
-            # ON CONFLICT matters: the row may exist with a balance this test needs raised, and the
-            # first version of this test only inserted when the row was absent.
-            if not await _enough_credits(5):
-                await Database.execute(
-                    "INSERT INTO maya_rp.resources (session_id, credits) VALUES (5, 50000000)"
-                    " ON CONFLICT (session_id) DO UPDATE SET credits = GREATEST(maya_rp.resources.credits,"
-                    " 50000000)")
-            first = await wd.design_blueprint("red proof twice", "Special", 0, 1, "L", 1, 5)
+    async def test_the_same_name_twice_is_refused_anywhere(self, monkeypatch):
+        async with _rolled_back(monkeypatch) as conn:
+            await conn.execute(
+                "INSERT INTO maya_rp.resources (session_id, credits) VALUES ($1, 50000000)", SID)
+            first = await wd.design_blueprint("red proof twice", "Special", 1, 1, "L", 1, SID)
             assert first.get("error") is None, first
-            second = await wd.design_blueprint("red proof twice", "Special", 0, 1, "L", 1, 5)
+            second = await wd.design_blueprint("red proof twice", "Special", 1, 1, "L", 1, SID)
             assert "already exists" in second.get("error", ""), second
-        finally:
-            await Database.execute(
-                "DELETE FROM maya_rp.weapon_blueprints WHERE LOWER(name)=LOWER($1)", "red proof twice")
-            if previous is None:
-                await Database.execute("DELETE FROM maya_rp.resources WHERE session_id=5")
-            else:
-                await Database.execute(
-                    "UPDATE maya_rp.resources SET credits = $1 WHERE session_id=5", previous["credits"])
-            await Database.close()
+            held = await conn.fetchval(
+                "SELECT COUNT(*) FROM maya_rp.weapon_blueprints WHERE LOWER(name)='red proof twice'")
+            assert held == 1, f"the armoury holds {held} copies of one blueprint name"
 
 
 class TestTheProductionLine:
-    async def test_an_unknown_blueprint_is_refused(self):
-        await Database.init()
-        out = await wd.produce_weapons("no such blueprint anywhere", 1, 5)
-        assert "not found" in out.get("error", ""), out
-        await Database.close()
+    async def test_an_unknown_blueprint_is_refused(self, monkeypatch):
+        async with _rolled_back(monkeypatch):
+            out = await wd.produce_weapons("no such blueprint anywhere", 1, SID)
+            assert "not found" in out.get("error", ""), out

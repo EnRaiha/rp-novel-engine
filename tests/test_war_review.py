@@ -3,10 +3,8 @@
 Defects covered:
 
 1. `tick_wars` advanced EVERY war row, including the ended ones: `list_wars`
-   returns both, and `advance` adds casualties before it looks at the status. Two
-   live session-3 wars sit at status='ended' with 8,048/2,821 and 1,140/624
-   casualties, and those counters were growing on every tick forever. The tick
-   asks for active wars only.
+   returns both, and `advance` adds casualties before it looks at the status. Ended
+   wars kept growing their casualty counters on every tick. The tick asks for active wars only.
 2. `declare` wrote a war row against a name it never checked: a misspelled
    opponent inserted the war, updated no faction, and reported success. It looks
    the faction up first, and refuses a second war against an opponent that
@@ -21,22 +19,46 @@ end-of-war event fires once because the block checks `status != 'ended'`; the
 phase-advance roll is skipped once the war reaches the last phase; and the
 winner is decided by the power ratio, not by a die.
 
-Note for the lead, not fixed here: `declare` still sets the standing of EVERY
-faction whose name matches the target (`LIKE %name%`, no LIMIT). Declaring war on
-"The Den" therefore turns every faction whose name contains that string hostile.
-Whether that is intended is a canon question.
+`declare` stores the resolved faction name and flags that one faction hostile by id and session. The
+fragment no longer reaches `wars.opponent_faction` or a LIKE update.
 
-No database: every test drives a fake Database.
+No database: every test drives a fake Database. SID is a scratch session id, never a frozen campaign.
 """
 from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
 
 import pytest
 
 import modules.war as war
 
 
+SID = 900 + os.getpid() % 100
+
+
+class _Conn:
+    """The connection `transaction()` yields; it records into the fake like the pool methods do."""
+
+    def __init__(self, fake):
+        self.fake = fake
+
+    async def fetch(self, sql, *args):
+        return await self.fake.fetch(sql, *args)
+
+    async def fetchrow(self, sql, *args):
+        return await self.fake.fetchrow(sql, *args)
+
+    async def fetchval(self, sql, *args):
+        return await self.fake.fetchval(sql, *args)
+
+    async def execute(self, sql, *args):
+        return await self.fake.execute(sql, *args)
+
+
 class FakeDB:
-    def __init__(self, fetch=None, fetchrow=None, fetchval=None, rows=None):
+    def __init__(self, fetch=None, fetchrow=None, fetchval=None, rows=None, fetchval_seq=None):
+        self.fetchval_seq = iter(fetchval_seq) if fetchval_seq is not None else None
         self.fetch_rows = fetch if fetch is not None else []
         self.row_map = rows or {}
         self.fetchrow_value = fetchrow
@@ -61,11 +83,17 @@ class FakeDB:
 
     async def fetchval(self, sql, *args):
         self.calls.append(("fetchval", " ".join(sql.split()), args))
+        if self.fetchval_seq is not None:
+            return next(self.fetchval_seq, 0)
         return self.fetchval_value
 
     async def execute(self, sql, *args):
         self.calls.append(("execute", " ".join(sql.split()), args))
         return "UPDATE 1"
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield _Conn(self)
 
     def sql(self, kind=None):
         return [c[1] for c in self.calls if kind is None or c[0] == kind]
@@ -76,12 +104,12 @@ class FakeDB:
 
 
 def _install(monkeypatch, fake):
-    for name in ("fetch", "fetchrow", "fetchval", "execute"):
+    for name in ("fetch", "fetchrow", "fetchval", "execute", "transaction"):
         monkeypatch.setattr("modules.war.Database." + name, getattr(fake, name))
     return fake
 
 
-WAR_ROW = {"id": 3, "session_id": 3, "opponent_faction": "The Den", "phase": "clash",
+WAR_ROW = {"id": 3, "session_id": SID, "opponent_faction": "The Den", "phase": "clash",
            "status": "active", "attacker_casualties": 10, "defender_casualties": 5,
            "casus_belli": "raid", "war_goal": "safety"}
 
@@ -91,19 +119,19 @@ WAR_ROW = {"id": 3, "session_id": 3, "opponent_faction": "The Den", "phase": "cl
 async def test_the_tick_asks_for_active_wars_only(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetch=[]))
 
-    await war.tick_wars(3)
+    await war.tick_wars(SID)
 
     sql = fake.sql("fetch")[0]
     assert "status = 'active'" in sql, sql
-    assert fake.args_for("FROM maya_rp.wars", "fetch")[0] == (3, True)
+    assert fake.args_for("FROM maya_rp.wars", "fetch")[0] == (SID, True)
 
 
 async def test_list_wars_still_returns_everything_by_default(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetch=[]))
 
-    await war.list_wars(3)
+    await war.list_wars(SID)
 
-    assert fake.args_for("FROM maya_rp.wars", "fetch")[0] == (3, False)
+    assert fake.args_for("FROM maya_rp.wars", "fetch")[0] == (SID, False)
 
 
 # ── 2. declare checks its opponent ──────────────────────────────────────
@@ -111,7 +139,7 @@ async def test_list_wars_still_returns_everything_by_default(monkeypatch):
 async def test_declaring_war_on_a_name_that_does_not_exist_is_refused(monkeypatch):
     fake = _install(monkeypatch, FakeDB(rows={"FROM maya_rp.factions": None}))
 
-    out = await war.declare("Nobody At All", "insult", "respect")
+    out = await war.declare("Nobody At All", "insult", "respect", session_id=SID)
 
     assert "No faction matching" in out["error"]
     assert not fake.args_for("INSERT INTO maya_rp.wars", "fetchval")
@@ -122,7 +150,7 @@ async def test_a_second_war_against_the_same_opponent_is_refused(monkeypatch):
         rows={"FROM maya_rp.factions": {"id": 6, "name": "The Den"}},
         fetchval=1))
 
-    out = await war.declare("The Den", "raid", "safety")
+    out = await war.declare("The Den", "raid", "safety", session_id=SID)
 
     assert "already running" in out["error"]
     assert not fake.args_for("INSERT INTO maya_rp.wars", "fetchval")
@@ -132,30 +160,38 @@ async def test_a_blank_opponent_is_refused(monkeypatch):
     fake = _install(monkeypatch, FakeDB())
 
     with pytest.raises(ValueError, match="target_faction must be a non-empty string"):
-        await war.declare("   ", "raid", "safety")
+        await war.declare("   ", "raid", "safety", session_id=SID)
 
     assert not fake.calls
 
 
 async def test_a_new_war_opens_at_escalation(monkeypatch):
-    opponents = iter([{"id": 6, "name": "The Den"}])
-    answers = iter([None, 2244, 91])      # no running war, game day, new id
+    fake = _install(monkeypatch, FakeDB(
+        rows={"FROM maya_rp.factions": {"id": 6, "name": "The Den"}},
+        fetchval_seq=[None, 2244, 91]))      # no running war, game day, new id
 
-    async def fetchrow(*_a, **_k):
-        return next(opponents, None)
-
-    async def fetchval(*_a, **_k):
-        return next(answers, 0)
-
-    fake = _install(monkeypatch, FakeDB())
-    monkeypatch.setattr("modules.war.Database.fetchrow", fetchrow)
-    monkeypatch.setattr("modules.war.Database.fetchval", fetchval)
-
-    out = await war.declare("The Den", "raid", "safety", session_id=3)
+    out = await war.declare("The Den", "raid", "safety", session_id=SID)
 
     assert out == {"war_id": 91, "phase": "escalation", "opponent": "The Den"}
+    opened = fake.args_for("INSERT INTO maya_rp.wars", "fetchval")[0]
+    assert opened == (SID, "The Den", "raid", "safety", 2244), opened
     turned = fake.args_for("SET standing='hostile'", "execute")[0]
-    assert turned == (3, "%The Den%")
+    assert turned == (6, SID), "the standing write must name the resolved faction id and the session"
+
+
+async def test_a_war_stores_the_resolved_faction_name_not_the_typed_fragment(monkeypatch):
+    """`advance` reads `faction_ships` by the stored name, so a raw fragment found no ships."""
+    fake = _install(monkeypatch, FakeDB(
+        rows={"FROM maya_rp.factions": {"id": 6, "name": "The Den"}},
+        fetchval_seq=[None, 2244, 91]))
+
+    out = await war.declare("den", "raid", "safety", session_id=SID)
+
+    assert out["opponent"] == "The Den", out
+    opened = fake.args_for("INSERT INTO maya_rp.wars", "fetchval")[0]
+    assert opened[1] == "The Den", opened
+    lookup = fake.args_for("FROM maya_rp.factions", "fetchrow")[0]
+    assert lookup == (SID, "%den%"), lookup
 
 
 # ── 3 + 4 + 5. The advance writes, the log level, the unknown phase ─────
@@ -170,13 +206,13 @@ async def test_the_casualty_and_phase_writes_carry_the_session(monkeypatch):
     monkeypatch.setattr("modules.war.Database.fetchval", fetchval)
     monkeypatch.setattr("modules.war.random.random", lambda: 0.0)     # advance the phase
 
-    out = await war.advance(3, 3)
+    out = await war.advance(3, SID)
 
     assert out["new_phase"] == "attrition"
     casualties = fake.args_for("attacker_casualties=attacker_casualties+$1", "execute")[0]
-    assert casualties[2] == 3 and casualties[3] == 3
+    assert casualties[2] == 3 and casualties[3] == SID, casualties
     phase = fake.args_for("SET phase=$1", "execute")[0]
-    assert phase == ("attrition", 3, 3)
+    assert phase == ("attrition", 3, SID), phase
 
 
 async def test_an_unknown_phase_is_named_and_still_advances(monkeypatch):
@@ -186,7 +222,7 @@ async def test_an_unknown_phase_is_named_and_still_advances(monkeypatch):
     _install(monkeypatch, FakeDB(rows={"FROM maya_rp.wars": row}, fetchval=100))
     monkeypatch.setattr("modules.war.random.random", lambda: 1.0)
 
-    out = await war.advance(3, 3)
+    out = await war.advance(3, SID)
 
     assert out["power_ratio"] == 1.0
     assert any("brouhaha" in m for m in seen), seen
@@ -197,7 +233,7 @@ async def test_the_end_of_war_fires_once(monkeypatch):
     fake = _install(monkeypatch, FakeDB(rows={"FROM maya_rp.wars": row}, fetchval=100))
     monkeypatch.setattr("modules.war.random.random", lambda: 1.0)
 
-    out = await war.advance(3, 3)
+    out = await war.advance(3, SID)
 
     assert out["ended"] is True and out["winner"] == "Player"
     assert len(fake.args_for("SET status='ended'", "execute")) == 1
@@ -208,7 +244,7 @@ async def test_an_ended_war_does_not_re_announce_its_end(monkeypatch):
     row = dict(WAR_ROW, phase="resolution", status="ended")
     fake = _install(monkeypatch, FakeDB(rows={"FROM maya_rp.wars": row}, fetchval=100))
 
-    out = await war.advance(3, 3)
+    out = await war.advance(3, SID)
 
     assert out["ended"] is True
     assert not fake.args_for("SET status='ended'", "execute")
@@ -218,7 +254,7 @@ async def test_an_ended_war_does_not_re_announce_its_end(monkeypatch):
 async def test_a_missing_war_is_answered_not_crashed(monkeypatch):
     _install(monkeypatch, FakeDB(rows={"FROM maya_rp.wars": None}))
 
-    assert await war.advance(99, 3) == {"error": "War not found"}
+    assert await war.advance(99, SID) == {"error": "War not found"}
 
 
 async def test_run_tick_reports_a_crash_as_an_error(monkeypatch):
@@ -231,7 +267,7 @@ async def test_run_tick_reports_a_crash_as_an_error(monkeypatch):
     _install(monkeypatch, FakeDB())
     monkeypatch.setattr("modules.war.Database.fetch", boom)
 
-    out = await war.run_tick(3)
+    out = await war.run_tick(SID)
 
     assert "no armies" in out["error"]
     assert any("no armies" in m for m in seen), seen
@@ -248,10 +284,10 @@ def test_contract_the_phase_ladder_runs_escalation_to_resolution():
 async def test_contract_the_powers_are_read_from_this_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(rows={"FROM maya_rp.wars": WAR_ROW}, fetchval=100))
 
-    await war.advance(3, 3)
+    await war.advance(3, SID)
 
     for sql in fake.sql("fetchval"):
         if "power_rating" in sql:
             assert "session_id=$1" in sql, sql
     enemy = fake.args_for("faction_ships", "fetchval")[0]
-    assert enemy == (3, "The Den")
+    assert enemy == (SID, "The Den")

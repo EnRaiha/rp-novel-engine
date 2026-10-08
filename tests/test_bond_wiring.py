@@ -53,6 +53,6 @@ class TestTheSessionReads:
 
     async def test_healing_an_unknown_character_is_answered_not_crashed(self):
         await Database.init()
-        out = await romance.process_healing(999_999, "rest", 5)
+        out = await romance.process_healing(999_999, "rest", 905)  # a scratch id: the writer refuses frozen session 5
         assert out is not None
         await Database.close()

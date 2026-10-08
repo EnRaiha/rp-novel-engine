@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 from core.log import error, info
 
 
@@ -178,6 +178,23 @@ def _calculate_bond_from_arc(arc_stage: str, intimacy_level: int) -> int:
     return min(10, stage_map.get(arc_stage, 0) + intimacy_level // 2)
 
 
+def _writable_session(session_id: int | None) -> int:
+    """Resolve the session for one call and refuse a frozen campaign.
+
+    Sessions 3 and 5 are reference data. Every writer here resolved `Config.SESSION_ID`, fixed at
+    import, and wrote without a freeze check, so a long-lived process mutated the frozen arc.
+
+    @param session_id - caller's session; `None` resolves through `core.session.require_session`.
+    @returns the resolved session id.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    from core.ooc import _refuse_frozen
+
+    sid = require_session(session_id)
+    _refuse_frozen(sid)
+    return sid
+
+
 async def _get_character_id(character_name: str, session_id: int) -> int | None:
     """Resolve character name to ID."""
     row = await Database.fetchrow(
@@ -265,18 +282,19 @@ def check_threshold(bond: int, action: str, companion_name: str | None = None) -
     """
     lower = (action or "").lower()
 
-    # Determine target tier
+    # The highest matching tier wins. Taking the first match in dict order read "tease, then kiss her"
+    # as ember and let a flame request through at bond 5.
     target_tier = None
     for tier_name, tier_cfg in TIERS.items():
         if any(a in lower for a in tier_cfg["actions"]):
-            target_tier = tier_name
-            break
+            if target_tier is None or tier_cfg["bond_threshold"] > TIERS[target_tier]["bond_threshold"]:
+                target_tier = tier_name
 
     if not target_tier:
         for tier_name, keywords in INTENT_KEYWORDS.items():
             if any(kw in lower for kw in keywords):
-                target_tier = tier_name
-                break
+                if target_tier is None or TIERS[tier_name]["bond_threshold"] > TIERS[target_tier]["bond_threshold"]:
+                    target_tier = tier_name
         if not target_tier:
             target_tier = "ember"
 
@@ -337,7 +355,7 @@ def check_jealousy_logic(active_name: str, current_bond: int, all_companions: li
     Check if a companion experiences jealousy.
     Ported from RomanceEngine.checkJealousy() + _jealousyNarrative().
     
-    Returns { jealous, intensity, narrative } or None.
+    Returns { jealous, intensity, rival, narrative } or None. `rival` is the name that triggered it.
     """
     active_lower = active_name.lower()
 
@@ -360,12 +378,12 @@ def check_jealousy_logic(active_name: str, current_bond: int, all_companions: li
 
     # Strong jealousy: rival bond >= 7 AND active bond >= 9
     if rival_bond >= 7 and current_bond >= 9:
-        return {"jealous": True, "intensity": "strong",
+        return {"jealous": True, "intensity": "strong", "rival": rname,
                 "narrative": _jealousy_narrative(active_lower, rname, "strong")}
 
     # Mild jealousy: rival bond >= 5 AND active bond >= 7
     if rival_bond >= 5 and current_bond >= 7:
-        return {"jealous": True, "intensity": "mild",
+        return {"jealous": True, "intensity": "mild", "rival": rname,
                 "narrative": _jealousy_narrative(active_lower, rname, "mild")}
 
     return None
@@ -403,6 +421,20 @@ def get_voice_profile(name: str) -> dict[str, Any]:
     if name not in VOICE_PROFILES:
         return {"error": f"no voice profile for '{name}'", "available": sorted(VOICE_PROFILES)}
     return VOICE_PROFILES[name]
+
+
+def _bond_line(bond_lines: dict[int, str], bond: int) -> str:
+    """Pick the line for the highest threshold the bond has reached.
+
+    `.get(bond)` matched only 5, 7 and 9, so bonds 6, 8 and 10 all answered with the bond-5 line.
+    A bond below the lowest threshold keeps the lowest line.
+
+    @param bond_lines - threshold to line.
+    @param bond - current bond.
+    @returns the line text.
+    """
+    reached = [t for t in bond_lines if t <= bond]
+    return bond_lines[max(reached)] if reached else bond_lines[min(bond_lines)]
 
 
 def generate_scene(context: dict, tier: str, companion_name: str, player_action: str) -> dict[str, Any]:
@@ -443,7 +475,7 @@ def generate_scene(context: dict, tier: str, companion_name: str, player_action:
              "notes": "MANDATORY aftercare. Soft words, bodies still touching, the quiet after."
              if tier == "inferno" else "Optional: tender wind-down or return to story."},
         ],
-        "bond_line": voice["bond_lines"].get(bond, voice["bond_lines"][5]),
+        "bond_line": _bond_line(voice["bond_lines"], bond),
         "location_mood": loc_mood,
     }
 
@@ -530,8 +562,7 @@ def calculate_pursuit(pursuits_player: int, pursuits_companion: int, saturation:
 
 async def get_romance_arcs(session_id: int | None = None) -> list[dict]:
     """Get all romance arcs for a session. Ported from RomanceState.getRomanceArcs()."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     rows = await Database.fetch(
         "SELECT a.*, c.name AS character_name, c.bond, c.archetype, "
         "c.voice_profile, c.dialogue_style "
@@ -545,8 +576,7 @@ async def get_romance_arcs(session_id: int | None = None) -> list[dict]:
 
 async def get_bond_ranking(session_id: int | None = None) -> list[dict]:
     """Get all characters sorted by bond. Ported from RomanceState.getBondRanking()."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     # arc_stage / intimacy_level live on romance_arcs, not on characters.
     rows = await Database.fetch(
         "SELECT c.id, c.name, c.bond, a.arc_stage, COALESCE(a.intimacy_level, 0) AS intimacy_level, "
@@ -568,9 +598,14 @@ async def advance_bond(
     """
     Advance bond for a character. Updates arc_stage, milestones.
     Ported from RomanceState.saveRomanceScene() + milestone logic.
+
+    @param character_id - character whose bond moves.
+    @param delta - signed bond change; the result clamps to 0-10. A negative delta never raises intimacy.
+    @param session_id - session; `None` resolves per call.
+    @returns bond old/new, arc stage, milestones and triggers; or the debuff block, or an error.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
 
     # M6: a locked penalty blocks intimacy outright; the story says the flesh
     # refuses, it does not silently skip the beat.
@@ -584,41 +619,38 @@ async def advance_bond(
             "bond_unchanged": True,
         }
 
-    # Get current state
-    arc = await _get_romance_arc(character_id, session_id)
-    char = await Database.fetchrow(
-        "SELECT id, name, bond FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
-        character_id, session_id,
-    )
-    if not char:
-        return {"error": "Character not found"}
-
-    current_bond = char["bond"]
-    new_bond = max(0, min(10, current_bond + delta))
-    new_stage = _map_bond_to_arc_stage(new_bond)
-    milestones = get_milestones(current_bond, new_bond)
-    crossed = get_crossed_thresholds(current_bond, new_bond)
-
-    # Update character bond
-    await Database.execute(
-        "UPDATE maya_rp.characters SET bond = $1 WHERE id = $2 AND session_id = $3",
-        new_bond, character_id, session_id,
-    )
-
-    # Update or create romance arc
-    if arc:
-        await Database.execute(
-            "UPDATE maya_rp.romance_arcs SET arc_stage = $1, intimacy_level = LEAST(intimacy_level + $2, 10), "
-            "updated_at = NOW() WHERE character_id = $3 AND session_id = $4",
-            new_stage, abs(delta), character_id, session_id,
+    # The character row is locked for the whole read-compute-write. Two concurrent +1 calls each
+    # read the same bond and both wrote bond+1, so one advance was lost.
+    async with Database.transaction() as conn:
+        char = await conn.fetchrow(
+            "SELECT id, name, bond FROM maya_rp.characters "
+            "WHERE id = $1 AND session_id = $2 FOR UPDATE",
+            character_id, session_id,
         )
-    else:
-        await Database.execute(
+        if not char:
+            return {"error": "Character not found"}
+
+        current_bond = char["bond"] or 0
+        new_bond = max(0, min(10, current_bond + delta))
+        new_stage = _map_bond_to_arc_stage(new_bond)
+        milestones = get_milestones(current_bond, new_bond)
+        crossed = get_crossed_thresholds(current_bond, new_bond)
+
+        await conn.execute(
+            "UPDATE maya_rp.characters SET bond = $1 WHERE id = $2 AND session_id = $3",
+            new_bond, character_id, session_id,
+        )
+
+        # Intimacy rises with a positive delta only. `abs(delta)` raised it on a penalty.
+        await conn.execute(
             "INSERT INTO maya_rp.romance_arcs "
             "(session_id, character_id, arc_stage, intimacy_level, scene_log, pursuit_stage, saturation_pct, "
             "initiatives_by_companion, initiatives_by_player, nights_shared) "
-            "VALUES ($1, $2, $3, $4, '[]'::jsonb, 'mutual', 0, 0, 0, 0)",
-            session_id, character_id, new_stage, max(0, new_bond - 4),
+            "VALUES ($1, $2, $3, $4, '[]'::jsonb, 'mutual', 0, 0, 0, 0) "
+            "ON CONFLICT (session_id, character_id) DO UPDATE SET "
+            "arc_stage = EXCLUDED.arc_stage, "
+            "intimacy_level = LEAST(romance_arcs.intimacy_level + $5, 10), updated_at = NOW()",
+            session_id, character_id, new_stage, max(0, new_bond - 4), max(0, delta),
         )
 
     result = {
@@ -643,9 +675,12 @@ async def check_jealousy(session_id: int | None = None) -> list[dict]:
     Check all romance arcs for jealousy triggers.
     Ported from RomanceEngine.checkJealousy() pattern, applied to all arcs.
     Returns list of jealousy events triggered.
+
+    @param session_id - session; `None` resolves per call.
+    @returns one dict per triggered arc: character, intensity, narrative.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
 
     arcs = await get_romance_arcs(session_id)
     all_companions = [{"name": a["character_name"], "bond": _calculate_bond_from_arc(a["arc_stage"], a["intimacy_level"])}
@@ -658,54 +693,39 @@ async def check_jealousy(session_id: int | None = None) -> list[dict]:
         jealousy = check_jealousy_logic(active_name, active_bond, all_companions)
 
         if jealousy:
-            # Get rival id
-            rival_name = None
-            for ac in all_companions:
-                if ac["name"] != active_name and ac["bond"] >= 7:
-                    rival_name = ac["name"]
-                    break
+            # The rival is the companion `check_jealousy_logic` picked (highest bond). A second scan
+            # here took the first companion at bond >= 7, so a rival at bond 5-6 resolved to no one
+            # and no row was ever written.
+            rival_name = jealousy["rival"]
+            rival_id = await _get_character_id(rival_name, session_id)
+            level = 2 if jealousy["intensity"] == "strong" else 1
 
-            rival_id = None
-            if rival_name:
-                rival_id = await _get_character_id(rival_name, session_id)
+            # The upsert and the event log commit together, and the upsert is one statement, so two
+            # ticks cannot both take the insert branch.
+            async with Database.transaction() as conn:
+                if rival_id is not None:
+                    await conn.execute(
+                        "INSERT INTO maya_rp.jealousy_states "
+                        "(session_id, character_id, rival_id, jealousy_level, last_trigger) "
+                        "VALUES ($1, $2, $3, $4, NOW()) "
+                        "ON CONFLICT (character_id, rival_id) DO UPDATE SET "
+                        "jealousy_level = LEAST(jealousy_states.jealousy_level + 1, 10), "
+                        "last_trigger = NOW()",
+                        session_id, a["character_id"], rival_id, level,
+                    )
+                else:
+                    # jealousy_states.rival_id is NOT NULL, so a rival with no character row
+                    # cannot be recorded. Inserting NULL killed the whole romance tick.
+                    info("romance",
+                         f"jealousy state skipped for {a['character_name']}: "
+                         f"rival '{rival_name}' has no character row")
 
-            # Upsert jealousy state
-            existing = await Database.fetchrow(
-                "SELECT id FROM maya_rp.jealousy_states "
-                "WHERE session_id = $1 AND character_id = $2",
-                session_id, a["character_id"],
-            )
-            if existing:
-                await Database.execute(
-                    "UPDATE maya_rp.jealousy_states SET jealousy_level = LEAST(jealousy_level + 1, 10), "
-                    "rival_id = COALESCE($1, rival_id), last_trigger = NOW() WHERE id = $2",
-                    rival_id, existing["id"],
+                await conn.execute(
+                    "INSERT INTO maya_rp.intimacy_events "
+                    "(session_id, character_id, event_type, intensity, narrative, bond_delta) "
+                    "VALUES ($1, $2, 'jealousy_scene', $3, $4, 0)",
+                    session_id, a["character_id"], level, jealousy["narrative"],
                 )
-            elif rival_id is not None:
-                # jealousy_states.rival_id is NOT NULL. A rival with no character
-                # row (the generic "another") cannot be recorded — inserting NULL
-                # raised NotNullViolation and killed the whole romance tick.
-                await Database.execute(
-                    "INSERT INTO maya_rp.jealousy_states "
-                    "(session_id, character_id, rival_id, jealousy_level, last_trigger) "
-                    "VALUES ($1, $2, $3, $4, NOW())",
-                    session_id, a["character_id"], rival_id,
-                    2 if jealousy["intensity"] == "strong" else 1,
-                )
-            else:
-                info("romance",
-                     f"jealousy state skipped for {a['character_name']}: "
-                     f"rival '{rival_name}' has no character row")
-
-            # Log as intimacy event
-            await Database.execute(
-                "INSERT INTO maya_rp.intimacy_events "
-                "(session_id, character_id, event_type, intensity, narrative, bond_delta) "
-                "VALUES ($1, $2, 'jealousy_scene', $3, $4, 0)",
-                session_id, a["character_id"],
-                2 if jealousy["intensity"] == "strong" else 1,
-                jealousy["narrative"],
-            )
 
             events.append({
                 "character": active_name,
@@ -729,30 +749,41 @@ async def process_healing(
     Apply a healing activity to reduce saturation.
     Ported from HealingTracker.applyHealing() + isHealed() + onHealed().
     3-stage progression: glutted (3 activities) → overfed (2 activities) → balanced.
-    """
-    if session_id is None:
-        session_id = Config.SESSION_ID
 
-    arc = await _get_romance_arc(character_id, session_id)
-    char = await Database.fetchrow(
-        "SELECT name FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
-        character_id, session_id,
-    )
-    if not arc or not char:
-        return {"error": "Character or romance arc not found"}
+    @param character_id - character to heal.
+    @param activity - key of `HEALING_DECAY`; unknown keys decay 10.
+    @param session_id - session; `None` resolves per call.
+    @returns saturation before/after, state, and the Trial by Fire trait when this call crosses to 20 or below.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
+
+    # The arc row is locked across read and write. Two concurrent heals read the same saturation
+    # and the second write erased the first heal.
+    async with Database.transaction() as conn:
+        arc = await conn.fetchrow(
+            "SELECT saturation_pct FROM maya_rp.romance_arcs "
+            "WHERE character_id = $1 AND session_id = $2 FOR UPDATE",
+            character_id, session_id,
+        )
+        char = await conn.fetchrow(
+            "SELECT name FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
+            character_id, session_id,
+        )
+        if not arc or not char:
+            return {"error": "Character or romance arc not found"}
+
+        decay = HEALING_DECAY.get(activity, 10)
+        current_sat = arc["saturation_pct"] or 0
+        new_sat = max(0, current_sat - decay)
+        await conn.execute(
+            "UPDATE maya_rp.romance_arcs SET saturation_pct = $1, updated_at = NOW() "
+            "WHERE character_id = $2 AND session_id = $3",
+            new_sat, character_id, session_id,
+        )
 
     name = char["name"]
-    decay = HEALING_DECAY.get(activity, 10)
-    current_sat = arc["saturation_pct"] or 0
-    new_sat = max(0, current_sat - decay)
     state_info = calculate_saturation_state(new_sat)
-
-    # Update saturation
-    await Database.execute(
-        "UPDATE maya_rp.romance_arcs SET saturation_pct = $1, updated_at = NOW() "
-        "WHERE character_id = $2 AND session_id = $3",
-        new_sat, character_id, session_id,
-    )
 
     result = {
         "character": name,
@@ -767,8 +798,9 @@ async def process_healing(
         "progress": "HEALED" if new_sat <= 20 else f"Stage: {state_info['state']}",
     }
 
-    # If healed — grant Trial by Fire bond boost
-    if new_sat <= 20:
+    # Trial by Fire rewards the recovery, so it fires on the call that crosses to 20 or below. Firing
+    # on `new_sat <= 20` alone paid +2 bond on every heal of a character already at or below 20.
+    if current_sat > 20 and new_sat <= 20:
         await advance_bond(character_id, 2, session_id)
         result["trait"] = "Trial by Fire"
         result["trait_effect"] = "Immune to Glutted for 10 sessions"
@@ -790,9 +822,13 @@ async def release_and_heal(
     """
     Release an imprisoned companion and set up healing arc.
     Ported from HealingTracker.releaseAndHeal().
+
+    @param character_id - companion to release.
+    @param session_id - session; `None` resolves per call.
+    @returns release summary, or an error when the character or its arc is missing.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
 
     char = await Database.fetchrow(
         "SELECT name, bond FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
@@ -833,51 +869,64 @@ async def process_indulgence(
     """
     Apply an intimacy session — increases saturation, updates pursuit ratio.
     Ported from IndulgenceTracker.applySession() + getState().
+
+    @param character_id - character who takes the session.
+    @param tier - key of `SATURATION_GAINS`; unknown keys gain 5.
+    @param player_initiated - whether the player started it.
+    @param session_id - session; `None` resolves per call.
+    @returns saturation before/after, state, pursuit and nights shared; or an error.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
 
-    arc = await _get_romance_arc(character_id, session_id)
-    char = await Database.fetchrow(
-        "SELECT name FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
-        character_id, session_id,
-    )
-    if not arc or not char:
-        return {"error": "Character or romance arc not found"}
+    # The arc row is locked across read, compute and write. Saturation, both initiative counters
+    # and nights_shared were read, incremented in Python and written back, so two concurrent
+    # sessions each wrote the same +1 and one night vanished.
+    async with Database.transaction() as conn:
+        arc = await conn.fetchrow(
+            "SELECT saturation_pct, initiatives_by_player, initiatives_by_companion, nights_shared "
+            "FROM maya_rp.romance_arcs WHERE character_id = $1 AND session_id = $2 FOR UPDATE",
+            character_id, session_id,
+        )
+        char = await conn.fetchrow(
+            "SELECT name FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
+            character_id, session_id,
+        )
+        if not arc or not char:
+            return {"error": "Character or romance arc not found"}
 
-    gain = SATURATION_GAINS.get(tier, 5)
-    current_sat = arc["saturation_pct"] or 0
-    new_sat = min(100, current_sat + gain)
+        gain = SATURATION_GAINS.get(tier, 5)
+        current_sat = arc["saturation_pct"] or 0
+        new_sat = min(100, current_sat + gain)
 
-    ip = (arc["initiatives_by_player"] or 0) + (1 if player_initiated else 0)
-    ic = (arc["initiatives_by_companion"] or 0) + (0 if player_initiated else 1)
-    ns = (arc["nights_shared"] or 0) + 1
+        ip = (arc["initiatives_by_player"] or 0) + (1 if player_initiated else 0)
+        ic = (arc["initiatives_by_companion"] or 0) + (0 if player_initiated else 1)
+        ns = (arc["nights_shared"] or 0) + 1
 
-    state_info = calculate_saturation_state(new_sat)
-    pursuit = calculate_pursuit(ip, ic, new_sat)
+        state_info = calculate_saturation_state(new_sat)
+        pursuit = calculate_pursuit(ip, ic, new_sat)
 
-    # Store the CURRENT GAME DAY (not session id) so decay can compare properly.
-    game_day = await Database.fetchval(
-        "SELECT COALESCE(game_day, 1) FROM maya_rp.sessions WHERE id=$1", session_id) or 1
+        # Store the CURRENT GAME DAY (not session id) so decay can compare properly.
+        game_day = await conn.fetchval(
+            "SELECT COALESCE(game_day, 1) FROM maya_rp.sessions WHERE id=$1", session_id) or 1
 
-    await Database.execute(
-        "UPDATE maya_rp.romance_arcs SET saturation_pct = $1, pursuit_stage = $2, "
-        "initiatives_by_player = $3, initiatives_by_companion = $4, "
-        "nights_shared = $5, last_intimacy_session = $6, intimacy_level = LEAST(intimacy_level + 1, 10), "
-        "updated_at = NOW() "
-        "WHERE character_id = $7 AND session_id = $8",
-        new_sat, pursuit["pursuit_stage"], ip, ic, ns, game_day,
-        character_id, session_id,
-    )
+        await conn.execute(
+            "UPDATE maya_rp.romance_arcs SET saturation_pct = $1, pursuit_stage = $2, "
+            "initiatives_by_player = $3, initiatives_by_companion = $4, "
+            "nights_shared = $5, last_intimacy_session = $6, intimacy_level = LEAST(intimacy_level + 1, 10), "
+            "updated_at = NOW() "
+            "WHERE character_id = $7 AND session_id = $8",
+            new_sat, pursuit["pursuit_stage"], ip, ic, ns, game_day,
+            character_id, session_id,
+        )
 
-    # Log intimacy event
-    await Database.execute(
-        "INSERT INTO maya_rp.intimacy_events "
-        "(session_id, character_id, event_type, intensity, narrative) "
-        "VALUES ($1, $2, $3, $4, $5)",
-        session_id, character_id, "intimacy", gain,
-        f"Intimacy session: {tier} tier, saturation {current_sat}→{new_sat}, {pursuit['pursuit_stage']}",
-    )
+        await conn.execute(
+            "INSERT INTO maya_rp.intimacy_events "
+            "(session_id, character_id, event_type, intensity, narrative) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            session_id, character_id, "intimacy", gain,
+            f"Intimacy session: {tier} tier, saturation {current_sat}→{new_sat}, {pursuit['pursuit_stage']}",
+        )
 
     result = {
         "character": char["name"],
@@ -898,30 +947,25 @@ async def decay_saturation(session_id: int | None = None) -> int:
     """
     Decay saturation for all arcs with no intimacy this tick.
     Ported from IndulgenceTracker.decayAll().
+
+    @param session_id - session; `None` resolves per call.
+    @returns the number of arcs decayed.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
 
     game_day = await Database.fetchval(
         "SELECT COALESCE(game_day, 1) FROM maya_rp.sessions WHERE id=$1", session_id) or 1
 
-    arcs = await Database.fetch(
-        "SELECT id, character_id, saturation_pct, last_intimacy_session "
-        "FROM maya_rp.romance_arcs WHERE session_id = $1 "
-        "AND (last_intimacy_session IS NULL OR last_intimacy_session < $2)",
+    # One statement does the read and the subtraction. A per-row read then absolute write erased
+    # any saturation gained between the two.
+    rows = await Database.fetch(
+        "UPDATE maya_rp.romance_arcs SET saturation_pct = GREATEST(0, COALESCE(saturation_pct, 0) - 10) "
+        "WHERE session_id = $1 AND (last_intimacy_session IS NULL OR last_intimacy_session < $2) "
+        "RETURNING id",
         session_id, game_day,
     )
-
-    count = 0
-    for a in arcs:
-        new_sat = max(0, (a["saturation_pct"] or 0) - 10)
-        await Database.execute(
-            "UPDATE maya_rp.romance_arcs SET saturation_pct = $1 WHERE id = $2",
-            new_sat, a["id"],
-        )
-        count += 1
-
-    return count
+    return len(rows)
 
 
 # ─── Tick ────────────────────────────────────────────────────────
@@ -932,9 +976,12 @@ async def run_tick(session_id: int | None = None) -> dict[str, Any]:
     - Decay saturation for inactive arcs
     - Check jealousy triggers
     - Log summary
+
+    @param session_id - session; `None` resolves per call.
+    @returns arc, decay and jealousy counts; or `{"error": ...}` when a step raises.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
 
     try:
         # 1. Decay saturation
@@ -1125,9 +1172,16 @@ async def execute_rolling_scene(
     """
     Erotic Playbook roll: d100 + modifiers vs 90.
     Magnitude, Not Gates — failure flavors the scene, never stops it.
+
+    @param initiator_id - character who starts the scene.
+    @param target_id - character the roll is about.
+    @param position - key of `POSITIONS`.
+    @param location - key of `LOCATION_MOODS`.
+    @param session_id - session; `None` resolves per call.
+    @returns the roll, modifiers, pass/fail and the sensory packet; or an error.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = _writable_session(session_id)
 
     pos_key = position.lower().replace(" ", "_")
     if pos_key not in POSITIONS:
@@ -1187,10 +1241,12 @@ async def execute_rolling_scene(
         if target_bond < 10:
             await advance_bond(target_id, 1, session_id)
 
+    # intimacy_events.intensity is CHECK >= 1. A score of 0 or less (roll 1 under a -40 trait
+    # penalty) raised here after the bond and saturation writes had committed.
     await Database.execute(
         "INSERT INTO maya_rp.intimacy_events (session_id, character_id, event_type, intensity, narrative, bond_delta) "
         "VALUES ($1, $2, 'scene_roll', $3, $4, $5)",
-        session_id, target_id, final_score, narrative_hook, 1 if passed else 0)
+        session_id, target_id, max(1, final_score), narrative_hook, 1 if passed else 0)
 
     info("romance", f"Roll: {initiator['name']} -> {target['name']} ({position} @ {location}) "
                     f"| Roll:{raw_roll}+{modifier}={final_score} vs {threshold} -> {'PASS' if passed else 'FAIL'}")
@@ -1218,25 +1274,33 @@ async def process_aftercare(
     initiator_id: int,
     session_id: int | None = None,
 ) -> dict[str, Any]:
-    """Aftercare & crowning: saturation cooldown, crowning prompt, event log."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    """Aftercare & crowning: saturation cooldown, crowning prompt, event log.
 
-    target = await Database.fetchrow(
-        "SELECT c.name, c.bond, ra.saturation_pct FROM maya_rp.characters c "
-        "JOIN maya_rp.romance_arcs ra ON c.id = ra.character_id AND ra.session_id = c.session_id "
-        "WHERE c.id=$1 AND c.session_id=$2",
-        target_id, session_id)
-    if not target:
-        return {"error": "Character or arc not found"}
+    @param target_id - character who receives aftercare.
+    @param initiator_id - character who gives it; unused by the write.
+    @param session_id - session; `None` resolves per call.
+    @returns new saturation, crowning prompt and instruction; or an error.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = _writable_session(session_id)
 
-    new_sat = max(30, (target["saturation_pct"] or 0) - 20)
-    await Database.execute(
-        "UPDATE maya_rp.romance_arcs SET saturation_pct=$1 WHERE character_id=$2 AND session_id=$3",
-        new_sat, target_id, session_id)
+    # The arc row is locked across read and write so a concurrent indulgence is not overwritten.
+    async with Database.transaction() as conn:
+        target = await conn.fetchrow(
+            "SELECT c.name, c.bond, ra.saturation_pct FROM maya_rp.characters c "
+            "JOIN maya_rp.romance_arcs ra ON c.id = ra.character_id AND ra.session_id = c.session_id "
+            "WHERE c.id=$1 AND c.session_id=$2 FOR UPDATE OF ra",
+            target_id, session_id)
+        if not target:
+            return {"error": "Character or arc not found"}
 
-    game_day = await Database.fetchval(
-        "SELECT COALESCE(game_day, 1) FROM maya_rp.sessions WHERE id=$1", session_id) or 1
+        new_sat = max(30, (target["saturation_pct"] or 0) - 20)
+        await conn.execute(
+            "UPDATE maya_rp.romance_arcs SET saturation_pct=$1 WHERE character_id=$2 AND session_id=$3",
+            new_sat, target_id, session_id)
+
+        game_day = await conn.fetchval(
+            "SELECT COALESCE(game_day, 1) FROM maya_rp.sessions WHERE id=$1", session_id) or 1
 
     crowning = random.choice([
         f"The torrent passes. {target['name']} lies spent, the tension replaced by a heavy, golden quiet.",

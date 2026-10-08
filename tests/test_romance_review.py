@@ -2,11 +2,13 @@
 
 Seven fixes. Each test fails against the module as it stood before. Nothing here writes to session 3,
 nothing touches the private scene machinery beyond the rows it cleans up, and every row this file
-creates in session 5 is removed in a `finally`.
+creates lives in a scratch session and is removed in a `finally`: the writers refuse the frozen
+session 5, which these tests used to write.
 """
 from __future__ import annotations
 
 import inspect
+import os
 import pathlib
 import sys
 
@@ -18,8 +20,25 @@ import pytest  # noqa: E402
 from core.db import Database  # noqa: E402
 from modules import romance  # noqa: E402
 
-SESSION = 5
+SESSION = 900 + os.getpid() % 100
 MARK = "review romance"
+
+
+@pytest.fixture(autouse=True)
+async def _scratch_session_row():
+    """`characters.session_id` is a foreign key into `sessions`: the scratch campaign needs its row."""
+    await Database.init()
+    await Database.execute(
+        "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'Romance review scratch','active')"
+        " ON CONFLICT (id) DO NOTHING", SESSION)
+    yield
+    for table in ("romance_arcs", "intimacy_events", "jealousy_states"):
+        try:
+            await Database.execute(f"DELETE FROM maya_rp.{table} WHERE session_id=$1", SESSION)
+        except Exception:  # noqa: BLE001 - a table without session_id has nothing to sweep here
+            pass
+    await Database.execute("DELETE FROM maya_rp.characters WHERE session_id=$1", SESSION)
+    await Database.execute("DELETE FROM maya_rp.sessions WHERE id=$1", SESSION)
 
 
 async def _character(bond=6, traits="[\"stoic\"]"):

@@ -54,17 +54,18 @@ class TestTheInfluence:
 
 
 class TestTheLastTwoWrites:
-    async def test_linking_a_decision_to_an_event_is_an_idempotent_write(self):
+    async def test_linking_a_decision_to_an_event_is_an_idempotent_write(self, scratch_session):
         """`link_event` is declared `-> None`: it updates and returns nothing. The contract is that it
-        completes, and that a second call with the same pair is not an error."""
+        completes, and that a second call with the same pair is not an error. The decision id matches no
+        row in the scratch session, so the update writes nothing."""
         await Database.init()
-        assert await decision.link_event(5, 999_999, 999_999) is None
-        assert await decision.link_event(5, 999_999, 999_999) is None
+        assert await decision.link_event(scratch_session, 999_999, 999_999) is None
+        assert await decision.link_event(scratch_session, 999_999, 999_999) is None
         await Database.close()
 
-    async def test_marking_news_read_answers(self):
+    async def test_marking_news_read_answers(self, scratch_session):
         await Database.init()
-        out = await news.mark_read(5, 999_999, "a headline that does not exist")
+        out = await news.mark_read(scratch_session, 999_999, "a headline that does not exist")
         assert out is not None
         await Database.close()
 

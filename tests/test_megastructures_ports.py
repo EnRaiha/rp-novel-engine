@@ -28,19 +28,21 @@ class TestTheCatalogues:
 
 
 class TestSessionScope:
-    async def test_ports_are_scoped_to_their_session(self):
+    async def test_ports_are_scoped_to_their_session(self, scratch_campaign):
+        mine_sid = scratch_campaign
+        other_sid = 900 + (mine_sid - 900 + 50) % 100
         await Database.init()
         territory = await Database.fetchval("SELECT id FROM maya_rp.territory LIMIT 1")
         pt = await Database.fetchval("SELECT id FROM maya_rp.port_types ORDER BY id LIMIT 1")
         assert territory and pt, "nothing to build with"
         row = await Database.fetchrow(
             "INSERT INTO maya_rp.ports (session_id, territory_id, port_type_id, name, level, status)"
-            " VALUES (3, $1, $2, 'red proof port', 1, 'active') RETURNING id", territory, pt)
+            " VALUES ($1, $2, $3, 'red proof port', 1, 'active') RETURNING id", mine_sid, territory, pt)
         try:
-            mine = await mp.get_port_overview(3)
-            theirs = await mp.get_port_overview(5)
-            assert any(r["id"] == row["id"] for r in mine), "session 3 cannot see its own port"
-            assert not any(r["id"] == row["id"] for r in theirs), "session 5 sees session 3 ports"
+            mine = await mp.get_port_overview(mine_sid)
+            theirs = await mp.get_port_overview(other_sid)
+            assert any(r["id"] == row["id"] for r in mine), "a session cannot see its own port"
+            assert not any(r["id"] == row["id"] for r in theirs), "another session sees this port"
         finally:
             await Database.execute("DELETE FROM maya_rp.ports WHERE id=$1", row["id"])
             await Database.close()

@@ -30,9 +30,9 @@ class TestCreateCargo:
         assert "nowhere" in out.get("error", ""), out
         await Database.close()
 
-    async def test_real_cargo_lands(self):
+    async def test_real_cargo_lands(self, scratch_campaign):
         await Database.init()
-        out = await logistics.create_cargo("red proof grain", 12, "ship", 7, 5)
+        out = await logistics.create_cargo("red proof grain", 12, "ship", 7, scratch_campaign)
         try:
             assert out.get("cargo_id"), out
             qty = await Database.fetchval(

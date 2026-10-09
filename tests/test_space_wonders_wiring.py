@@ -9,38 +9,6 @@ from __future__ import annotations
 import pathlib
 import sys
 
-import pytest_asyncio
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _clean_story_log():
-    """Remove the story_log rows this file writes.
-
-    `explore_anomaly` records an entry for the session it explores. This file never deleted them, so each
-    full-suite run left a row in session 5 and a teammate cleared nine by hand before reporting it. The
-    ceiling is taken before the test and only rows above it are removed, so nothing a teammate wrote in
-    the meantime is touched.
-    """
-    from core.db import Database
-
-    await Database.init()
-    ceiling = await Database.fetchval(
-        "SELECT COALESCE(max(id), 0) FROM maya_rp.story_log WHERE session_id=5")
-    yield
-    # Delete by id, and only rows this module's code path writes. A ceiling delete is what destroyed 169
-    # rows of session-5 events in another reviewer's test today: he reused a story_log ceiling against the
-    # events table, which numbers independently. This one is scoped to one table, one session, one ceiling
-    # AND the two titles explore_anomaly produces, so it cannot reach a row it did not cause. The rule from
-    # that incident is simple: a test may only delete what it created, by id.
-    written = await Database.fetch(
-        "SELECT id FROM maya_rp.story_log WHERE session_id=5 AND id > $1"
-        " AND (title LIKE 'Anomaly%' OR category = 'anomaly')", ceiling)
-    if written:
-        await Database.execute(
-            "DELETE FROM maya_rp.story_log WHERE id = ANY($1::bigint[])",
-            [row["id"] for row in written])
-    await Database.close()
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -58,12 +26,13 @@ async def _discovery(session_id: int):
 
 
 class TestTheGate:
-    async def test_a_discovery_from_another_session_is_refused(self):
+    async def test_a_discovery_from_another_session_is_refused(self, scratch_campaign):
+        other = 900 + (scratch_campaign - 900 + 50) % 100
         await Database.init()
-        row = await _discovery(3)
+        row = await _discovery(scratch_campaign)
         try:
-            refused = await sw.explore_anomaly(row["id"], 100, 5)
-            assert "not found in session 5" in refused.get("error", ""), refused
+            refused = await sw.explore_anomaly(row["id"], 100, other)
+            assert f"not found in session {other}" in refused.get("error", ""), refused
             explored = await Database.fetchval(
                 "SELECT explored FROM maya_rp.discoveries WHERE id=$1", row["id"])
             assert explored is False, "the refused call explored it anyway"
@@ -71,11 +40,11 @@ class TestTheGate:
             await Database.execute("DELETE FROM maya_rp.discoveries WHERE id=$1", row["id"])
             await Database.close()
 
-    async def test_a_session_can_resolve_its_own_discovery(self):
+    async def test_a_session_can_resolve_its_own_discovery(self, scratch_campaign):
         await Database.init()
-        row = await _discovery(5)
+        row = await _discovery(scratch_campaign)
         try:
-            out = await sw.explore_anomaly(row["id"], 100, 5)
+            out = await sw.explore_anomaly(row["id"], 100, scratch_campaign)
             assert out.get("error") is None, out
             # `explore_anomaly` rolls for danger and rewards with `random`, so whether the discovery is
             # marked explored varies between runs. This test was flaky because it asserted the roll's

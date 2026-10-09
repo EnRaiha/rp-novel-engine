@@ -57,20 +57,21 @@ class TestTheTickSurfacesWhatItKnows:
 
 
 class TestMoraleCannotGoNegative:
-    async def test_the_wired_writer_clamps_at_zero(self):
+    async def test_the_wired_writer_clamps_at_zero(self, scratch_session):
         """The defect, run as SQL rather than read as source.
 
         The old statement is executed first to prove the defect was real: it returns a negative
         morale. The fixed statement is then executed against the same row and must floor at zero.
+        Both statements touch every crew row of the session, so the session is a scratch one.
         """
-        await Database.init()
+        await _open_scratch(scratch_session)
         row = await Database.fetchrow(
             "INSERT INTO maya_rp.crew_roster (session_id, name, morale)"
-            " VALUES (5, 'red proof hand', 5) RETURNING id")
+            " VALUES ($1, 'red proof hand', 5) RETURNING id", scratch_session)
         try:
             await Database.execute(
                 "UPDATE maya_rp.crew_roster SET morale=LEAST(100, morale+$1) WHERE session_id=$2",
-                -50, 5)
+                -50, scratch_session)
             broken = await Database.fetchval(
                 "SELECT morale FROM maya_rp.crew_roster WHERE id=$1", row["id"])
             assert broken < 0, (
@@ -80,13 +81,12 @@ class TestMoraleCannotGoNegative:
                 "UPDATE maya_rp.crew_roster SET morale=$1 WHERE id=$2", 5, row["id"])
             await Database.execute(
                 "UPDATE maya_rp.crew_roster SET morale=GREATEST(0, LEAST(100, morale+$1))"
-                " WHERE session_id=$2", -50, 5)
+                " WHERE session_id=$2", -50, scratch_session)
             fixed = await Database.fetchval(
                 "SELECT morale FROM maya_rp.crew_roster WHERE id=$1", row["id"])
             assert fixed == 0, f"morale floored at {fixed}, not 0"
         finally:
-            await Database.execute("DELETE FROM maya_rp.crew_roster WHERE id=$1", row["id"])
-            await Database.close()
+            await _close_scratch(scratch_session)
 
     async def test_social_update_morale_also_clamps(self, scratch_session):
         """The session has no crew, and `_get_fleet_morale` returns its default 50 when the roster is

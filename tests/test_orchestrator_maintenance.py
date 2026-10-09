@@ -27,7 +27,10 @@ from scripts import orchestrator as orch  # noqa: E402
 
 @pytest.fixture
 def recorded(monkeypatch):
-    """Record every module the tick tries to run, and stop it touching the database."""
+    """Record every module the tick tries to run, and stop it touching the database.
+
+    A test asks for `scratch_campaign` before this fixture: the campaign opens the pool first, and this
+    fixture then replaces `Database.init`."""
     seen: list[str] = []
 
     async def fake_tick(name, mod, session_id):
@@ -39,15 +42,15 @@ def recorded(monkeypatch):
 
     monkeypatch.setattr(orch, "tick", fake_tick)
     monkeypatch.setattr(orch.Database, "init", fake_init)
-    # These tests tick session 5, which is frozen on this machine; the frozen skip has its own test.
+    # The tests tick a scratch campaign; the frozen skip has its own test.
     monkeypatch.setattr("core.session.is_frozen", lambda sid: False)
     return seen
 
 
-async def test_the_tick_is_skipped_while_maintenance_is_armed(recorded, monkeypatch, capsys):
+async def test_the_tick_is_skipped_while_maintenance_is_armed(scratch_campaign, recorded, monkeypatch, capsys):
     monkeypatch.setattr("core.maintenance.active", lambda: True)
 
-    await orch.run_full_tick(session_id=5, verbose=True)
+    await orch.run_full_tick(session_id=scratch_campaign, verbose=True)
 
     assert recorded == [], (
         f"the tick ran {len(recorded)} module(s) while maintenance was armed: {recorded[:4]}. "
@@ -55,12 +58,12 @@ async def test_the_tick_is_skipped_while_maintenance_is_armed(recorded, monkeypa
     assert "SKIPPED" in capsys.readouterr().out, "the skip was silent"
 
 
-async def test_the_tick_still_ticks_when_maintenance_is_disarmed(recorded, monkeypatch):
+async def test_the_tick_still_ticks_when_maintenance_is_disarmed(scratch_campaign, recorded, monkeypatch):
     """The other direction. A guard that never lets the tick run is an outage, not a guard."""
     monkeypatch.setattr("core.maintenance.active", lambda: False)
 
     try:
-        await orch.run_full_tick(session_id=5, verbose=False)
+        await orch.run_full_tick(session_id=scratch_campaign, verbose=False)
     except Exception:
         # Later phases touch modules whose real work is out of scope here; what this test asserts is that
         # the guard let the tick reach them at all.
@@ -69,18 +72,19 @@ async def test_the_tick_still_ticks_when_maintenance_is_disarmed(recorded, monke
     assert recorded, "the tick ran no module while maintenance was disarmed"
 
 
-async def test_a_frozen_session_is_skipped_once_instead_of_failing_every_module(recorded, monkeypatch, capsys):
+async def test_a_frozen_session_is_skipped_once_instead_of_failing_every_module(
+        scratch_campaign, recorded, monkeypatch, capsys):
     """The module writers refuse a frozen session, so ticking it gave 31 FrozenSession errors."""
     monkeypatch.setattr("core.maintenance.active", lambda: False)
     monkeypatch.setattr("core.session.is_frozen", lambda sid: True)
 
-    await orch.run_full_tick(session_id=5, verbose=True)
+    await orch.run_full_tick(session_id=scratch_campaign, verbose=True)
 
     assert recorded == [], f"the tick ran {recorded[:4]} against a frozen session"
     assert "frozen" in capsys.readouterr().out, "the skip was silent"
 
 
-async def test_a_statistics_read_that_fails_does_not_stop_the_tick(recorded, monkeypatch):
+async def test_a_statistics_read_that_fails_does_not_stop_the_tick(scratch_campaign, recorded, monkeypatch):
     """The write-tracking snapshot runs before the phases, and it must not be able to hold them up.
 
     This test exists because the first version did: `snapshot()` called the database before any
@@ -97,7 +101,7 @@ async def test_a_statistics_read_that_fails_does_not_stop_the_tick(recorded, mon
     monkeypatch.setattr(tick_writes, "snapshot", explode)
 
     try:
-        await orch.run_full_tick(session_id=5, verbose=False)
+        await orch.run_full_tick(session_id=scratch_campaign, verbose=False)
     except Exception:
         pass
 

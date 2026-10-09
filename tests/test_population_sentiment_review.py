@@ -1,7 +1,6 @@
 """Population sentiment review: what reading `modules/population_sentiment.py` in full turned up.
 
-Two defects. Nothing here writes to session 3, and every row this file creates in session 5 is
-removed in a `finally`.
+Two defects. Every row this file creates belongs to `scratch_campaign` and is removed in a `finally`.
 """
 from __future__ import annotations
 
@@ -16,10 +15,8 @@ import pytest  # noqa: E402
 from core.db import Database  # noqa: E402
 from modules import population_sentiment as ps  # noqa: E402
 
-SESSION = 5
 
-
-async def _territory(name="review sentiment system", morale=50, tax=0.05, crisis=0,
+async def _territory(sid, name="review sentiment system", morale=50, tax=0.05, crisis=0,
                 performance=50):
     # The id is taken well above max(id): a concurrent run can insert into this table between the
     # subquery and the insert, and the sequence itself is behind max(id).
@@ -30,15 +27,15 @@ async def _territory(name="review sentiment system", morale=50, tax=0.05, crisis
         "tax_rate, crisis_level, title_performance) "
         "VALUES ((SELECT COALESCE(MAX(id), 0) + 500000 FROM maya_rp.territory), $1, $2, 'Iron Concord', "
         "$3, $4, $5, $6) RETURNING id",
-        SESSION, name, morale, tax, crisis, performance)
+        sid, name, morale, tax, crisis, performance)
 
 
-async def _sentiment(territory_id, faction="Iron Concord", sentiment=5):
+async def _sentiment(sid, territory_id, faction="Iron Concord", sentiment=5):
     return await Database.fetchval(
         "INSERT INTO maya_rp.population_sentiment "
         "(session_id, territory_id, faction_name, sentiment, approval, fear, trust, bias) "
         "VALUES ($1, $2, $3, $4, 55, 10, 45, 0) RETURNING id",
-        SESSION, territory_id, faction, sentiment)
+        sid, territory_id, faction, sentiment)
 
 
 async def _drop(territory_id):
@@ -48,35 +45,35 @@ async def _drop(territory_id):
 
 
 class TestTheStatusQuery:
-    async def test_a_faction_filter_without_a_territory_is_answerable(self):
+    async def test_a_faction_filter_without_a_territory_is_answerable(self, scratch_campaign):
         """The placeholder was $3 in a query that bound one argument, so this raised."""
         await Database.init()
-        tid = await _territory()
-        await _sentiment(tid)
+        tid = await _territory(scratch_campaign)
+        await _sentiment(scratch_campaign, tid)
         try:
-            rows = await ps.status(SESSION, faction_name="Iron Concord")
+            rows = await ps.status(scratch_campaign, faction_name="Iron Concord")
             assert [r["territory_id"] for r in rows] == [tid], rows
         finally:
             await _drop(tid)
             await Database.close()
 
-    async def test_all_four_filter_shapes_answer(self):
+    async def test_all_four_filter_shapes_answer(self, scratch_campaign):
         await Database.init()
-        tid = await _territory()
-        await _sentiment(tid)
+        tid = await _territory(scratch_campaign)
+        await _sentiment(scratch_campaign, tid)
         try:
-            assert len(await ps.status(SESSION)) == 1
-            assert len(await ps.status(SESSION, territory_id=tid)) == 1
-            assert len(await ps.status(SESSION, faction_name="Iron")) == 1
-            assert len(await ps.status(SESSION, territory_id=tid, faction_name="Iron")) == 1
+            assert len(await ps.status(scratch_campaign)) == 1
+            assert len(await ps.status(scratch_campaign, territory_id=tid)) == 1
+            assert len(await ps.status(scratch_campaign, faction_name="Iron")) == 1
+            assert len(await ps.status(scratch_campaign, territory_id=tid, faction_name="Iron")) == 1
         finally:
             await _drop(tid)
             await Database.close()
 
-    async def test_a_filter_that_matches_nothing_answers_empty(self):
+    async def test_a_filter_that_matches_nothing_answers_empty(self, scratch_campaign):
         await Database.init()
         try:
-            assert await ps.status(SESSION, faction_name="nobody at all") == []
+            assert await ps.status(scratch_campaign, faction_name="nobody at all") == []
         finally:
             await Database.close()
 
@@ -101,13 +98,13 @@ class TestTheSessionIsResolvedAtCallTime:
 
 
 class TestTheDrivers:
-    async def test_refresh_moves_approval_with_the_drivers(self, monkeypatch):
+    async def test_refresh_moves_approval_with_the_drivers(self, scratch_campaign, monkeypatch):
         """Same row in, same row out: the formula is deterministic and territory-scoped."""
         await Database.init()
-        tid = await _territory(morale=70, tax=0.05, crisis=0)
-        sid = await _sentiment(tid)
+        tid = await _territory(scratch_campaign, morale=70, tax=0.05, crisis=0)
+        sid = await _sentiment(scratch_campaign, tid)
         try:
-            out = await ps.refresh(SESSION, tid)
+            out = await ps.refresh(scratch_campaign, tid)
             assert out == {"updated": 1}, out
             row = await Database.fetchrow(
                 "SELECT sentiment, approval, fear, trust FROM maya_rp.population_sentiment WHERE id = $1",
@@ -120,22 +117,22 @@ class TestTheDrivers:
             await _drop(tid)
             await Database.close()
 
-    async def test_a_failing_territory_stays_out_of_another_session(self):
+    async def test_a_failing_territory_stays_out_of_another_session(self, scratch_campaign):
         await Database.init()
-        tid = await _territory()
-        await _sentiment(tid)
+        tid = await _territory(scratch_campaign)
+        await _sentiment(scratch_campaign, tid)
         try:
             assert await ps.refresh(7, tid) == {"updated": 0}
         finally:
             await _drop(tid)
             await Database.close()
 
-    async def test_a_manual_shift_is_clamped_and_named(self):
+    async def test_a_manual_shift_is_clamped_and_named(self, scratch_campaign):
         await Database.init()
-        tid = await _territory()
-        sid = await _sentiment(tid, sentiment=95)
+        tid = await _territory(scratch_campaign)
+        sid = await _sentiment(scratch_campaign, tid, sentiment=95)
         try:
-            out = await ps.shift(SESSION, tid, "Iron Concord", 40, "review")
+            out = await ps.shift(scratch_campaign, tid, "Iron Concord", 40, "review")
             assert out["sentiment"] == 100, out
             assert out["delta"] == 40
             stored = await Database.fetchval(
@@ -145,10 +142,10 @@ class TestTheDrivers:
             await _drop(tid)
             await Database.close()
 
-    async def test_a_shift_with_no_row_is_refused(self):
+    async def test_a_shift_with_no_row_is_refused(self, scratch_campaign):
         await Database.init()
         try:
-            out = await ps.shift(SESSION, 999999999, "nobody", 5, "review")
+            out = await ps.shift(scratch_campaign, 999999999, "nobody", 5, "review")
             assert "no sentiment row" in out["error"], out
         finally:
             await Database.close()

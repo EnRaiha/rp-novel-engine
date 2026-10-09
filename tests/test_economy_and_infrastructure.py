@@ -47,7 +47,9 @@ class TestTheSharedLedger:
 
 
 class TestSessionScope:
-    async def test_a_facility_built_in_one_session_is_invisible_to_another(self):
+    async def test_a_facility_built_in_one_session_is_invisible_to_another(self, scratch_campaign):
+        mine_sid = scratch_campaign
+        other_sid = 900 + (mine_sid - 900 + 50) % 100
         await Database.init()
         kind = await Database.fetchval(
             "SELECT id FROM maya_rp.infrastructure_types ORDER BY id LIMIT 1")
@@ -55,13 +57,13 @@ class TestSessionScope:
         row = await Database.fetchrow(
             "INSERT INTO maya_rp.infrastructure_instances"
             " (session_id, infrastructure_type_id, name, level, status)"
-            " VALUES (3, $1, 'red proof yard', 1, 'active') RETURNING id", kind)
+            " VALUES ($1, $2, 'red proof yard', 1, 'active') RETURNING id", mine_sid, kind)
         try:
-            mine = await infrastructure.list_infrastructure(3)
-            theirs = await infrastructure.list_infrastructure(5)
-            assert any(r["id"] == row["id"] for r in mine), "session 3 cannot see its own facility"
-            assert not any(r["id"] == row["id"] for r in theirs), "session 5 sees session 3 facilities"
-            opened = await infrastructure.get_infrastructure(row["id"], 5)
+            mine = await infrastructure.list_infrastructure(mine_sid)
+            theirs = await infrastructure.list_infrastructure(other_sid)
+            assert any(r["id"] == row["id"] for r in mine), "a session cannot see its own facility"
+            assert not any(r["id"] == row["id"] for r in theirs), "another session sees this facility"
+            opened = await infrastructure.get_infrastructure(row["id"], other_sid)
             assert opened == {}, "the detail read leaks across sessions"
         finally:
             await Database.execute(

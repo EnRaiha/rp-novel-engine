@@ -1,7 +1,8 @@
 """Module review tests for modules/space_wonders.py (2026-10-03).
 
-The database-backed tests create their own planets, sectors and discoveries and
-delete them in a finally, so nothing is left behind in any session.
+The database-backed tests create their own sectors and discoveries in `scratch_session` and
+delete them in a finally. The tests that stub `sw.Database` also stub `EventBus.emit`, which
+writes `events` through the real pool.
 """
 from __future__ import annotations
 
@@ -21,6 +22,10 @@ from core.db import Database  # noqa: E402
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+async def _no_emit(event_type, data):
+    """Stands in for `EventBus.emit`, whose `events` insert goes through the real pool."""
 
 
 class _StubDB:
@@ -114,7 +119,7 @@ def test_credit_says_when_the_session_has_no_resources_row(monkeypatch):
     assert any("No resources row for session 5" in line[-1] for line in logged)
 
 
-def test_hunt_pays_the_loot_it_reports(monkeypatch):
+def test_hunt_pays_the_loot_it_reports(monkeypatch, scratch_session):
     stub = _StubDB(
         answers=[
             ("FROM maya_rp.animal_encounters", {"id": 7, "animal_id": 3}),
@@ -130,8 +135,9 @@ def test_hunt_pays_the_loot_it_reports(monkeypatch):
     )
     monkeypatch.setattr(sw, "Database", stub)
     monkeypatch.setattr(sw.random, "random", lambda: 0.0)  # force the hit
+    monkeypatch.setattr(sw.EventBus, "emit", _no_emit)
 
-    out = _run(sw.hunt_animal(7, 100, session_id=5))
+    out = _run(sw.hunt_animal(7, 100, session_id=scratch_session))
 
     assert out["success"] is True
     # The loot rolls 0.8-1.2x, so the contract is that the paid amount equals
@@ -162,7 +168,7 @@ def test_survey_applies_the_planet_type_modifiers(monkeypatch):
     assert out["yield"]["fuel"] == 100
 
 
-def test_explore_decodes_the_anomaly_reward_pool(monkeypatch):
+def test_explore_decodes_the_anomaly_reward_pool(monkeypatch, scratch_session):
     stub = _StubDB(answers=[
         ("FROM maya_rp.discoveries", {"id": 4, "target_id": 2}),
         ("FROM maya_rp.space_anomalies", {
@@ -172,8 +178,9 @@ def test_explore_decodes_the_anomaly_reward_pool(monkeypatch):
     ], resources_row={"credits": 100})
     monkeypatch.setattr(sw, "Database", stub)
     monkeypatch.setattr(sw.random, "random", lambda: 0.0)  # force the success branch
+    monkeypatch.setattr(sw.EventBus, "emit", _no_emit)
 
-    out = _run(sw.explore_anomaly(4, 100, session_id=5))
+    out = _run(sw.explore_anomaly(4, 100, session_id=scratch_session))
 
     assert out["outcome"] == "success"
     assert out["resources"]["applied"]["credits"] == out["loot"]["credits"]
@@ -198,13 +205,13 @@ def _read(row, key):
 
 
 class TestSessionScope:
-    def test_survey_refuses_another_sessions_planet(self):
+    def test_survey_refuses_another_sessions_planet(self, scratch_session):
         """The survey borrows a real row and never creates one.
 
         `tests/test_dry_run_safety.py` fingerprints maya_rp.planets, so this test
-        inserts nothing: it takes an existing unsurveyed session-3 planet, asserts
-        the call from session 5 is refused, and writes the original value back in
-        the finally whatever happened.
+        inserts nothing: it takes an existing unsurveyed session-3 planet and asserts
+        the call from the scratch session is refused. The finally writes the original
+        value back only when the planet changed, which means the survey broke.
         """
 
         async def scenario():
@@ -214,49 +221,50 @@ class TestSessionScope:
                 "WHERE session_id = 3 AND surveyed = FALSE ORDER BY id LIMIT 1")
             try:
                 assert row, "no unsurveyed session-3 planet to borrow"
-                out = await sw.survey_planet(row["id"], session_id=5)
+                out = await sw.survey_planet(row["id"], session_id=scratch_session)
                 after = await Database.fetchval(
                     "SELECT surveyed FROM maya_rp.planets WHERE id=$1", row["id"])
                 return out, after
             finally:
                 if row:
-                    await Database.execute(
-                        "UPDATE maya_rp.planets SET surveyed=$1 WHERE id=$2",
-                        row["surveyed"], row["id"])
+                    current = await Database.fetchval(
+                        "SELECT surveyed FROM maya_rp.planets WHERE id=$1", row["id"])
+                    if current != row["surveyed"]:
+                        await Database.execute(
+                            "UPDATE maya_rp.planets SET surveyed=$1 WHERE id=$2",
+                            row["surveyed"], row["id"])
                 await Database.close()
 
         out, after = _run(scenario())
-        assert "not found in session 5" in out.get("error", ""), out
+        assert f"not found in session {scratch_session}" in out.get("error", ""), out
         assert after is False, "the refused survey marked another campaign's planet surveyed"
 
-    def test_a_discovery_lands_in_the_named_session(self):
+    def test_a_discovery_lands_in_the_named_session(self, scratch_session):
+        """`sectors.session_id` has an FK to `sessions` with no cascade: the test seeds the scratch
+        session row and removes the sector before it removes the row."""
+
         async def scenario():
             await Database.init()
-            sector = await Database.fetchval(
-                "INSERT INTO maya_rp.sectors (session_id, name, x_coord, y_coord) "
-                "VALUES (5, 'review-temp-sector', 0, 0) RETURNING id")
-            discovery = None
-            mark = await Database.fetchval(
-                "SELECT COALESCE(MAX(id), 0) FROM maya_rp.story_log WHERE session_id = 5")
+            await Database.execute(
+                "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1, 'wonders review', 'active')"
+                " ON CONFLICT (id) DO NOTHING", scratch_session)
             try:
-                out = await sw.discover_anomaly(sector, session_id=5)
-                discovery = out.get("discovery_id")
+                sector = await Database.fetchval(
+                    "INSERT INTO maya_rp.sectors (session_id, name, x_coord, y_coord) "
+                    "VALUES ($1, 'review-temp-sector', 0, 0) RETURNING id", scratch_session)
+                out = await sw.discover_anomaly(sector, session_id=scratch_session)
                 owner = await Database.fetchval(
-                    "SELECT session_id FROM maya_rp.discoveries WHERE id=$1", discovery)
+                    "SELECT session_id FROM maya_rp.discoveries WHERE id=$1", out.get("discovery_id"))
                 return out, owner
             finally:
-                # discover_anomaly logs to story_log; the test removes its own line
-                # so session 5 keeps no trace of the run.
-                await Database.execute(
-                    "DELETE FROM maya_rp.story_log WHERE session_id = 5 AND id > $1 "
-                    "AND category = 'exploration' AND title LIKE 'Anomaly: %'", mark)
-                await Database.execute("DELETE FROM maya_rp.discoveries WHERE id=$1", discovery)
-                await Database.execute("DELETE FROM maya_rp.sectors WHERE id=$1", sector)
+                # `discoveries` and `story_log` cascade from the session row.
+                await Database.execute("DELETE FROM maya_rp.sectors WHERE session_id = $1", scratch_session)
+                await Database.execute("DELETE FROM maya_rp.sessions WHERE id = $1", scratch_session)
                 await Database.close()
 
         out, owner = _run(scenario())
         assert out.get("discovery_id"), out
-        assert owner == 5, "the discovery was written into another session"
+        assert owner == scratch_session, "the discovery was written into another session"
 
 
 def test_the_tick_reads_inside_its_own_session(monkeypatch):

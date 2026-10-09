@@ -1,8 +1,7 @@
 """Megastructures & Ports review: what reading the module in full turned up.
 
 The tick took a session and never put it in its read, and the port upgrade resolved its port by id
-alone. Nothing here writes to session 3, and every row this file creates in session 5 is removed in a
-`finally`.
+alone. Every row this file creates belongs to `scratch_session` and is removed in a `finally`.
 """
 from __future__ import annotations
 
@@ -19,13 +18,12 @@ from asyncpg.exceptions import PostgresError  # noqa: E402
 from core.db import Database  # noqa: E402
 from modules import megastructures_ports as mp  # noqa: E402
 
-SESSION = 5
 TYPE_ID = 1          # Dyson Sphere: two phases, phase 1 costs fuel, alloys and dream essence
 PORT_TYPE_ID = 1     # Spaceport: upgrades large_spaceport, shipyard
 UPGRADE = "large_spaceport"
 
 
-async def _construction(session_id=SESSION, progress=0, phase=1):
+async def _construction(session_id, progress=0, phase=1):
     return await Database.fetchval(
         "INSERT INTO maya_rp.megastructure_construction "
         "(session_id, megastructure_type_id, current_phase, progress_pct, status, started_at) "
@@ -33,15 +31,11 @@ async def _construction(session_id=SESSION, progress=0, phase=1):
         session_id, TYPE_ID, phase, progress)
 
 
-async def _port(session_id=SESSION, level=1):
+async def _port(session_id, level=1):
     return await Database.fetchval(
         "INSERT INTO maya_rp.ports (session_id, port_type_id, name, level, status) "
         "VALUES ($1, $2, 'review port', $3, 'active') RETURNING id",
         session_id, PORT_TYPE_ID, level)
-
-
-async def _drop_construction(cid):
-    await Database.execute("DELETE FROM maya_rp.megastructure_construction WHERE id = $1", cid)
 
 
 async def _drop_port(pid):
@@ -71,30 +65,32 @@ class _RecordingDatabase:
 
 
 class TestTheTickStaysInItsCampaign:
-    async def test_advancing_ignores_another_campaign(self):
+    async def test_advancing_ignores_another_campaign(self, scratch_session):
         """One phase is 365 game days, so 365 days in one call is the call that would pause it."""
         await Database.init()
-        cid = await _construction(progress=0)
+        await _seed_session(scratch_session)
         try:
+            cid = await _construction(scratch_session, progress=0)
             await mp.advance_megastructure(7, 365.0)
             status = await Database.fetchval(
                 "SELECT status FROM maya_rp.megastructure_construction WHERE id = $1", cid)
             assert status == "construction", "another campaign's tick paused this construction site"
         finally:
-            await _drop_construction(cid)
+            await _drop_session(scratch_session)
             await Database.close()
 
-    async def test_advancing_its_own_site_reports_what_it_did(self):
+    async def test_advancing_its_own_site_reports_what_it_did(self, scratch_session):
         await Database.init()
-        cid = await _construction(progress=0)
+        await _seed_session(scratch_session)
         try:
-            tally = await mp.advance_megastructure(SESSION, 365.0)
+            cid = await _construction(scratch_session, progress=0)
+            tally = await mp.advance_megastructure(scratch_session, 365.0)
             assert tally == {"advanced": 1, "paused": 1, "completed": 0}, tally
             row = await Database.fetchrow(
                 "SELECT status, progress_pct FROM maya_rp.megastructure_construction WHERE id = $1", cid)
             assert row["status"] == "paused", dict(row)
         finally:
-            await _drop_construction(cid)
+            await _drop_session(scratch_session)
             await Database.close()
 
     async def test_a_sub_one_percent_step_reaches_the_integer_column(self, scratch_session, monkeypatch):
@@ -151,7 +147,7 @@ class TestTheTickStaysInItsCampaign:
         default = inspect.signature(mp.run_tick).parameters["session_id"].default
         assert default is None, default
 
-    async def test_a_failing_tick_is_logged_as_a_fault(self, monkeypatch):
+    async def test_a_failing_tick_is_logged_as_a_fault(self, scratch_session, monkeypatch):
         seen = []
 
         async def boom(session_id, game_days=0.5):
@@ -159,38 +155,43 @@ class TestTheTickStaysInItsCampaign:
 
         monkeypatch.setattr(mp, "advance_megastructure", boom)
         monkeypatch.setattr(mp, "error", lambda module, message: seen.append(message))
-        out = await mp.run_tick(SESSION)
+        out = await mp.run_tick(scratch_session)
         assert "construction query died" in out["error"], out
         assert seen, "a failing tick printed and said nothing at fault level"
 
 
 class TestThePorts:
-    async def test_upgrading_another_campaigns_port_is_refused(self):
+    async def test_upgrading_another_campaigns_port_is_refused(self, scratch_session):
         await Database.init()
-        pid = await _port()
+        await _seed_session(scratch_session)
         try:
+            pid = await _port(scratch_session)
             out = await mp.upgrade_port(7, pid, UPGRADE)
             assert "not found in session 7" in out.get("error", ""), out
             level = await Database.fetchval("SELECT level FROM maya_rp.ports WHERE id = $1", pid)
             assert level == 1, "another campaign raised this port"
-        finally:
             await _drop_port(pid)
+        finally:
+            await _drop_session(scratch_session)
             await Database.close()
 
-    async def test_a_port_without_the_upgrade_is_refused(self):
+    async def test_a_port_without_the_upgrade_is_refused(self, scratch_session):
         await Database.init()
-        pid = await _port()
+        await _seed_session(scratch_session)
         try:
-            out = await mp.upgrade_port(SESSION, pid, "orbital_cathedral")
+            pid = await _port(scratch_session)
+            out = await mp.upgrade_port(scratch_session, pid, "orbital_cathedral")
             assert "not available" in out.get("error", ""), out
-        finally:
             await _drop_port(pid)
+        finally:
+            await _drop_session(scratch_session)
             await Database.close()
 
 
 class TestTheStatusReaders:
-    async def test_both_readers_answer_without_a_session_argument(self):
+    async def test_both_readers_answer_without_a_session_argument(self, scratch_session, monkeypatch):
         """`Config` is read here and the module never imported it: the default path was NameError."""
+        monkeypatch.setattr(mp.Config, "SESSION_ID", scratch_session)
         await Database.init()
         try:
             assert await mp.get_megastructure_status() == []
@@ -198,22 +199,23 @@ class TestTheStatusReaders:
         finally:
             await Database.close()
 
-    async def test_a_construction_in_another_session_is_invisible(self):
+    async def test_a_construction_in_another_session_is_invisible(self, scratch_session):
         await Database.init()
-        cid = await _construction()
+        await _seed_session(scratch_session)
         try:
+            await _construction(scratch_session)
             assert await mp.get_megastructure_status(7) == []
-            assert len(await mp.get_megastructure_status(SESSION)) == 1
+            assert len(await mp.get_megastructure_status(scratch_session)) == 1
         finally:
-            await _drop_construction(cid)
+            await _drop_session(scratch_session)
             await Database.close()
 
 
 class TestTheDoors:
-    async def test_an_unknown_type_is_refused(self):
+    async def test_an_unknown_type_is_refused(self, scratch_session):
         await Database.init()
         try:
-            out = await mp.start_construction(SESSION, 999999999)
+            out = await mp.start_construction(scratch_session, 999999999)
             assert "not found" in out["error"], out
         finally:
             await Database.close()

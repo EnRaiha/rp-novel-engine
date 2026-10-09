@@ -5,7 +5,6 @@ name_gen, memory, campaign and refit. Each was the only door its module was miss
 """
 from __future__ import annotations
 
-import os
 import pathlib
 import sys
 
@@ -18,17 +17,18 @@ from core import campaign, dramatic_structure, memory, session_rituals  # noqa: 
 from core.db import Database  # noqa: E402
 from core.decision_models import pirate_event_features  # noqa: E402
 from modules import image_gen, physical_state, refit, ship_generation  # noqa: E402
+from tests.conftest import scratch_id  # noqa: E402
 
 
 @pytest_asyncio.fixture
-async def campaign_row():
-    """The scratch campaign's `maya_rp.sessions` row, 900 + pid % 100, the slot `scratch_session` hands out.
+async def campaign_row(request):
+    """The scratch campaign's `maya_rp.sessions` row, the slot `scratch_session` hands out.
 
     A test asks for this fixture BEFORE `scratch_session`: pytest tears down in reverse order, so
     `scratch_session` clears every child row first and the row is removed last, after nothing references it.
     Sessions 3 and 5 are frozen reference data and are never written.
     """
-    sid = 900 + os.getpid() % 100
+    sid = scratch_id(request.module.__name__)
     await Database.init()
     await Database.execute(
         "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'rp-engine test scratch','active')"
@@ -40,9 +40,10 @@ async def campaign_row():
 
 
 class TestTheRituals:
-    async def test_the_close_is_a_sentence(self):
+    async def test_the_close_is_a_sentence(self, campaign_row, scratch_session):
+        """`generate_close` seeds a `narrative_pacing` row for its session, so it runs in a scratch campaign."""
         await Database.init()
-        out = await session_rituals.generate_close(5)
+        out = await session_rituals.generate_close(scratch_session)
         assert isinstance(out, str) and out, out
         await Database.close()
 

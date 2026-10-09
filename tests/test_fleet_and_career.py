@@ -6,7 +6,6 @@ against fleets nothing could form, and a crew member could earn experience and n
 """
 from __future__ import annotations
 
-import os
 import pathlib
 import sys
 
@@ -17,17 +16,18 @@ import pytest_asyncio  # noqa: E402
 
 from core.db import Database  # noqa: E402
 from modules import crew_career, fleet  # noqa: E402
+from tests.conftest import scratch_id  # noqa: E402
 
 
 @pytest_asyncio.fixture
-async def campaign_row():
-    """The scratch campaign's `maya_rp.sessions` row, 900 + pid % 100, the slot `scratch_session` hands out.
+async def campaign_row(request):
+    """The scratch campaign's `maya_rp.sessions` row, the slot `scratch_session` hands out.
 
     A test asks for this fixture BEFORE `scratch_session`: pytest tears down in reverse order, so
     `scratch_session` clears every child row first and the row is removed last, after nothing references it.
     Sessions 3 and 5 are frozen reference data and are never written.
     """
-    sid = 900 + os.getpid() % 100
+    sid = scratch_id(request.module.__name__)
     await Database.init()
     await Database.execute(
         "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'rp-engine test scratch','active')"
@@ -55,7 +55,7 @@ class TestTheFleetRoundTrip:
     async def test_the_listing_is_scoped_to_its_session(self, campaign_row, scratch_session):
         """A fleet in one scratch campaign does not appear in another; the second id is only read."""
         sid = scratch_session
-        other_sid = 900 + (os.getpid() + 50) % 100
+        other_sid = 900 + (sid - 900 + 50) % 100
         await Database.init()
         await fleet.create_fleet("red proof scoped", "spearhead", sid)
         try:

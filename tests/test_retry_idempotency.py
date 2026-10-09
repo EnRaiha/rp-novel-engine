@@ -30,6 +30,9 @@ from modules._economy import _deduct_resources
 #: not typed from memory.
 MID_FLIGHT = "connection was closed in the middle of operation"
 
+#: A session id in the scratch range. The fake pool receives it and nothing connects, so no row exists.
+SESSION = 900
+
 
 class FakeConn:
     """One server connection: records the statements it receives, then loses the socket."""
@@ -143,7 +146,7 @@ async def test_a_statement_that_reached_the_server_is_not_replayed(pool):
 
     with pytest.raises(asyncpg.exceptions.ConnectionDoesNotExistError):
         await db.Database.execute(
-            "UPDATE maya_rp.resources SET credits = credits - $1 WHERE session_id = $2", 100, 5)
+            "UPDATE maya_rp.resources SET credits = credits - $1 WHERE session_id = $2", 100, SESSION)
 
     assert len(received) == 1, f"the statement ran {len(received)} times: {received}"
     assert calls == {"init": 1, "close": 1}, calls
@@ -160,7 +163,7 @@ async def test_the_ledger_charge_runs_once_when_the_socket_dies_mid_charge(pool)
     _, _, received = pool
 
     with pytest.raises(asyncpg.exceptions.ConnectionDoesNotExistError):
-        await _deduct_resources(5, {"credits": 100})
+        await _deduct_resources(SESSION, {"credits": 100})
 
     updates = [sql for sql, _ in received if sql.startswith("UPDATE")]
     assert len(updates) == 1, f"the treasury was charged {len(updates)} times: {received}"

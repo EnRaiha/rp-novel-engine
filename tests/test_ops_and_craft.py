@@ -7,7 +7,6 @@ ask it to.
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 import sys
 
@@ -18,17 +17,18 @@ import pytest_asyncio  # noqa: E402
 
 from core.db import Database  # noqa: E402
 from modules import academy, alchemy, corporations, crew_system, darkops, espionage  # noqa: E402
+from tests.conftest import scratch_id  # noqa: E402
 
 
 @pytest_asyncio.fixture
-async def campaign_row():
-    """The scratch campaign's `maya_rp.sessions` row, 900 + pid % 100, the slot `scratch_session` hands out.
+async def campaign_row(request):
+    """The scratch campaign's `maya_rp.sessions` row, the slot `scratch_session` hands out.
 
     A test asks for this fixture BEFORE `scratch_session`: pytest tears down in reverse order, so
     `scratch_session` clears every child row first and the row is removed last, after nothing references it.
     Sessions 3 and 5 are frozen reference data and are never written.
     """
-    sid = 900 + os.getpid() % 100
+    sid = scratch_id(request.module.__name__)
     await Database.init()
     await Database.execute(
         "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1,'rp-engine test scratch','active')"

@@ -3,7 +3,7 @@ import random, json
 from datetime import datetime, timezone
 from core.db import Database
 from core.config import Config
-from modules._economy import _check_afford, _deduct_resources
+from modules._economy import InsufficientResources, _deduct_resources, stochastic_round
 from core.events import EventBus
 from core.log import error
 
@@ -41,7 +41,8 @@ async def seed_infestation(session_id: int, sector_id: int, territory_id: int = 
                "🚨 SOMETHING IS WRONG",
                f"Strange readings from {sname}. Spores detected. Infestation begun.", 5)
 
-    await EventBus.emit("infestation_seeded", {"infestation_id": iid["id"], "sector_id": sector_id})
+    await EventBus.emit("infestation_seeded", {"infestation_id": iid["id"], "sector_id": sector_id,
+                                               "session_id": session_id})
     return {"infestation_id": iid["id"], "sector": sname, "stage": "Spore Drift"}
 
 async def spread_infestation(session_id: int, game_days: float = 0.5):
@@ -56,11 +57,15 @@ async def spread_infestation(session_id: int, game_days: float = 0.5):
         JOIN maya_rp.infestation_stages st ON st.id = ii.stage_id
         WHERE ii.status = 'active' AND ii.session_id = $1
     """, session_id):
-        base_spread = inst["spread_rate"] * game_days
+        # `spread_rate` is NUMERIC and arrives as Decimal, which a float multiply refuses.
+        rate = float(inst["spread_rate"])
+        base_spread = rate * game_days
         if inst.get("contained"):
             base_spread *= max(0, 1 - (inst["containment_level"] or 0) / 100)
 
-        new_progress = (inst["spread_progress"] or 0) + base_spread * 5
+        # `spread_progress` and `biomass` are INTEGER and a tick adds under 1 at slow rates
+        # (Spore Drift: 0.25), so a plain int() would store 0 on every tick.
+        new_progress = min(100, stochastic_round((inst["spread_progress"] or 0) + base_spread * 5))
 
         if new_progress >= 100:
             next_s = await Database.fetchrow(
@@ -87,22 +92,26 @@ async def spread_infestation(session_id: int, game_days: float = 0.5):
                     UPDATE maya_rp.infestation_instances
                     SET spread_progress = $1, biomass = biomass + $2
                     WHERE id = $3
-                """, new_progress, int(inst["spread_rate"] * game_days * 10), inst["id"])
+                """, new_progress, stochastic_round(rate * game_days * 10), inst["id"])
         else:
             await Database.execute("""
                 UPDATE maya_rp.infestation_instances
                 SET spread_progress = $1, biomass = biomass + $2
                 WHERE id = $3
-            """, new_progress, int(inst["spread_rate"] * game_days * 5), inst["id"])
+            """, new_progress, stochastic_round(rate * game_days * 5), inst["id"])
 
-        # Spread to neighbor sectors
+        # Spread to neighbor sectors. `space_lanes.origin` and `.destination` are sector NAMES (TEXT),
+        # and `sectors` is UNIQUE (session_id, name), so the join inside the lane's session maps the
+        # infested sector id to its neighbours' ids. A name with no sector in this session resolves to nothing.
         if random.random() < (0.01 * inst["threat_level"] * game_days):
-            neighbors = await Database.fetch(
-                "SELECT destination FROM maya_rp.space_lanes WHERE session_id = $1 AND origin = $2",
-                session_id, inst["sector_id"]
-            )
+            neighbors = await Database.fetch("""
+                SELECT d.id FROM maya_rp.space_lanes sl
+                JOIN maya_rp.sectors o ON o.name = sl.origin AND o.session_id = sl.session_id
+                JOIN maya_rp.sectors d ON d.name = sl.destination AND d.session_id = sl.session_id
+                WHERE sl.session_id = $1 AND o.id = $2
+            """, session_id, inst["sector_id"])
             if neighbors:
-                target = random.choice(neighbors)["destination"]
+                target = random.choice(neighbors)["id"]
                 existing = await Database.fetchrow(
                     "SELECT id FROM maya_rp.infestation_instances "
                     "WHERE session_id = $1 AND sector_id = $2 AND status = 'active'",
@@ -153,20 +162,22 @@ async def apply_containment(session_id: int, infestation_id: int, measure_name: 
         if not researched or not researched["unlocked"]:
             return {"error": f'Research "{measure["research_required"]}" required.'}
 
-    # Check and deduct cost
     cost = {"credits": measure["cost_credits"]}
     res_costs = _j(measure.get("cost_resources"))
     for k, v in res_costs.items():
         cost[k] = v
-    ok, msg = await _check_afford(session_id, cost)
-    if not ok:
-        return {"error": f"Insufficient: {msg}"}
-    await _deduct_resources(session_id, cost)
 
+    # The guarded debit decides affordability, so no read-then-debit window exists. The charge and
+    # the containment commit together: a fault in the effect refunds the cost.
     new_level = min(100, (inf["containment_level"] or 0) + int(measure["effectiveness"] * 30))
-    await Database.execute("""
-        UPDATE maya_rp.infestation_instances SET contained = TRUE, containment_level = $1 WHERE id = $2
-    """, new_level, infestation_id)
+    try:
+        async with Database.transaction() as conn:
+            await _deduct_resources(session_id, cost, conn=conn)
+            await conn.execute("""
+                UPDATE maya_rp.infestation_instances SET contained = TRUE, containment_level = $1 WHERE id = $2
+            """, new_level, infestation_id)
+    except InsufficientResources as e:
+        return {"error": f"Insufficient: {e}"}
 
     await _log(session_id, "horror",
                f"🛡️ CONTAINMENT: {measure_name}",
@@ -233,7 +244,8 @@ async def advance_eradication(session_id: int, game_days: float = 0.5):
         asset_bonus = 1 + len(assets) * 0.1
 
         gain = 5 * strat_mod * asset_bonus * game_days
-        new_progress = min(100, (camp["progress"] or 0) + gain)
+        # `progress` is INTEGER and a tick adds under 1 at low game_days; int() would stall the campaign.
+        new_progress = min(100, stochastic_round((camp["progress"] or 0) + gain))
         biomass_removed = int((inf["biomass"] or 0) * (gain / 100))
 
         await Database.execute(
@@ -270,14 +282,16 @@ async def _generate_campaign_event(session_id: int, camp: dict, inf: dict):
     ]
     etype, desc, effects = random.choice(events)
 
-    if "damage" in effects and _j(camp.get("assets_assigned")):
-        assets = list(camp["assets_assigned"])
-        if assets:
-            assets.pop(random.randrange(len(assets)))
-            await Database.execute(
-                "UPDATE maya_rp.eradication_campaigns SET assets_assigned = $1 WHERE id = $2",
-                json.dumps(assets), camp["id"]
-            )
+    # `assets_assigned` is jsonb with no codec, so it arrives as a str; `_j` decodes it. list() on
+    # the str would split it into characters. NULL and an empty list both mean no assets.
+    decoded = _j(camp.get("assets_assigned"))
+    assets = list(decoded) if isinstance(decoded, list) else []
+    if "damage" in effects and assets:
+        assets.pop(random.randrange(len(assets)))
+        await Database.execute(
+            "UPDATE maya_rp.eradication_campaigns SET assets_assigned = $1 WHERE id = $2",
+            json.dumps(assets), camp["id"]
+        )
     if "bonus" in effects:
         await Database.execute(
             "UPDATE maya_rp.eradication_campaigns SET progress = progress + 5 WHERE id = $1",

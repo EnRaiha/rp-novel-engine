@@ -33,24 +33,30 @@ class TestTheParametersMeanSomething:
             assert threat.get("session_id") in (None, 3), threat
         await Database.close()
 
-    async def test_an_infestation_from_another_session_is_refused(self):
+    async def test_an_infestation_from_another_session_is_refused(self, scratch_session):
+        """The infestation lives in the scratch session. A session that owns no rows asks for it."""
         await Database.init()
         stage = await Database.fetchval("SELECT id FROM maya_rp.infestation_stages LIMIT 1")
         if stage is None:
             await Database.close()
             return
+        await Database.execute(
+            "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1, 'space-horror wiring scratch', 'active')"
+            " ON CONFLICT (id) DO NOTHING", scratch_session)
+        other = scratch_session + 1000
         row = await Database.fetchrow(
             "INSERT INTO maya_rp.infestation_instances"
             " (session_id, stage_id, biomass, spread_progress, status)"
-            " VALUES (3, $1, 1, 0, 'active') RETURNING id", stage)
+            " VALUES ($1, $2, 1, 0, 'active') RETURNING id", scratch_session, stage)
         try:
-            detail = await sh.get_infestation_detail(row["id"], 5)
+            detail = await sh.get_infestation_detail(row["id"], other)
             assert detail == {}, "the detail read leaks across sessions"
-            refused = await sh.apply_containment(5, row["id"], "Flame Wall")
-            assert "not found in session 5" in refused.get("error", ""), refused
+            refused = await sh.apply_containment(other, row["id"], "Flame Wall")
+            assert f"not found in session {other}" in refused.get("error", ""), refused
         finally:
             await Database.execute(
                 "DELETE FROM maya_rp.infestation_instances WHERE id=$1", row["id"])
+            await Database.execute("DELETE FROM maya_rp.sessions WHERE id = $1", scratch_session)
             await Database.close()
 
 

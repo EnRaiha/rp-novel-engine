@@ -44,6 +44,7 @@ class Database:
     _lock: asyncio.Lock | None = None
     _lock_loop: asyncio.AbstractEventLoop | None = None
     _pool_loop: asyncio.AbstractEventLoop | None = None
+    _pool_made: asyncpg.Pool | None = None
     _fallback_warned: bool = False
 
     @classmethod
@@ -53,13 +54,14 @@ class Database:
         Such a pool cannot serve any loop: its connections wait on futures of a loop that no longer
         runs. A script that calls `asyncio.run` twice, or a test run, meets this after the first run.
         """
-        return cls.pool is not None and cls._pool_loop is not None and cls._pool_loop.is_closed()
+        return (cls.pool is not None and cls.pool is cls._pool_made
+                and cls._pool_loop is not None and cls._pool_loop.is_closed())
 
     @classmethod
     def _drop_orphaned_pool(cls) -> None:
         """Terminate and forget an orphaned pool. The caller holds `_pool_lock()`."""
         if cls._pool_orphaned():
-            orphan, cls.pool, cls._pool_loop = cls.pool, None, None
+            orphan, cls.pool, cls._pool_loop, cls._pool_made = cls.pool, None, None, None
             try:
                 orphan.terminate()
             except Exception as exc:  # noqa: BLE001 - a pool on a dead loop failing to die must not block the new one
@@ -109,6 +111,7 @@ class Database:
                 timeout=Config.DB_TIMEOUT,
             )
             cls._pool_loop = asyncio.get_running_loop()
+            cls._pool_made = cls.pool
             # The name generator keeps a module-level connection. `set_global_conn` was its one
             # caller-less function: it had no init hook, so the generator it configures could never be
             # reached without a caller passing a connection in. Imported here rather than at the top to
@@ -152,7 +155,7 @@ class Database:
             except Exception:  # deliberate: a failing close during shutdown must not raise
                 pass
             cls.pool = None
-        cls._pool_loop = None
+        cls._pool_loop = cls._pool_made = None
 
     @classmethod
     async def _ensure_pool(cls) -> asyncpg.Pool:

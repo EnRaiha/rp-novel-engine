@@ -16,34 +16,37 @@ Usage:
   python3 scripts/char_query.py char "nadia"
   python3 scripts/char_query.py char queens
   python3 scripts/char_query.py groups
-  python3 scripts/char_query.py alias list | alias "<a>" | alias add "<a>" "<char>"
+  python3 scripts/char_query.py alias list | alias "<a>" | alias add "<a>" "<char>" | alias rm "<a>"
   python3 scripts/char_query.py loc "Mastika"      # territory/system by name
-  python3 scripts/char_query.py loc "741,280"      # 1000-grid system nearest
+  python3 scripts/char_query.py loc "741,280"      # 1000-grid system nearest (territory "X-Y" names)
   python3 scripts/char_query.py loc "12,12"        # sector grid (0–24) nearest
   python3 scripts/char_query.py ship "Nusantara"   # ship by name/class/type
   --json on any command for machine-readable output.
 """
 from __future__ import annotations
-import asyncio, difflib, json, os, re, sys
+import asyncio, difflib, json, os, re, sys, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yaml
 from core.db import Database
 from core.config import Config
 
 ROSTER_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "roster.yaml")
-# 1000-grid system coordinates (Voronoi Day-178 scale; system names are "X-Y")
-TERR_1000_FILE = os.path.expanduser("~/backups/territory_1000_20260808.json")
 
 ROSTER_HEADER = ("# Roster — curated character reference for char:query.\n"
                  "# DB (maya_rp.characters) is always truth; this file is the convenience layer.\n"
                  "# char:query <group> resolves every entry live and flags stale names.\n"
-                 "# aliases:  nickname / role-keyword → canonical character name\n")
+                 "# aliases:          nickname / role-keyword → canonical character name, every session\n"
+                 "# session_aliases:  the same, for one session id only, and wins over `aliases`\n")
 
 
 # ─── Fuzzy engine (stdlib only) ──────────────────────────────────────────
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+def _like(q: str) -> str:
+    """`q` as a contains-pattern with `\\`, `%` and `_` literal. Pair every LIKE with ESCAPE '\\'."""
+    return "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 def _base(name: str) -> str:
     """'Nadia Voss (General of the North)' → 'nadia voss'"""
@@ -67,23 +70,98 @@ def _lev(a: str, b: str) -> int:
 
 # ─── Roster (YAML: aliases + groups) ─────────────────────────────────────
 
-def _load_roster() -> dict:
+def _alias_map(raw) -> dict:
+    return {_norm(k): v for k, v in (raw or {}).items()}
+
+def _roster_session(session_id: int | None) -> int | None:
+    """The session whose aliases to merge: the given one, else the call's, else none (shared only)."""
+    if session_id is not None:
+        return int(session_id)
+    try:
+        return _call_session()
+    except RuntimeError:
+        return None
+
+def _load_roster(session_id: int | None = None) -> dict:
+    """The roster for one session.
+
+    @param session_id - session whose own aliases apply; defaults to the session resolved for this call,
+        and to the shared aliases alone when none resolves.
+    @returns `aliases` (shared, then this session's on top), `groups`, `shared` (the shared aliases
+        alone), `by_session` (every session's own aliases, for saving) and `session`.
+    """
     d = {}
     if os.path.exists(ROSTER_FILE):
-        with open(ROSTER_FILE) as f:
+        with open(ROSTER_FILE, encoding="utf-8") as f:
             d = yaml.safe_load(f) or {}
+    shared = _alias_map(d.get("aliases"))
+    by_session = {str(k): _alias_map(v) for k, v in (d.get("session_aliases") or {}).items()}
+    sid = _roster_session(session_id)
     return {
-        "aliases": {_norm(k): v for k, v in (d.get("aliases") or {}).items()},
+        "aliases": {**shared, **(by_session.get(str(sid)) or {})},
         "groups": {_norm(k): [str(n) for n in v]
                    for k, v in (d.get("groups") or {}).items()},
+        "shared": shared,
+        "by_session": by_session,
+        "session": sid,
     }
 
+def _write_text_atomic(path: str, text: str) -> None:
+    """Replace `path` with `text` through a temp file in the same directory.
+
+    A crash leaves the old file whole. An in-place write truncates the file first, and a truncated
+    roster loads as empty.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".roster.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, os.stat(path).st_mode & 0o777)
+        except FileNotFoundError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
 def _save_roster(roster: dict) -> None:
-    os.makedirs(os.path.dirname(ROSTER_FILE), exist_ok=True)
-    with open(ROSTER_FILE, "w") as f:
-        f.write(ROSTER_HEADER)
-        yaml.safe_dump({"aliases": roster["aliases"], "groups": roster["groups"]},
-                       f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    body = {"aliases": roster["shared"], "groups": roster["groups"]}
+    own = {k: v for k, v in roster["by_session"].items() if v}
+    if own:
+        body["session_aliases"] = own
+    _write_text_atomic(ROSTER_FILE, ROSTER_HEADER + yaml.safe_dump(
+        body, allow_unicode=True, sort_keys=False, default_flow_style=False))
+
+def add_alias(roster: dict, alias: str, target: str) -> None:
+    """Bind `alias` to `target` for the roster's session only. Needs a resolved session."""
+    if roster["session"] is None:
+        raise RuntimeError("no session resolved: an alias belongs to one session")
+    a = _norm(alias)
+    roster["by_session"].setdefault(str(roster["session"]), {})[a] = target
+    roster["aliases"][a] = target
+
+def remove_alias(roster: dict, alias: str) -> str:
+    """Remove `alias` from the roster's session. Returns `removed`, `shared` or `absent`.
+
+    A shared alias applies to every session, so it stays: edit `aliases` in the roster file to drop it.
+    """
+    a = _norm(alias)
+    own = roster["by_session"].get(str(roster["session"])) or {}
+    if a in own:
+        del own[a]
+        roster["aliases"].pop(a, None)
+        if a in roster["shared"]:
+            roster["aliases"][a] = roster["shared"][a]
+        return "removed"
+    return "shared" if a in roster["shared"] else "absent"
 
 
 # ─── Character resolution ────────────────────────────────────────────────
@@ -214,18 +292,6 @@ def resolve_group(group: str, roster: dict, chars: list[dict]) -> dict:
 
 # ─── Loc (territory / coordinate) ────────────────────────────────────────
 
-_terr1000_cache: list | None = None
-
-def _terr1000() -> list:
-    global _terr1000_cache
-    if _terr1000_cache is None:
-        if os.path.exists(TERR_1000_FILE):
-            _terr1000_cache = json.load(open(TERR_1000_FILE))
-        else:
-            _terr1000_cache = []
-    return _terr1000_cache
-
-
 def _call_session() -> int:
     """The session for this call, not the one that was current at import.
 
@@ -256,25 +322,20 @@ async def resolve_loc(query: str, session_id: int | None = None) -> dict:
             return {"ok": True, "kind": "coords", "query": (x, y, z), "grid": f"z{z}",
                     "sectors": rows, "note": f"nearest sectors on the z={z} plane"}
         if x > 30 or y > 30:
-            # 1000-grid: system names encode "X-Y" coordinates
+            # 1000-grid: this session's territory rows whose names encode "X-Y" coordinates
             systems = []
-            for t in _terr1000():
-                cm = re.fullmatch(r"(\d+)-(\d+)", t.get("system_name", ""))
+            for r in await Database.fetch(
+                    "SELECT system_name, controlling_faction, population, development_level, "
+                    "governor_name, status FROM maya_rp.territory "
+                    "WHERE session_id=$1 AND system_name ~ $2", sid, r"^\d+-\d+$"):
+                cm = re.fullmatch(r"(\d+)-(\d+)", r["system_name"] or "")
                 if cm:
-                    systems.append((int(cm.group(1)), int(cm.group(2)), t))
+                    systems.append((int(cm.group(1)), int(cm.group(2)), dict(r)))
             if systems:
                 systems.sort(key=lambda s: (s[0] - x) ** 2 + (s[1] - y) ** 2)
-                nearest = [{"x": sx, "y": sy, "system_name": t.get("system_name"),
+                nearest = [{**t, "x": sx, "y": sy,
                             "controlling_faction": t.get("controlling_faction") or "unclaimed"}
                            for sx, sy, t in systems[:5]]
-                # cross-ref population from territory table where present
-                names = [n["system_name"] for n in nearest]
-                terr = {r["system_name"]: dict(r) for r in await Database.fetch(
-                    "SELECT system_name, population, development_level, governor_name, status "
-                    "FROM maya_rp.territory WHERE session_id=$1 AND system_name = ANY($2::text[])",
-                    sid, names)}
-                for n in nearest:
-                    n.update(terr.get(n["system_name"], {}))
                 return {"ok": True, "kind": "coords", "query": (x, y),
                         "grid": "1000", "systems": nearest,
                         "note": "nearest systems on the 1000-grid"}
@@ -287,12 +348,12 @@ async def resolve_loc(query: str, session_id: int | None = None) -> dict:
     terr = [dict(r) for r in await Database.fetch(
         "SELECT system_name, controlling_faction, population, development_level, "
         "governor_name, status, crisis_level FROM maya_rp.territory "
-        "WHERE session_id=$1 AND LOWER(system_name) LIKE $2 "
-        "ORDER BY population DESC LIMIT 10", sid, f"%{q}%")]
+        "WHERE session_id=$1 AND LOWER(system_name) LIKE $2 ESCAPE '\\' "
+        "ORDER BY population DESC LIMIT 10", sid, _like(q))]
     sect = [dict(r) for r in await Database.fetch(
         "SELECT name, x_coord, y_coord, z_coord, controlled_by, star_type, hazard_level, hidden "
-        "FROM maya_rp.sectors WHERE LOWER(name) LIKE $1 AND (session_id=$2 OR session_id IS NULL)"
-        " LIMIT 10", f"%{q}%", sid)]
+        "FROM maya_rp.sectors WHERE LOWER(name) LIKE $1 ESCAPE '\\' AND (session_id=$2 OR session_id IS NULL)"
+        " LIMIT 10", _like(q), sid)]
     if terr or sect:
         return {"ok": True, "kind": "name", "territories": terr, "sectors": sect}
     names = [r["system_name"] for r in await Database.fetch(
@@ -317,9 +378,10 @@ async def resolve_ship(query: str, session_id: int | None = None) -> dict:
     rows = [dict(r) for r in await Database.fetch(
         "SELECT name, ship_type, sub_class, tier, hull, hull_current, power_rating, "
         "location, status, veteran_kills FROM maya_rp.ships "
-        "WHERE session_id=$1 AND (LOWER(name) LIKE $2 "
-        "OR LOWER(COALESCE(sub_class,'')) LIKE $2 OR LOWER(COALESCE(ship_type,'')) LIKE $2) "
-        "ORDER BY power_rating DESC LIMIT 10", sid, f"%{q}%")]
+        "WHERE session_id=$1 AND (LOWER(name) LIKE $2 ESCAPE '\\' "
+        "OR LOWER(COALESCE(sub_class,'')) LIKE $2 ESCAPE '\\' "
+        "OR LOWER(COALESCE(ship_type,'')) LIKE $2 ESCAPE '\\') "
+        "ORDER BY power_rating DESC LIMIT 10", sid, _like(q))]
     if rows:
         return {"ok": True, "kind": "exact-ish", "ships": rows}
     names = [r["name"] for r in await Database.fetch(
@@ -365,14 +427,14 @@ async def main():
             return
         if rest[0] == "add" and len(rest) >= 3:
             a, target = _norm(rest[1]), " ".join(rest[2:])
-            chars = await _load_characters()
+            chars = await _load_characters(_call_session())
             hit = next((c for c in chars if _norm(c["name"]) == _norm(target)
                         or _base(c["name"]) == _base(target)), None)
             if not hit:
                 print(json.dumps({"ok": False, "error": f"target '{target}' not found"})
                       if want_json else f"✗ target '{target}' not found in characters")
                 return
-            roster["aliases"][a] = hit["name"]
+            add_alias(roster, a, hit["name"])
             _save_roster(roster)
             print(json.dumps({"ok": True, "alias": a, "target": hit["name"]},
                              ensure_ascii=False) if want_json
@@ -380,10 +442,16 @@ async def main():
             return
         if rest[0] == "rm" and len(rest) >= 2:
             a = _norm(rest[1])
-            if a in roster["aliases"]:
-                del roster["aliases"][a]
+            outcome = remove_alias(roster, a)
+            if outcome == "removed":
                 _save_roster(roster)
-            print(json.dumps({"ok": True, "removed": a}) if want_json else f"✅ removed {a}")
+            if want_json:
+                print(json.dumps({"ok": outcome == "removed", "removed": a if outcome == "removed" else None,
+                                  "result": outcome}))
+            else:
+                print({"removed": f"✅ removed {a}",
+                       "shared": f"✗ '{a}' is a shared alias. Edit `aliases` in the roster file to drop it",
+                       "absent": f"✗ no alias '{a}'"}[outcome])
             return
         a = _norm(rest[0])
         target = roster["aliases"].get(a)

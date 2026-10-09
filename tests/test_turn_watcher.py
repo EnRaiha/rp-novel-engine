@@ -65,22 +65,22 @@ def _turn(id_: int, text: str) -> dict:
 # ── the watermark ────────────────────────────────────────────────────────────
 
 def test_a_missing_watermark_starts_at_zero(watcher):
-    assert tw.read_watermark()["last_id"] == 0
+    assert tw.read_watermark(watcher["session"], "x")["last_id"] == 0
 
 
 def test_the_watermark_round_trips(watcher):
-    tw.write_watermark({"last_id": 42, "processed": 7})
+    tw.write_watermark({"last_id": 42, "processed": 7}, watcher["session"], "x")
 
-    assert tw.read_watermark()["last_id"] == 42
-    assert tw.read_watermark()["updated_at"], "a watermark with no time cannot be judged stale"
+    assert tw.read_watermark(watcher["session"], "x")["last_id"] == 42
+    assert tw.read_watermark(watcher["session"], "x")["updated_at"], "a watermark with no time cannot be judged stale"
 
 
-def test_a_corrupt_watermark_is_reported_and_not_fatal(watcher):
-    watcher["watermark"].write_text("{not json", encoding="utf-8")
+def test_a_corrupt_watermark_is_refused_and_not_read_as_zero(watcher):
+    """Reading it as 0 replays the whole history through the tracker."""
+    tw.watermark_path(watcher["session"], "x").write_text("{not json", encoding="utf-8")
 
-    state = tw.read_watermark()
-
-    assert state["last_id"] == 0, "a bad watermark must not stop the watcher"
+    with pytest.raises(tw.WatermarkCorrupt):
+        tw.read_watermark(watcher["session"], "x")
 
 
 # ── one pass ─────────────────────────────────────────────────────────────────
@@ -90,7 +90,7 @@ async def test_no_new_turns_is_a_clean_no_op(watcher):
                          skip_failed=False)
 
     assert code == 0
-    assert tw.read_watermark()["last_id"] == 0
+    assert tw.read_watermark(watcher["session"], "x")["last_id"] == 0
 
 
 async def test_a_turn_advances_the_watermark_and_is_counted(watcher):
@@ -100,7 +100,7 @@ async def test_a_turn_advances_the_watermark_and_is_counted(watcher):
                          skip_failed=False)
 
     assert code == 0
-    assert tw.read_watermark()["last_id"] == 1
+    assert tw.read_watermark(watcher["session"], "x")["last_id"] == 1
     assert await Database.fetchval(
         "SELECT count(*) FROM maya_rp.terms WHERE session_id=$1", watcher["session"]) == 1
 
@@ -112,7 +112,7 @@ async def test_a_dry_run_leaves_the_watermark_alone(watcher):
                          skip_failed=False)
 
     assert code == 0
-    assert tw.read_watermark()["last_id"] == 0, "a dry run that moves the cursor loses the turn"
+    assert tw.read_watermark(watcher["session"], "x")["last_id"] == 0, "a dry run that moves the cursor loses the turn"
     assert await Database.fetchval(
         "SELECT count(*) FROM maya_rp.terms WHERE session_id=$1", watcher["session"]) == 0
 
@@ -147,7 +147,7 @@ async def test_a_failing_turn_stops_the_pass_and_keeps_the_watermark(watcher, mo
                          skip_failed=False)
 
     assert code == 3, "a failure must be visible in the exit code, not only the log"
-    assert tw.read_watermark()["last_id"] == 0
+    assert tw.read_watermark(watcher["session"], "x")["last_id"] == 0
 
 
 async def test_skip_failed_advances_past_it_on_request(watcher, monkeypatch):
@@ -162,7 +162,7 @@ async def test_skip_failed_advances_past_it_on_request(watcher, monkeypatch):
                          skip_failed=True)
 
     assert code == 0
-    assert tw.read_watermark()["last_id"] == 3, "--skip-failed is how an operator says move on"
+    assert tw.read_watermark(watcher["session"], "x")["last_id"] == 3, "--skip-failed is how an operator says move on"
 
 
 # ── what it never does ───────────────────────────────────────────────────────
@@ -176,7 +176,7 @@ async def test_a_status_message_is_read_and_writes_nothing(watcher):
 
     assert await Database.fetchval(
         "SELECT count(*) FROM maya_rp.terms WHERE session_id=$1", watcher["session"]) == 0
-    assert tw.read_watermark()["last_id"] == 4, "it still advances: the turn was read"
+    assert tw.read_watermark(watcher["session"], "x")["last_id"] == 4, "it still advances: the turn was read"
 
 
 # ── the freeze door ──────────────────────────────────────────────────────────
@@ -221,7 +221,7 @@ async def test_a_pass_over_a_frozen_session_writes_nothing(watcher, monkeypatch)
                          skip_failed=False)
 
     assert code == 0, "refusing a frozen campaign is not an error; the poll keeps running"
-    assert tw.read_watermark()["last_id"] == 0, "the cursor did not move over a frozen campaign"
+    assert tw.read_watermark(watcher["session"], "x")["last_id"] == 0, "the cursor did not move over a frozen campaign"
     assert await Database.fetchval(
         "SELECT count(*) FROM maya_rp.terms WHERE session_id=$1", watcher["session"]) == 0
 

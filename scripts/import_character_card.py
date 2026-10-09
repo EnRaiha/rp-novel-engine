@@ -16,10 +16,14 @@ The card is mapped onto our structures, never dumped raw:
   * `--queue-portrait` queues the neutral portrait for the new dossier.
 
 Idempotent: an existing character is updated in the fields that are still empty,
-and a hand-written sheet is never overwritten unless `--force`.
+and a hand-written sheet is never overwritten unless `--force`. A non-empty `intro.md`
+is never overwritten unless `--force-intro`.
+
+`--session` resolves through `core.session.require_session`: the flag, then `RP_SESSION`,
+then the active arc. Nothing resolved is an error.
 
     python3 scripts/import_character_card.py --card card.png --dry-run
-    python3 scripts/import_character_card.py --card card.json --session 3 --queue-portrait
+    python3 scripts/import_character_card.py --card card.json --session 7 --queue-portrait
 """
 from __future__ import annotations
 
@@ -33,9 +37,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.config import Config  # noqa: E402
 from core.db import Database  # noqa: E402
 from core import portraits  # noqa: E402
+from core.session import require_session  # noqa: E402
 
 
 def load_card(path: Path) -> dict:
@@ -228,7 +232,7 @@ async def name_report(session: int, name: str, *, near_limit: int = 2) -> dict:
 
 
 async def import_card(session: int, fields: dict, *, force: bool, dry_run: bool,
-                      queue_portrait: bool) -> str:
+                      queue_portrait: bool, force_intro: bool = False) -> str:
     if not fields["name"]:
         raise ValueError("card has no name")
     traits = [t.strip() for t in re.split(r"[,\n;]", fields["personality"]) if t.strip()][:8]
@@ -260,12 +264,14 @@ async def import_card(session: int, fields: dict, *, force: bool, dry_run: bool,
         updates = {key: row[key] for key in ("description", "appearance", "background", "traits")
                    if force or not existing[key]}
         if updates:
+            # $1 is the id, $2.. are the values in `updates` order. A placeholder with no
+            # reference makes asyncpg raise, so the numbers must be gapless.
             assignments = ", ".join(
-                f"{key}=${index + 3}::jsonb" if key == "traits" else f"{key}=${index + 3}"
+                f"{key}=${index + 2}::jsonb" if key == "traits" else f"{key}=${index + 2}"
                 for index, key in enumerate(updates))
             await Database.execute(
                 f"UPDATE maya_rp.characters SET {assignments} WHERE id=$1",  # noqa: S608 - fixed column names
-                existing["id"], session,
+                existing["id"],
                 *[json.dumps(value) if key == "traits" else value for key, value in updates.items()])
         character_id = existing["id"]
         outcome = f"updated {len(updates)} field(s)"
@@ -284,9 +290,14 @@ async def import_card(session: int, fields: dict, *, force: bool, dry_run: bool,
     sheet = root / "sheet.md"
     if force or not sheet.is_file():
         sheet.write_text(sheet_for(fields, row), encoding="utf-8")
+    intro = root / "intro.md"
+    # Read before `scaffold_fields`: it writes a non-empty template when the file is missing.
+    intro_kept = intro.is_file() and bool(intro.read_text(encoding="utf-8").strip())
     portraits.scaffold_fields(fields["name"], role=row["role"], lore=fields["scenario"])
-    (root / "intro.md").write_text(
-        f"# {fields['name']} — Intro\n\n{fields['first_mes'] or '- (entrance beat unset)'}\n", encoding="utf-8")
+    if force_intro or not intro_kept:
+        intro.write_text(
+            f"# {fields['name']} — Intro\n\n{fields['first_mes'] or '- (entrance beat unset)'}\n",
+            encoding="utf-8")
     if fields["mes_example"]:
         voice = root / "voice.md"
         current = voice.read_text(encoding="utf-8") if voice.is_file() else f"# {fields['name']} — Voice\n"
@@ -306,18 +317,23 @@ async def import_card(session: int, fields: dict, *, force: bool, dry_run: bool,
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Import a V2/V3 character card into the campaign")
     parser.add_argument("--card", required=True, type=Path, help="card .json, .png or .charx")
-    parser.add_argument("--session", type=int, default=Config.SESSION_ID)
+    parser.add_argument("--session", type=int, default=None,
+                        help="campaign id. The default resolves through RP_SESSION or the active arc")
     parser.add_argument("--origin", default="", help="label recorded in the sheet")
     parser.add_argument("--queue-portrait", action="store_true")
-    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--force", action="store_true",
+                        help="overwrite sheet.md and fields that are already filled")
+    parser.add_argument("--force-intro", action="store_true",
+                        help="overwrite a non-empty intro.md with the card's first message")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
+    session = require_session(args.session)
     fields = contact(load_card(args.card))
     fields["origin"] = args.origin or args.card.name
     await Database.init()
-    result = await import_card(args.session, fields, force=args.force,
-                               dry_run=args.dry_run, queue_portrait=args.queue_portrait)
+    result = await import_card(session, fields, force=args.force, dry_run=args.dry_run,
+                               queue_portrait=args.queue_portrait, force_intro=args.force_intro)
     await Database.close()
     print(f"{fields['name']}: {result}")
     return 0

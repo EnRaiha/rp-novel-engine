@@ -184,8 +184,10 @@ def cmd_rewrite(args: argparse.Namespace) -> int:
     index = [s["line"] for s in scenes(path, args.level)].index(hit["line"])
     start = marks[index].start()
     end = marks[index + 1].start() if index + 1 < len(marks) else len(text)
+    # The heading match stops before its newline, so the line break is written here.
     title_line = marks[index].group(0)
-    updated = text[:start] + title_line + replacement.rstrip() + "\n\n" + text[end:]
+    body = replacement.lstrip("\r\n").rstrip()
+    updated = text[:start] + title_line + "\n\n" + body + "\n\n" + text[end:]
 
     saved = archive(path, f"rewrite of scene {hit['title']!r} at line {hit['line']}")
     path.write_text(updated, encoding="utf-8")

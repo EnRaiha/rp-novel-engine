@@ -19,6 +19,16 @@ THE WATERMARK MOVES ONLY PAST A TURN THAT WAS PROCESSED, and a turn that raises 
 reported. Advancing past it would lose it silently; retrying it forever would hide that it is stuck.
 `--skip-failed` is how an operator says "I have seen this one, move on".
 
+ONE WATERMARK FILE PER SESSION AND LABEL. A turn id is global in `dsh_turns`, so a shared cursor makes
+one session skip the turns another has already passed. The files sit beside `WATERMARK`:
+`rp-turn-watcher.<session>.<label>.json`. The old shared file belongs to session 5 and `tkg-play`, the
+CLI defaults, and that key reads it until its own file exists. The old file is never modified.
+
+A CORRUPT WATERMARK REFUSES THE PASS. A missing file starts at 0. A file that cannot be read, or that
+holds no non-negative integer `last_id`, raises `WatermarkCorrupt`: the pass logs it, exits 3 and
+processes nothing, because starting at 0 replays the whole history through the tracker. Restore the
+file, or run `--reset` to start at 0 on purpose.
+
 AND IT EXITS 3 WHEN SOMETHING FAILED, so `systemctl status` and the journal show it. Nothing it does
 reaches back into the engine: a failure here cannot stop a turn, and the context block it feeds is
 already written to report and return empty rather than raise.
@@ -37,39 +47,77 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.config import Config  # noqa: E402
 from core.db import Database  # noqa: E402
 from core.log import error, info, warn  # noqa: E402
+from core.session import _atomic_write  # noqa: E402
 
 WATERMARK = Path.home() / ".cache" / "rp-turn-watcher.json"
 DEFAULT_LABEL = "tkg-play"
+# The shared file at `WATERMARK` was written with the CLI defaults: session 5, label `tkg-play`.
+LEGACY_SESSION = 5
 
 # The last freeze message reported, so a 60-second poll states a frozen campaign once.
 _FREEZE_NOTICE = ""
 
 
-def read_watermark() -> dict:
-    """The last turn id processed, or a fresh one. A corrupt file is reported, not fatal."""
+class WatermarkCorrupt(RuntimeError):
+    """A watermark file exists and holds no usable cursor. The pass must not start at 0."""
+
+
+def watermark_path(session_id: int, label: str = DEFAULT_LABEL) -> Path:
+    """The file that holds the cursor of one session and label.
+
+    @param session_id - engine session id.
+    @param label - `dsh_turns.session_id` value being read. It is percent-encoded, so no two labels share a file.
+    @returns the path; the file may not exist.
+    """
+    return WATERMARK.with_name(
+        f"{WATERMARK.stem}.{int(session_id)}.{quote(label, safe='')}{WATERMARK.suffix}")
+
+
+def _source(session_id: int, label: str) -> Path | None:
+    """The file to read the cursor from: its own, else the shared file for the session it belonged to."""
+    own = watermark_path(session_id, label)
+    if own.exists():
+        return own
+    if (session_id, label) == (LEGACY_SESSION, DEFAULT_LABEL) and WATERMARK.exists():
+        return WATERMARK
+    return None
+
+
+def read_watermark(session_id: int, label: str = DEFAULT_LABEL) -> dict:
+    """The last turn id processed for one session and label, or a fresh state when no file exists.
+
+    @param session_id - engine session id.
+    @param label - `dsh_turns.session_id` value being read.
+    @returns state with `last_id`, `processed` and `updated_at`.
+    @raises WatermarkCorrupt when a file exists and is unreadable, not a JSON object, or holds no
+        non-negative integer `last_id`. Nothing is guessed: a guess of 0 replays every turn.
+    """
+    path = _source(session_id, label)
+    if path is None:
+        return {"last_id": 0, "processed": 0, "updated_at": None}
     try:
-        data = json.loads(WATERMARK.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("last_id"), int):
-            return data
-    except FileNotFoundError:
-        pass
-    except Exception as e:  # noqa: BLE001 - a bad watermark must not stop the watcher
-        warn("turn-watcher", f"watermark unreadable ({e}); starting from the beginning")
-    return {"last_id": 0, "processed": 0, "updated_at": None}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001 - any read or parse error is the same refusal
+        raise WatermarkCorrupt(f"watermark {path} is unreadable ({type(e).__name__}: {e})") from e
+    last_id = data.get("last_id") if isinstance(data, dict) else None
+    if isinstance(last_id, bool) or not isinstance(last_id, int) or last_id < 0:
+        raise WatermarkCorrupt(f"watermark {path} holds no non-negative integer last_id: {data!r:.200}")
+    return data
 
 
-def write_watermark(state: dict) -> None:
-    WATERMARK.parent.mkdir(parents=True, exist_ok=True)
-    state = {**state, "updated_at": datetime.now(timezone.utc).isoformat()}
-    tmp = WATERMARK.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
-    tmp.replace(WATERMARK)
+def write_watermark(state: dict, session_id: int, label: str = DEFAULT_LABEL) -> None:
+    """Store the cursor of one session and label through a temp file, so a crash leaves the old one."""
+    path = watermark_path(session_id, label)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {**state, "session": int(session_id), "label": label,
+             "updated_at": datetime.now(timezone.utc).isoformat()}
+    _atomic_write(path, json.dumps(state, indent=1))
 
 
 async def new_turns(label: str, after: int, limit: int) -> list[dict]:
@@ -143,7 +191,13 @@ async def once(*, session_id: int, label: str, apply: bool, limit: int,
     """One pass. Returns the exit code: 0 always ran, 3 something could not be processed."""
     if apply and not _session_is_writable(session_id):
         return 0
-    state = read_watermark()
+    try:
+        state = read_watermark(session_id, label)
+    except WatermarkCorrupt as e:
+        error("turn-watcher", f"{e}. Processing nothing.")
+        print(f"  {e}")
+        print(f"  restore it, or run --reset --session {session_id} --label {label} to start at 0")
+        return 3
     start = state["last_id"]
     turns = await new_turns(label, start, limit)
     if not turns:
@@ -172,11 +226,11 @@ async def once(*, session_id: int, label: str, apply: bool, limit: int,
              f"{result['terms_found']} term(s) found, {result['terms_written']} new")
         state["last_id"] = turn["id"]
         if apply:
-            write_watermark(state)
+            write_watermark(state, session_id, label)
 
     state["processed"] = state.get("processed", 0) + processed
     if apply:
-        write_watermark(state)
+        write_watermark(state, session_id, label)
     what = "wrote" if apply else "would write"
     print(f"  {processed} turn(s) past id {start} · scene moved {moved} · {what} {terms_written} term(s)")
     if not apply:
@@ -207,18 +261,24 @@ async def main() -> int:
                         help="advance past a turn that raised, instead of stopping")
     parser.add_argument("--watch", action="store_true", help="poll until stopped")
     parser.add_argument("--seconds", type=int, default=60, help="poll interval with --watch")
-    parser.add_argument("--status", action="store_true", help="print the watermark and exit")
-    parser.add_argument("--reset", action="store_true", help="set the watermark back to 0")
+    parser.add_argument("--status", action="store_true",
+                        help="print the watermark of --session and --label, then exit")
+    parser.add_argument("--reset", action="store_true",
+                        help="set the watermark of --session and --label to 0")
     parser.add_argument("--once", action="store_true", help="one pass (the default)")
     args = parser.parse_args()
 
     if args.status:
-        print(json.dumps(read_watermark(), indent=1))
-        print(f"watermark file: {WATERMARK}")
+        try:
+            print(json.dumps(read_watermark(args.session, args.label), indent=1))
+        except WatermarkCorrupt as e:
+            print(str(e))
+            return 3
+        print(f"watermark file: {_source(args.session, args.label) or watermark_path(args.session, args.label)}")
         return 0
     if args.reset:
-        write_watermark({"last_id": 0, "processed": 0})
-        print("watermark reset to 0")
+        write_watermark({"last_id": 0, "processed": 0}, args.session, args.label)
+        print(f"watermark for session {args.session}, label {args.label}, reset to 0")
         return 0
 
     await Database.init()

@@ -56,6 +56,8 @@ class _StubDB:
                 if {rel["faction_a"], rel["faction_b"]} == {args[1], args[2]}:
                     return rel
             return None
+        if "FROM maya_rp.territory" in sql:
+            return {"id": 11, "system_name": "TKG"}
         if "FROM maya_rp.factions" in sql:
             for f in FACTIONS:
                 if f["id"] == args[0]:
@@ -128,6 +130,7 @@ def test_a_powerful_hostile_schedules_a_raid(monkeypatch):
     assert raids, "a 9000-power hostile faction scheduled nothing"
     assert raids[0][0] == 5 and raids[0][1] == "Iron Concord"
     assert raids[0][3] >= 5400, raids[0]      # 0.6x to 1.0x of 9000
+    assert raids[0][2] == "TKG" and raids[0][5] == 11, raids[0]
 
 
 def test_hot_tension_can_start_a_border_war(monkeypatch):

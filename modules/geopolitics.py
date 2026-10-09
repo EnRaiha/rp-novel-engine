@@ -4,11 +4,11 @@ from __future__ import annotations
 import json, random
 from typing import Any
 from core.db import Database
-from core.config import Config
 from core.log import info
+from core.session import require_session
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     factions = await Database.fetch("SELECT id,name,standing,economic_strength,pirate_fleet_power,reputation FROM maya_rp.factions WHERE session_id=$1 AND name!='Setia Empire'", session_id)
     events = 0
     for i, fa in enumerate(factions):
@@ -37,17 +37,23 @@ async def run_tick(session_id: int = None) -> dict:
     for fa in factions:
         power = fa["pirate_fleet_power"] or 0
         if power > 5000 and fa["standing"] == "hostile" and random.random() < 0.3:
-            target = await Database.fetchval(
-                "SELECT system_name FROM maya_rp.territory WHERE session_id=$1 AND controlling_faction='Setia Empire' "
-                "ORDER BY RANDOM() LIMIT 1", session_id)
+            target = await Database.fetchrow(
+                "SELECT id, system_name FROM maya_rp.territory WHERE session_id=$1 "
+                "AND controlling_faction='Setia Empire' ORDER BY RANDOM() LIMIT 1", session_id)
             if target:
                 eta = random.randint(3, 10)
-                await Database.execute(
+                # One pending raid per faction and target: ticks_remaining > 0 and not responded.
+                tag = await Database.execute(
                     "INSERT INTO maya_rp.incoming_raids (session_id, faction_name, target_system, enemy_power, "
-                    "ticks_remaining, detected) VALUES ($1,$2,$3,$4,$5,false) "
-                    "ON CONFLICT DO NOTHING",
-                    session_id, fa["name"], target, int(power * random.uniform(0.6, 1.0)), eta)
-                events += 1
+                    "ticks_remaining, detected, target_territory_id) "
+                    "SELECT $1::int, $2::text, $3::text, $4::int, $5::int, false, $6::int "
+                    "WHERE NOT EXISTS (SELECT 1 FROM maya_rp.incoming_raids WHERE session_id=$1::int "
+                    "AND faction_name=$2::text AND target_system=$3::text AND ticks_remaining > 0 "
+                    "AND COALESCE(player_responded, false) = false)",
+                    session_id, fa["name"], target["system_name"],
+                    int(power * random.uniform(0.6, 1.0)), eta, target["id"])
+                if str(tag).endswith(" 1"):
+                    events += 1
     # Escalation engine (2026-08-14): hot relations without an active war
     # occasionally tip into open conflict (border war rows, conservative).
     hot = await Database.fetch(

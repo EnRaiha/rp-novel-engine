@@ -17,19 +17,17 @@ CLI:
 """
 from __future__ import annotations
 import json
-from core.config import Config
 from core.db import Database
+from core.session import require_session
 
 
 def _sid(session_id: int | None) -> int:
     """The session for this call, resolved at call time.
 
-    This module used to hold `SID = Config.SESSION_ID` at import. A module-level copy freezes on the
-    session that was active when the module was first imported, so every default path here ran
-    against that campaign for the life of the process: a tick aimed at Arc I prompted, appointed and
-    wrote for whichever campaign happened to be current at import.
+    An explicit id wins. Otherwise RP_SESSION, then the active arc file. Raises RuntimeError when
+    nothing resolves. Never reads `Config.SESSION_ID`, which is fixed at import.
     """
-    return Config.SESSION_ID if session_id is None else session_id
+    return require_session(session_id)
 
 ADJUTANTS = ["Maya", "Hanum Voss", "Sara Valdez", "Maria"]
 
@@ -65,16 +63,32 @@ async def set_dark(session_id: int | None, dark: bool) -> None:
 
 async def _prompt(session_id: int, ministry: str, holder: str, action: str,
                   target: str, impact: str, urgency: str = "normal",
-                  adj: str | None = None) -> None:
-    if adj is None:
-        n = await Database.fetchval(
-            "SELECT COUNT(*) FROM maya_rp.adjutant_prompts WHERE session_id=$1", session_id)
-        adj = ADJUTANTS[n % len(ADJUTANTS)]
-    await Database.execute(
-        """INSERT INTO maya_rp.adjutant_prompts
-           (session_id, ministry, holder, action, target, impact, urgency, status, routed_via)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8)""",
-        session_id, ministry, holder, action, target, impact, urgency, adj)
+                  adj: str | None = None) -> bool:
+    """Queue one prompt unless the same (session, ministry, action) is already pending.
+
+    The table has no unique key for this, so the check and the insert run under one per-session
+    advisory lock: a concurrent tick waits, then sees the committed row.
+
+    @returns True when a row was inserted, False when a pending duplicate exists.
+    """
+    async with Database.transaction() as conn:
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('ministry_ai_prompt'), $1)", session_id)
+        if adj is None:
+            n = await conn.fetchval(
+                "SELECT COUNT(*) FROM maya_rp.adjutant_prompts WHERE session_id=$1", session_id)
+            adj = ADJUTANTS[n % len(ADJUTANTS)]
+        tag = await conn.execute(
+            """INSERT INTO maya_rp.adjutant_prompts
+               (session_id, ministry, holder, action, target, impact, urgency, status, routed_via)
+               SELECT $1::int, $2::text, $3::text, $4::text, $5::text, $6::text, $7::text,
+                      'pending', $8::text
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM maya_rp.adjutant_prompts
+                   WHERE session_id=$1::int AND ministry=$2::text AND action=$4::text
+                     AND status='pending')""",
+            session_id, ministry, holder, action, target, impact, urgency, adj)
+    return tag == "INSERT 0 1"
 
 
 async def run_tick(session_id: int | None = None) -> dict:
@@ -82,7 +96,12 @@ async def run_tick(session_id: int | None = None) -> dict:
     present = await king_status(session_id)
     dark = await dark_status(session_id)
     taken = 0      # actions ministries executed autonomously (King away / dark mode)
-    prompted = 0   # prompts raised (King present, or Mastika/critical always)
+    prompted = 0   # new prompts queued; a pending duplicate is not counted
+
+    async def raise_prompt(*args, **kwargs) -> None:
+        nonlocal prompted
+        if await _prompt(session_id, *args, **kwargs):
+            prompted += 1
 
     # Dark mode: deputies (co-ministers) run their portfolios — prompt only critical.
     def holder_for(ministry: str) -> str:
@@ -93,11 +112,10 @@ async def run_tick(session_id: int | None = None) -> dict:
         "SELECT COUNT(*) FROM maya_rp.factions WHERE session_id=$1 AND name='Iron Concord' AND status='active'",
         session_id) or 0
     if present:
-        await _prompt(session_id, "Lord of War", "Kapten Rizwan Aziz",
-                      "Respond to Iron Concord activity", "frontier staging",
-                      f"Iron Concord active ({probes} faction) — recommend response posture.",
-                      "high")
-        prompted += 1
+        await raise_prompt("Lord of War", "Kapten Rizwan Aziz",
+                           "Respond to Iron Concord activity", "frontier staging",
+                           f"Iron Concord active ({probes} faction) — recommend response posture.",
+                           "high")
     else:
         # Away/dark: autonomous defense posture (within charter: patrol/escort only)
         # Dark mode: deputies also quietly reposition fleets, no prompt.
@@ -111,22 +129,20 @@ async def run_tick(session_id: int | None = None) -> dict:
         "SELECT crisis_level FROM maya_rp.territory "
         "WHERE session_id=$1 AND requires_king_prompt ORDER BY id LIMIT 1", session_id) or 0
     if crisis and crisis >= 3:
-        await _prompt(session_id, "Cabinet", "Aina Merpati & Azlan Perak",
-                      "Mastika crisis response", "TKG Mastika",
-                      f"Crisis level {crisis} at capital — requires King's direction.",
-                      "critical")
-        prompted += 1
+        await raise_prompt("Cabinet", "Aina Merpati & Azlan Perak",
+                           "Mastika crisis response", "TKG Mastika",
+                           f"Crisis level {crisis} at capital — requires King's direction.",
+                           "critical")
 
     # ── Lord of Industry ──
     queued = await Database.fetchval(
         "SELECT COUNT(*) FROM maya_rp.build_queue WHERE session_id=$1 AND status='queued'", session_id) or 0
     if present:
         if queued > 15:
-            await _prompt(session_id, "Lord of Industry", "Maya Khatri",
-                          "Production backlog review", "Heaven Yard",
-                          f"{queued} builds queued — prioritization needs royal direction.",
-                          "normal")
-            prompted += 1
+            await raise_prompt("Lord of Industry", "Maya Khatri",
+                               "Production backlog review", "Heaven Yard",
+                               f"{queued} builds queued — prioritization needs royal direction.",
+                               "normal")
         else:
             taken += 1
     else:
@@ -135,61 +151,65 @@ async def run_tick(session_id: int | None = None) -> dict:
 
     # ── Lord Diplomat ──
     if present:
-        await _prompt(session_id, "Lord Diplomat", "Lady Serena Ashford",
-                      "Diplomatic overture available", "rim factions",
-                      "Trade/treaty window with neutral factions; requires royal sign-off.",
-                      "normal")
-        prompted += 1
+        await raise_prompt("Lord Diplomat", "Lady Serena Ashford",
+                           "Diplomatic overture available", "rim factions",
+                           "Trade/treaty window with neutral factions; requires royal sign-off.",
+                           "normal")
     else:
         # Away: low-stakes trade autonomous, no treaties. Dark: also freeze high-value talks.
         taken += 1
 
     # ── Lord of the Deep ──
     if present:
-        await _prompt(session_id, "Lord of the Deep", "Nadia Voss",
-                      "Deep recon proposal", "uncharted rim",
-                      "Propose extended survey of uncharted lanes.",
-                      "normal")
-        prompted += 1
+        await raise_prompt("Lord of the Deep", "Nadia Voss",
+                           "Deep recon proposal", "uncharted rim",
+                           "Propose extended survey of uncharted lanes.",
+                           "normal")
     else:
         taken += 1
 
     # ── Lord Governor (colonial/trade) ──
     if present:
-        await _prompt(session_id, "Lord Governor", "Council-appointed",
-                      "Governor portfolio review", "crown systems",
-                      "Colonial/trade actions awaiting royal direction.",
-                      "normal")
-        prompted += 1
+        await raise_prompt("Lord Governor", "Council-appointed",
+                           "Governor portfolio review", "crown systems",
+                           "Colonial/trade actions awaiting royal direction.",
+                           "normal")
     else:
         taken += 1
 
     # ── Governor pipeline (added 2026-08-14) ──
     # Conquered/acquired territories without a governor get one: highest-score
-    # pending applicant first, else a Crown caretaker.
+    # vetted applicant first, else a Crown caretaker. Applicant status flow:
+    # applied -> vetted | skipped_loyalty -> appointed. Only `vetted` is appointable.
     assigned = 0
     ungov = await Database.fetch(
         "SELECT id, system_name FROM maya_rp.territory WHERE session_id=$1 AND "
         "controlling_faction='Setia Empire' AND (governor_name IS NULL OR governor_name='')",
         session_id)
     for t in ungov:
-        applicant = await Database.fetchrow(
-            "SELECT id, name FROM maya_rp.governor_applicants "
-            "WHERE session_id=$1 AND status='pending' ORDER BY total_score DESC LIMIT 1",
-            session_id)
-        gov = applicant["name"] if applicant else "Acting Governor (Crown caretaker)"
-        await Database.execute(
-            "UPDATE maya_rp.territory SET governor_name=$1 WHERE id=$2", gov, t["id"])
-        if applicant:
-            await Database.execute(
-                "UPDATE maya_rp.governor_applicants SET status='appointed' WHERE id=$1",
-                applicant["id"])
-        await Database.execute(
-            "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
-            "VALUES ($1, NOW(), 'appointment', $2, $3, $4, 3)",
-            session_id, f"Governor: {gov}",
-            f"{gov} appointed governor of {t['system_name']}",
-            json.dumps(["governor", t["system_name"]]))
+        # One transaction: the territory lock, the applicant claim, the name and the event commit
+        # together. A concurrent tick skips the locked territory and cannot take the same applicant.
+        async with Database.transaction() as conn:
+            open_row = await conn.fetchrow(
+                "SELECT id FROM maya_rp.territory WHERE id=$1 AND session_id=$2 AND "
+                "(governor_name IS NULL OR governor_name='') FOR UPDATE SKIP LOCKED",
+                t["id"], session_id)
+            if not open_row:
+                continue
+            applicant = await conn.fetchrow(
+                "UPDATE maya_rp.governor_applicants SET status='appointed' WHERE id=("
+                "SELECT id FROM maya_rp.governor_applicants WHERE session_id=$1 AND status='vetted' "
+                "ORDER BY total_score DESC NULLS LAST, id LIMIT 1 FOR UPDATE SKIP LOCKED) "
+                "RETURNING id, name", session_id)
+            gov = applicant["name"] if applicant else "Acting Governor (Crown caretaker)"
+            await conn.execute(
+                "UPDATE maya_rp.territory SET governor_name=$1 WHERE id=$2", gov, t["id"])
+            await conn.execute(
+                "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
+                "VALUES ($1, NOW(), 'appointment', $2, $3, $4, 3)",
+                session_id, f"Governor: {gov}",
+                f"{gov} appointed governor of {t['system_name']}",
+                json.dumps(["governor", t["system_name"]]))
         assigned += 1
     if assigned:
         taken += assigned

@@ -5,6 +5,7 @@ import random
 from core.db import Database
 from core.config import Config
 from core.log import info
+from core.session import require_session
 
 TEMPLATES = {
     "build": ["A new vessel joins the fleet: {title}.", "Construction complete: {title} slides into formation."],
@@ -22,7 +23,7 @@ async def narrate_event(event_type: str, title: str, description: str) -> str:
     return template.format(title=title) + (" " + description if description else "")
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     try:
         events = await Database.fetch("SELECT event_type, title, description FROM maya_rp.events WHERE session_id=$1 ORDER BY id DESC LIMIT 3", session_id)
         narratives = [await narrate_event(e["event_type"], e["title"], e["description"] or "") for e in events]

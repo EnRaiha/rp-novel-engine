@@ -5,9 +5,11 @@ import random
 from typing import Any
 from core.db import Database
 from core.config import Config
+from core.session import require_session
 
 async def generate(session_id: int = None) -> dict | None:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _writes_allowed
     if random.random()>0.15: return None
     from core.pacing import PacingDirector
     pm = await PacingDirector.get_mode(session_id)
@@ -23,10 +25,11 @@ async def generate(session_id: int = None) -> dict | None:
         # Mark the row that was read. Matching on faction and target marked every
         # raid of the same faction at the same system: three live undetected
         # Gale Runner raids at 433-472 collapsed into one POV cut, and the other
-        # two could never be reported.
-        await Database.execute(
-            "UPDATE maya_rp.incoming_raids SET detected=true WHERE session_id=$1 AND id=$2",
-            session_id, raid["id"])
+        # two could never be reported. A frozen campaign gets the cut and keeps the flag.
+        if _writes_allowed(session_id):
+            await Database.execute(
+                "UPDATE maya_rp.incoming_raids SET detected=true WHERE session_id=$1 AND id=$2",
+                session_id, raid["id"])
         # enemy_power and ticks_remaining are nullable columns; `{None:,}` raises.
         power = int(raid["enemy_power"] or 0)
         ticks = int(raid["ticks_remaining"] or 0)

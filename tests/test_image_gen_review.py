@@ -21,6 +21,12 @@ import pytest
 import modules.image_gen as ig
 
 
+@pytest.fixture(autouse=True)
+def _writable(monkeypatch):
+    """The real frozen list must not decide these tests: they name session 3 or 5."""
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: False)
+
+
 class FakeDB:
     def __init__(self, rows=None, execute_tag="INSERT 0 1"):
         self.row_map = rows or {}

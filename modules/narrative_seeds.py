@@ -6,14 +6,16 @@ from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import error, info
+from core.session import require_session
 
 
 async def plant_seed(seed_type: str, content: str, payoff_condition: str = "",
                      payoff_template: str = "", payoff_by_day: int = None,
                      session_id: int = None):
     """Plant a narrative seed for later payoff."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     game_day = await Database.fetchval(
         "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
 
@@ -27,8 +29,7 @@ async def plant_seed(seed_type: str, content: str, payoff_condition: str = "",
 
 async def get_foreshadow_ops(session_id: int = None) -> list[dict]:
     """Get seeds that should be hinted at in current narrative."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     game_day = await Database.fetchval(
         "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
 
@@ -48,8 +49,9 @@ async def mark_foreshadowed(seed_id: int, session_id: int = None):
     @returns {"seed_id", "marked", "status"}. `marked` is False for a seed that is missing,
     belongs to another session, or is already closed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     returned = await Database.fetchval(
         "UPDATE maya_rp.narrative_seeds "
         "SET foreshadow_count = COALESCE(foreshadow_count, 0) + 1, "
@@ -65,8 +67,9 @@ async def pay_off(seed_id: int, session_id: int = None) -> dict:
 
     @returns the paid seed, or a dict with `error` when the seed is missing or already closed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     async with Database.transaction() as conn:
         seed = await conn.fetchrow(
             "UPDATE maya_rp.narrative_seeds SET status='paid_off' "
@@ -93,8 +96,9 @@ async def pay_off(seed_id: int, session_id: int = None) -> dict:
 
 async def run_tick(session_id: int = None) -> dict:
     """Check for auto-payoff seeds that have reached their payoff day."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         game_day = await Database.fetchval(
             "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1

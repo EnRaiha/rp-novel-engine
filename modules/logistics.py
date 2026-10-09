@@ -27,7 +27,9 @@ async def create_cargo(item: str, qty: float, loc_type: str, loc_id: int, sessio
 
     @returns the new row's id, or an error dict naming what was refused.
     """
-    if session_id is None: session_id = require_session(None)
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if qty is None or not math.isfinite(qty) or qty <= 0:
         return {"error": f"quantity must be greater than zero, got {qty!r}"}
     if not (loc_type or "").strip():
@@ -50,7 +52,9 @@ async def transport(cargo_id: int, dest_type: str, dest_id: int, ship_id: int, s
     could create. The guards here mirror `create_cargo`, and the mission refuses cargo that does not
     exist rather than tracking a phantom.
     """
-    if session_id is None: session_id = require_session(None)
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if not dest_type or dest_id is None:
         return {"error": "a destination needs both a type and an id"}
     # One cargo row takes one mission, or the later arrival overwrites the first delivery.
@@ -78,7 +82,9 @@ async def transport(cargo_id: int, dest_type: str, dest_id: int, ship_id: int, s
 async def run_tick(session_id: int = None) -> dict:
     """Deliver every mission whose arrival day has come. The claim and the cargo move share
     one transaction: an error on the cargo write rolls the claim back, so the next tick retries."""
-    if session_id is None: session_id = require_session(None)
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     gd = await _game_day(session_id)
     moved = 0
     async with Database.transaction() as conn:

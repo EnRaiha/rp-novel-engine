@@ -7,7 +7,9 @@ from core.log import info
 from core.session import require_session
 
 async def generate_prompt(session_id: int | None = None) -> dict:
-    if session_id is None: session_id = require_session(None)
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     # `hull` was selected here and never used: it is a numeric hull value, not a
     # class name, so it could not go into a prompt.
     ships = await Database.fetchrow("SELECT name, tier FROM maya_rp.ships WHERE session_id=$1 ORDER BY RANDOM() LIMIT 1", session_id)
@@ -28,5 +30,5 @@ async def generate_prompt(session_id: int | None = None) -> dict:
     return {"prompt": prompt, "scene_type": scene_type}
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = require_session(None)
+    session_id = require_session(session_id)
     return {"status": "image_gen_ready"}

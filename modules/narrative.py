@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from core.db import Database
 from core.config import Config
 from core.log import info
+from core.session import require_session
 from core.utils import calc_game_days
 from core.events import EventBus
 
@@ -28,8 +29,9 @@ async def run_tick(session_id: int | None = None) -> dict:
     argument wrote story entries into the archive. Every path answers with counts now; the tick used
     to return None and end with a print.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     row = await Database.fetchrow("SELECT last_tick_at FROM resources WHERE session_id=$1", session_id)
     if not row or not row.get("last_tick_at"):
         return {"game_days": 0.0, "ambient": 0, "hooks": 0}

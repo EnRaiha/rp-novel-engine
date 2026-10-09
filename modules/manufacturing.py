@@ -6,6 +6,7 @@ from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import info, error
+from core.session import require_session
 
 
 class _StockShort(Exception):
@@ -13,7 +14,9 @@ class _StockShort(Exception):
 
 
 async def run_tick(session_id: int | None = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         lines = await Database.fetch(
             "SELECT pl.id, pl.colony_id, pl.recipe_id, pl.efficiency, pl.status "

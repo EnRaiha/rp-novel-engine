@@ -10,11 +10,27 @@ from __future__ import annotations
 import pathlib
 import sys
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.db import Database  # noqa: E402
 from modules import logistics  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _writable(monkeypatch):
+    """The real frozen list must not decide these tests: they name session 3 or 5."""
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: False)
+
+
+@pytest.fixture(autouse=True)
+async def _fresh_pool():
+    """A pool left by an earlier test is bound to that test's event loop. Close it before and after each test."""
+    await Database.close()
+    yield
+    await Database.close()
 
 
 class TestCreateCargo:

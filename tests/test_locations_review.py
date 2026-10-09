@@ -34,6 +34,12 @@ import pytest
 from modules import locations
 
 
+@pytest.fixture(autouse=True)
+def _writable(monkeypatch):
+    """The real frozen list must not decide these tests: they name session 3 or 5."""
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: False)
+
+
 class FakeDB:
     def __init__(self, tags=("UPDATE 1",), value=1):
         self.tags = list(tags)

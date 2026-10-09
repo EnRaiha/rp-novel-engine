@@ -11,6 +11,7 @@ from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import error, info
+from core.session import require_session
 
 DEFAULT_THRESHOLD = 3
 # clues.source_type is enum-checked in the schema; `source` is free text and
@@ -20,6 +21,9 @@ ALLOWED_SOURCE_TYPES = ("discovery", "interrogation", "companion_insight",
 RED_HERRING_SOURCE = "misdirection"
 
 async def create_investigation(session_id: int, title: str, template: str = "generic", difficulty: int = 5) -> dict:
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     inv_id = await Database.fetchval(
         "INSERT INTO maya_rp.investigations (session_id, title, template_name, difficulty, status) VALUES ($1,$2,$3,$4,'active') RETURNING id",
         session_id, title, template, difficulty,
@@ -52,6 +56,9 @@ async def add_clue(session_id: int, investigation_id: int, text: str, source: st
     An unknown `source_type` still falls back to `discovery`, which is deliberate and reported in the
     return value rather than hidden.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if source_type not in ALLOWED_SOURCE_TYPES:
         source_type = "discovery"
     refusal = await _owned_investigation(session_id, investigation_id)
@@ -81,6 +88,9 @@ async def add_clue(session_id: int, investigation_id: int, text: str, source: st
     return {"clue_id": clue_id, "investigation_id": investigation_id}
 
 async def deduce(session_id: int, investigation_id: int, description: str = "") -> dict:
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     inv = await Database.fetchrow(
         "SELECT id, template_name, status FROM maya_rp.investigations WHERE id=$1 AND session_id=$2",
         investigation_id, session_id,
@@ -117,6 +127,9 @@ async def deduce(session_id: int, investigation_id: int, description: str = "") 
             "threshold": threshold, "investigation_id": investigation_id}
 
 async def generate_red_herring(session_id: int, investigation_id: int) -> dict:
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     refusal = await _owned_investigation(session_id, investigation_id)
     if refusal:
         return {"error": refusal}
@@ -150,7 +163,9 @@ async def _bump_clue_count(investigation_id: int):
 async def run_tick(session_id: int = None) -> dict:
     """Investigation aging: an active case older than 20 wall-clock days (from `created_at`) with no
     deductions turns `cold` and logs one `trail_growing_cold` entry. The status guard makes it once."""
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         active = await Database.fetch(
             "SELECT id, title, deductions_made, created_at FROM maya_rp.investigations "

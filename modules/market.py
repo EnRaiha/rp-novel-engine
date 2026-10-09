@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from core.db import Database
 from core.config import Config
 from core.log import info
+from core.session import require_session
 from core.utils import calc_game_days
 
 SEED_COMMODITIES = [
@@ -49,8 +50,7 @@ def market_index(pairs: list) -> float:
 
 async def get_market_index(session_id: int | None = None) -> float:
     """Live mean price deviation across all commodities."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     rows = await Database.fetch(
         "SELECT base_price, current_price FROM maya_rp.commodities WHERE session_id=$1",
         session_id)
@@ -80,8 +80,9 @@ async def _seed(session_id: int, tick: int = 0) -> None:
 
 
 async def run_tick(session_id: int | None = None) -> dict:
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     row = await Database.fetchrow(
         "SELECT last_tick_at FROM maya_rp.resources WHERE session_id=$1", session_id)
     if not row or not row.get("last_tick_at"):

@@ -25,6 +25,12 @@ import pytest
 import modules.meanwhile as meanwhile
 
 
+@pytest.fixture(autouse=True)
+def _writable(monkeypatch):
+    """The real frozen list must not decide these tests: they name session 3 or 5."""
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: False)
+
+
 class FakeDB:
     def __init__(self, rows=None, fetch=None, fetchval=None):
         self.row_map = rows or {}

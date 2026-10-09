@@ -48,6 +48,8 @@ async def dark_status(session_id: int | None = None) -> bool:
 
 async def set_king(session_id: int | None, present: bool) -> None:
     session_id = _sid(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     await Database.execute(
         "UPDATE maya_rp.sessions SET king_present=$2, dark_mode=NOT $2 WHERE id=$1",
         session_id, present)
@@ -56,6 +58,8 @@ async def set_king(session_id: int | None, present: bool) -> None:
 async def set_dark(session_id: int | None, dark: bool) -> None:
     """DARK MODE toggle: dark=TRUE → king_present=FALSE; dark=FALSE → king_present=TRUE."""
     session_id = _sid(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     await Database.execute(
         "UPDATE maya_rp.sessions SET dark_mode=$2, king_present=NOT $2 WHERE id=$1",
         session_id, dark)
@@ -93,6 +97,8 @@ async def _prompt(session_id: int, ministry: str, holder: str, action: str,
 
 async def run_tick(session_id: int | None = None) -> dict:
     session_id = _sid(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     present = await king_status(session_id)
     dark = await dark_status(session_id)
     taken = 0      # actions ministries executed autonomously (King away / dark mode)
@@ -229,6 +235,9 @@ async def pending(session_id: int | None = None) -> list[dict]:
 
 
 async def resolve(session_id: int, prompt_id: int, decision: str) -> dict:
+    session_id = _sid(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if decision not in ("accepted", "rejected"):
         return {"error": "decision must be accepted/rejected"}
     # The update targeted a prompt by id and session and answered with the decision either way, so a

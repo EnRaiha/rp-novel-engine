@@ -29,6 +29,9 @@ async def set_player_location(session_id: int, location: str, ship: str = None):
     a name that is not in it cannot be matched by `get_characters_at_location`, so the
     scene cast would read empty for a reason nothing else would explain.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     known = await Database.fetchval(
         "SELECT 1 FROM maya_rp.location_catalog WHERE name=$1", location)
     if not known:
@@ -87,8 +90,9 @@ async def set_character_presence(character_id: int, location: str, session_id: i
     was never written here: the CLI could place a character for a year and no
     reader would see it move.
     """
-    if session_id is None:
-        session_id = require_session(None)
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     async with Database.transaction() as conn:
         tag = await conn.execute(
             "UPDATE maya_rp.characters SET scene_location=$1 WHERE id=$2 AND session_id=$3",
@@ -174,8 +178,7 @@ async def get_scene_context(session_id: int) -> dict:
 
 async def run_tick(session_id: int = None) -> dict:
     """Location tick — currently idle, presence managed manually."""
-    if session_id is None:
-        session_id = require_session(None)
+    session_id = require_session(session_id)
     return {"status": "locations_ready"}
 
 

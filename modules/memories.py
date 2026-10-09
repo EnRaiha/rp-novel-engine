@@ -5,6 +5,7 @@ from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import info, error
+from core.session import require_session
 
 
 def _like_escape(word: str) -> str:
@@ -21,8 +22,9 @@ async def store(character_id: int, memory_type: str, content: str,
                 keywords: list = None, weight: int = 5, expires_day: int = None,
                 source_event_id: int = None, session_id: int = None):
     """Store a character memory."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     game_day = await Database.fetchval(
         "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
 
@@ -38,9 +40,9 @@ async def store(character_id: int, memory_type: str, content: str,
 
 async def recall(character_id: int, context_text: str,
                  session_id: int = None) -> list[dict]:
-    """Find memories relevant to current context."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    """Find memories relevant to current context. A frozen campaign is read without the recall bump."""
+    session_id = require_session(session_id)
+    from core.ooc import _writes_allowed
     game_day = await Database.fetchval(
         "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
 
@@ -58,18 +60,18 @@ async def recall(character_id: int, context_text: str,
         "ORDER BY emotional_weight DESC, recalled_count ASC LIMIT 5",
         character_id, session_id, game_day, words)
 
-    for m in rows:
-        await Database.execute(
-            "UPDATE maya_rp.character_memories SET recalled_count=recalled_count+1, "
-            "last_recalled_at_game_day=$1 WHERE id=$2 AND session_id=$3",
-            game_day, m["id"], session_id)
+    if _writes_allowed(session_id):
+        for m in rows:
+            await Database.execute(
+                "UPDATE maya_rp.character_memories SET recalled_count=recalled_count+1, "
+                "last_recalled_at_game_day=$1 WHERE id=$2 AND session_id=$3",
+                game_day, m["id"], session_id)
     return [dict(r) for r in rows]
 
 
 async def get_inner_world(character_id: int, session_id: int = None) -> dict:
     """Full emotional state packet for narration."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     rows = await Database.fetch(
         "SELECT memory_type, content, emotional_weight FROM maya_rp.character_memories "
         "WHERE character_id=$1 AND session_id=$2 "
@@ -96,8 +98,7 @@ async def get_inner_world(character_id: int, session_id: int = None) -> dict:
 
 async def cmd_memory_surface(character_name: str, context: str, session_id: int = None):
     """CLI: surface relevant memories for a character."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     char = await Database.fetchrow(
         "SELECT id, name FROM maya_rp.characters WHERE session_id=$1 "
         "AND LOWER(name) LIKE LOWER($2) ESCAPE '\\' ORDER BY id LIMIT 1",
@@ -115,8 +116,9 @@ async def cmd_memory_surface(character_name: str, context: str, session_id: int 
 
 async def run_tick(session_id: int = None) -> dict:
     """Memory tick: expire old memories."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         game_day = await Database.fetchval(
             "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
@@ -176,8 +178,9 @@ async def consolidate_memories(session_id: int = None, character_id: int | None 
     recalled < 3 times) into one 'consolidated' memory per character; archive the
     originals. Mimics human memory — the gist survives, the granular detail fades.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     # This path DELETES the originals, so a nonsense window would take the whole
     # history: a negative age_days moved the cutoff into the future and matched
     # every memory the character owned.

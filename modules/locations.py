@@ -4,8 +4,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 from core.db import Database
-from core.config import Config
 from core.log import info, warn
+from core.session import require_session
 
 SHIP_LOCATIONS = [
     "bridge", "quarters", "observation_deck", "garden", "forge",
@@ -34,11 +34,13 @@ async def set_player_location(session_id: int, location: str, ship: str = None):
     if not known:
         warn("locations", f"{location!r} is not in maya_rp.location_catalog; readers that match "
                           "scene_location against the catalogue will not find this scene")
+    # current_focus is varchar(50); the `location` column holds the full name.
+    focus = f"Location: {location} on {ship or 'unknown'}"[:50]
     await Database.execute(
         "INSERT INTO maya_rp.player_context (session_id, location, current_focus, mood, updated_at) "
         "VALUES ($1, $2, $3, 'normal', NOW()) "
         "ON CONFLICT (session_id) DO UPDATE SET location=$2, current_focus=$3, updated_at=NOW()",
-        session_id, location, f"Location: {location} on {ship or 'unknown'}")
+        session_id, location, focus)
     info("locations", f"Player moved to: {location} on {ship or 'unknown'}")
 
 
@@ -86,17 +88,20 @@ async def set_character_presence(character_id: int, location: str, session_id: i
     reader would see it move.
     """
     if session_id is None:
-        session_id = Config.SESSION_ID
-    await Database.execute(
-        "INSERT INTO maya_rp.character_presence_log (character_table, character_id, new_presence, reason) "
-        "VALUES ('characters', $1, $2, 'location_update')",
-        character_id, location)
-    tag = await Database.execute(
-        "UPDATE maya_rp.characters SET scene_location=$1 WHERE id=$2 AND session_id=$3",
-        location, character_id, session_id)
-    if tag.rsplit(" ", 1)[-1] == "0":
-        warn("locations", f"character #{character_id} is not in session {session_id}; "
-                          "appearance unchanged")
+        session_id = require_session(None)
+    async with Database.transaction() as conn:
+        tag = await conn.execute(
+            "UPDATE maya_rp.characters SET scene_location=$1 WHERE id=$2 AND session_id=$3",
+            location, character_id, session_id)
+        if tag.rsplit(" ", 1)[-1] == "0":
+            warn("locations", f"character #{character_id} is not in session {session_id}; "
+                              "appearance unchanged")
+            return None
+        # new_presence is varchar(20): the log keeps a prefix, scene_location keeps the full name.
+        await conn.execute(
+            "INSERT INTO maya_rp.character_presence_log (character_table, character_id, new_presence, reason) "
+            "VALUES ('characters', $1, $2, 'location_update')",
+            character_id, location[:20] if location else None)
     return None
 
 
@@ -170,7 +175,7 @@ async def get_scene_context(session_id: int) -> dict:
 async def run_tick(session_id: int = None) -> dict:
     """Location tick — currently idle, presence managed manually."""
     if session_id is None:
-        session_id = Config.SESSION_ID
+        session_id = require_session(None)
     return {"status": "locations_ready"}
 
 
@@ -179,7 +184,7 @@ async def run_tick(session_id: int = None) -> dict:
 async def cmd_goto(location: str, ship: str = None, session_id: int = None):
     """CLI: move player to a location."""
     if session_id is None:
-        session_id = Config.SESSION_ID
+        session_id = require_session(None)
     if ship is None:
         ship = "Flagship"
     await set_player_location(session_id, location, ship)

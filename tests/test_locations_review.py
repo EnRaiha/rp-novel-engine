@@ -56,6 +56,19 @@ class FakeDB:
         database, which makes a unit test depend on what is in `location_catalog` that day."""
         return self.value
 
+    def transaction(self):
+        """`set_character_presence` runs its UPDATE and INSERT on the yielded connection."""
+        fake = self
+
+        class _Tx:
+            async def __aenter__(self):
+                return fake
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Tx()
+
 
 @pytest.fixture
 def db(monkeypatch):
@@ -67,6 +80,7 @@ def db(monkeypatch):
     monkeypatch.setattr(locations.Database, "fetch", staticmethod(fake.fetch))
     monkeypatch.setattr(locations.Database, "fetchrow", staticmethod(fake.fetchrow))
     monkeypatch.setattr(locations.Database, "fetchval", staticmethod(fake.fetchval))
+    monkeypatch.setattr(locations.Database, "transaction", staticmethod(fake.transaction))
     return fake, logs
 
 
@@ -78,14 +92,17 @@ async def test_placing_a_character_moves_it_where_readers_look(db):
     assert len(moves) == 1, fake.executes
     assert moves[0][1] == ("medbay", 42, 5), moves[0][1]
     assert any(e[0].startswith("INSERT INTO maya_rp.character_presence_log") for e in fake.executes)
+    assert [e[0].split()[0] for e in fake.executes] == ["UPDATE", "INSERT"], fake.executes
 
 
 async def test_placing_another_campaigns_character_says_so(db):
     """(2) The update is scoped, so the miss has to be reported."""
     fake, logs = db
-    fake.tags = ["INSERT 0 1", "UPDATE 0"]
+    fake.tags = ["UPDATE 0"]
     await locations.set_character_presence(999, "medbay", session_id=5)
     assert logs["warn"], "a placement that moved nothing was silent"
+    assert not any(e[0].startswith("INSERT INTO maya_rp.character_presence_log") for e in fake.executes), \
+        fake.executes
 
 
 async def test_set_player_location_writes_the_column_readers_use(db):

@@ -7,18 +7,28 @@ Serves:
   GET /api/status  → engine status
 
 Run:  python3 scripts/map_server.py [--port 3460]
+
+Env:
+  MAP_BIND     listen address, default 127.0.0.1. A non-loopback address needs MAP_PASS.
+  MAP_DB_DSN   libpq URI for a dedicated role (for example the SELECT-only map_reader).
+               Default: core.config.Config.DSN. The session is read-only either way.
+  MAP_USER, MAP_PASS, MAP_API_KEY   auth (see check_auth).
 """
-import json, re, sys, argparse, os, base64, functools, time, subprocess
+import json, re, sys, argparse, os, base64, functools, time, subprocess, ipaddress, secrets
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from flask import Flask, jsonify, send_from_directory, Response, request
 import psycopg2
-from core.log import error
-
-APP = Flask(__name__, static_folder=None)
 
 # `core` lives one level up; the unit runs this file directly, so the engine
-# package is not on sys.path by default.
+# package is not on sys.path by default. The insert must precede every `core` import.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core import portraits  # noqa: E402
+from core.config import Config  # noqa: E402
+from core.log import error  # noqa: E402
+
+APP = Flask(__name__, static_folder=None)
 
 ASSETS = "/home/maya/Bumi-Hijau/wiki/rp-dev/canon/assets"
 
@@ -62,13 +72,70 @@ def require_auth(fn):
     return wrapper
 
 
+def bind_host(environ=None) -> str:
+    """Address the server listens on: `MAP_BIND`, else loopback.
+
+    A non-loopback address needs `MAP_PASS`, so a server open to the network never runs without a password.
+    """
+    env = os.environ if environ is None else environ
+    host = (env.get("MAP_BIND") or "127.0.0.1").strip()
+    if not _is_loopback(host) and not env.get("MAP_PASS"):
+        sys.exit(f"map_server: refusing to bind {host} without MAP_PASS. "
+                 "Set MAP_PASS, or set MAP_BIND to a loopback address.")
+    return host
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def csp(script_src: str = "'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net") -> str:
+    """Content-Security-Policy value. The default `script_src` serves the static pages, whose inline
+    handlers and three.js CDN scripts need it. `connect-src` and `img-src` stay on this origin, so
+    injected script has nowhere to send data."""
+    return "; ".join((
+        "default-src 'self'",
+        f"script-src {script_src}",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: blob:",
+        "connect-src 'self'",
+        "object-src 'none'",
+        "base-uri 'none'",
+        "form-action 'self'",
+        "frame-ancestors 'self'",
+    ))
+
+
+@APP.after_request
+def harden(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Content-Security-Policy", csp())
+    return response
+
+
+def db_dsn(environ=None) -> str:
+    """libpq URI for the map server's connection.
+
+    `MAP_DB_DSN` names a dedicated role, for example the SELECT-only `map_reader`. Without it the engine's
+    `Config.DSN` applies. `search_path` is an asyncpg setting that libpq rejects, so it is dropped.
+    """
+    env = os.environ if environ is None else environ
+    dsn = (env.get("MAP_DB_DSN") or "").strip() or Config.DSN
+    parts = urlsplit(dsn)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "search_path"]
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
 def db():
-    """Read-only restricted role: maya_rp schema ONLY (no DML, no other schemas)."""
-    return psycopg2.connect(host=os.environ.get("POSTGRES_HOST", "192.168.100.253"),
-                            port=int(os.environ.get("POSTGRES_PORT", 5432)),
-                            user=os.environ.get("MAP_DB_USER", "map_reader"),
-                            dbname=os.environ.get("POSTGRES_DB", "maya_memory"),
-                            password=os.environ.get("MAP_DB_PASS", "mapread2026"))
+    """Connection for one request. The session is read-only whichever role the DSN names."""
+    conn = psycopg2.connect(db_dsn())
+    conn.set_session(readonly=True)
+    return conn
 
 def q(cur, sql):
     cur.execute(sql)
@@ -214,7 +281,11 @@ def _play_url() -> str:
 @APP.route("/characters/<path:relpath>")
 @require_auth
 def characters(relpath):
-    return send_from_directory(CHARACTERS, relpath)
+    """Files under the characters folder. `send_from_directory` refuses a path outside it. The sandbox
+    policy stops a stray .html or .svg in the folder from running script on this origin."""
+    response = send_from_directory(CHARACTERS, relpath)
+    response.headers["Content-Security-Policy"] = "sandbox; default-src 'none'; img-src 'self'"
+    return response
 
 
 @APP.route("/roster")
@@ -245,8 +316,7 @@ def api_roster():
         ORDER BY COALESCE(c.bond,0) DESC, c.id
     """)
     conn.close()
-    from core import portraits  # occasion -> the emotion file that was written
-
+    # occasion -> the emotion file that was written
     data = []
     for row in rows:
         slug = re.sub(r"[^a-z0-9]+", "-", row["name"].lower()).strip("-")
@@ -295,6 +365,16 @@ def _slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-") or "unknown"
 
 
+def _like_contains(text: str) -> str:
+    """LIKE pattern that matches `text` literally anywhere (pair with `ESCAPE '\\'`)."""
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+# Portrait emotion keys become file names under a character folder, so a key must be one plain word.
+_EMOTION_KEY = re.compile(r"[A-Za-z0-9_-]{1,40}")
+
+
 @APP.route("/nav.js")
 @require_auth
 def nav_script():
@@ -305,7 +385,15 @@ def nav_script():
 @APP.route("/characters")
 @require_auth
 def characters_page():
-    return send_from_directory(ASSETS, "characters.html")
+    """The workbench page. Its inline script runs only with this response's nonce, so markup injected
+    through a character field cannot run script on a page that can write files."""
+    nonce = secrets.token_urlsafe(16)
+    html = (Path(ASSETS) / "characters.html").read_text(encoding="utf-8")
+    html = html.replace("<script>", f'<script nonce="{nonce}">')
+    response = Response(html, mimetype="text/html")
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["Content-Security-Policy"] = csp(f"'self' 'nonce-{nonce}'")
+    return response
 
 
 @APP.route("/api/characters")
@@ -348,8 +436,6 @@ def api_character(cid):
         conn.close()
         return jsonify({"error": "no such character"}), 404
     name = row["name"]
-    from core import portraits
-
     root = portraits.character_dir(name, cid)
     files = {}
     for field in CHAR_FILES:
@@ -375,9 +461,10 @@ def api_character(cid):
                         " FROM maya_rp.ooc_suspicion s WHERE s.session_id = %s AND s.observer_id = %s",
                   (row["session_id"], cid))
     events = qp(cur, "SELECT id, happened_at, event_type, COALESCE(narrative_title, title) AS title, importance"
-                     " FROM maya_rp.events WHERE session_id=%s AND (title ILIKE %s OR description ILIKE %s)"
+                     " FROM maya_rp.events WHERE session_id=%s"
+                     " AND (title ILIKE %s ESCAPE '\\' OR description ILIKE %s ESCAPE '\\')"
                      " ORDER BY happened_at DESC LIMIT 12",
-               (row["session_id"], f"%{name}%", f"%{name}%"))
+               (row["session_id"], _like_contains(name), _like_contains(name)))
     conn.close()
     return jsonify({
         "character": dict(row),
@@ -397,21 +484,10 @@ def api_character(cid):
 @APP.route("/api/characters/<int:cid>", methods=["POST"])
 @require_auth
 def api_character_update(cid):
-    payload = request.get_json(silent=True) or {}
-    updates = {k: v for k, v in payload.items() if k in CHAR_EDITABLE}
-    if not updates:
-        return jsonify({"error": "no editable fields in payload", "editable": list(CHAR_EDITABLE)}), 400
-    assignments = ", ".join(f"{col} = %s" for col in updates)
-    values = [None if v == "" else v for v in updates.values()]
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(f"UPDATE maya_rp.characters SET {assignments} WHERE id = %s RETURNING id, name", values + [cid])
-    updated = cur.fetchone()
-    conn.commit()
-    conn.close()
-    if updated is None:
-        return jsonify({"error": "no such character"}), 404
-    return jsonify({"ok": True, "id": updated["id"], "fields": list(updates)})
+    """Always 403. The database session is read-only and the `map_reader` role holds SELECT only on
+    `characters`, so a write cannot succeed. The workbench shows this message in its status line."""
+    return jsonify({"error": "read-only: the map server cannot modify character rows",
+                    "editable": list(CHAR_EDITABLE)}), 403
 
 
 @APP.route("/api/characters/<int:cid>/version", methods=["POST"])
@@ -422,22 +498,22 @@ def api_character_version(cid):
     emotion = str(payload.get("emotion") or "")
     try:
         version = int(payload.get("version"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return jsonify({"error": "version must be an integer"}), 400
     if not emotion:
         return jsonify({"error": "emotion is required"}), 400
+    if not _EMOTION_KEY.fullmatch(emotion):
+        return jsonify({"error": "emotion must be letters, digits, underscore or hyphen"}), 400
     conn = db()
     cur = conn.cursor()
     row = qp(cur, "SELECT name FROM maya_rp.characters WHERE id = %s", (cid,), one=True)
     conn.close()
     if row is None:
         return jsonify({"error": "no such character"}), 404
-    from core import portraits
-
     try:
         live = portraits.promote_version(row["name"], emotion, version, cid)
-    except ValueError as error:
-        return jsonify({"error": str(error)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 404
     return jsonify({"ok": True, "emotion": emotion, "version": version, "live": str(live)})
 
 
@@ -563,7 +639,10 @@ def api_ooc_trace():
     the audit visible instead of implied.
     """
     sid = ooc_session(request.args.get("session"))
-    limit = max(1, min(50, int(request.args.get("limit") or 12)))
+    try:
+        limit = max(1, min(50, int(request.args.get("limit") or 12)))
+    except ValueError:
+        limit = 12
     conn = db()
     cur = conn.cursor()
     state = qp(cur, "SELECT arc_stage, deviation, roleplay_points, audits, findings, debuff, updated_at"
@@ -601,5 +680,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=3460)
     args = ap.parse_args()
-    print(f"MAP API on http://0.0.0.0:{args.port}  (PG → JSON → galaxy map)")
-    APP.run(host="0.0.0.0", port=args.port, debug=False)
+    host = bind_host()
+    print(f"MAP API on http://{host}:{args.port}  (PG → JSON → galaxy map)")
+    APP.run(host=host, port=args.port, debug=False)

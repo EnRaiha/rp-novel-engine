@@ -14,6 +14,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import pytest  # noqa: E402
+from asyncpg.exceptions import PostgresError  # noqa: E402
 
 from core.db import Database  # noqa: E402
 from modules import megastructures_ports as mp  # noqa: E402
@@ -162,3 +163,151 @@ class TestTheDoors:
             assert "not found" in out["error"], out
         finally:
             await Database.close()
+
+
+# ── the phase-1 charge ───────────────────────────────────────────────────────
+
+
+class _GateOpenDatabase:
+    """Answers the research gate; every other statement still runs on the real pool.
+
+    All six `megastructure_types` name a `research_required` project and none of those names exists
+    in the live `research_projects` catalogue, so the gate refuses every type before the charge. The
+    seeded alternative is a global row in the live tech catalogue, which this test will not write.
+    """
+
+    @staticmethod
+    async def fetchrow(sql, *args):
+        if "research_projects" in sql:
+            return {"unlocked": True}
+        return await Database.fetchrow(sql, *args)
+
+    @staticmethod
+    async def execute(sql, *args):
+        return await Database.execute(sql, *args)
+
+    @staticmethod
+    def transaction():
+        return Database.transaction()
+
+
+async def _seed_session(session_id: int) -> None:
+    """`resources.session_id` and `megastructure_construction.session_id` both carry a FK to `sessions`."""
+    await Database.execute(
+        "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1, 'mega charge review', 'active')"
+        " ON CONFLICT (id) DO NOTHING", session_id)
+
+
+async def _drop_session(session_id: int) -> None:
+    """`resources_session_id_fkey` is the one FK to `sessions` here with no ON DELETE CASCADE."""
+    for table in ("resources", "megastructure_construction", "story_log"):
+        await Database.execute(f"DELETE FROM maya_rp.{table} WHERE session_id = $1", session_id)
+    await Database.execute("DELETE FROM maya_rp.sessions WHERE id = $1", session_id)
+
+
+class TestTheCharge:
+    """The debit and the construction row are one unit of work, and the row takes a naive timestamp.
+
+    `estimated_completion` is TIMESTAMP WITHOUT TIME ZONE and asyncpg raises DataError on a tz-aware
+    value for it, so the charge used to commit on the pool and the insert then raised: the credits
+    were spent and no construction row existed. Sessions 3 and 5 are frozen reference, so every row
+    here belongs to `scratch_session`.
+    """
+
+    async def test_a_construction_is_paid_for_and_recorded(self, scratch_session, monkeypatch):
+        """TYPE_ID phase 1 costs 100000 alloys, 50000 fuel and 100 dream essence, once."""
+        monkeypatch.setattr(mp, "Database", _GateOpenDatabase)
+        await Database.init()
+        await _seed_session(scratch_session)
+        try:
+            await Database.execute(
+                "INSERT INTO maya_rp.resources (session_id, credits, alloys, fuel, dream_essence) "
+                "VALUES ($1, 0, 200000, 100000, 200)", scratch_session)
+            out = await mp.start_construction(scratch_session, TYPE_ID)
+            assert "error" not in out, out
+            status = await Database.fetchval(
+                "SELECT status FROM maya_rp.megastructure_construction WHERE session_id = $1",
+                scratch_session)
+            assert status == "construction", "the charge committed with no construction row"
+            row = await Database.fetchrow(
+                "SELECT alloys, fuel, dream_essence FROM maya_rp.resources WHERE session_id = $1",
+                scratch_session)
+            assert (row["alloys"], row["fuel"], row["dream_essence"]) == (100000, 50000, 100), dict(row)
+        finally:
+            await _drop_session(scratch_session)
+            await Database.close()
+
+    async def test_a_failed_insert_leaves_the_treasury_whole(self, scratch_session, monkeypatch):
+        """Sector 999999999 breaks `megastructure_construction_sector_id_fkey` after the debit.
+
+        The base class is caught so this test stays about the rollback: a tz-aware timestamp also
+        raises a `PostgresError` from the same insert, and the sibling test owns that property.
+        """
+        monkeypatch.setattr(mp, "Database", _GateOpenDatabase)
+        await Database.init()
+        await _seed_session(scratch_session)
+        try:
+            await Database.execute(
+                "INSERT INTO maya_rp.resources (session_id, credits, alloys, fuel, dream_essence) "
+                "VALUES ($1, 0, 200000, 100000, 200)", scratch_session)
+            with pytest.raises(PostgresError):
+                await mp.start_construction(scratch_session, TYPE_ID, sector_id=999999999)
+            row = await Database.fetchrow(
+                "SELECT alloys, fuel, dream_essence FROM maya_rp.resources WHERE session_id = $1",
+                scratch_session)
+            assert (row["alloys"], row["fuel"], row["dream_essence"]) == (200000, 100000, 200), \
+                "the insert failed but the phase-1 charge stayed committed"
+            sites = await Database.fetchval(
+                "SELECT count(*) FROM maya_rp.megastructure_construction WHERE session_id = $1",
+                scratch_session)
+            assert sites == 0, sites
+        finally:
+            await _drop_session(scratch_session)
+            await Database.close()
+
+    async def test_the_completion_is_bound_naive(self, monkeypatch):
+        """The insert binds a naive datetime: the column is TIMESTAMP WITHOUT TIME ZONE."""
+        recorded = {}
+
+        class _Conn:
+            async def fetchrow(self, sql, *args):
+                recorded["estimated"] = args[4]
+                return {"id": 1}
+
+        class _Transaction:
+            async def __aenter__(self):
+                return _Conn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        # The INSERT is answered on both paths: the transaction connection when the charge and the
+        # insert share one, the pool when they do not. This test owns the timestamp alone.
+        class _StubDatabase:
+            async def fetchrow(self, sql, *args):
+                if "INSERT INTO maya_rp.megastructure_construction" in sql:
+                    recorded["estimated"] = args[4]
+                    return {"id": 1}
+                return {"id": TYPE_ID, "name": "Dyson Sphere", "research_required": None,
+                        "construction_phases": [{"phase": 1, "cost": {}, "time_days": 365}]}
+
+            def transaction(self):
+                return _Transaction()
+
+        async def _afford(session_id, costs, conn=None):
+            return True, ""
+
+        async def _charge(session_id, costs, conn=None):
+            return costs
+
+        async def _logged(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(mp, "Database", _StubDatabase())
+        monkeypatch.setattr(mp, "_check_afford", _afford)
+        monkeypatch.setattr(mp, "_deduct_resources", _charge)
+        monkeypatch.setattr(mp, "_log", _logged)
+
+        out = await mp.start_construction(7, TYPE_ID)
+        assert "error" not in out, out
+        assert recorded["estimated"].tzinfo is None, "a tz-aware value cannot enter a naive column"

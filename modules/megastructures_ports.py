@@ -44,22 +44,24 @@ async def start_construction(session_id: int, megastructure_type_id: int,
     if not ok:
         return {"error": f"Insufficient resources: {msg}"}
 
-    # Deduct phase 1 cost
-    charged = await _deduct_resources(session_id, phase1_cost)
-
-    # Schedule completion
+    # `estimated_completion` is TIMESTAMP WITHOUT TIME ZONE and asyncpg raises DataError on a tz-aware
+    # value for it (measured on 0.31.0), so the timestamp is stripped before the insert. Charge and
+    # insert share one transaction because a debit committed alone left the credits spent with no
+    # construction row when the insert raised on that timestamp.
     total_days = sum(p.get("time_days", 0) for p in phases)
-    estimated = datetime.now(timezone.utc) + timedelta(days=total_days)
+    estimated = (datetime.now(timezone.utc) + timedelta(days=total_days)).replace(tzinfo=None)
 
-    cid = await Database.fetchrow("""
-        INSERT INTO maya_rp.megastructure_construction
-            (session_id, megastructure_type_id, sector_id, territory_id,
-             current_phase, progress_pct, started_at, estimated_completion,
-             status, resources_allocated)
-        VALUES ($1, $2, $3, $4, 1, 0, NOW(), $5, 'construction', $6)
-        RETURNING id
-    """, session_id, megastructure_type_id, sector_id, territory_id,
-        estimated, json.dumps({"phase1": phase1_cost}))
+    async with Database.transaction() as conn:
+        charged = await _deduct_resources(session_id, phase1_cost, conn)
+        cid = await conn.fetchrow("""
+            INSERT INTO maya_rp.megastructure_construction
+                (session_id, megastructure_type_id, sector_id, territory_id,
+                 current_phase, progress_pct, started_at, estimated_completion,
+                 status, resources_allocated)
+            VALUES ($1, $2, $3, $4, 1, 0, NOW(), $5, 'construction', $6)
+            RETURNING id
+        """, session_id, megastructure_type_id, sector_id, territory_id,
+            estimated, json.dumps({"phase1": phase1_cost}))
 
     await _log(session_id, "megastructure",
                f"🏗️ Megastructure Started: {mt['name']}",

@@ -96,6 +96,14 @@ async def run_tick(session_id: int = None):
     if gd < 0.01:
         return
 
+    # Compare-and-set on last_tick_at: one tick owns the period. A crash after the claim loses that
+    # period's income. Accepted: claim first, never pay twice.
+    claimed = await Database.execute(
+        "UPDATE maya_rp.resources SET last_tick_at=$1 WHERE session_id=$2 AND last_tick_at=$3",
+        datetime.now(timezone.utc), session_id, row["last_tick_at"])
+    if claimed != "UPDATE 1":
+        return
+
     # Get territories
     terr = await Database.fetch(
         "SELECT id, system_name, population, tax_rate, development_level, "
@@ -246,8 +254,8 @@ async def run_tick(session_id: int = None):
         inc_c += toll_income
 
     await Database.execute(
-        "UPDATE resources SET alloys=alloys+$1, fuel=fuel+$2, credits=credits+$3, last_tick_at=$4 WHERE session_id=$5",
-        inc_a, inc_f, inc_c, datetime.now(timezone.utc), session_id)
+        "UPDATE resources SET alloys=alloys+$1, fuel=fuel+$2, credits=credits+$3 WHERE session_id=$4",
+        inc_a, inc_f, inc_c, session_id)
 
     print(f"  Economy: +{total_rev:,}C tax | +{inc_a:,}A / +{inc_f:,}F / +{inc_c:,}C "
           f"| pop {total_empire_pop:,} (loss {global_pop_loss:,}, refugees {refugee_pool:,})"

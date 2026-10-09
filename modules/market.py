@@ -89,8 +89,10 @@ async def run_tick(session_id: int | None = None) -> dict:
     gd = calc_game_days(row["last_tick_at"])
     if gd < 0.01:
         return {"skipped": "no game day elapsed"}
-    await _seed(session_id, tick := (await Database.fetchval(
-        "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 0))
+    tick = await Database.fetchval(
+        "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 0
+    # A commodity seeded now carries yesterday's marker, so the claim below lets it price once.
+    await _seed(session_id, tick - 1)
     commodities = await Database.fetch(
         "SELECT id, name, base_price, current_price, volatility, supply, demand "
         "FROM maya_rp.commodities WHERE session_id=$1", session_id)
@@ -101,9 +103,13 @@ async def run_tick(session_id: int | None = None) -> dict:
         # supply/demand drift: production fills shortage, consumption drains surplus
         s = int(c["supply"] * (1 + gd * 0.005))
         d = int(c["demand"] * (1 + gd * 0.006))
-        await Database.execute(
-            "UPDATE maya_rp.commodities SET current_price=$1, supply=$2, demand=$3, "
-            "last_tick_at=$5 WHERE id=$4", round(new_price, 2), s, d, c["id"], tick)
+        # Claim the commodity for this game day: it prices at most once per day, however many ticks overlap.
+        won = await Database.execute(
+            "UPDATE maya_rp.commodities SET current_price=$1, supply=$2, demand=$3, last_tick_at=$5 "
+            "WHERE id=$4 AND (last_tick_at IS NULL OR last_tick_at < $5)",
+            round(new_price, 2), s, d, c["id"], tick)
+        if won != "UPDATE 1":
+            continue
         await Database.execute(
             "INSERT INTO maya_rp.price_history (commodity_id, tick_number, price, volume) "
             "VALUES ($1,$2,$3,$4)",

@@ -54,7 +54,7 @@ class _StubDB:
 
     async def execute(self, sql, *args):
         self.writes.append((sql, args))
-        return "OK"
+        return "UPDATE 1" if sql.lstrip().startswith("UPDATE") else "OK"
 
 
 COMMODITY = {"id": 3, "name": "Water Ice", "base_price": 0.8, "current_price": 0.8,

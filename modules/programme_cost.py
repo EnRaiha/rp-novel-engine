@@ -35,7 +35,7 @@ Formulas, written out so a test can check them:
                                = 20 * target_days(tier) + 2000 * lab_levels
         20 C per programme-day is ten crew-equivalents at the canon wage of
         2 C per crew-day (modules/fleet_economy.py). 2000 C per lab level is
-        tech_tree.build_lab's own price.
+        tech_tree.build_lab's own price. lab_levels is capped at LAB_LEVEL_CAP.
 
     kill_score(step, deniable, screened, importance)
                                = 30 * step + 20 * deniable - 25 * screened
@@ -142,12 +142,14 @@ def progress_per_day(lead_present: bool, lab_level: int, doctrine: str) -> int:
 
 def advance(
     progress_days: int,
-    last_progress_day: int,
+    last_progress_day: int | None,
     game_day: int,
     rate: int,
     target: int,
 ) -> int:
-    """New programme_days after a tick. Same game_day twice adds nothing."""
+    """New programme_days after a tick. Same game_day twice adds nothing. A new row (None) adds nothing."""
+    if last_progress_day is None:
+        last_progress_day = game_day
     elapsed = max(0, game_day - last_progress_day)
     if rate <= 0:
         return max(0, min(progress_days, target))
@@ -158,6 +160,7 @@ def target_credits(tier_target: int, lab_levels: int = LAB_LEVEL_CAP) -> int:
     """Credit to fund a programme from zero: lead upkeep plus lab plant."""
     if lab_levels < 0:
         raise ValueError("lab_levels cannot be negative")
+    lab_levels = min(lab_levels, LAB_LEVEL_CAP)
     return (
         LEAD_UPKEEP_CREDITS_PER_DAY * target_days(tier_target)
         + LAB_LEVEL_CREDITS * lab_levels

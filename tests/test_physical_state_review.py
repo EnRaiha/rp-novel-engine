@@ -39,7 +39,7 @@ class _StubDB:
         if "RETURNING id" in sql:
             self.writes.append((sql, args))
             return self.returning_rows
-        if "became_scar=true" in sql:
+        if "status='scar'" in sql:
             return self.scars
         if "heal_by_game_day>$3" in sql:
             return self.injuries
@@ -82,25 +82,23 @@ def test_the_scar_roll_lands_in_the_return(monkeypatch):
 def test_healed_injuries_are_marked_on_read(monkeypatch):
     stub = _StubDB(injuries=[],
                    scars=[{"description": "knife", "body_part": "cheek"}])
-    stub.healed = [{"id": 5, "description": "cut", "body_part": "hand", "became_scar": False}]
 
     async def fetch(sql, *args):
         stub.reads.append((sql, args))
         if "RETURNING id" in sql:
-            return []
-        if "became_scar=true" in sql:
+            return [{"id": 5}]
+        if "status='scar'" in sql:
             return stub.scars
-        if "heal_by_game_day>$3" in sql:
-            return []
-        return stub.healed
+        return []
     monkeypatch.setattr(stub, "fetch", fetch)
     monkeypatch.setattr(ps, "Database", stub)
 
     out = _run(ps.get_state(2071, session_id=5))
 
     assert out["healed"] == 1 and out["visual"] == "They bear a scar on the cheek.", out
-    marked = [args for sql, args in stub.writes if "SET status=$1" in sql]
-    assert marked == [("healed", 5)], marked
+    heals = [sql for sql, _ in stub.reads if "RETURNING id" in sql]
+    assert len(heals) == 1, heals
+    assert "status='active'" in heals[0] and "heal_by_game_day<=$3" in heals[0], heals
 
 
 def test_a_character_with_nothing_wrong_reads_no_visual(monkeypatch):

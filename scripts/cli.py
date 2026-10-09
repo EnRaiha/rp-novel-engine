@@ -3109,7 +3109,7 @@ async def cmd_programme():
         tier = int(flags.get("tier") or 5)
         lab = int(flags.get("lab") or 0)
         days = cost.target_days(tier)
-        credits = cost.target_credits(tier)
+        credits = cost.target_credits(tier, lab if "lab" in flags else cost.LAB_LEVEL_CAP)
         print(f"tier {tier}: {days} programme-days ({cost.lost_years(days, 1):.1f} years at one rate) "
               f"· {credits:,} C")
         for doctrine in ("science_tech", "magic", "balance"):

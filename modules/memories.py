@@ -90,7 +90,7 @@ async def get_inner_world(character_id: int, session_id: int = None) -> dict:
         "secrets": len(grouped.get("secret", [])),
         "grudges": len(grouped.get("grudge", [])),
         "high_impact": [{"type": r["memory_type"], "content": r["content"]}
-                        for r in rows if r["emotional_weight"] >= 8][:5],
+                        for r in rows if (r["emotional_weight"] or 0) >= 8][:5],
     }
 
 
@@ -99,8 +99,9 @@ async def cmd_memory_surface(character_name: str, context: str, session_id: int 
     if session_id is None:
         session_id = Config.SESSION_ID
     char = await Database.fetchrow(
-        "SELECT id, name FROM maya_rp.characters WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) LIMIT 1",
-        session_id, f"%{character_name}%")
+        "SELECT id, name FROM maya_rp.characters WHERE session_id=$1 "
+        "AND LOWER(name) LIKE LOWER($2) ESCAPE '\\' ORDER BY id LIMIT 1",
+        session_id, f"%{_like_escape(character_name)}%")
     if not char:
         print(f"Character '{character_name}' not found.")
         return
@@ -119,9 +120,11 @@ async def run_tick(session_id: int = None) -> dict:
     try:
         game_day = await Database.fetchval(
             "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
+        # 0 marks an expired row. Readers hide it, and this UPDATE must not match it again.
         tag = await Database.execute(
             "UPDATE maya_rp.character_memories SET expires_at_game_day=0 "
-            "WHERE session_id=$1 AND expires_at_game_day IS NOT NULL AND expires_at_game_day < $2",
+            "WHERE session_id=$1 AND expires_at_game_day IS NOT NULL AND expires_at_game_day > 0 "
+            "AND expires_at_game_day < $2",
             session_id, game_day)
         # `Database.execute` returns the status tag, so this key used to hold the
         # string "UPDATE 3" where a count belongs.
@@ -205,6 +208,10 @@ async def consolidate_memories(session_id: int = None, character_id: int | None 
             if len(mems) < min_count:
                 continue
             summary = await _summarize([m["content"] for m in mems])
+            # An all-empty extractive gist is ".", which must not replace the originals.
+            if not any(ch.isalpha() for ch in summary):
+                info("memories", f"Skipped char {cid}: summary has no text")
+                continue
             # The gist REPLACES the originals (the old docstring said "archive",
             # the code deleted). Wrap insert+delete in one transaction so a
             # crash can't leave a duplicated summary or orphaned originals.

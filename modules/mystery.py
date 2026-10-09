@@ -58,8 +58,7 @@ async def add_clue(session_id: int, investigation_id: int, text: str, source: st
     if refusal:
         return {"error": refusal}
     if connects_to is not None:
-        # A link is written to the row with the higher id, so a target that does not exist silently
-        # linked this clue to a shape that is not in the case.
+        # The link is stored on the new clue, so the target must exist in this session and case.
         target = await Database.fetchrow(
             "SELECT id, session_id, investigation_id FROM maya_rp.clues WHERE id=$1", connects_to)
         if not target:
@@ -67,19 +66,17 @@ async def add_clue(session_id: int, investigation_id: int, text: str, source: st
         if int(target["session_id"]) != int(session_id):
             return {"error": f"clue {connects_to} belongs to session {target['session_id']},"
                              f" not {session_id}"}
-        if int(target["investigation_id"]) != int(investigation_id):
+        target_case = target["investigation_id"]
+        if target_case is None:
+            return {"error": f"clue {connects_to} belongs to no investigation"}
+        if int(target_case) != int(investigation_id):
             return {"error": f"clue {connects_to} belongs to investigation"
-                             f" {target['investigation_id']}, not {investigation_id}"}
+                             f" {target_case}, not {investigation_id}"}
     clue_id = await Database.fetchval(
         "INSERT INTO maya_rp.clues (session_id, source, source_type, text, connects_to_clue, revealed, revealed_by_character, investigation_id) "
         "VALUES ($1,$2,$3,$4,$5,true,$6,$7) RETURNING id",
         session_id, source, source_type, text, connects_to, revealed_by, investigation_id,
     )
-    if connects_to:
-        await Database.execute(
-            "UPDATE maya_rp.clues SET connects_to_clue=$1 WHERE id=$2",
-            min(clue_id, connects_to), max(clue_id, connects_to),
-        )
     await _bump_clue_count(investigation_id)
     return {"clue_id": clue_id, "investigation_id": investigation_id}
 
@@ -151,9 +148,8 @@ async def _bump_clue_count(investigation_id: int):
     )
 
 async def run_tick(session_id: int = None) -> dict:
-    """Investigation aging (added 2026-08-14): active investigations older
-    than 20 game-days with no deductions log a 'trail aging' entry — the GM
-    sees cold cases instead of them silently persisting."""
+    """Investigation aging: an active case older than 20 wall-clock days (from `created_at`) with no
+    deductions turns `cold` and logs one `trail_growing_cold` entry. The status guard makes it once."""
     if session_id is None: session_id = Config.SESSION_ID
     try:
         active = await Database.fetch(
@@ -166,10 +162,17 @@ async def run_tick(session_id: int = None) -> dict:
             age = (await Database.fetchval(
                 "SELECT EXTRACT(EPOCH FROM NOW()-$1::timestamptz)/86400", inv["created_at"]))
             if age >= 20 and (inv.get("deductions_made") or 0) == 0:
-                await Database.execute(
-                    "INSERT INTO maya_rp.investigation_log (session_id, investigation_id, entry_type, description) "
-                    "VALUES ($1,$2,'dead_end','trail_growing_cold')",
-                    session_id, inv["id"])
+                async with Database.transaction() as conn:
+                    claimed = await conn.fetchval(
+                        "UPDATE maya_rp.investigations SET status='cold' "
+                        "WHERE id=$1 AND session_id=$2 AND status='active' RETURNING id",
+                        inv["id"], session_id)
+                    if claimed is None:
+                        continue
+                    await conn.execute(
+                        "INSERT INTO maya_rp.investigation_log (session_id, investigation_id, entry_type, description) "
+                        "VALUES ($1,$2,'dead_end','trail_growing_cold')",
+                        session_id, inv["id"])
                 decayed += 1
                 info("mystery", f"Decay: investigation {inv['id']} ({inv['title']}) going cold")
         info("mystery", f"Tick: {len(active)} active, {decayed} aging")

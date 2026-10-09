@@ -9,11 +9,15 @@ from core.events import EventBus
 
 CATEGORIES = ["economy", "social", "military", "diplomatic", "science", "mystery"]
 
-async def _story_entry(session_id: int, cat: str, title: str, content: str, imp: int = 1):
-    await Database.execute(
+async def _story_entry(session_id: int, cat: str, title: str, content: str, imp: int = 1, conn=None):
+    """Write the `story_log` row and its `events` row together. Pass `conn` to join a caller's transaction."""
+    if conn is None:
+        async with Database.transaction() as own:
+            return await _story_entry(session_id, cat, title, content, imp, conn=own)
+    await conn.execute(
         "INSERT INTO story_log (session_id, category, title, content, importance) VALUES ($1,$2,$3,$4,$5)",
         session_id, cat, title, content, imp)
-    await Database.execute(
+    await conn.execute(
         "INSERT INTO events (session_id, event_type, title, description, importance, tags) VALUES ($1,'narrative',$2,$3,$4,$5)",
         session_id, title, content, imp, json.dumps(["narrative", cat]))
 
@@ -84,12 +88,19 @@ async def run_tick(session_id: int | None = None) -> dict:
             "intrigue": "A coded message intercepted — someone is plotting within the council.",
         }
         desc = descs.get(ht, "Something stirs in the deep.")
-        await Database.execute(
-            "INSERT INTO narrative_hooks (session_id, hook_type, description, status) "
-            "VALUES ($1,$2,$3,'active')",
-            session_id, ht, desc)
-        await _story_entry(session_id, "narrative", f"Hook: {ht.title()}", desc, 2)
-        hooks_made += 1
+        # One transaction: the hook, its story entry and the duplicate and cap guards commit together.
+        async with Database.transaction() as conn:
+            created = await conn.fetchval(
+                "INSERT INTO narrative_hooks (session_id, hook_type, description, status) "
+                "SELECT $1::int, $2::varchar, $3::text, 'active' "
+                "WHERE NOT EXISTS (SELECT 1 FROM narrative_hooks "
+                "WHERE session_id=$1 AND status='active' AND description=$3) "
+                "AND (SELECT COUNT(*) FROM narrative_hooks WHERE session_id=$1 AND status='active') < 3 "
+                "RETURNING id",
+                session_id, ht, desc)
+            if created is not None:
+                await _story_entry(session_id, "narrative", f"Hook: {ht.title()}", desc, 2, conn=conn)
+                hooks_made += 1
 
     info("narrative", f"Tick: {ambient} ambient, {hooks_made} new hooks, {active} already active")
     return {"game_days": gd, "ambient": ambient, "hooks": hooks_made, "hooks_active": active}

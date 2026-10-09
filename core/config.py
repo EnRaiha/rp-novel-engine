@@ -9,9 +9,11 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import os
 from typing import ClassVar
+from urllib.parse import urlsplit, urlunsplit
 
 
 #: True when the process default came from the fallback rather than from the engine's own resolver.
@@ -45,19 +47,50 @@ def _default_session() -> int:
         return 3  # no arc file and no override: the legacy TKG campaign
 
 
+#: Built-in DSN. It holds the `rp_engine` password, so `RP_ENGINE_DSN` can replace it.
+_DEFAULT_DSN = (
+    "postgres://rp_engine:REDACTED@postgresql.tail73711d.ts.net:5432/maya_memory"
+    "?search_path=maya_rp,public"
+)
+_DB_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}")
+
+
+def _resolve_dsn(environ=None) -> tuple[str, bool]:
+    """Resolve the database DSN from the environment.
+
+    `RP_ENGINE_DSN` replaces the built-in DSN. `RP_ENGINE_DB` then replaces the database name in
+    whichever DSN applies. `OC_PG_*` is not read: on this host it names a superuser, and the engine
+    must keep running as `rp_engine`.
+
+    @param environ - mapping to read, `os.environ` by default.
+    @returns `(dsn, used_default)`. `used_default` is true when the environment named no DSN.
+    @raises RuntimeError - `RP_ENGINE_DB` is not a plain database name. The message never carries a DSN.
+    """
+    env = os.environ if environ is None else environ
+    given = (env.get("RP_ENGINE_DSN") or "").strip()
+    dsn = given or _DEFAULT_DSN
+    name = (env.get("RP_ENGINE_DB") or "").strip()
+    if name:
+        if not _DB_NAME.fullmatch(name):
+            raise RuntimeError("RP_ENGINE_DB must be a plain database name (letters, digits, underscore)")
+        dsn = urlunsplit(urlsplit(dsn)._replace(path="/" + name))
+    return dsn, not given
+
+
+_DSN, _DSN_FALLBACK = _resolve_dsn()
+
+
 class Config:
     """Static config — imported directly, no instantiation needed."""
 
     # ─── Database ───────────────────────────────────────────────
-    # RP_ENGINE has OWNER on maya_rp schema. Roast me for hardcoding.
+    # The built-in DSN is in this file. RP_ENGINE_DSN replaces it. RP_ENGINE_DB replaces the database name only.
     # This is a single-user private Tailscale game engine.
     # Addressed by its Tailscale name, per the addressing convention: `100.65.243.60:5432` is the
     # fallback and stays in this comment rather than in the DSN. Measured before the change: the
     # name resolves through MagicDNS and the engine connects and queries through it.
-    DSN: ClassVar[str] = (
-        "postgres://rp_engine:REDACTED@postgresql.tail73711d.ts.net:5432/maya_memory"
-        "?search_path=maya_rp,public"
-    )
+    DSN: ClassVar[str] = _DSN
+    DSN_FALLBACK_USED: ClassVar[bool] = _DSN_FALLBACK
     DB_MIN_SIZE: ClassVar[int] = 1
     DB_MAX_SIZE: ClassVar[int] = 15  # Increased for concurrent kilo_bridge + tick safety
     DB_TIMEOUT: ClassVar[int] = 30  # seconds
@@ -163,12 +196,15 @@ class Config:
     def summary(cls) -> str:
         # The host comes from the DSN rather than a second copy of it, so a move of the database
         # cannot leave the summary pointing at the old address.
-        host = cls.DSN.split("@", 1)[-1].split("/", 1)[0]
+        # `netloc` rather than a split on "@": a DSN without credentials has no "@" and starts with the scheme.
+        parts = urlsplit(cls.DSN)
+        host = parts.netloc.rsplit("@", 1)[-1]
+        database = parts.path.lstrip("/")
         lines = [
             f"╔══ RP Engine Config ════════════════════════",
             f"║ Session:     {cls.SESSION_ID} ({cls.RP_UNIVERSE})",
             f"║ RP Mode:     {'ACTIVE' if cls.RP_MODE_ACTIVE else 'OFF'} ({cls.RP_TONE})",
-            f"║ Database:    postgres://rp_engine@{host}/maya_memory",
+            f"║ Database:    postgres://rp_engine@{host}/{database}",
             f"║ Schema:      maya_rp (260 tables)",
             f"║ Time mult:   {cls.TIME_MULTIPLIER}x",
             f"║ Modules on:  {len(cls.active_modules())}",

@@ -30,6 +30,7 @@ session it started with, which is the documented behaviour and the Lead's open i
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import re
 import sys
@@ -95,5 +96,6 @@ class TestTheDatabaseAddress:
         assert _dsn_host() in Config.summary()
 
     def test_the_dsn_still_carries_its_user_schema_and_database(self):
-        assert "rp_engine" in Config.DSN and "maya_memory" in Config.DSN
+        assert "rp_engine" in Config.DSN
+        assert (os.environ.get("RP_ENGINE_DB") or "maya_memory") in Config.DSN
         assert "search_path=maya_rp" in Config.DSN

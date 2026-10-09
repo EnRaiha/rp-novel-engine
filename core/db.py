@@ -43,6 +43,7 @@ class Database:
     pool: asyncpg.Pool | None = None
     _lock: asyncio.Lock | None = None
     _lock_loop: asyncio.AbstractEventLoop | None = None
+    _fallback_warned: bool = False
 
     @classmethod
     def _pool_lock(cls) -> asyncio.Lock:
@@ -77,6 +78,9 @@ class Database:
     async def _create_locked(cls) -> asyncpg.Pool:
         """Create the pool if absent. The caller holds `_pool_lock()`."""
         if cls.pool is None:
+            if Config.DSN_FALLBACK_USED and not cls._fallback_warned:
+                cls._fallback_warned = True
+                warn("db", "RP_ENGINE_DSN is not set: using the DSN built into core/config.py")
             cls.pool = await asyncpg.create_pool(
                 dsn=Config.DSN,
                 min_size=Config.DB_MIN_SIZE,

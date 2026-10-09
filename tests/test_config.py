@@ -8,7 +8,7 @@ class TestConfig:
     def test_dsn_set(self):
         assert Config.DSN is not None
         assert "rp_engine" in Config.DSN
-        assert "maya_memory" in Config.DSN
+        assert (os.environ.get("RP_ENGINE_DB") or "maya_memory") in Config.DSN
 
     def test_session_id_follows_the_arc(self, tmp_path, monkeypatch):
         """The process default comes from the engine's single session source."""

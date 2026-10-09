@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Foreshadowing & Payoff System — plant narrative seeds, hint at them, payoff later."""
 from __future__ import annotations
+import json
 from typing import Any
 from core.db import Database
 from core.config import Config
@@ -42,10 +43,10 @@ async def get_foreshadow_ops(session_id: int = None) -> list[dict]:
 
 
 async def mark_foreshadowed(seed_id: int, session_id: int = None):
-    """Mark a seed as foreshadowed (hinted at).
+    """Count one hint on an open seed. The third hint closes it as `paid_off` and emits no event.
 
-    The lookup ran by seed id alone and never read the session it was handed, so one campaign could
-    mark another campaign's seed as hinted.
+    @returns {"seed_id", "marked", "status"}. `marked` is False for a seed that is missing,
+    belongs to another session, or is already closed.
     """
     if session_id is None:
         session_id = Config.SESSION_ID
@@ -54,32 +55,39 @@ async def mark_foreshadowed(seed_id: int, session_id: int = None):
         "SET foreshadow_count = COALESCE(foreshadow_count, 0) + 1, "
         "    status = CASE WHEN COALESCE(foreshadow_count, 0) + 1 >= COALESCE(max_foreshadows, 3) "
         "                  THEN 'paid_off' ELSE 'foreshadowed' END "
-        "WHERE id=$1 AND session_id=$2 RETURNING status",
+        "WHERE id=$1 AND session_id=$2 AND status IN ('planted','foreshadowed') RETURNING status",
         seed_id, session_id)
     return {"seed_id": seed_id, "marked": returned is not None, "status": returned}
 
 
 async def pay_off(seed_id: int, session_id: int = None) -> dict:
-    """Trigger a seed's payoff event."""
+    """Pay off one open seed. The claim and the PAYOFF event share one transaction.
+
+    @returns the paid seed, or a dict with `error` when the seed is missing or already closed.
+    """
     if session_id is None:
         session_id = Config.SESSION_ID
-    seed = await Database.fetchrow(
-        "SELECT id, content, payoff_event_template, seed_type FROM maya_rp.narrative_seeds "
-        "WHERE id=$1 AND session_id=$2",
-        seed_id, session_id)
-    if not seed:
-        return {"error": f"seed {seed_id} not found in session {session_id}"}
-
-    await Database.execute(
-        "UPDATE maya_rp.narrative_seeds SET status='paid_off' WHERE id=$1 AND session_id=$2",
-        seed_id, session_id)
-    await Database.execute(
-        "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
-        "VALUES ($1, NOW(), 'payoff', $2, $3, $4, 4)",
-        session_id,
-        f"PAYOFF: {seed.get('payoff_event_template', seed['seed_type'])}",
-        seed["content"],
-        '["narrative", "payoff", "' + seed["seed_type"] + '"]')
+    async with Database.transaction() as conn:
+        seed = await conn.fetchrow(
+            "UPDATE maya_rp.narrative_seeds SET status='paid_off' "
+            "WHERE id=$1 AND session_id=$2 AND status IN ('planted','foreshadowed') "
+            "RETURNING id, content, payoff_event_template, seed_type",
+            seed_id, session_id)
+        if not seed:
+            status = await conn.fetchval(
+                "SELECT status FROM maya_rp.narrative_seeds WHERE id=$1 AND session_id=$2",
+                seed_id, session_id)
+            if status is None:
+                return {"error": f"seed {seed_id} not found in session {session_id}"}
+            return {"seed_id": seed_id, "paid_off": False,
+                    "error": f"seed {seed_id} is {status}, not open for payoff"}
+        await conn.execute(
+            "INSERT INTO maya_rp.events (session_id, happened_at, event_type, title, description, tags, importance) "
+            "VALUES ($1, NOW(), 'payoff', $2, $3, $4, 4)",
+            session_id,
+            f"PAYOFF: {seed['payoff_event_template'] or seed['seed_type'] or 'seed'}",
+            seed["content"],
+            json.dumps(["narrative", "payoff", seed["seed_type"] or "unknown"]))
     return {"seed_id": seed_id, "paid_off": True, "content": seed["content"]}
 
 
@@ -92,15 +100,22 @@ async def run_tick(session_id: int = None) -> dict:
             "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
         due = await Database.fetch(
             "SELECT id, content, payoff_event_template, seed_type "
-            "FROM maya_rp.narrative_seeds WHERE session_id=$1 AND status='planted' "
+            "FROM maya_rp.narrative_seeds WHERE session_id=$1 "
+            "AND status IN ('planted','foreshadowed') "
             "AND payoff_game_day IS NOT NULL AND payoff_game_day <= $2",
             session_id, game_day)
-        paid = 0
+        paid = failed = 0
         for d in due:
-            await pay_off(d["id"], session_id)
-            paid += 1
-        info("narrative_seeds", f"Tick: {paid} auto-payoffs")
-        return {"auto_payoffs": paid}
+            try:
+                result = await pay_off(d["id"], session_id)
+            except Exception as e:
+                error("narrative_seeds", f"payoff of seed {d['id']} failed: {e}")
+                failed += 1
+                continue
+            if result.get("paid_off"):
+                paid += 1
+        info("narrative_seeds", f"Tick: {paid} auto-payoffs, {failed} failed")
+        return {"auto_payoffs": paid, "failed": failed} if failed else {"auto_payoffs": paid}
     except Exception as e:
         error("narrative_seeds", f"tick failed for session {session_id}: {e}")
         return {"error": str(e)}

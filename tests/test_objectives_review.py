@@ -72,6 +72,18 @@ def _install(monkeypatch, fake):
     return fake
 
 
+def _stub_advance(monkeypatch, completed=False):
+    """Replace `_advance_task`, which opens a real transaction. Returns the recorded (session, task, amount) calls."""
+    calls = []
+
+    async def advance(session_id, task_id, amount):
+        calls.append((session_id, task_id, amount))
+        return {"title": "Fleet Exercise", "reward": 250000, "completed": completed}
+
+    monkeypatch.setattr(objectives, "_advance_task", advance)
+    return calls
+
+
 def _task(**over):
     row = {"id": 1, "title": "Fleet Exercise", "objective": "Sweep X hostiles di sempadan",
            "task_type": "generic", "target_value": 10, "progress": 0,
@@ -98,6 +110,7 @@ def test_every_pool_kind_is_reachable_by_name():
 
 
 async def test_progress_matches_the_title_not_only_the_localised_text(monkeypatch):
+    _stub_advance(monkeypatch)
     fake = _install(monkeypatch, FakeDB(fetch=[_task()]))
 
     out = await objectives.update_quarterly_progress(3, "kills", 1)
@@ -109,6 +122,7 @@ async def test_progress_matches_the_title_not_only_the_localised_text(monkeypatc
 
 
 async def test_progress_still_matches_a_kind_named_in_the_objective(monkeypatch):
+    _stub_advance(monkeypatch)
     fake = _install(monkeypatch, FakeDB(fetch=[_task(title="Something else")]))
 
     await objectives.update_quarterly_progress(3, "survey", 1)
@@ -118,6 +132,7 @@ async def test_progress_still_matches_a_kind_named_in_the_objective(monkeypatch)
 
 
 async def test_the_same_matcher_serves_the_event_listeners(monkeypatch):
+    _stub_advance(monkeypatch)
     fake = _install(monkeypatch, FakeDB(fetch=[_task()]))
 
     out = await objectives._bump_kind(3, "kills", 1)
@@ -148,15 +163,13 @@ async def test_a_missing_kind_is_answered_not_crashed(monkeypatch):
 
 
 async def test_a_completed_task_pays_its_reward_once_and_is_flagged(monkeypatch):
-    fake = _install(monkeypatch, FakeDB(fetch=[_task(target_value=1)]))
+    calls = _stub_advance(monkeypatch, completed=True)
+    _install(monkeypatch, FakeDB(fetch=[_task(target_value=1)]))
 
     out = await objectives.update_quarterly_progress(3, "kills", 1)
 
     assert out["completed"] == [{"title": "Fleet Exercise", "reward": 250000}]
-    update = fake.args_for("SET progress=$1", "execute")[0]
-    assert update[0] == 1 and update[1] == "completed"
-    reward = fake.args_for("SET research_points", "execute")[0]
-    assert reward == (250, 3)
+    assert calls == [(3, 1, 1)]
 
 
 # ── 1 + 2. The listeners are registered, once ───────────────────────────

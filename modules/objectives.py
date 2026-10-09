@@ -91,28 +91,69 @@ def task_titles_for(kind: str) -> list[str]:
 
 
 async def generate_quarterly_tasks(session_id: int = None) -> dict:
-    """Generate 4 quarterly tasks untuk quarter semasa (game_day // 90)."""
+    """Generate 4 quarterly tasks untuk quarter semasa (game_day // 90).
+
+    A quarter that holds tasks in any status is left alone, so a finished quarter is not minted again.
+    The four inserts share one transaction.
+    """
     if session_id is None: session_id = Config.SESSION_ID
     gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id)
     quarter = (gd or 1) // 90
     existing = await Database.fetchval(
-        "SELECT COUNT(*) FROM maya_rp.quarterly_tasks WHERE session_id=$1 AND quarter=$2 AND status='active'",
+        "SELECT COUNT(*) FROM maya_rp.quarterly_tasks WHERE session_id=$1 AND quarter=$2",
         session_id, quarter)
     if existing:
         return {"quarter": quarter, "already_active": existing}
 
     import random
     tasks = random.sample(QUARTERLY_TASK_POOL, 4)
-    for i, t in enumerate(tasks, start=1):
-        # Gacha blueprint reward: tier weight (rare = high tier)
-        tier = random.choices(BLUEPRINT_TIERS, weights=[50, 30, 15, 5])[0]
-        reward_val = {1: 250000, 2: 750000, 3: 2000000, 4: 6000000}[tier]
-        await Database.execute(
-            """INSERT INTO maya_rp.quarterly_tasks
-               (session_id, quarter, task_index, title, objective, target_value, reward_type, reward_value)
-               VALUES ($1, $2, $3, $4, $5, $6, 'blueprint', $7)""",
-            session_id, quarter, i, t["title"], t["objective"], t["target"], reward_val)
+    async with Database.transaction() as conn:
+        for i, t in enumerate(tasks, start=1):
+            # Gacha blueprint reward: tier weight (rare = high tier)
+            tier = random.choices(BLUEPRINT_TIERS, weights=[50, 30, 15, 5])[0]
+            reward_val = {1: 250000, 2: 750000, 3: 2000000, 4: 6000000}[tier]
+            await conn.execute(
+                """INSERT INTO maya_rp.quarterly_tasks
+                   (session_id, quarter, task_index, title, objective, target_value, reward_type, reward_value)
+                   VALUES ($1, $2, $3, $4, $5, $6, 'blueprint', $7)""",
+                session_id, quarter, i, t["title"], t["objective"], t["target"], reward_val)
     return {"quarter": quarter, "generated": len(tasks)}
+
+
+async def _advance_task(session_id: int, task_id: int, amount: int) -> dict | None:
+    """Add `amount` to one active task. A completion and its reward share one transaction.
+
+    The add runs in SQL on the stored value, so a concurrent writer cannot be overwritten. The
+    `status='active'` guard lets one caller complete the task and pay its reward.
+    `progress` and `current_progress` hold the same value after every call.
+
+    @returns {"title", "reward", "completed"}, or None when the task is no longer active.
+    """
+    async with Database.transaction() as conn:
+        row = await conn.fetchrow(
+            """UPDATE maya_rp.quarterly_tasks SET
+                 progress = GREATEST(COALESCE(progress,0), COALESCE(current_progress,0)) + $3,
+                 current_progress = GREATEST(COALESCE(progress,0), COALESCE(current_progress,0)) + $3,
+                 status = CASE WHEN COALESCE(NULLIF(required_amount,0), NULLIF(target_value,0), 0) > 0
+                                AND GREATEST(COALESCE(progress,0), COALESCE(current_progress,0)) + $3
+                                    >= COALESCE(NULLIF(required_amount,0), NULLIF(target_value,0))
+                               THEN 'completed' ELSE 'active' END,
+                 completed_at = CASE WHEN COALESCE(NULLIF(required_amount,0), NULLIF(target_value,0), 0) > 0
+                                AND GREATEST(COALESCE(progress,0), COALESCE(current_progress,0)) + $3
+                                    >= COALESCE(NULLIF(required_amount,0), NULLIF(target_value,0))
+                               THEN NOW() ELSE completed_at END
+               WHERE id=$1 AND session_id=$2 AND status='active'
+               RETURNING title, objective, status, reward_value""",
+            task_id, session_id, amount)
+        if row is None:
+            return None
+        if row["status"] == "completed":
+            # Gacha blueprint reward → research project unlocked (simulated)
+            await conn.execute(
+                "UPDATE maya_rp.resources SET research_points = research_points + $1 WHERE session_id = $2",
+                (row["reward_value"] or 0) // 1000, session_id)
+    return {"title": row["title"] or row["objective"], "reward": row["reward_value"],
+            "completed": row["status"] == "completed"}
 
 
 async def update_quarterly_progress(session_id: int = None, kind: str = None, amount: int = 1) -> dict:
@@ -120,28 +161,25 @@ async def update_quarterly_progress(session_id: int = None, kind: str = None, am
     if session_id is None: session_id = Config.SESSION_ID
     if not kind:
         return {"error": "kind required (kills/survey/trade/credits/duels/wrecks/dev/crew)"}
+    amount = int(amount)
     if amount < 1:
         raise ValueError(f"amount must be at least 1, got {amount}")
     titles = task_titles_for(kind)
     tasks = await Database.fetch(
-        "SELECT id, title, target_value, progress, reward_value FROM maya_rp.quarterly_tasks "
+        "SELECT id, title FROM maya_rp.quarterly_tasks "
         "WHERE session_id=$1 AND status='active' "
         "AND (title = ANY($3::text[]) OR objective ILIKE '%'||$2||'%')",
         session_id, kind, titles)
+    updated = 0
     completed = []
     for t in tasks:
-        np_ = (t["progress"] or 0) + amount
-        done = np_ >= t["target_value"]
-        await Database.execute(
-            "UPDATE maya_rp.quarterly_tasks SET progress=$1, status=$2, completed_at=CASE WHEN $2='completed' THEN NOW() ELSE completed_at END WHERE id=$3",
-            np_, "completed" if done else "active", t["id"])
-        if done:
-            # Gacha blueprint reward → research project unlocked (simulated)
-            await Database.execute(
-                "UPDATE maya_rp.resources SET research_points=research_points+$1 WHERE session_id=$2",
-                t["reward_value"] // 1000, session_id)
-            completed.append({"title": t["title"], "reward": t["reward_value"]})
-    return {"updated": len(tasks), "completed": completed}
+        result = await _advance_task(session_id, t["id"], amount)
+        if result is None:
+            continue
+        updated += 1
+        if result["completed"]:
+            completed.append({"title": result["title"], "reward": result["reward"]})
+    return {"updated": updated, "completed": completed}
 
 
 async def quarterly_tasks_view(session_id: int = None) -> dict:
@@ -196,27 +234,21 @@ async def _register_event_listeners() -> None:
 async def _bump_kind(session_id: int, kind: str, amount: int = 1) -> dict:
     """Kemaskini progress tasks ikut kind (kills/survey/trade/credits/duels/wrecks/dev/crew/build).
 
-    One matcher, shared with `update_quarterly_progress`: the pool's own kind
-    mapping. The three text probes this replaced could not match a localised
-    objective, and every live task carries `task_type = 'generic'`, so the probe
-    was the only path that could ever have worked.
+    Shares the matcher (the pool's own kind mapping) and the advance-and-pay step with
+    `update_quarterly_progress`, so the EventBus path pays the same reward as the manual path.
     """
     titles = task_titles_for(kind)
     tasks = await Database.fetch(
-        "SELECT id, task_type, objective, title, target_value, current_progress, required_amount, reward_blueprint, progress "
-        "FROM maya_rp.quarterly_tasks WHERE session_id=$1 AND status='active' "
+        "SELECT id, title FROM maya_rp.quarterly_tasks WHERE session_id=$1 AND status='active' "
         "AND (title = ANY($3::text[]) OR objective ILIKE '%'||$2||'%')",
         session_id, kind, titles)
+    updated = 0
     completed = []
     for t in tasks:
-        cur = (t.get("current_progress") or t.get("progress") or 0) + amount
-        req = t.get("required_amount") or t.get("target_value") or 0
-        done = req > 0 and cur >= req
-        await Database.execute(
-            "UPDATE maya_rp.quarterly_tasks SET current_progress=$1, progress=$1, "
-            "status=$2, completed_at=CASE WHEN $2='completed' THEN NOW() ELSE completed_at END WHERE id=$3",
-            cur, "completed" if done else "active", t["id"])
-        if done:
-            rw = t.get("reward_blueprint") or t.get("reward_value") or 0
-            completed.append({"title": t.get("title") or t.get("objective"), "reward": rw})
-    return {"updated": len(tasks), "completed": completed}
+        result = await _advance_task(session_id, t["id"], amount)
+        if result is None:
+            continue
+        updated += 1
+        if result["completed"]:
+            completed.append({"title": result["title"], "reward": result["reward"]})
+    return {"updated": updated, "completed": completed}

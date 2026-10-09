@@ -12,6 +12,10 @@ from core.db import Database
 from core.config import Config
 from core.log import info
 
+#: A hull in one of these states is not waiting for hands; crewing it would set it back to 'active'.
+_OUT_OF_SERVICE = ("destroyed", "lost")
+
+
 # Kadar produksi: academy campus produce crew per tick ikut slots & prestige
 def _academy_output(slots_used: int, max_students: int, prestige: int) -> int:
     """Pelajar grad → crew. Kadar: 8% slots + prestige bonus per tick (bulk crew)."""
@@ -63,41 +67,53 @@ async def produce_crew(session_id: int | None = None) -> dict:
 
 
 async def consume_crew(session_id: int | None, ship_id: int, required: int) -> dict:
-    """Ship launch consume crew dari pool. Kurang → undercrewed (penalty, bukan block)."""
+    """Ship launch consume crew dari pool. Kurang → undercrewed (penalty, bukan block).
+
+    The ship row is locked and the pool is debited by one guarded relative UPDATE, in one
+    transaction with the hull update. A destroyed or lost hull is refused: launch sets 'active'.
+    """
     if session_id is None:
         session_id = Config.SESSION_ID
+    if required < 0:
+        return {"error": f"required crew cannot be negative, got {required}"}
     gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
-    pool = await Database.fetchval("SELECT crew_pool FROM maya_rp.resources WHERE session_id=$1", session_id) or 0
-    ship = await Database.fetchrow(
-        "SELECT name FROM maya_rp.ships WHERE id=$1 AND session_id=$2", ship_id, session_id)
-    if ship is None:
-        return {"error": f"ship {ship_id} is not in session {session_id}"}
-    name = ship["name"]
+    async with Database.transaction() as conn:
+        ship = await conn.fetchrow(
+            "SELECT name, status FROM maya_rp.ships WHERE id=$1 AND session_id=$2 FOR UPDATE",
+            ship_id, session_id)
+        if ship is None:
+            return {"error": f"ship {ship_id} is not in session {session_id}"}
+        if ship["status"] in _OUT_OF_SERVICE:
+            return {"error": f"ship {ship_id} is {ship['status']} and cannot be crewed"}
+        name = ship["name"]
 
-    if pool >= required:
-        new_pool = pool - required
-        await Database.execute(
-            "UPDATE maya_rp.resources SET crew_pool=$1, crew_consumed_total=crew_consumed_total+$2 WHERE session_id=$3",
-            new_pool, required, session_id)
-        await Database.execute(
-            "UPDATE maya_rp.ships SET crew_current=$1, undercrewed_penalty=0, status='active'"
-            " WHERE id=$2 AND session_id=$3",
-            required, ship_id, session_id)
-        await Database.execute(
+        new_pool = await conn.fetchval(
+            "UPDATE maya_rp.resources SET crew_pool = crew_pool - $1,"
+            " crew_consumed_total = COALESCE(crew_consumed_total, 0) + $1"
+            " WHERE session_id = $2 AND crew_pool >= $1 RETURNING crew_pool",
+            required, session_id)
+        if new_pool is not None:
+            await conn.execute(
+                "UPDATE maya_rp.ships SET crew_current=$1, undercrewed_penalty=0, status='active'"
+                " WHERE id=$2 AND session_id=$3",
+                required, ship_id, session_id)
+            await conn.execute(
+                "INSERT INTO maya_rp.crew_consumption_log (session_id, game_day, ship_id, ship_name, amount, pool_after) "
+                "VALUES ($1,$2,$3,$4,$5,$6)", session_id, gd, ship_id, name, required, new_pool)
+            return {"consumed": required, "pool_after": new_pool, "status": "active"}
+
+        # Shortage — undercrewed (Stakes Integrity: kapal jadi liability, bukan block)
+        pool = await conn.fetchval(
+            "SELECT crew_pool FROM maya_rp.resources WHERE session_id=$1", session_id) or 0
+        deficit = required - pool
+        penalty = round(deficit / max(1, required), 3)
+        await conn.execute(
+            "UPDATE maya_rp.ships SET crew_current=$1, crew_required=$2, undercrewed_penalty=$3, status='undercrewed' "
+            "WHERE id=$4 AND session_id=$5", pool, required, penalty, ship_id, session_id)
+        await conn.execute(
             "INSERT INTO maya_rp.crew_consumption_log (session_id, game_day, ship_id, ship_name, amount, pool_after) "
-            "VALUES ($1,$2,$3,$4,$5,$6)", session_id, gd, ship_id, name, required, new_pool)
-        return {"consumed": required, "pool_after": new_pool, "status": "active"}
-
-    # Shortage — undercrewed (Stakes Integrity: kapal jadi liability, bukan block)
-    deficit = required - pool
-    penalty = round(deficit / max(1, required), 3)
-    await Database.execute(
-        "UPDATE maya_rp.ships SET crew_current=$1, crew_required=$2, undercrewed_penalty=$3, status='undercrewed' "
-        "WHERE id=$4 AND session_id=$5", pool, required, penalty, ship_id, session_id)
-    await Database.execute(
-        "INSERT INTO maya_rp.crew_consumption_log (session_id, game_day, ship_id, ship_name, amount, pool_after) "
-        "VALUES ($1,$2,$3,$4,$5,$6)", session_id, gd, ship_id, name, pool, 0)
-    return {"consumed": pool, "deficit": deficit, "penalty": penalty, "status": "undercrewed"}
+            "VALUES ($1,$2,$3,$4,$5,$6)", session_id, gd, ship_id, name, pool, 0)
+        return {"consumed": pool, "deficit": deficit, "penalty": penalty, "status": "undercrewed"}
 
 
 async def backfill_history(session_id: int | None = None, start_day: int = 26, end_day: int | None = None,
@@ -254,16 +270,36 @@ async def graduation_cycle(session_id: int | None = None) -> dict:
     return {"day": gd, "graduated": total, "campuses": len(graduated)}
 
 
+class _Contended(Exception):
+    """Another writer changed the ship, the pool or the free roster while one ship was allocated."""
+
+
+def _free_roster(min_clr: int, session_param: str) -> str:
+    """FROM/WHERE for the free, active roster rows a ship of clearance `min_clr` may take.
+
+    C5+ takes screened clearance>=5 rows only. `session_param` is the session placeholder of the
+    statement the fragment is embedded in.
+    """
+    where = (f"FROM maya_rp.crew_roster WHERE session_id={session_param}"
+             " AND ship_id IS NULL AND status='active'")
+    return where + " AND clearance_level >= 5 AND screened=true" if min_clr >= 5 else where
+
+
 async def ai_allocate_crew(session_id: int | None = None) -> dict:
     """HEAVEN AI CONTROL — urus alokasi crew dari Heaven core.
     Prioriti: C5+ (tier>=5) crew clearance/loyalty/screened dulu, lepas tu C1-C4 (tier<5).
-    Pool numeric → crew_roster rows diwujudkan (functional crew) semasa allocate."""
+    Pool numeric → crew_roster rows diwujudkan (functional crew) semasa allocate.
+
+    Each hull is one transaction: ship row locked and re-read, pool debited by a guarded relative
+    UPDATE, roster rows created for what the free roster lacks, rows assigned, ship and log written.
+    The pool is the binding limit, not the free roster, so an empty roster still gets crewed.
+    """
     if session_id is None:
         session_id = Config.SESSION_ID
     gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
     pool = await Database.fetchval("SELECT crew_pool FROM maya_rp.resources WHERE session_id=$1", session_id) or 0
     if pool <= 0:
-        return {"allocated": 0, "pool": 0, "note": "Pool kosong — tunggu graduation/recruitment"}
+        return {"allocated": 0, "pool": 0, "pool_after": 0, "note": "Pool kosong — tunggu graduation/recruitment"}
 
     # Semua kapal yang perlukan crew (undercrewed / crew_current < crew), prioriti tier tinggi dulu
     ships = await Database.fetch(
@@ -281,69 +317,71 @@ async def ai_allocate_crew(session_id: int | None = None) -> dict:
     for s in ships:
         if pool <= 0:
             break
-        need = (s["crew"] or 0) - (s["crew_current"] or 0)
-        if need <= 0:
+        want = min((s["crew"] or 0) - (s["crew_current"] or 0), pool)
+        if want <= 0:
             continue
         min_clr = s["min_clearance"] or (5 if (s["tier"] or 0) >= 5 else 1)
-        # C5+ (tier>=5): kena crew clearance >=5 (screened)
-        if min_clr >= 5:
-            avail = await Database.fetchval(
-                """SELECT COUNT(*) FROM maya_rp.crew_roster
-                   WHERE session_id=$1 AND ship_id IS NULL AND status='active'
-                     AND clearance_level >= 5 AND screened=true""", session_id) or 0
-            take = min(need, avail, pool)
-        else:
-            # C1-C4: mana-mana crew functional — cipta dari pool kalau crew_roster tak cukup
-            avail = await Database.fetchval(
-                """SELECT COUNT(*) FROM maya_rp.crew_roster
-                   WHERE session_id=$1 AND ship_id IS NULL AND status='active'""", session_id) or 0
-            take = min(need, avail, pool)
-        if take <= 0:
+        # Names are database lookups: they run before the transaction so the ship and pool rows
+        # stay unlocked meanwhile.
+        free = await Database.fetchval(f"SELECT COUNT(*) {_free_roster(min_clr, '$1')}", session_id) or 0
+        names = [await _name_gen.unique_crew_name() for _ in range(max(0, want - free))]
+        try:
+            async with Database.transaction() as conn:
+                ship = await conn.fetchrow(
+                    "SELECT crew, crew_current, tier, min_clearance FROM maya_rp.ships"
+                    " WHERE id=$1 AND session_id=$2 AND status IN ('active','undercrewed') FOR UPDATE",
+                    s["id"], session_id)
+                if ship is None:
+                    continue
+                crew, current = ship["crew"] or 0, ship["crew_current"] or 0
+                min_clr = ship["min_clearance"] or (5 if (ship["tier"] or 0) >= 5 else 1)
+                take = min(crew - current, pool)
+                if take <= 0:
+                    continue
+                free = await conn.fetchval(f"SELECT COUNT(*) {_free_roster(min_clr, '$1')}", session_id) or 0
+                if take - free > len(names):
+                    raise _Contended()
+                # The guarded debit comes before any roster row exists. A lost race leaves no crew.
+                left = await conn.fetchval(
+                    "UPDATE maya_rp.resources SET crew_pool = crew_pool - $1"
+                    " WHERE session_id = $2 AND crew_pool >= $1 RETURNING crew_pool",
+                    take, session_id)
+                if left is None:
+                    raise _Contended()
+                if take > free:
+                    await conn.execute(
+                        """INSERT INTO maya_rp.crew_roster
+                             (session_id, name, role, status, loyalty_flag, clearance_level, screened)
+                           SELECT $1::int, n, 'crew', 'active', 'neutral', $3::int, $4::bool
+                           FROM unnest($2::text[]) AS n""",
+                        session_id, names[:take - free], min_clr, min_clr >= 5)
+                # Assign crew (screened dulu untuk C5+). SKIP LOCKED: a row another allocator holds is not ours.
+                assigned = await conn.fetch(
+                    f"""UPDATE maya_rp.crew_roster SET ship_id=$1 WHERE id IN
+                        (SELECT id {_free_roster(min_clr, '$2')} LIMIT $3 FOR UPDATE SKIP LOCKED)
+                        RETURNING id""",
+                    s["id"], session_id, take)
+                if len(assigned) != take:
+                    raise _Contended()
+                new_crew = current + take
+                status = "active" if new_crew >= crew else "undercrewed"
+                penalty = 0 if status == "active" else round((crew - new_crew) / (crew or 1), 3)
+                await conn.execute(
+                    "UPDATE maya_rp.ships SET crew_current=$1, status=$2, undercrewed_penalty=$3"
+                    " WHERE id=$4 AND session_id=$5",
+                    new_crew, status, penalty, s["id"], session_id)
+                await conn.execute(
+                    "INSERT INTO maya_rp.crew_allocation_log (session_id, game_day, ship_id, ship_name, crew_assigned, source) "
+                    "VALUES ($1,$2,$3,$4,$5,'ai_heaven')", session_id, gd, s["id"], s["name"], take)
+        except _Contended:
+            info("crew_system", f"allocation of ship {s['id']} skipped: crew state changed underneath it")
+            pool = await Database.fetchval(
+                "SELECT crew_pool FROM maya_rp.resources WHERE session_id=$1", session_id) or 0
             continue
-        # Jika crew_roster tak cukup (pool numeric > rows), cipta crew rows dari pool
-        rows_needed = take
-        while rows_needed > 0:
-            existing_free = await Database.fetchval(
-                """SELECT COUNT(*) FROM maya_rp.crew_roster WHERE session_id=$1 AND ship_id IS NULL AND status='active'""",
-                session_id) or 0
-            if existing_free <= 0:
-                # Cipta functional crew dari pool — unique first+family name
-                clr = min_clr
-                crew_name = await _name_gen.unique_crew_name()
-                await Database.execute(
-                    """INSERT INTO maya_rp.crew_roster (session_id, name, role, status, loyalty_flag, clearance_level, screened)
-                       VALUES ($1, $2, $3, 'active', 'neutral', $4, $5)""",
-                    session_id, crew_name,
-                    "crew", clr, clr >= 5)
-            rows_needed -= 1
-        # Assign crew (screened dulu untuk C5+)
-        if min_clr >= 5:
-            await Database.execute(
-                """UPDATE maya_rp.crew_roster SET ship_id=$1 WHERE id IN
-                   (SELECT id FROM maya_rp.crew_roster WHERE session_id=$2 AND ship_id IS NULL
-                    AND status='active' AND clearance_level>=5 AND screened=true LIMIT $3)""",
-                s["id"], session_id, take)
-        else:
-            await Database.execute(
-                """UPDATE maya_rp.crew_roster SET ship_id=$1 WHERE id IN
-                   (SELECT id FROM maya_rp.crew_roster WHERE session_id=$2 AND ship_id IS NULL
-                    AND status='active' LIMIT $3)""",
-                s["id"], session_id, take)
-        new_crew = (s["crew_current"] or 0) + take
-        status = "active" if new_crew >= (s["crew"] or 0) else "undercrewed"
-        penalty = 0 if status == "active" else round(((s["crew"] or 1) - new_crew) / (s["crew"] or 1), 3)
-        await Database.execute(
-            "UPDATE maya_rp.ships SET crew_current=$1, status=$2, undercrewed_penalty=$3 WHERE id=$4",
-            new_crew, status, penalty, s["id"])
-        pool -= take
+        pool = left
         allocated += take
         details.append({"ship": s["name"], "assigned": take, "status": status})
-        await Database.execute(
-            "INSERT INTO maya_rp.crew_allocation_log (session_id, game_day, ship_id, ship_name, crew_assigned, source) "
-            "VALUES ($1,$2,$3,$4,$5,'ai_heaven')", session_id, gd, s["id"], s["name"], take)
 
-    await Database.execute(
-        "UPDATE maya_rp.resources SET crew_pool=$1 WHERE session_id=$2", pool, session_id)
     return {"allocated": allocated, "pool_after": pool, "ships": details}
 
 

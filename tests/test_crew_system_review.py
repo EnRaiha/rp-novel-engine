@@ -40,21 +40,24 @@ class TestTheCreditIsReported:
 
 
 class TestTheShipIsScoped:
-    async def test_crew_cannot_be_consumed_for_another_campaigns_ship(self):
+    async def test_crew_cannot_be_consumed_for_another_campaigns_ship(self, scratch_session):
         await Database.init()
-        foreign = await Database.fetchval("SELECT id FROM maya_rp.ships WHERE session_id=3 LIMIT 1")
-        if foreign is None:
+        try:
+            foreign = await Database.fetchval("SELECT id FROM maya_rp.ships WHERE session_id=3 LIMIT 1")
+            if foreign is None:
+                return
+            out = await crew_system.consume_crew(scratch_session, int(foreign), 10)
+            assert f"not in session {scratch_session}" in out.get("error", ""), out
+        finally:
             await Database.close()
-            return
-        out = await crew_system.consume_crew(5, int(foreign), 10)
-        assert "not in session 5" in out.get("error", ""), out
-        await Database.close()
 
-    async def test_a_missing_ship_is_refused_by_name(self):
+    async def test_a_missing_ship_is_refused_by_name(self, scratch_session):
         await Database.init()
-        out = await crew_system.consume_crew(5, 999_999, 10)
-        assert "not in session 5" in out.get("error", ""), out
-        await Database.close()
+        try:
+            out = await crew_system.consume_crew(scratch_session, 999_999, 10)
+            assert f"not in session {scratch_session}" in out.get("error", ""), out
+        finally:
+            await Database.close()
 
 
 class TestTheReport:

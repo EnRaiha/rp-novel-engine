@@ -9,7 +9,7 @@ Replaces the old random-drift tick with core.decision_models:
 """
 from __future__ import annotations
 from core.db import Database
-from core.config import Config
+from core.session import require_session
 from core.log import error, info
 from core.decision_models import (detect_pirate_group, predict_pirate_policy,
                                   predict_pirate_survival, log_decision)
@@ -30,7 +30,7 @@ def _doctrine(group: str) -> tuple:
 
 async def run_tick(session_id: int | None = None) -> dict:
     if session_id is None:
-        session_id = Config.SESSION_ID
+        session_id = require_session(None)
     try:
         factions = await Database.fetch(
             "SELECT id, name, is_pirate, pirate_fleet_power, treasury, reputation "
@@ -48,16 +48,18 @@ async def run_tick(session_id: int | None = None) -> dict:
                                 "cond": "clean_crew", "act": "check_first"},
                                policy["class"], policy.get("probs"), group, session_id)
             fp_lo, fp_hi, t_lo, t_hi, vol = _doctrine(group)
-            # doctrine-shaped drift
+            # Doctrine-shaped drift. Relative writes keep a concurrent update from pirates.py.
+            # A credit always applies. A debit applies only when the balance covers it.
             if _chance(vol):
-                fp = (f["pirate_fleet_power"] or 0) + _randint(fp_lo, fp_hi)
                 await Database.execute(
-                    "UPDATE maya_rp.factions SET pirate_fleet_power=$1 WHERE id=$2",
-                    max(0, fp), f["id"])
+                    "UPDATE maya_rp.factions SET pirate_fleet_power = GREATEST(0, COALESCE(pirate_fleet_power, 0) + $1) "
+                    "WHERE id=$2 AND session_id=$3", _randint(fp_lo, fp_hi), f["id"], session_id)
             if _chance(vol):
-                tres = (f["treasury"] or 0) + _randint(t_lo, t_hi)
                 await Database.execute(
-                    "UPDATE maya_rp.factions SET treasury=$1 WHERE id=$2", tres, f["id"])
+                    "UPDATE maya_rp.factions SET treasury = COALESCE(treasury, 0) + $1::bigint "
+                    "WHERE id=$2 AND session_id=$3 "
+                    "AND ($1::bigint >= 0 OR COALESCE(treasury, 0) + $1::bigint >= 0)",
+                    _randint(t_lo, t_hi), f["id"], session_id)
             decisions += 1
         info("faction_ai", f"Tick: {decisions} pirate decisions (ML/rules)")
         return {"factions": len(factions), "decisions": decisions}

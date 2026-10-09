@@ -316,6 +316,22 @@ async def get_reachable_systems(session_id: int, origin: str, max_jumps: int = 3
 # FOG OF WAR — ported from fog-of-war.js
 # ═══════════════════════════════════════════════════════════════
 
+def _level_of(status, fleet_presence) -> str:
+    """Fog level of one territory row. Both visibility readers use this rule.
+
+    @param status - `territory.status`.
+    @param fleet_presence - `territory.fleet_presence`, may be `None`.
+    @returns a key of `VIS_ORDER`, never `uncharted`.
+    """
+    if status == "controlled":
+        return "colonized"
+    if status == "contested":
+        return "explored"
+    if fleet_presence and fleet_presence > 0:
+        return "surveyed"
+    return "scanned"
+
+
 async def get_visibility(session_id: int, system_name: str) -> dict:
     """Get visibility level for a system. Ported from FogOfWar.getVisibility()."""
     # Check if system is in our territory
@@ -327,14 +343,7 @@ async def get_visibility(session_id: int, system_name: str) -> dict:
     if not row:
         return {"level": "uncharted", "detail": 0, "can_travel": False, "shows_resources": False}
     s = row["status"]
-    if s == "controlled":
-        level = "colonized"
-    elif s == "contested":
-        level = "explored"
-    elif row["fleet_presence"] and row["fleet_presence"] > 0:
-        level = "surveyed"
-    else:
-        level = "scanned"
+    level = _level_of(s, row["fleet_presence"])
     return {"level": level, **VISIBILITY_LEVELS[level], "status": s}
 
 
@@ -359,10 +368,13 @@ async def reveal_system(session_id: int, system_name: str, level: str = "scanned
     # `explored` raised CheckViolationError. It also wrote "contested" for a plain scan, which reads
     # back as `explored` and marks a political contest nobody asked for.
     status = {"colonized": "controlled", "explored": "contested"}.get(level, "neutral")
-    await Database.execute(
+    tag = await Database.execute(
         "UPDATE maya_rp.territory SET status = $1 WHERE session_id = $2 AND system_name = $3",
         status, session_id, system_name,
     )
+    if tag.split()[-1:] == ["0"]:
+        return {"revealed": False, "level": old_level, "requested": level,
+                "reason": f"no territory row for '{system_name}' in session {session_id}"}
     read_back = (await get_visibility(session_id, system_name)).get("level")
     return {"revealed": True, "level": level, "previous_level": old_level, "status": status,
             "read_back": read_back}
@@ -378,7 +390,7 @@ async def get_visible_systems(session_id: int, min_level: str = "scanned") -> li
     min_idx = VIS_ORDER.index(min_level) if min_level in VIS_ORDER else 1
     result = []
     for r in rows:
-        level = "colonized" if r["status"] == "controlled" else "surveyed" if r["fleet_presence"] else "scanned"
+        level = _level_of(r["status"], r["fleet_presence"])
         if VIS_ORDER.index(level) >= min_idx:
             result.append({"system": r["system_name"], "level": level, "faction": r["controlling_faction"]})
     return result
@@ -449,6 +461,15 @@ async def get_faction_presence(session_id: int) -> dict:
 # CELESTIAL INDEX — ported from celestial-index.js
 # ═══════════════════════════════════════════════════════════════
 
+def _like_contains(text: str) -> str:
+    """LIKE pattern matching `text` as a literal substring (pair with `ESCAPE '\\'`).
+
+    @param text - user text.
+    @returns the escaped `%text%` pattern.
+    """
+    return "%" + str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
 async def search_all(session_id: int, query: str) -> list[dict]:
     """Search all celestial entities. Ported from CelestialIndex.search()."""
     q = query.lower()
@@ -458,8 +479,9 @@ async def search_all(session_id: int, query: str) -> list[dict]:
         if q in (sys.get("system_name") or "").lower():
             results.append({"type": "system", "name": sys["system_name"], "faction": sys.get("controlling_faction")})
     planets = await Database.fetch(
-        "SELECT name, system_name FROM maya_rp.planets WHERE session_id = $1 AND LOWER(name) LIKE $2",
-        session_id, f"%{q}%",
+        "SELECT name, system_name FROM maya_rp.planets "
+        "WHERE session_id = $1 AND LOWER(name) LIKE $2 ESCAPE '\\'",
+        session_id, _like_contains(q),
     )
     for p in planets:
         results.append({"type": "planet", "name": p["name"], "system": p["system_name"]})

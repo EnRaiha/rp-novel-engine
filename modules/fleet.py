@@ -4,8 +4,8 @@ from __future__ import annotations
 import random, math
 from typing import Any
 from core.db import Database
-from core.config import Config
 from core.log import info
+from core.session import require_session
 
 FORMATION_MULT = {
     "wall": (0.90, 1.25), "crescent": (1.15, 0.90), "spearhead": (1.30, 0.80),
@@ -20,7 +20,7 @@ TACTIC_NAMES = frozenset({
 })
 
 async def create_fleet(name: str, formation: str = "spearhead", session_id: int | None = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     if formation not in FORMATION_MULT:
         # The schema allows exactly the six in FORMATION_MULT, and the CLI says so.
         # An unknown name used to be stored and then fight at 1.0/1.0 in silence.
@@ -37,8 +37,8 @@ async def create_fleet(name: str, formation: str = "spearhead", session_id: int 
     info("fleet", f"Created fleet '{name}' [{formation}]")
     return {"fleet": name, "formation": formation}
 
-async def assign_ship(ship_name: str, fleet_name: str, position: int = 0, session_id: int | None = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+async def assign_ship(ship_name: str, fleet_name: str, position: int | None = None, session_id: int | None = None) -> dict:
+    if session_id is None: session_id = require_session(None)
     sid = await Database.fetchval(
         "SELECT id FROM maya_rp.ships WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) LIMIT 1",
         session_id, f"%{ship_name}%")
@@ -47,13 +47,21 @@ async def assign_ship(ship_name: str, fleet_name: str, position: int = 0, sessio
         "SELECT id FROM maya_rp.fleets WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) LIMIT 1",
         session_id, f"%{fleet_name}%")
     if not fid: return {"error": f"Fleet '{fleet_name}' not found"}
+    if position in (None, 0):  # cli.py:703 passes 0 for "not given"
+        taken = {r["position"] for r in await Database.fetch(
+            "SELECT position FROM maya_rp.fleet_members WHERE fleet_id=$1 AND ship_id<>$2", fid, sid)}
+        position = next((p for p in range(1, 11) if p not in taken), None)
+        if position is None:
+            return {"error": f"Fleet '{fleet_name}' is full: positions 1 to 10 are taken"}
+    elif isinstance(position, bool) or not isinstance(position, int) or not 1 <= position <= 10:
+        return {"error": f"position must be an integer from 1 to 10, got {position!r}"}
     await Database.execute(
         "INSERT INTO maya_rp.fleet_members (fleet_id, ship_id, position) VALUES ($1,$2,$3) "
         "ON CONFLICT (fleet_id, ship_id) DO UPDATE SET position=$3", fid, sid, position)
     return {"assigned": True, "ship": ship_name, "fleet": fleet_name, "position": position}
 
 async def list_fleets(session_id: int | None = None) -> list[dict]:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     fleets = await Database.fetch(
         "SELECT f.id, f.name, f.formation, f.status, s.name AS flagship "
         "FROM maya_rp.fleets f LEFT JOIN maya_rp.ships s ON f.flagship_id=s.id "
@@ -73,7 +81,7 @@ async def list_fleets(session_id: int | None = None) -> list[dict]:
     return result
 
 async def fleet_battle(fleet_name: str, tactic: str, threat: str, session_id: int | None = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     fleet = await Database.fetchrow(
         "SELECT id, name, formation FROM maya_rp.fleets WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) LIMIT 1",
         session_id, f"%{fleet_name}%")
@@ -136,7 +144,7 @@ async def fleet_battle(fleet_name: str, tactic: str, threat: str, session_id: in
             "enemy_power": round(enemy_power)}
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     fleets = await list_fleets(session_id)
     info("fleet", f"Tick: {len(fleets)} fleets")
     return {"fleets": len(fleets)}

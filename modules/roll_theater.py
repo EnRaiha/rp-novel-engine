@@ -294,7 +294,12 @@ async def list_blessings(session_id: int) -> list[dict]:
 
 
 async def consume_blessing(session_id: int, blessing: str) -> bool:
-    """Spend one charge (regenerates after 30 game days). Returns success."""
+    """Spend one charge (regenerates after 30 game days). Returns success.
+
+    One statement picks the lowest-id usable row and spends it. The outer
+    WHERE repeats the usable check, so a concurrent spend of the last charge
+    re-checks the new row version and loses instead of spending it twice.
+    """
     gd = (
         await Database.fetchval(
             "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id
@@ -302,26 +307,15 @@ async def consume_blessing(session_id: int, blessing: str) -> bool:
         or 0
     )
     row = await Database.fetchrow(
-        "SELECT id, charges, last_used_game_day FROM maya_rp.roll_blessings "
-        "WHERE session_id=$1 AND blessing=$2",
+        "UPDATE maya_rp.roll_blessings SET charges = CASE WHEN COALESCE(charges, 0) > 0 THEN charges - 1 ELSE 0 END,"
+        " last_used_game_day = $3 WHERE id = (SELECT id FROM maya_rp.roll_blessings WHERE session_id=$1 AND blessing=$2"
+        " AND (COALESCE(charges, 0) > 0 OR $3 - COALESCE(last_used_game_day, -999) >= 30) ORDER BY id LIMIT 1)"
+        " AND (COALESCE(charges, 0) > 0 OR $3 - COALESCE(last_used_game_day, -999) >= 30) RETURNING id",
         session_id,
         blessing,
-    )
-    if not row:
-        return False
-    charges = row["charges"] or 0
-    last = row["last_used_game_day"] or -999
-    if charges <= 0 and gd - last < 30:
-        return False
-    if charges <= 0:
-        charges = 1  # refreshed after 30 days
-    await Database.execute(
-        "UPDATE maya_rp.roll_blessings SET charges=$1, last_used_game_day=$2 WHERE id=$3",
-        charges - 1,
         gd,
-        row["id"],
     )
-    return True
+    return row is not None
 
 
 # ── Betting pools ───────────────────────────────────────────────────────
@@ -418,6 +412,14 @@ async def resolve_pool(session_id: int, king_won: bool) -> dict:
     )
     if not pool:
         return {"resolved": False}
+    # Claim first: a second resolver reads the same open pool and loses here.
+    claimed = await Database.fetchrow(
+        "UPDATE maya_rp.roll_pools SET result=$1, status='closed' WHERE id=$2 AND status='open' RETURNING id",
+        "king" if king_won else "house",
+        pool["id"],
+    )
+    if claimed is None:
+        return {"resolved": False}
     bets = await Database.fetch(
         "SELECT id, bettor_name, bet_credits, bet_side FROM maya_rp.pool_bets WHERE pool_id=$1",
         pool["id"],
@@ -435,11 +437,6 @@ async def resolve_pool(session_id: int, king_won: bool) -> dict:
             )
     # Net, not gross: paying 1.8 on the winners can put an upset pool underwater.
     house_keeps = (pool["credits_in_pool"] or 0) - paid
-    await Database.execute(
-        "UPDATE maya_rp.roll_pools SET result=$1, status='closed' WHERE id=$2",
-        "king" if king_won else "house",
-        pool["id"],
-    )
     crown_fee = max(0, house_keeps // 2)
     crown_credited = False
     if king_won and crown_fee:

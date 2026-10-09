@@ -123,6 +123,7 @@ def test_hunt_pays_the_loot_it_reports(monkeypatch, scratch_session):
     stub = _StubDB(
         answers=[
             ("FROM maya_rp.animal_encounters", {"id": 7, "animal_id": 3}),
+            ("UPDATE maya_rp.animal_encounters", {"id": 7}),
             # jsonb arrives as text from asyncpg; hunt_animal called .items() on it.
             ("FROM maya_rp.space_animals", {
                 "id": 3, "name": "Void Skimmer", "species": "skimmer",
@@ -171,6 +172,7 @@ def test_survey_applies_the_planet_type_modifiers(monkeypatch):
 def test_explore_decodes_the_anomaly_reward_pool(monkeypatch, scratch_session):
     stub = _StubDB(answers=[
         ("FROM maya_rp.discoveries", {"id": 4, "target_id": 2}),
+        ("UPDATE maya_rp.discoveries", {"id": 4}),
         ("FROM maya_rp.space_anomalies", {
             "id": 2, "name": "The Quiet Gate", "type": "gate", "reward_pool":
             '{"credits": 400, "exploration": "new_system"}', "danger_level": 1,

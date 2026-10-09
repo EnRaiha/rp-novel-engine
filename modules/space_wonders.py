@@ -50,6 +50,24 @@ def _as_dict(value) -> dict:
     return {}
 
 
+def _as_list(value) -> list:
+    """Decode a jsonb array column into a new list.
+
+    The driver returns jsonb as text, and the text `'[]'` is truthy, so
+    `not features` never held and no feature rolled. Anything that is not a
+    list, or does not parse to one, becomes an empty list.
+    """
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
 async def survey_planet(planet_id: int, session_id: int | None = None) -> dict:
     """Survey a planet to discover its type, features, and resource potential.
 
@@ -82,7 +100,7 @@ async def survey_planet(planet_id: int, session_id: int | None = None) -> dict:
         final[res] = int(amt * mult)
 
     # Check for special features
-    features = p.get("features") or []
+    features = _as_list(p.get("features"))
     if not features and p.get("planet_type"):
         # Roll for a random feature
         feat = await _roll_feature(p["planet_type"])
@@ -223,16 +241,18 @@ async def hunt_animal(encounter_id: int, fleet_power: int = 100,
             else:
                 loot[res] = int(amt * random.uniform(0.8, 1.2))
 
+        # Claim first: a second hunt read the same active row and loses here.
+        claimed = await Database.fetchval(
+            "UPDATE maya_rp.animal_encounters SET status = 'hunted', resolved_at = NOW(), outcome = 'success'"
+            " WHERE id = $1 AND status = 'active' RETURNING id", encounter_id)
+        if claimed is None:
+            return {"error": f"Encounter {encounter_id} not found in session {session_id},"
+                             f" or already resolved."}
+
         # The bus carries the audit event; no listener is registered for
         # `resources:add`, so `_credit_resources` below is what moves the number.
         await EventBus.emit("resources:add", dict(loot, session_id=session_id))
         credited = await _credit_resources(session_id, loot)
-
-        await Database.execute("""
-            UPDATE maya_rp.animal_encounters
-            SET status = 'hunted', resolved_at = NOW(), outcome = 'success'
-            WHERE id = $1
-        """, encounter_id)
 
         await _log(session_id, "exploration", f"Hunted {animal['name']}",
                    f"Successfully hunted a {animal['species']}! Gained: {loot}", 2)
@@ -240,11 +260,12 @@ async def hunt_animal(encounter_id: int, fleet_power: int = 100,
                 "resources": credited}
     else:
         damage = int(fleet_power * random.uniform(0.05, 0.15))
-        await Database.execute("""
-            UPDATE maya_rp.animal_encounters
-            SET status = 'fled', resolved_at = NOW(), outcome = 'failure'
-            WHERE id = $1
-        """, encounter_id)
+        claimed = await Database.fetchval(
+            "UPDATE maya_rp.animal_encounters SET status = 'fled', resolved_at = NOW(), outcome = 'failure'"
+            " WHERE id = $1 AND status = 'active' RETURNING id", encounter_id)
+        if claimed is None:
+            return {"error": f"Encounter {encounter_id} not found in session {session_id},"
+                             f" or already resolved."}
 
         await _log(session_id, "exploration", f"Hunt Failed: {animal['name']}",
                    f"Attempt to hunt {animal['species']} failed. Lost {damage} fleet power.", 2)
@@ -277,11 +298,12 @@ async def tame_animal(encounter_id: int, trainer_skill: int = 5,
     success = roll < success_chance
 
     if success:
-        await Database.execute("""
-            UPDATE maya_rp.animal_encounters
-            SET status = 'tamed', resolved_at = NOW(), outcome = 'success'
-            WHERE id = $1
-        """, encounter_id)
+        claimed = await Database.fetchval(
+            "UPDATE maya_rp.animal_encounters SET status = 'tamed', resolved_at = NOW(), outcome = 'success'"
+            " WHERE id = $1 AND status = 'active' RETURNING id", encounter_id)
+        if claimed is None:
+            return {"error": f"Encounter {encounter_id} not found in session {session_id},"
+                             f" or already resolved."}
 
         # Add tamed animal bonus — store as empire modifier
         ability = animal.get("special_ability", "")
@@ -296,11 +318,12 @@ async def tame_animal(encounter_id: int, trainer_skill: int = 5,
             "rarity": animal["rarity"]
         }
     else:
-        await Database.execute("""
-            UPDATE maya_rp.animal_encounters
-            SET status = 'fled', resolved_at = NOW(), outcome = 'failure'
-            WHERE id = $1
-        """, encounter_id)
+        claimed = await Database.fetchval(
+            "UPDATE maya_rp.animal_encounters SET status = 'fled', resolved_at = NOW(), outcome = 'failure'"
+            " WHERE id = $1 AND status = 'active' RETURNING id", encounter_id)
+        if claimed is None:
+            return {"error": f"Encounter {encounter_id} not found in session {session_id},"
+                             f" or already resolved."}
 
         await _log(session_id, "exploration", f"Taming Failed: {animal['name']}",
                    f"Attempt to tame {animal['species']} failed. It fled.", 1)
@@ -402,19 +425,25 @@ async def explore_anomaly(discovery_id: int, fleet_power: int = 100,
             else:
                 loot[res] = int(amt * random.uniform(0.8, 1.2))
 
-        await EventBus.emit("resources:add", dict(loot, session_id=session_id))
-        credited = await _credit_resources(session_id, loot)
         outcome = "success"
     else:
-        credit_report = {"applied": {}, "skipped": {}, "credited": False}
         damage = int(fleet_power * random.uniform(0.1, 0.4))
         outcome = "failure"
 
-    await Database.execute("""
-        UPDATE maya_rp.discoveries
-        SET explored = TRUE, explored_at = NOW(), results = $1
-        WHERE id = $2
-    """, json.dumps({"outcome": outcome, "loot": loot, "damage": damage}), discovery_id)
+    # Claim first: a second exploration read the same unexplored row and loses here.
+    claimed = await Database.fetchval(
+        "UPDATE maya_rp.discoveries SET explored = TRUE, explored_at = NOW(), results = $1"
+        " WHERE id = $2 AND explored = FALSE RETURNING id",
+        json.dumps({"outcome": outcome, "loot": loot, "damage": damage}), discovery_id)
+    if claimed is None:
+        return {"error": f"Discovery {discovery_id} not found in session {session_id},"
+                         f" or already explored."}
+
+    if outcome == "success":
+        await EventBus.emit("resources:add", dict(loot, session_id=session_id))
+        credited = await _credit_resources(session_id, loot)
+    else:
+        credit_report = {"applied": {}, "skipped": {}, "credited": False}
 
     await _log(session_id, "exploration", f"Anomaly Explored: {anomaly['name']}",
                f"Outcome: {outcome}. {'Gained resources' if outcome == 'success' else f'Took {damage} damage.'}",

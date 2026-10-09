@@ -37,6 +37,10 @@ W_FEAR    = 0.15
 W_RES     = 0.10
 W_GOV     = 0.10
 
+# refresh moves each value this fraction of the way to its driver target per tick, by at most MAX_STEP.
+REFRESH_RATE = 0.25
+MAX_STEP = 10
+
 
 def _clamp(v: float, lo: int = -100, hi: int = 100) -> int:
     return int(max(lo, min(hi, round(v))))
@@ -65,23 +69,35 @@ async def init_for_territory(session_id: int | None = None) -> int:
     return n
 
 
-async def refresh(session_id: int | None = None, territory_id: int | None = None) -> dict:
-    """Recompute sentiment for all rows (or one territory). Returns updated count."""
+async def refresh(session_id: int | None = None, territory_id: int | None = None,
+                  dry_run: bool = False) -> dict:
+    """Move all rows (or one territory) toward their driver targets. Returns the updated count.
+
+    Each value moves REFRESH_RATE of the gap per tick, capped at MAX_STEP, so a `shift` decays over
+    several ticks. `dry_run` writes nothing and returns the planned moves under `deltas`.
+    """
     session_id = _sid(session_id)
     rows = await Database.fetch(
         """SELECT ps.id, ps.territory_id, ps.faction_name,
+                  ps.sentiment, ps.approval, ps.fear, ps.trust,
                   t.morale, t.tax_rate, t.crisis_level, t.slave_revolt_risk,
                   t.title_performance, t.governor_name, t.id AS tid
            FROM maya_rp.population_sentiment ps
            JOIN maya_rp.territory t ON t.id = ps.territory_id
            WHERE ps.session_id=$1 AND ($2::int IS NULL OR ps.territory_id=$2::int)""",
         session_id, territory_id)
+
+    def step(target: int, current: int) -> int:
+        return max(-MAX_STEP, min(MAX_STEP, int(round((target - current) * REFRESH_RATE))))
+
     updated = 0
+    deltas = []
     for r in rows:
         morale   = float(r["morale"] if r["morale"] is not None else 50)
         tax      = float(r["tax_rate"] if r["tax_rate"] is not None else 0.05)
         crisis   = float(r["crisis_level"] if r["crisis_level"] is not None else 0)
-        revolt   = float(r["slave_revolt_risk"] if r["slave_revolt_risk"] is not None else 0)
+        # slave_revolt_risk is an integer 0..100; the drivers read it as a 0..1 fraction.
+        revolt   = float(r["slave_revolt_risk"] if r["slave_revolt_risk"] is not None else 0) / 100.0
         gov_perf = float(r["title_performance"] if r["title_performance"] is not None else 50)
         has_gov  = 1 if (r["governor_name"] and r["governor_name"] != "") else 0
 
@@ -99,36 +115,49 @@ async def refresh(session_id: int | None = None, territory_id: int | None = None
         trust    = _clamp(trust, 0, 100)
         new_sent = _clamp(sentiment)
 
-        old = r["faction_name"]  # for reason logging we just note driver set
+        d_approval = step(approval, r["approval"])
+        d_fear = step(fear, r["fear"])
+        d_trust = step(trust, r["trust"])
+        d_sentiment = step(new_sent, r["sentiment"])
+
+        if dry_run:
+            deltas.append({"id": r["id"], "approval": d_approval, "fear": d_fear,
+                           "trust": d_trust, "sentiment": d_sentiment})
+            continue
+
         reason = f"drivers: morale {morale} tax {round(tax*100)}% crisis {crisis} revolt {round(revolt*100)}% gov {'y' if has_gov else 'n'}"
         await Database.execute(
-            """UPDATE maya_rp.population_sentiment
-               SET sentiment=$2, approval=$3, fear=$4, trust=$5,
-                   last_shift = $2 - (SELECT sentiment FROM maya_rp.population_sentiment WHERE id=$1),
-                   last_shift_reason=$6, updated_at=NOW()
-               WHERE id=$1""",
-            r["id"], new_sent, approval, fear, trust, reason)
+            """UPDATE maya_rp.population_sentiment SET
+                   approval  = GREATEST(0, LEAST(100, approval + $2::int)),
+                   fear      = GREATEST(0, LEAST(100, fear + $3::int)),
+                   trust     = GREATEST(0, LEAST(100, trust + $4::int)),
+                   sentiment = GREATEST(-100, LEAST(100, sentiment + $5::int)),
+                   last_shift = GREATEST(-100, LEAST(100, sentiment + $5::int)) - sentiment,
+                   last_shift_reason = $6, updated_at = NOW()
+               WHERE id = $1 AND session_id = $7::int""",
+            r["id"], d_approval, d_fear, d_trust, d_sentiment, reason, session_id)
         updated += 1
+    if dry_run:
+        return {"updated": 0, "dry_run": True, "deltas": deltas}
     return {"updated": updated}
 
 
 async def shift(session_id: int | None, territory_id: int, faction_name: str,
                 delta: int, reason: str) -> dict:
-    """Manual/narrative shift (news, events, decrees). Clamped."""
+    """Manual/narrative shift (news, events, decrees). Clamped. One statement, so a concurrent write cannot be lost."""
     session_id = _sid(session_id)
     row = await Database.fetchrow(
-        """SELECT id, sentiment FROM maya_rp.population_sentiment
-           WHERE session_id=$1::int AND territory_id=$2::int AND faction_name=$3::text""",
-        session_id, territory_id, faction_name)
+        """UPDATE maya_rp.population_sentiment SET
+               sentiment = GREATEST(-100, LEAST(100, sentiment + $4::int)),
+               last_shift = GREATEST(-100, LEAST(100, sentiment + $4::int)) - sentiment,
+               last_shift_reason = $5, updated_at = NOW()
+           WHERE session_id=$1::int AND territory_id=$2::int AND faction_name=$3::text
+           RETURNING sentiment""",
+        session_id, territory_id, faction_name, delta, reason)
     if not row:
         return {"error": f"no sentiment row for {faction_name} @ {territory_id}"}
-    new = _clamp(row["sentiment"] + delta)
-    await Database.execute(
-        """UPDATE maya_rp.population_sentiment
-           SET sentiment=$2, last_shift=$3, last_shift_reason=$4, updated_at=NOW()
-           WHERE id=$1""",
-        row["id"], new, new - row["sentiment"], reason)
-    return {"territory_id": territory_id, "faction": faction_name, "sentiment": new, "delta": delta, "reason": reason}
+    return {"territory_id": territory_id, "faction": faction_name, "sentiment": row["sentiment"],
+            "delta": delta, "reason": reason}
 
 
 async def apply_news_bias(session_id: int | None = None, limit: int = 50) -> int:
@@ -196,7 +225,8 @@ async def status(session_id: int | None = None, territory_id: int | None = None,
         # identical, so a faction filter without a territory bound one argument and left the other
         # unnamed: `status(session, faction_name=...)`, which is what `cli.py sentiment` calls by
         # default, died with "could not determine data type of parameter $2".
-        args.append(f"%{faction_name}%")
-        q += f" AND ps.faction_name ILIKE ${len(args)}"
+        escaped = faction_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        args.append(f"%{escaped}%")
+        q += f" AND ps.faction_name ILIKE ${len(args)} ESCAPE '\\'"
     q += " ORDER BY ps.sentiment DESC"
     return await Database.fetch(q, *args)

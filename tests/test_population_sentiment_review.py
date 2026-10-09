@@ -99,7 +99,7 @@ class TestTheSessionIsResolvedAtCallTime:
 
 class TestTheDrivers:
     async def test_refresh_moves_approval_with_the_drivers(self, scratch_campaign, monkeypatch):
-        """Same row in, same row out: the formula is deterministic and territory-scoped."""
+        """Each value moves a quarter of the way to its driver target, capped at 10."""
         await Database.init()
         tid = await _territory(scratch_campaign, morale=70, tax=0.05, crisis=0)
         sid = await _sentiment(scratch_campaign, tid)
@@ -109,10 +109,10 @@ class TestTheDrivers:
             row = await Database.fetchrow(
                 "SELECT sentiment, approval, fear, trust FROM maya_rp.population_sentiment WHERE id = $1",
                 sid)
-            assert row["approval"] == 63, dict(row)  # 55 + 20 * 0.4
+            assert row["approval"] == 57, dict(row)  # target 63 (55 + 20 * 0.4), move round(8 * 0.25) = 2
             assert row["fear"] == 10, dict(row)
             assert row["trust"] == 45, dict(row)
-            assert row["sentiment"] == 30, dict(row)  # 63 * 0.55 - 10 * 0.45
+            assert row["sentiment"] == 11, dict(row)  # target 30 (63 * 0.55 - 10 * 0.45), move round(25 * 0.25) = 6
         finally:
             await _drop(tid)
             await Database.close()

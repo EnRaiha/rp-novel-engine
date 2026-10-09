@@ -28,16 +28,52 @@ RESOURCE_COLUMNS = ("credits", "alloys", "fuel", "dream_essence", "rare_earth",
 _RESOURCE_SELECT = ", ".join(RESOURCE_COLUMNS)
 
 
-async def _check_afford(session_id: int, costs: dict) -> tuple:
+class InsufficientResources(ValueError):
+    """The ledger cannot pay a cost. Subclasses `ValueError`, the type callers already catch for a
+    cost the ledger cannot charge, so an uncaught shortage reads as a refused cost and not a crash."""
+
+
+def stochastic_round(value: float) -> int:
+    """Round to an integer with an expected value equal to `value`.
+
+    `progress_pct`, `spread_progress` and `eradication_campaigns.progress` are INTEGER columns and a
+    tick adds well under 1 (Spore Drift: 0.25 per tick). `int()` truncated every such step to 0, so a
+    site or infestation at that rate never moved. Rounding up with probability equal to the fraction
+    keeps the long-run rate exact without a column change.
+
+    @param value - a non-negative float.
+    @returns floor(value), plus 1 with probability equal to the fractional part.
+    """
+    import random
+
+    whole = int(value)
+    return whole + (1 if random.random() < (value - whole) else 0)
+
+
+def _cost_qty(res: str, qty) -> int:
+    """A cost as the integer the ledger columns take.
+
+    asyncpg rejects a float for an INTEGER or BIGINT parameter, and catalogue costs come out of jsonb,
+    where `50000.0` is legal. A negative cost would credit the treasury, so it is refused.
+    """
+    if isinstance(qty, bool) or qty is None or qty != int(qty) or qty < 0:
+        raise ValueError(f"cost for {res!r} must be a non-negative whole number, got {qty!r}")
+    return int(qty)
+
+
+async def _check_afford(session_id: int, costs: dict, conn=None) -> tuple:
     """Can this session pay? @returns (ok, reason when it cannot).
 
     A resource the ledger has no column for is refused with THAT reason, so a
     caller can tell a catalogue naming a missing column from a treasury that is
     short. Both used to read as "unknown resource".
+
+    @param session_id - the campaign whose treasury is read.
+    @param costs - resource column to quantity.
+    @param conn - the caller's transaction connection. Omitted: the pool.
     """
-    r = await Database.fetchrow(
-        f"SELECT {_RESOURCE_SELECT} FROM maya_rp.resources WHERE session_id = $1", session_id
-    )
+    sql = f"SELECT {_RESOURCE_SELECT} FROM maya_rp.resources WHERE session_id = $1"
+    r = await (conn or Database).fetchrow(sql, session_id)
     if not r:
         return False, "no resources"
     for res, qty in costs.items():
@@ -49,37 +85,47 @@ async def _check_afford(session_id: int, costs: dict) -> tuple:
     return True, ""
 
 
-async def _deduct_resources(session_id: int, costs: dict) -> dict:
-    """Take the cost.
+async def _deduct_resources(session_id: int, costs: dict, conn=None) -> dict:
+    """Take the cost, all of it or none of it.
 
-    @returns what was actually charged, per resource: NUMBERS only, so a caller
-    can iterate `.items()` without meeting a bookkeeping entry.
+    The debit is ONE `UPDATE ... WHERE session_id AND every column >= its cost RETURNING`. It used
+    to run one `GREATEST(0, col - $n)` statement per resource after a separate check: two requests
+    could both pass the check and spend the same credits, the clamp hid the shortfall, and a
+    multi-resource cost could charge credits and then fail on alloys.
 
-    A cost naming anything outside the whitelist is REFUSED before a single
-    charge, and named. It used to be skipped and reported under a "#skipped"
-    string key, which is both a mixed-type dict and a building paid for with
-    nothing at all. Refusing up front also means a rejected cost cannot leave a
-    half-charged treasury behind.
+    @param session_id - the campaign whose treasury is charged.
+    @param costs - resource column to quantity. Whole, non-negative numbers.
+    @param conn - the caller's transaction connection, so the charge commits or rolls back with the
+        effect it pays for. Omitted: the pool, one statement.
+    @returns what was charged, per resource: NUMBERS only, so a caller can iterate `.items()`.
+    @raises ValueError - a cost names a resource the ledger cannot charge, or a bad quantity.
+        Refused before any charge.
+    @raises InsufficientResources - the treasury is short, or the session has no resources row.
+        Nothing is charged.
     """
     unknown = [res for res in costs if res not in RESOURCE_COLUMNS]
     if unknown:
         raise ValueError(
             f"cost names resources the ledger cannot charge: {unknown}. "
             f"Known columns: {list(RESOURCE_COLUMNS)}")
-    charged: dict[str, float] = {}
-    for res, qty in costs.items():
-        remaining = await Database.fetchval(
-            f"UPDATE maya_rp.resources SET {res} = GREATEST(0, {res} - $1)"
-            " WHERE session_id = $2 RETURNING " + res,
-            qty, session_id,
-        )
-        # GREATEST(0, ...) clamps the result, which means a charge that arrives twice leaves the treasury
-        # short with no trace of the second one: once the column reaches zero the replay changes nothing it
-        # can be seen by. The value returned here is the balance AFTER the charge, so a replay inside
-        # `Database._run`'s at-least-once retry shows as a second line with a smaller or zero balance rather
-        # than as nothing at all. Behaviour is unchanged; only the evidence is.
-        charged[res] = qty
-        from core.log import info as _log
+    charged = {res: _cost_qty(res, qty) for res, qty in costs.items()}
+    due = {res: qty for res, qty in charged.items() if qty > 0}
+    if not due:
+        return charged
+    sets, guards, args = [], [], [session_id]
+    for res, qty in due.items():
+        args.append(qty)
+        sets.append(f"{res} = COALESCE({res}, 0) - ${len(args)}")
+        guards.append(f"COALESCE({res}, 0) >= ${len(args)}")
+    sql = (f"UPDATE maya_rp.resources SET {', '.join(sets)} "
+           f"WHERE session_id = $1 AND {' AND '.join(guards)} "
+           f"RETURNING {', '.join(due)}")
+    runner = conn or Database
+    row = await runner.fetchrow(sql, *args)
+    if row is None:
+        ok, why = await _check_afford(session_id, due, conn)
+        raise InsufficientResources(why or f"the ledger changed under the charge for session {session_id}")
+    from core.log import info as _log
 
-        _log("economy", f"charged {qty} {res} from session {session_id}: balance now {remaining}")
+    _log("economy", f"charged {due} from session {session_id}: balance now {dict(row)}")
     return charged

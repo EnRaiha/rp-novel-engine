@@ -4,6 +4,7 @@ from core.config import Config
 from core.utils import calc_game_days, clamp
 from datetime import datetime, timezone
 from core.log import error, info
+from modules._economy import InsufficientResources, _deduct_resources
 
 # Progressive marginal tax brackets — PERCENTAGE rates that thin with world size.
 # Big worlds still pay more absolute tax (they are huge), but a smaller
@@ -272,32 +273,37 @@ async def resolve_intent(session_id: int, action: str, target: str, amount: int 
     if action == "buy" or action == "purchase":
         if amount <= 0:
             amount = 100_000
-        if r["credits"] >= amount:
-            await Database.execute(
-                "UPDATE maya_rp.resources SET credits = credits - $1 WHERE session_id=$2",
-                amount, session_id)
-            return {
-                "domain": "economy",
-                "success": True,
-                "cost": amount,
-                "credits_remaining": r["credits"] - amount,
-                "narrative_hook": f"Purchased {target} for {amount:,} credits.",
-            }
-        else:
+        # ONE GUARDED STATEMENT, NOT A CHECK THEN A DEBIT. The read at the top of this function
+        # decided affordability, and a second buy landing between that read and the UPDATE passed the
+        # same check and spent the same credits. `_deduct_resources` puts the comparison inside the
+        # statement, so a treasury that moved underneath is refused instead of overdrawn, and the
+        # balance reported back is read after the charge rather than computed from the stale read.
+        try:
+            await _deduct_resources(session_id, {"credits": amount})
+        except InsufficientResources:
             return {
                 "domain": "economy",
                 "success": False,
                 "cost": amount,
-                "credits_available": r["credits"],
-                "narrative_hook": f"Insufficient funds for {target}. Need {amount:,}C, have {r['credits']:,}C.",
+                "credits_available": int(r["credits"] or 0),
+                "narrative_hook": f"Insufficient funds for {target}. Need {amount:,}C, have {int(r['credits'] or 0):,}C.",
             }
+        remaining = await Database.fetchval(
+            "SELECT credits FROM maya_rp.resources WHERE session_id=$1", session_id)
+        return {
+            "domain": "economy",
+            "success": True,
+            "cost": amount,
+            "credits_remaining": int(remaining or 0),
+            "narrative_hook": f"Purchased {target} for {amount:,} credits.",
+        }
 
     elif action == "invest":
         # `min(amount or 500_000, credits)` MINTED credits: a negative amount, or
         # a treasury already below zero, made `credits = credits - invest_amt` go
         # UP. Nothing invests what the treasury does not hold.
         wanted = amount if amount > 0 else 500_000
-        invest_amt = max(0, min(wanted, int(r["credits"] or 0)))
+        invest_amt = int(max(0, min(wanted, int(r["credits"] or 0))))
         if invest_amt == 0:
             return {
                 "domain": "economy",
@@ -306,9 +312,7 @@ async def resolve_intent(session_id: int, action: str, target: str, amount: int 
                 "credits_available": int(r["credits"] or 0),
                 "narrative_hook": f"Nothing to invest in {target}: the treasury holds {int(r['credits'] or 0):,}C.",
             }
-        await Database.execute(
-            "UPDATE maya_rp.resources SET credits = credits - $1 WHERE session_id=$2",
-            invest_amt, session_id)
+        await _deduct_resources(session_id, {"credits": invest_amt})
         return {
             "domain": "economy",
             "success": True,
@@ -319,9 +323,12 @@ async def resolve_intent(session_id: int, action: str, target: str, amount: int 
 
     elif action == "sell" or action == "trade":
         gain = amount if amount > 0 else 200_000
+        # A credit is a payout, not a charge, so it does not go through `_deduct_resources`. It does
+        # need the integer cast: asyncpg rejects a float for the INTEGER column, and `amount` arrives
+        # from a jsonb argument, where `200000.0` is legal.
         await Database.execute(
             "UPDATE maya_rp.resources SET credits = credits + $1 WHERE session_id=$2",
-            gain, session_id)
+            int(gain), session_id)
         return {
             "domain": "economy",
             "success": True,

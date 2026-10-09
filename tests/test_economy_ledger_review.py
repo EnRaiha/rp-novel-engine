@@ -28,10 +28,28 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import re  # noqa: E402
+
 from core.db import Database  # noqa: E402
 from modules import infrastructure  # noqa: E402
-from modules._economy import (RESOURCE_COLUMNS, _check_afford,  # noqa: E402
-                              _deduct_resources)
+from modules._economy import (RESOURCE_COLUMNS, InsufficientResources,  # noqa: E402
+                              _check_afford, _deduct_resources, stochastic_round)
+
+
+def _guard_denies(sql: str, args, row) -> bool:
+    """True when a guarded charge's WHERE clause cannot match the fixed row.
+
+    Without this the fake answers a short charge exactly like a paid one, so a test of the refusal
+    passed with the guard deleted from the statement. That was measured: removing the guard failed a
+    SQL-shape assertion elsewhere and left the refusal test green.
+    """
+    if not isinstance(row, dict) or "UPDATE maya_rp.resources" not in sql:
+        return False
+    for match in re.finditer(r"COALESCE\((\w+), 0\) >= \$(\d+)", sql):
+        column, index = match.group(1), int(match.group(2))
+        if (row.get(column) or 0) < args[index - 1]:
+            return True
+    return False
 
 
 class FakeDB:
@@ -41,12 +59,15 @@ class FakeDB:
 
     async def fetchrow(self, sql, *args):
         self.calls.append(("fetchrow", " ".join(sql.split()), args))
+        if _guard_denies(sql, args, self.fetchrow_value):
+            return None
         return self.fetchrow_value
 
     async def fetchval(self, sql, *args):
-        # The charge path moved from execute() to fetchval(UPDATE ... RETURNING <col>) so a replayed charge
-        # leaves a trace. Not stubbing fetchval did not merely make this test red: it let the charge through
-        # to the live pool, so the test wrote to maya_rp.resources for real and the fake recorded nothing.
+        # Kept stubbed even though the charge no longer calls it. Leaving a method unstubbed did not
+        # merely make a test red: it let the statement through to the live pool, so the test wrote to
+        # maya_rp.resources for real and the fake recorded nothing. Any new call path gets a stub here
+        # before it gets a test.
         self.calls.append(("fetchval", " ".join(sql.split()), args))
         return 0.0
 
@@ -86,14 +107,85 @@ async def test_the_refusal_lists_what_can_be_charged(monkeypatch):
 
 
 async def test_charged_holds_numbers_only(monkeypatch):
-    fake = _install(monkeypatch, FakeDB())
+    # ONE guarded statement charges the whole cost now: every column is compared to its cost in the
+    # WHERE clause and all of it is debited in the same UPDATE. The row is that statement's RETURNING.
+    fake = _install(monkeypatch, FakeDB(fetchrow={"credits": 900, "alloys": 80}))
 
     charged = await _deduct_resources(5, {"credits": 100, "alloys": 20})
 
     assert charged == {"credits": 100, "alloys": 20}
     assert all(isinstance(v, (int, float)) for v in charged.values())
     assert all(isinstance(k, str) and not k.startswith("#") for k in charged)
-    assert len(fake.sql("fetchval")) == 2
+    assert len(fake.sql("fetchrow")) == 1, "the cost is one statement, not one statement per resource"
+    assert not fake.sql("fetchval"), "the per-resource charge path is gone"
+    sql = fake.sql("fetchrow")[0]
+    assert "COALESCE(credits, 0) >= $" in sql and "COALESCE(alloys, 0) >= $" in sql, \
+        "every resource is guarded in the WHERE"
+
+
+async def test_a_short_treasury_charges_nothing(monkeypatch):
+    """The guard is in the statement. When it does not match, nothing moved and the caller is told by
+    exception rather than by a clamped column: `GREATEST(0, credits - $1)` used to take a treasury to
+    zero and report success."""
+    # A treasury of 10 against a cost of 100. The row is a real one, so the fake has to apply the
+    # statement's own guard to reject it. A bare `fetchrow=None` made this test green with the guard
+    # deleted from the SQL, which is the definition of passing for the wrong reason.
+    fake = _install(monkeypatch, FakeDB(fetchrow={"credits": 10}))
+
+    with pytest.raises(InsufficientResources):
+        await _deduct_resources(5, {"credits": 100})
+
+    # Two reads: the guarded UPDATE, then `_check_afford` to say WHY it did not match, so the caller
+    # is told "no resources" or the short column rather than a bare refusal.
+    assert len(fake.sql("fetchrow")) == 2, "the failed charge is the UPDATE plus the reason"
+    assert not fake.sql("execute"), "a refused charge still moved the treasury"
+
+
+async def test_a_zero_cost_issues_no_statement(monkeypatch):
+    """A cost of zero is a no-op, not an UPDATE that rewrites the row."""
+    fake = _install(monkeypatch, FakeDB(fetchrow={"credits": 900}))
+
+    assert await _deduct_resources(5, {"credits": 0}) == {"credits": 0}
+
+    assert not fake.sql("fetchrow"), "a zero cost still ran a statement"
+
+
+async def test_a_float_cost_is_refused_before_any_charge(monkeypatch):
+    """asyncpg rejects a float for an INTEGER parameter, and catalogue costs come out of jsonb, where
+    `50000.0` is legal. It is refused here rather than at the driver."""
+    fake = _install(monkeypatch, FakeDB(fetchrow={"credits": 900}))
+
+    with pytest.raises(ValueError, match="whole number"):
+        await _deduct_resources(5, {"credits": 500.5})
+
+    assert not fake.sql("fetchrow"), "a bad quantity still reached the database"
+
+
+async def test_a_negative_cost_is_refused(monkeypatch):
+    """A negative cost would credit the treasury."""
+    fake = _install(monkeypatch, FakeDB(fetchrow={"credits": 900}))
+
+    with pytest.raises(ValueError, match="whole number"):
+        await _deduct_resources(5, {"credits": -50})
+
+    assert not fake.sql("fetchrow")
+
+
+def test_stochastic_round_keeps_the_long_run_rate():
+    """`progress_pct`, `spread_progress` and `eradication_campaigns.progress` are INTEGER columns and
+    a tick adds well under 1 (Spore Drift: 0.25). `int()` truncated every step to 0, so a site at that
+    rate never moved. The expected value of the rounded result is the value itself."""
+    import random
+
+    random.seed(20261009)
+    value = 0.25
+    draws = 40_000
+    total = sum(stochastic_round(value) for _ in range(draws))
+
+    assert abs(total / draws - value) < 0.02, "the long-run rate drifted"
+    assert stochastic_round(0.0) == 0
+    assert stochastic_round(0.999) in (0, 1)
+    assert stochastic_round(7.0) == 7, "a whole number is returned unchanged"
 
 
 async def test_an_empty_cost_charges_nothing(monkeypatch):

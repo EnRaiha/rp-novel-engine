@@ -54,6 +54,13 @@ class FakeConn:
         self.received.append((" ".join(sql.split()), args))
         return 0.0
 
+    async def fetchrow(self, sql, *args):
+        # The charge is `fetchrow(UPDATE ... RETURNING ...)` now, one guarded statement, not a
+        # `fetchval` per resource. It has to come back with a mapping: the caller logs `dict(row)`,
+        # and the float `fetchval` returns raised TypeError on the success path.
+        result = await self.fetchval(sql, *args)
+        return {} if result is not None else None
+
     async def execute(self, sql, *args):
         return await self.fetchval(sql, *args)
 
@@ -143,7 +150,13 @@ async def test_a_statement_that_reached_the_server_is_not_replayed(pool):
 
 
 async def test_the_ledger_charge_runs_once_when_the_socket_dies_mid_charge(pool):
-    """The sharpest site: a replayed charge is invisible, because GREATEST(0, ...) clamps it."""
+    """The sharpest site: a replayed charge is a second charge, and nothing in the row shows it.
+
+    `GREATEST(0, credits - $1)` used to clamp, so a replay onto a zero balance changed nothing a
+    reader could see. The charge is one guarded `UPDATE ... WHERE COALESCE(credits, 0) >= $n` now, so
+    the clamp is gone, but a replay with enough left in the treasury still debits twice. The
+    statement must therefore reach the server exactly once.
+    """
     _, _, received = pool
 
     with pytest.raises(asyncpg.exceptions.ConnectionDoesNotExistError):
@@ -151,7 +164,7 @@ async def test_the_ledger_charge_runs_once_when_the_socket_dies_mid_charge(pool)
 
     updates = [sql for sql, _ in received if sql.startswith("UPDATE")]
     assert len(updates) == 1, f"the treasury was charged {len(updates)} times: {received}"
-    assert "GREATEST(0, credits - $1)" in updates[0], updates
+    assert "COALESCE(credits, 0) - $2" in updates[0], updates
 
 
 async def test_a_socket_failure_is_not_replayed_either(pool):

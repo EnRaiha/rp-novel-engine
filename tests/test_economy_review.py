@@ -22,11 +22,29 @@ already right are asserted below as the module contract.
 
 No database: every test drives a fake Database.
 """
+import re
 from datetime import datetime, timezone
 
 import pytest
 
 import modules.economy as economy
+
+
+def _guard_denies(sql: str, args, row) -> bool:
+    """True when a guarded charge's WHERE clause cannot match the fixed row.
+
+    The fake answers every `fetchrow` with one row, so a charge of 1000 against a treasury of 10 came
+    back as paid and the refusal test failed for the wrong reason. The charge is one
+    `UPDATE ... WHERE COALESCE(<col>, 0) >= $n`, and this reads those guards out of the statement and
+    applies them to the row, which is what the database does with them.
+    """
+    if not isinstance(row, dict) or "UPDATE maya_rp.resources" not in sql:
+        return False
+    for match in re.finditer(r"COALESCE\((\w+), 0\) >= \$(\d+)", sql):
+        column, index = match.group(1), int(match.group(2))
+        if (row.get(column) or 0) < args[index - 1]:
+            return True
+    return False
 
 
 class FakeDB:
@@ -42,6 +60,8 @@ class FakeDB:
         for marker, value in self.fetchrow_rows:
             if marker in sql:
                 return value
+        if _guard_denies(sql, args, self.fetchrow_value):
+            return None
         return self.fetchrow_value
 
     async def fetch(self, sql, *args):
@@ -178,13 +198,16 @@ async def test_invest_never_raises_the_treasury(monkeypatch, amount, credits, ex
     out = await economy.resolve_intent(3, "invest", "the yards", amount)
 
     assert out["invested"] == expected_invested
-    spends = fake.args_for("credits = credits -", "execute")
+    # The charge is one guarded `fetchrow(UPDATE ... WHERE COALESCE(credits, 0) >= $2 RETURNING ...)`,
+    # so the binds are (session_id, amount). It used to be an `execute` that subtracted whatever the
+    # caller asked for after a separate affordability read.
+    spends = fake.args_for("COALESCE(credits, 0) -", "fetchrow")
     if expected_invested == 0:
         assert not spends, "a refused investment still moved money"
         assert out["success"] is False
     else:
-        assert spends[0] == (expected_invested, 3)
-        assert spends[0][0] > 0
+        assert spends[0] == (3, expected_invested)
+        assert spends[0][1] > 0
 
 
 async def test_buy_still_refuses_a_treasury_it_cannot_cover(monkeypatch):

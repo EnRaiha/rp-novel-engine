@@ -93,23 +93,36 @@ async def update_profile(character_id: int, profile_data: dict, session_id: int 
     info("profile", f"Profile updated for character {character_id}")
 
 
+async def _append_locked(column: str, entry: dict, character_id: int, session_id: int) -> None:
+    """Append `entry` to the jsonb list in `column`, with the row locked from read to write.
+
+    The read and the write are two statements. Without the lock two concurrent grants read the same
+    list and the second write drops the first entry. A `||` append is not used: on a column that holds
+    an object it merges keys silently, and `_as_list` refuses that column by name.
+
+    @param column - `wardrobe_jsonb` or `inventory_jsonb`, never caller text.
+    """
+    async with Database.transaction() as conn:
+        row = await conn.fetchrow(
+            f"SELECT {column} FROM maya_rp.characters WHERE id = $1 AND session_id = $2 FOR UPDATE",
+            character_id, session_id,
+        )
+        _require_character(row, character_id, session_id)
+        entries = _as_list(row[column], column)
+        entries.append(entry)
+        await conn.execute(
+            f"UPDATE maya_rp.characters SET {column} = $1 WHERE id = $2 AND session_id = $3",
+            json.dumps(entries), character_id, session_id,
+        )
+
+
 async def add_to_wardrobe(character_id: int, outfit: dict, session_id: int = None):
     """Add a new outfit to a character's closet."""
     if session_id is None:
         session_id = Config.SESSION_ID
     if not isinstance(outfit, dict):
         raise ValueError("outfit must be a mapping")
-    row = await Database.fetchrow(
-        "SELECT wardrobe_jsonb FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
-        character_id, session_id,
-    )
-    _require_character(row, character_id, session_id)
-    wardrobe = _as_list(row["wardrobe_jsonb"], "wardrobe_jsonb")
-    wardrobe.append(outfit)
-    await Database.execute(
-        "UPDATE maya_rp.characters SET wardrobe_jsonb = $1 WHERE id = $2 AND session_id = $3",
-        json.dumps(wardrobe), character_id, session_id,
-    )
+    await _append_locked("wardrobe_jsonb", outfit, character_id, session_id)
 
 
 async def set_outfit(character_id: int, outfit_id: str, session_id: int = None) -> bool:
@@ -141,17 +154,7 @@ async def add_item(character_id: int, item: dict, session_id: int = None):
         session_id = Config.SESSION_ID
     if not isinstance(item, dict):
         raise ValueError("item must be a mapping")
-    row = await Database.fetchrow(
-        "SELECT inventory_jsonb FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
-        character_id, session_id,
-    )
-    _require_character(row, character_id, session_id)
-    inv = _as_list(row["inventory_jsonb"], "inventory_jsonb")
-    inv.append(item)
-    await Database.execute(
-        "UPDATE maya_rp.characters SET inventory_jsonb = $1 WHERE id = $2 AND session_id = $3",
-        json.dumps(inv), character_id, session_id,
-    )
+    await _append_locked("inventory_jsonb", item, character_id, session_id)
 
 
 async def grant(character_id: int, *, item: dict | None = None, outfit: dict | None = None,
@@ -350,6 +353,11 @@ async def get_character_card(character_id: int, session_id: int = None) -> str:
     return "\n".join(lines)
 
 
+def _contains(text) -> str:
+    """LIKE pattern that matches `text` as a literal substring. Pair it with `ESCAPE '\\'`."""
+    return "%" + str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
 async def get_character_card_by_name(name: str, session_id: int = None) -> str:
     """Lookup a character by name and return card.
     Tries exact match first, then prefix/LIKE, ordered by bond descending.
@@ -367,9 +375,9 @@ async def get_character_card_by_name(name: str, session_id: int = None) -> str:
     if not row:
         row = await Database.fetchrow(
             """SELECT id FROM maya_rp.characters
-               WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2)
+               WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) ESCAPE '\\'
                ORDER BY COALESCE(bond, 0) DESC LIMIT 1""",
-            session_id, f"%{name}%",
+            session_id, _contains(name),
         )
     if row:
         return await get_character_card(row["id"], session_id)

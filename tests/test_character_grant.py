@@ -49,33 +49,35 @@ class TestGrant:
 
 
 class TestAddItemReachesTheCoercion:
-    async def test_an_item_lands_in_a_dict_shaped_inventory(self):
+    async def test_an_item_lands_in_a_dict_shaped_inventory(self, scratch_session):
         """The red proof for the fix: before it, this raised AttributeError on `.append`.
 
-        Nine characters carried `{}` in the column. Setting one back to that shape and adding an item
-        proves `add_item` routes through the coercion rather than testing the helper in isolation.
+        Nine characters carried `{}` in the column. A scratch character set to that shape proves
+        `add_item` routes through the coercion rather than testing the helper in isolation.
         """
         import json as _json
 
         from core.db import Database
+        from modules.character_profile import add_item
 
         await Database.init()
-        target = await Database.fetchrow(
-            "SELECT id, inventory_jsonb FROM maya_rp.characters"
-            " WHERE session_id = 5 AND jsonb_typeof(inventory_jsonb) = 'array' LIMIT 1")
-        assert target, "no character to test against"
-        before = target["inventory_jsonb"]
         try:
+            await Database.execute("DELETE FROM maya_rp.characters WHERE session_id = $1", scratch_session)
+            await Database.execute("DELETE FROM maya_rp.sessions WHERE id = $1", scratch_session)
             await Database.execute(
-                "UPDATE maya_rp.characters SET inventory_jsonb='{}'::jsonb WHERE id=$1", target["id"])
-            from modules.character_profile import add_item
-            await add_item(int(target["id"]), {"name": "red proof item"}, 5)
+                "INSERT INTO maya_rp.sessions (id, name, status) VALUES ($1, 'grant scratch', 'active')",
+                scratch_session)
+            cid = await Database.fetchval(
+                "INSERT INTO maya_rp.characters (session_id, name, inventory_jsonb)"
+                " VALUES ($1, 'Grant Subject', '{}'::jsonb) RETURNING id", scratch_session)
+
+            await add_item(int(cid), {"name": "red proof item"}, scratch_session)
+
             after = await Database.fetchval(
-                "SELECT inventory_jsonb FROM maya_rp.characters WHERE id=$1", target["id"])
+                "SELECT inventory_jsonb FROM maya_rp.characters WHERE id=$1", cid)
             items = after if isinstance(after, list) else _json.loads(after)
             assert any(i.get("name") == "red proof item" for i in items), after
         finally:
-            await Database.execute(
-                "UPDATE maya_rp.characters SET inventory_jsonb=$1::jsonb WHERE id=$2",
-                before if isinstance(before, str) else _json.dumps(before), target["id"])
+            await Database.execute("DELETE FROM maya_rp.characters WHERE session_id = $1", scratch_session)
+            await Database.execute("DELETE FROM maya_rp.sessions WHERE id = $1", scratch_session)
             await Database.close()

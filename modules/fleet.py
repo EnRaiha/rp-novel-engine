@@ -19,6 +19,22 @@ TACTIC_NAMES = frozenset({
     "defense", "hold", "patrol", "standard", "balanced",
 })
 
+def _like(text: str) -> str:
+    """Escape `\\`, `%` and `_` so `text` matches itself inside a LIKE pattern."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+async def _find(table: str, columns: str, session_id: int, name: str):
+    """Exact name first (any case), else an escaped substring. `table` and `columns` are code literals."""
+    rows = await Database.fetch(
+        f"SELECT {columns} FROM maya_rp.{table} WHERE session_id=$1 AND LOWER(name)=LOWER($2) ORDER BY id",
+        session_id, name)
+    if not rows:
+        rows = await Database.fetch(
+            f"SELECT {columns} FROM maya_rp.{table} WHERE session_id=$1 "
+            f"AND LOWER(name) LIKE LOWER($2) ESCAPE '\\' ORDER BY id LIMIT 6",
+            session_id, f"%{_like(name)}%")
+    return rows
+
 async def create_fleet(name: str, formation: str = "spearhead", session_id: int | None = None) -> dict:
     if session_id is None: session_id = require_session(None)
     if formation not in FORMATION_MULT:
@@ -39,14 +55,16 @@ async def create_fleet(name: str, formation: str = "spearhead", session_id: int 
 
 async def assign_ship(ship_name: str, fleet_name: str, position: int | None = None, session_id: int | None = None) -> dict:
     if session_id is None: session_id = require_session(None)
-    sid = await Database.fetchval(
-        "SELECT id FROM maya_rp.ships WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) LIMIT 1",
-        session_id, f"%{ship_name}%")
-    if not sid: return {"error": f"Ship '{ship_name}' not found"}
-    fid = await Database.fetchval(
-        "SELECT id FROM maya_rp.fleets WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) LIMIT 1",
-        session_id, f"%{fleet_name}%")
-    if not fid: return {"error": f"Fleet '{fleet_name}' not found"}
+    ships = await _find("ships", "id, name", session_id, ship_name)
+    if not ships: return {"error": f"Ship '{ship_name}' not found"}
+    if len(ships) > 1:
+        return {"error": f"Ship '{ship_name}' is ambiguous: {', '.join(r['name'] for r in ships)}. Use the full name."}
+    sid = ships[0]["id"]
+    fleets = await _find("fleets", "id, name, formation", session_id, fleet_name)
+    if not fleets: return {"error": f"Fleet '{fleet_name}' not found"}
+    if len(fleets) > 1:
+        return {"error": f"Fleet '{fleet_name}' is ambiguous: {', '.join(r['name'] for r in fleets)}. Use the full name."}
+    fid = fleets[0]["id"]
     if position in (None, 0):  # cli.py:703 passes 0 for "not given"
         taken = {r["position"] for r in await Database.fetch(
             "SELECT position FROM maya_rp.fleet_members WHERE fleet_id=$1 AND ship_id<>$2", fid, sid)}
@@ -82,10 +100,11 @@ async def list_fleets(session_id: int | None = None) -> list[dict]:
 
 async def fleet_battle(fleet_name: str, tactic: str, threat: str, session_id: int | None = None) -> dict:
     if session_id is None: session_id = require_session(None)
-    fleet = await Database.fetchrow(
-        "SELECT id, name, formation FROM maya_rp.fleets WHERE session_id=$1 AND LOWER(name) LIKE LOWER($2) LIMIT 1",
-        session_id, f"%{fleet_name}%")
-    if not fleet: return {"error": f"Fleet '{fleet_name}' not found"}
+    fleets = await _find("fleets", "id, name, formation", session_id, fleet_name)
+    if not fleets: return {"error": f"Fleet '{fleet_name}' not found"}
+    if len(fleets) > 1:
+        return {"error": f"Fleet '{fleet_name}' is ambiguous: {', '.join(r['name'] for r in fleets)}. Use the full name."}
+    fleet = fleets[0]
 
     ships = await Database.fetch(
         "SELECT s.id, s.name, s.hull_current, s.hull, s.speed, s.tier, s.power_rating FROM maya_rp.fleet_members fm "

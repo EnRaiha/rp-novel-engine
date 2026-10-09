@@ -9,13 +9,18 @@ from core.session import require_session
 
 async def run_tick(session_id: int = None) -> dict:
     if session_id is None: session_id = require_session(None)
-    factions = await Database.fetch("SELECT id,name,standing,economic_strength,pirate_fleet_power,reputation FROM maya_rp.factions WHERE session_id=$1 AND name!='Setia Empire'", session_id)
+    factions = await Database.fetch("SELECT id,name,standing,economic_strength,pirate_fleet_power,reputation FROM maya_rp.factions WHERE session_id=$1 AND name!='Setia Empire' ORDER BY id", session_id)
     events = 0
     for i, fa in enumerate(factions):
         for j, fb in enumerate(factions):
             if i >= j: continue
             if random.random() > 0.1: continue
-            rel = await Database.fetchrow("SELECT standing FROM maya_rp.faction_relations WHERE session_id=$1 AND faction_a=$2 AND faction_b=$3", session_id,fa["id"],fb["id"])
+            # A pair is stored in either order; the row written as (fa, fb) wins over its mirror.
+            rel = await Database.fetchrow(
+                "SELECT standing FROM maya_rp.faction_relations WHERE session_id=$1 "
+                "AND ((faction_a=$2 AND faction_b=$3) OR (faction_a=$3 AND faction_b=$2)) "
+                "ORDER BY (faction_a=$2) DESC LIMIT 1",
+                session_id, fa["id"], fb["id"])
             stand = rel["standing"] if rel else "neutral"
             desc = ""
             imp = 1
@@ -26,7 +31,7 @@ async def run_tick(session_id: int = None) -> dict:
                 imp = 2
             elif stand == "neutral" and random.random() < 0.4:
                 desc = f"Trade convoy spotted between {fa['name']} and {fb['name']} territory."
-            elif stand == "ally":
+            elif stand in ("ally", "allied"):
                 desc = f"Joint fleet maneuvers detected: {fa['name']} & {fb['name']}."
             if desc:
                 await Database.execute("INSERT INTO maya_rp.events(session_id,happened_at,event_type,title,description,tags,importance) VALUES($1,NOW(),'geopolitics',$2,$3,$4,$5)", session_id,desc[:80],desc,'["geopolitics","background"]',imp)

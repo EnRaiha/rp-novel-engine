@@ -5,8 +5,8 @@ import json
 import random
 from typing import Any
 from core.db import Database
-from core.config import Config
 from core.log import info, warn
+from core.session import require_session
 from modules._economy import InsufficientResources, _deduct_resources
 
 BURN_RATES = {"per_active_ship": 10, "base_consumption": 50, "food_per_pop": 0.001}
@@ -111,7 +111,7 @@ async def generate_caravan(session_id: int) -> dict:
     return {"cargo": cargo, "quantity": qty, "origin": "friendly_territory", "transit_days": random.randint(1, 5)}
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     try:
         burn = await apply_burn(session_id)
         info("fleet_economy", f"Tick: burn={burn.get('burn',{}).get('fuel',0)}f {burn.get('burn',{}).get('food',0)}fd")

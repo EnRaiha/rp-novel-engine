@@ -13,6 +13,7 @@ sole-DeepSeek decision. Ollama remains ONLY for embeddings (core/embed.py).
 """
 
 from __future__ import annotations
+import json
 import re
 from typing import Any
 
@@ -104,7 +105,8 @@ async def upsert_template(
     """Upsert a stream template + regenerate its semantic embedding.
 
     Raises `ValueError` for empty text or a `generate` blocked marker: the interceptor serves a
-    stored template verbatim.
+    stored template verbatim. An empty `readable_hint` or a `required_context` of `None` keeps the
+    stored value. A `required_context` of `[]` clears it.
     """
     text = (expanded_text or "").strip()
     if not text or text.startswith(BLOCKED_PREFIX):
@@ -122,12 +124,14 @@ async def upsert_template(
     await Database.execute(
         "INSERT INTO maya_rp.stream_templates "
         "(trigger_tag, expanded_text, category, readable_hint, required_context, trigger_tag_embed) "
-        "VALUES ($1, $2, $3, $4, $5::jsonb, $6::vector) "
+        "VALUES ($1, $2, $3, $4, COALESCE($5::jsonb, '[]'::jsonb), $6::vector) "
         "ON CONFLICT (trigger_tag) DO UPDATE SET "
         "expanded_text = EXCLUDED.expanded_text, "
         "category = EXCLUDED.category, "
-        "readable_hint = EXCLUDED.readable_hint, "
-        "required_context = EXCLUDED.required_context, "
+        # An omitted hint or context (`''`, `None`) keeps the stored value: the hint and its vector
+        # must stay a pair, and `[]` is the only way to clear the context.
+        "readable_hint = COALESCE(NULLIF(EXCLUDED.readable_hint, ''), stream_templates.readable_hint), "
+        "required_context = COALESCE($5::jsonb, stream_templates.required_context), "
         # A caller that supplies no `readable_hint` computed no vector, so EXCLUDED's is NULL.
         # Overwriting with it dropped the template out of the interceptor's semantic tier, which
         # reads `trigger_tag_embed` and skips every row where it is NULL.
@@ -137,7 +141,7 @@ async def upsert_template(
         expanded_text,
         category,
         readable_hint,
-        __import__("json").dumps(required_context or []),
+        json.dumps(required_context) if required_context is not None else None,
         vstr,
     )
 

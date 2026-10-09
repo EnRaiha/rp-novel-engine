@@ -104,32 +104,71 @@ async def tick_header(msg: str):
     """Log tick phase header."""
     info("orchestrator", msg)
 
-async def run_full_tick(session_id: int = None, verbose: bool = True):
-    # GM MAYA maintenance stops the tick. Measured on 2026-10-03: `gm_maint status` reported the mode and
-    # four modules read it, but this entry point never asked, so the tick kept writing to the live session
-    # while the brake the operator reached for was armed. It opened a `fuel_zero` collapse arc (Dead in the
-    # Water, 12:00) against a session whose resources row this engine had zeroed. A guard that four callers
-    # honour and the one that drives them ignores is not a guard.
+def guard_session(session_id: int | None = None, verbose: bool = True, label: str = "RP ENGINE TICK") -> int | None:
+    """Apply the brakes every run of the engine must pass, and resolve its session.
+
+    - GM MAYA maintenance armed stops the run. The tick once kept writing to the live session
+      with the brake armed and opened a `fuel_zero` collapse arc (2026-10-03).
+    - The session resolves per call through `require_session`. A process that outlives an arc
+      change must not keep running on the session it started on. Maintenance resolves no
+      session, so the brake runs first.
+    - A frozen session is reference data. Every module writer refuses it, so running it only
+      yields one FrozenSession error per module.
+
+    @param session_id - explicit session id; None resolves through `require_session`.
+    @param verbose - print the reason when the run stops.
+    @param label - the run's name in the printed reason.
+    @returns the session id to run on, or None when the run must not start.
+    @raises RuntimeError when no session resolves.
+    @raises core.session.FrozenListUnreadable when the frozen list cannot be read.
+    """
     from core import maintenance
+    from core.session import is_frozen, require_session
 
     if maintenance.active():
         if verbose:
-            print("  RP ENGINE TICK SKIPPED — GM MAYA maintenance is armed")
-        return
-
-    # Resolved per tick, after the maintenance brake: a process that outlives an arc change must
-    # not keep ticking the session it started on, and maintenance resolves no session at all.
-    from core.session import require_session
-
+            print(f"  {label} SKIPPED — GM MAYA maintenance is armed")
+        return None
     session_id = require_session(session_id)
-
-    # A frozen session is reference data: every module writer refuses it, so ticking it only
-    # produced one FrozenSession error per module and no state change. Say so once and stop.
-    from core.session import is_frozen
-
     if is_frozen(session_id):
         if verbose:
-            print(f"  RP ENGINE TICK SKIPPED — session {session_id} is frozen for reference")
+            print(f"  {label} SKIPPED — session {session_id} is frozen for reference")
+        return None
+    return session_id
+
+
+#: A session's events older than 180 days move to `events_archive` once it holds more rows than this.
+EVENTS_ARCHIVE_MIN_ROWS = 5000
+
+
+async def archive_old_events(session_id: int) -> int:
+    """Move one session's events older than 180 days into `events_archive`.
+
+    Every statement is scoped to `session_id`: the tick of one campaign must not archive or delete
+    the events of another, frozen campaigns included. The move is one statement, so a row cannot
+    be deleted without landing in the archive.
+
+    @param session_id - the session this tick runs on.
+    @returns the number of rows archived; 0 when nothing is old or the session is under the threshold.
+    """
+    old = await Database.fetchval(
+        "SELECT COUNT(*) FROM maya_rp.events "
+        "WHERE session_id=$1 AND happened_at < NOW() - INTERVAL '180 days'", session_id)
+    total = await Database.fetchval(
+        "SELECT COUNT(*) FROM maya_rp.events WHERE session_id=$1", session_id)
+    if not old or not total or total <= EVENTS_ARCHIVE_MIN_ROWS:
+        return 0
+    return await Database.fetchval(
+        "WITH moved AS ("
+        "DELETE FROM maya_rp.events "
+        "WHERE session_id=$1 AND happened_at < NOW() - INTERVAL '180 days' RETURNING *), "
+        "archived AS (INSERT INTO maya_rp.events_archive SELECT * FROM moved RETURNING 1) "
+        "SELECT COUNT(*) FROM archived", session_id)
+
+
+async def run_full_tick(session_id: int = None, verbose: bool = True):
+    session_id = guard_session(session_id, verbose)
+    if session_id is None:
         return
 
     if _tick_lock.locked():
@@ -410,16 +449,9 @@ async def run_full_tick(session_id: int = None, verbose: bool = True):
         # events retention: archive rows older than 180 days when the table
         # grows past 5K rows, so "recent events" queries stay fast.
         try:
-            old = await Database.fetchval(
-                "SELECT COUNT(*) FROM maya_rp.events WHERE happened_at < NOW() - INTERVAL '180 days'")
-            total_ev = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.events")
-            if old and total_ev and total_ev > 5000:
-                archived = await Database.execute(
-                    "INSERT INTO maya_rp.events_archive SELECT * FROM maya_rp.events "
-                    "WHERE happened_at < NOW() - INTERVAL '180 days'")
-                await Database.execute(
-                    "DELETE FROM maya_rp.events WHERE happened_at < NOW() - INTERVAL '180 days'")
-                info("orchestrator", f"Housekeeping: archived {old} old events")
+            archived = await archive_old_events(session_id)
+            if archived:
+                info("orchestrator", f"Housekeeping: archived {archived} old events")
         except Exception as e:
             error("orchestrator", f"Housekeeping failed: {e}")
         try:
@@ -509,14 +541,21 @@ MODULE_MAP = {
     "voyage": voyage_mod, "population_sentiment": population_sentiment_mod, "ministry_ai": ministry_ai_mod,
 }
 
-async def run_single(session_id: int, module_name: str):
-    """Run a single module by name."""
-    await Database.init()
+async def run_single(session_id: int | None, module_name: str):
+    """Run a single module by name, behind the brakes the full tick passes.
+
+    @param session_id - explicit session id; None resolves through `require_session`.
+    @param module_name - key of `MODULE_MAP`.
+    """
+    session_id = guard_session(session_id, label="RP ENGINE MODULE RUN")
+    if session_id is None:
+        return
     mod = MODULE_MAP.get(module_name)
     if not mod:
         print(f"Unknown module: {module_name}")
         print(f"Available: {', '.join(sorted(MODULE_MAP.keys()))}")
         return
+    await Database.init()
     print(f"\nRunning single module: {module_name}")
     await run_module(module_name, mod, session_id)
     await Database.close()
@@ -524,6 +563,6 @@ async def run_single(session_id: int, module_name: str):
 if __name__ == "__main__":
     report_session_drift()
     if len(sys.argv) > 1 and sys.argv[1] != "all":
-        asyncio.run(run_single(Config.SESSION_ID, sys.argv[1]))
+        asyncio.run(run_single(None, sys.argv[1]))
     else:
         asyncio.run(run_full_tick())

@@ -72,48 +72,38 @@ def test_the_burn_follows_its_declared_rates(monkeypatch):
 
 
 def test_a_fleet_with_no_crew_still_pays_the_base_cost(monkeypatch):
-    stub = _StubDB(ships=0, population=0, crew=0)
+    stub = _StubDB(ships=1, population=0, crew=0)
     monkeypatch.setattr(fe, "Database", stub)
     burn = _run(fe.calculate_daily_burn(5))
     assert burn["credits"] == 100
     assert burn["food"] == 1
 
 
-# ── The burn is applied in one statement ────────────────────────────────
-
-
-def test_the_burn_is_decremented_in_the_database(monkeypatch):
-    """The old read-modify-write set absolute values from a snapshot."""
-    stub = _StubDB(updated={"fuel": 900, "alloys": 500, "credits": 700})
+def test_a_session_with_no_billed_ship_burns_nothing(monkeypatch):
+    """Two phantom ships were billed when the count was zero."""
+    stub = _StubDB(ships=0, population=1_000_000, crew=100)
     monkeypatch.setattr(fe, "Database", stub)
-
-    out = _run(fe.apply_burn(3))
-
-    (sql, args), = stub.writes
-    assert "fuel=GREATEST(0, fuel-$1)" in sql and "RETURNING" in sql, sql
-    assert args == (90, 0, 300, 3)
-    assert out["fuel_remaining"] == 900 and out["credits_remaining"] == 700
+    burn = _run(fe.calculate_daily_burn(5))
+    assert burn == {"fuel": 0, "food": 0, "alloy": 0, "credits": 0, "active_ships": 0, "crew": 0}
 
 
-def test_a_session_with_no_resources_row_is_refused(monkeypatch):
-    stub = _StubDB(updated=None)
-    monkeypatch.setattr(fe, "Database", stub)
-
-    out = _run(fe.apply_burn(5))
-
-    assert "No resources row for session 5" in out["error"], out
+# ── The tick ────────────────────────────────────────────────────────────
+# The charge, the once-per-game-day claim and the shortfall record run against the live schema in
+# tests/test_fleet_economy_fix2.py.
 
 
 def test_the_tick_reports_the_burn_and_survives_its_own_error(monkeypatch):
-    stub = _StubDB(updated={"fuel": 10, "alloys": 10, "credits": 10})
-    monkeypatch.setattr(fe, "Database", stub)
+    async def fake_apply(session_id):
+        return {"burn": {"fuel": 90}, "fuel_remaining": 10}
+
+    monkeypatch.setattr(fe, "apply_burn", fake_apply)
     out = _run(fe.run_tick(session_id=3))
     assert out["burn"]["fuel"] == 90 and out["fuel_remaining"] == 10
 
-    class _Boom(_StubDB):
-        async def fetchval(self, sql, *args):
-            raise RuntimeError("connection reset")
-    monkeypatch.setattr(fe, "Database", _Boom())
+    async def boom(session_id):
+        raise RuntimeError("connection reset")
+
+    monkeypatch.setattr(fe, "apply_burn", boom)
     logged = []
     monkeypatch.setattr(fe, "info", lambda *a: logged.append(a[-1]))
     out = _run(fe.run_tick(session_id=3))

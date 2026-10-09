@@ -15,10 +15,8 @@ the take loop never dips into the reserved quantity; a zero-throughput line writ
 no nought-quantity stockpile row; the blocked and unblocked counters are separate;
 and the line selection joins `colonies` on its session.
 
-Reported to the lead, not fixed: the sufficiency check and the take are separate
-statements, so two ticks racing could each see enough stock and together consume
-more than exists. Making that atomic needs a conditional UPDATE or a transaction
-over the whole line.
+The take is guarded and shares one transaction with the outputs. The race and the
+rollback run against the database in tests/test_infra_manufacturing_fix2.py.
 
 No database: every test drives a fake Database.
 """
@@ -71,9 +69,23 @@ class FakeDB:
                 if needle in c[1] and (kind is None or c[0] == kind)]
 
 
+class _Tx:
+    """Stands in for `Database.transaction()`: yields the fake as the connection."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def __aenter__(self):
+        return self.conn
+
+    async def __aexit__(self, *exc):
+        return False
+
+
 def _install(monkeypatch, fake):
     for name in ("fetch", "fetchrow", "fetchval", "execute"):
         monkeypatch.setattr("modules.manufacturing.Database." + name, getattr(fake, name))
+    monkeypatch.setattr("modules.manufacturing.Database.transaction", lambda: _Tx(fake))
     return fake
 
 

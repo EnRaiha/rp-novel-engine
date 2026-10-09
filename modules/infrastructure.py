@@ -50,26 +50,29 @@ async def build_infrastructure(session_id: int, type_id: int,
         if not researched or not researched["unlocked"]:
             return {"error": f'Research "{it["required_tech"]}" required.'}
 
-    # Check cost
-    cost = {"credits": it["build_cost_credits"]}
+    # `build_cost_credits` is nullable: NULL costs nothing.
+    cost = {"credits": it["build_cost_credits"] or 0}
     res_costs = _j(it.get("build_cost_resources"))
     for k, v in res_costs.items():
         cost[k] = v
-    ok, msg = await _check_afford(session_id, cost)
-    if not ok:
-        return {"error": f"Insufficient resources: {msg}"}
-    charged = await _deduct_resources(session_id, cost)
 
     if not name:
         name = f"{it['name']} {random.randint(100, 999)}"
 
-    iid = await Database.fetchrow("""
-        INSERT INTO maya_rp.infrastructure_instances
-            (session_id, infrastructure_type_id, territory_id, sector_id,
-             name, level, status, built_at)
-        VALUES ($1, $2, $3, $4, $5, 1, 'active', NOW())
-        RETURNING id
-    """, session_id, type_id, territory_id, sector_id, name)
+    # The charge and the row commit together. An INSERT error rolls the charge back.
+    # A treasury that a racing build emptied returns an error instead of raising.
+    async with Database.transaction() as conn:
+        try:
+            charged = await _deduct_resources(session_id, cost, conn=conn)
+        except ValueError as exc:   # short treasury, a resource the ledger lacks (food), a bad quantity
+            return {"error": f"Insufficient resources: {exc}"}
+        iid = await conn.fetchrow("""
+            INSERT INTO maya_rp.infrastructure_instances
+                (session_id, infrastructure_type_id, territory_id, sector_id,
+                 name, level, status, built_at)
+            VALUES ($1, $2, $3, $4, $5, 1, 'active', NOW())
+            RETURNING id
+        """, session_id, type_id, territory_id, sector_id, name)
 
     await _log(session_id, "infrastructure",
                f"🏗️ {it['category'].title()} Built: {name}",
@@ -128,18 +131,22 @@ async def upgrade_infrastructure(session_id: int, inst_id: int) -> dict:
         elif cat == "arcane":
             upgrade_cost["dream_essence"] = 2 * level
 
-    ok, why = await _check_afford(session_id, upgrade_cost)
-    if not ok:
-        return {"error": f"Insufficient resources for upgrade: {why}"}
-    charged = await _deduct_resources(session_id, upgrade_cost)
-
-    new_level = level + 1
-    bonus = 1.0 + (new_level - 1) * 0.1
-    await Database.execute("""
-        UPDATE maya_rp.infrastructure_instances
-        SET level = $1, last_upgrade = NOW(), production_bonus = $2
-        WHERE id = $3 AND session_id = $4
-    """, new_level, bonus, inst_id, session_id)
+    # Claim the level first, then charge, in one transaction. Only the upgrade that moves the
+    # level pays. A charge error rolls the claim back. `production_bonus` uses the pre-update level.
+    try:
+        async with Database.transaction() as conn:
+            row = await conn.fetchrow(
+                "UPDATE maya_rp.infrastructure_instances SET level = level + 1, last_upgrade = NOW(),"
+                " production_bonus = 1.0 + level * 0.1"
+                " WHERE id = $1 AND session_id = $2 AND level = $3 RETURNING level, production_bonus",
+                inst_id, session_id, inst["level"])
+            if row is not None:
+                charged = await _deduct_resources(session_id, upgrade_cost, conn=conn)
+    except ValueError as exc:
+        return {"error": f"Insufficient resources for upgrade: {exc}"}
+    if row is None:
+        return {"error": f"Infrastructure {inst_id} changed level while the upgrade ran. Retry the upgrade."}
+    new_level, bonus = row["level"], float(row["production_bonus"])
 
     await _log(session_id, "infrastructure",
                f"⬆️ Upgraded: {inst['name']}",

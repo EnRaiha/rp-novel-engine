@@ -7,7 +7,9 @@ Defects covered:
    session raised NameError instead of defaulting.
 2. `run_tick` defaulted to the literal session 3 — the frozen reference
    campaign — while Config.SESSION_ID resolves to the active arc.
-3. `upgrade_infrastructure` wrote the new level with `WHERE id = $3` alone.
+3. `upgrade_infrastructure` wrote the new level with `WHERE id = $3` alone. It now claims
+   the level with `WHERE id = $2 AND session_id = ... AND level = $3` and charges on the
+   same transaction connection.
 4. `run_production_tick` credited `resources` and then logged the payout into
    `infrastructure_production` whether or not the UPDATE matched a row, so a
    session with no `resources` row logged production that never landed.
@@ -30,6 +32,8 @@ column.
 No database: every test drives a fake Database.
 """
 from __future__ import annotations
+
+from decimal import Decimal
 
 import pytest
 
@@ -70,9 +74,23 @@ class FakeDB:
                 if needle in c[1] and (kind is None or c[0] == kind)]
 
 
+class _Tx:
+    """Stands in for `Database.transaction()`: yields the given connection."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def __aenter__(self):
+        return self.conn
+
+    async def __aexit__(self, *exc):
+        return False
+
+
 def _install(monkeypatch, fake):
     for name in ("fetch", "fetchrow", "fetchval", "execute"):
         monkeypatch.setattr("modules.infrastructure.Database." + name, getattr(fake, name))
+    monkeypatch.setattr("modules.infrastructure.Database.transaction", lambda: _Tx(fake))
     return fake
 
 
@@ -135,24 +153,28 @@ async def test_run_tick_reports_a_crash_as_an_error(monkeypatch):
 async def test_upgrade_writes_by_id_and_session(monkeypatch):
     inst = {"id": 3, "session_id": 5, "level": 2, "name": "Foundry",
             "infrastructure_type_id": 1}
-    fake = _install(monkeypatch, FakeDB(
-        fetchrow=lambda sql, args: inst if "infrastructure_instances" in sql else {"category": "mining"}))
 
-    async def afford(session_id, cost):
-        return True, ""
+    def fetchrow(sql, args):
+        if "RETURNING level" in sql:
+            return {"level": 3, "production_bonus": Decimal("1.2")}
+        return inst if "infrastructure_instances" in sql else {"category": "mining"}
 
-    async def deduct(session_id, cost):
+    fake = _install(monkeypatch, FakeDB(fetchrow=fetchrow))
+    charged_on = []
+
+    async def deduct(session_id, cost, conn=None):
+        charged_on.append(conn)
         return dict(cost)
 
-    monkeypatch.setattr("modules.infrastructure._check_afford", afford)
     monkeypatch.setattr("modules.infrastructure._deduct_resources", deduct)
 
     out = await infra.upgrade_infrastructure(5, 3)
 
     assert out["new_level"] == 3
-    update = fake.args_for("SET level = $1", "execute")[0]
-    assert update == (3, pytest.approx(1.2), 3, 5)
-    assert "session_id = $4" in fake.sql("execute")[0]
+    assert out["bonus"] == pytest.approx(1.2)
+    assert fake.args_for("RETURNING level", "fetchrow")[0] == (3, 5, 2)
+    assert "session_id = $2" in [s for s in fake.sql("fetchrow") if "RETURNING level" in s][0]
+    assert charged_on == [fake], "the charge left the claim's transaction"
 
 
 async def test_upgrade_refuses_an_instance_from_another_campaign(monkeypatch):
@@ -270,22 +292,25 @@ async def test_build_accepts_placement_owned_by_this_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=None, fetchval=1, execute_tag="UPDATE 1"))
     monkeypatch.setattr("modules.infrastructure.Database.fetchrow",
                         FakeDB(fetchrow=it).fetchrow)
+    tx_conn = FakeDB(fetchrow={"id": 9})
+    monkeypatch.setattr("modules.infrastructure.Database.transaction", lambda: _Tx(tx_conn))
+    charged_on = []
 
-    async def afford(session_id, cost):
-        return True, ""
-
-    async def deduct(session_id, cost):
+    async def deduct(session_id, cost, conn=None):
+        charged_on.append(conn)
         return dict(cost)
 
-    monkeypatch.setattr("modules.infrastructure._check_afford", afford)
     monkeypatch.setattr("modules.infrastructure._deduct_resources", deduct)
 
     out = await infra.build_infrastructure(5, 1, territory_id=42, name="Deep Mine")
 
     assert out["name"] == "Deep Mine" and out["category"] == "mining"
+    assert out["infrastructure_id"] == 9
     assert "Territory 42 is not in session" not in str(out)
     owns = fake.args_for("FROM maya_rp.territory", "fetchval")
     assert owns and owns[0] == (42, 5)
+    assert charged_on == [tx_conn], "the charge left the build's transaction"
+    assert tx_conn.args_for("INSERT INTO maya_rp.infrastructure_instances", "fetchrow")
 
 
 # ── Contract the module claims ───────────────────────────────────────────

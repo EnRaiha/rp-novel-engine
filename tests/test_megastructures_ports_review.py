@@ -49,6 +49,27 @@ async def _drop_port(pid):
     await Database.execute("DELETE FROM maya_rp.ports WHERE id = $1", pid)
 
 
+class _RecordingDatabase:
+    """Answers one unfinished site and keeps every value the tick binds for `progress_pct`.
+
+    A long-run rate needs thousands of ticks, which is a rate at which the pool would dominate the
+    run. Nothing is lost by leaving it out: asyncpg truncates on encode, so the value bound here is
+    the last point at which a fractional step can survive, and the read and the write are the whole
+    of the path this test measures.
+    """
+
+    def __init__(self):
+        self.written = []
+
+    async def fetch(self, sql, *args):
+        return [{"id": 1, "status": "construction", "current_phase": 1, "progress_pct": 0,
+                 "construction_phases": [{"phase": 1, "cost": {}, "time_days": 365}],
+                 "name": "Dyson Sphere"}]
+
+    async def execute(self, sql, *args):
+        self.written.append(args[0])
+
+
 class TestTheTickStaysInItsCampaign:
     async def test_advancing_ignores_another_campaign(self):
         """One phase is 365 game days, so 365 days in one call is the call that would pause it."""
@@ -76,22 +97,55 @@ class TestTheTickStaysInItsCampaign:
             await _drop_construction(cid)
             await Database.close()
 
-    async def test_a_short_tick_stores_nothing_at_all(self):
-        """`progress_pct` is an integer column and the advance is a fraction of a percent.
+    async def test_a_sub_one_percent_step_reaches_the_integer_column(self, scratch_session, monkeypatch):
+        """Two pinned draws through the real column: 0.137 rounds up once, then rounds down.
 
-        Reported, not fixed: the write truncates, so a 0.5 game-day tick against a 365-day phase
-        stores 0 and the construction never moves. A whole-number column is a migration.
+        The write truncates nothing in Python, so the loss happens at the column: asyncpg binds a
+        float into `progress_pct` as an integer without raising (measured: 0.25 stores 0), and one
+        tick against a 365-day phase is 0.137. The old expectation here was `progress == 0`, which
+        is that truncation.
         """
+        import random
+
         await Database.init()
-        cid = await _construction(progress=0)
+        await _seed_session(scratch_session)
         try:
-            await mp.advance_megastructure(SESSION, 0.5)
+            cid = await _construction(scratch_session, progress=0)
+
+            monkeypatch.setattr(random, "random", lambda: 0.0)      # the fraction rounds up
+            await mp.advance_megastructure(scratch_session, 0.5)
             progress = await Database.fetchval(
                 "SELECT progress_pct FROM maya_rp.megastructure_construction WHERE id = $1", cid)
-            assert progress == 0
+            assert progress == 1, "a sub-1% step was truncated to nothing"
+
+            monkeypatch.setattr(random, "random", lambda: 0.999)    # and the next one rounds down
+            await mp.advance_megastructure(scratch_session, 0.5)
+            progress = await Database.fetchval(
+                "SELECT progress_pct FROM maya_rp.megastructure_construction WHERE id = $1", cid)
+            assert progress == 1, "the step was counted twice"
         finally:
-            await _drop_construction(cid)
+            await _drop_session(scratch_session)
             await Database.close()
+
+    async def test_a_short_tick_keeps_the_long_run_rate(self, monkeypatch):
+        """0.5 game days against a 365-day phase is 0.137% of the phase, and the column is INTEGER.
+
+        One draw decides nothing: rounding up is correct 13.7% of the time. Seeded, over many
+        ticks, the mean is the check. A mean of 0 is the truncation (`int()` in Python, or the
+        column's own encode); a mean of 1 is an unconditional round up.
+        """
+        import random
+
+        recorder = _RecordingDatabase()
+        monkeypatch.setattr(mp, "Database", recorder)
+        random.seed(20261009)
+        ticks = 40_000
+        for _ in range(ticks):
+            await mp.advance_megastructure(7, 0.5)
+
+        assert len(recorder.written) == ticks, "the tick did not reach its write"
+        rate = sum(recorder.written) / ticks
+        assert abs(rate - (0.5 / 365) * 100) < 0.02, f"the long-run rate drifted: {rate}"
 
     async def test_the_tick_does_not_default_to_the_frozen_campaign(self):
         default = inspect.signature(mp.run_tick).parameters["session_id"].default
@@ -311,3 +365,97 @@ class TestTheCharge:
         out = await mp.start_construction(7, TYPE_ID)
         assert "error" not in out, out
         assert recorded["estimated"].tzinfo is None, "a tz-aware value cannot enter a naive column"
+
+
+# ── the paused site ──────────────────────────────────────────────────────────
+
+
+async def _paused_construction(session_id, progress=100):
+    """A site that reached the phase boundary and could not pay for the next phase."""
+    return await Database.fetchval(
+        "INSERT INTO maya_rp.megastructure_construction "
+        "(session_id, megastructure_type_id, current_phase, progress_pct, status, started_at) "
+        "VALUES ($1, $2, 1, $3, 'paused', NOW()) RETURNING id",
+        session_id, TYPE_ID, progress)
+
+
+class TestThePausedSite:
+    """A paused site left the tick's read set for good, so the treasury recovering changed nothing.
+
+    The read filtered on `mc.status = 'construction'`, and the only writes to that column are
+    `paused` and `completed`: nothing put a site back, so the eleven paused and repair rows in the
+    reference campaign could never move again. Every row here belongs to `scratch_session`.
+
+    Dyson Sphere phase 2 costs 200000 alloys and 1000 rare earth, and takes 730 days.
+    """
+
+    async def test_a_paused_site_resumes_when_the_next_phase_is_affordable(self, scratch_session):
+        await Database.init()
+        await _seed_session(scratch_session)
+        try:
+            await Database.execute(
+                "INSERT INTO maya_rp.resources (session_id, credits, alloys, fuel, dream_essence,"
+                " rare_earth) VALUES ($1, 0, 250000, 0, 0, 1000)", scratch_session)
+            cid = await _paused_construction(scratch_session)
+
+            await mp.advance_megastructure(scratch_session, 365.0)
+
+            row = await Database.fetchrow(
+                "SELECT current_phase, progress_pct, status FROM maya_rp.megastructure_construction"
+                " WHERE id = $1", cid)
+            assert (row["current_phase"], row["progress_pct"], row["status"]) == (2, 0, "construction"), \
+                dict(row)
+            left = await Database.fetchrow(
+                "SELECT alloys, rare_earth FROM maya_rp.resources WHERE session_id = $1",
+                scratch_session)
+            assert (left["alloys"], left["rare_earth"]) == (50000, 0), \
+                f"phase 2 was not charged exactly once: {dict(left)}"
+
+            # The resumed site keeps building, and a tick inside phase 2 charges nothing.
+            await mp.advance_megastructure(scratch_session, 365.0)
+            row = await Database.fetchrow(
+                "SELECT current_phase, progress_pct, status FROM maya_rp.megastructure_construction"
+                " WHERE id = $1", cid)
+            assert (row["current_phase"], row["progress_pct"], row["status"]) == (2, 50, "construction"), \
+                dict(row)
+            left = await Database.fetchrow(
+                "SELECT alloys, rare_earth FROM maya_rp.resources WHERE session_id = $1",
+                scratch_session)
+            assert (left["alloys"], left["rare_earth"]) == (50000, 0), \
+                f"a phase the site already paid for was charged again: {dict(left)}"
+        finally:
+            await _drop_session(scratch_session)
+            await Database.close()
+
+    async def test_a_paused_site_that_still_cannot_afford_stays_paused(self, scratch_session):
+        """The resume rides on the phase the site can pay for, and one stall is logged once.
+
+        Folding the resume into the progress write instead flipped the site back to `construction`
+        on a tick that could not pay, so the next tick paused it again: one stall, two entries.
+        """
+        await Database.init()
+        await _seed_session(scratch_session)
+        try:
+            await Database.execute(
+                "INSERT INTO maya_rp.resources (session_id, credits, alloys, fuel, dream_essence,"
+                " rare_earth) VALUES ($1, 0, 1000, 0, 0, 0)", scratch_session)
+            cid = await _paused_construction(scratch_session)
+
+            await mp.advance_megastructure(scratch_session, 365.0)
+            await mp.advance_megastructure(scratch_session, 365.0)
+
+            row = await Database.fetchrow(
+                "SELECT current_phase, progress_pct, status FROM maya_rp.megastructure_construction"
+                " WHERE id = $1", cid)
+            assert (row["current_phase"], row["progress_pct"], row["status"]) == (1, 100, "paused"), \
+                dict(row)
+            left = await Database.fetchval(
+                "SELECT alloys FROM maya_rp.resources WHERE session_id = $1", scratch_session)
+            assert left == 1000, "an unaffordable phase was charged"
+            entries = await Database.fetchval(
+                "SELECT count(*) FROM maya_rp.story_log WHERE session_id = $1"
+                " AND category = 'megastructure'", scratch_session)
+            assert entries == 0, f"an already-paused site logged its stall {entries} times"
+        finally:
+            await _drop_session(scratch_session)
+            await Database.close()

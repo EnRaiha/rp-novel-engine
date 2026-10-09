@@ -3,7 +3,7 @@ import random, json
 from datetime import datetime, timezone, timedelta
 from core.db import Database
 from core.config import Config
-from modules._economy import _check_afford, _deduct_resources
+from modules._economy import _check_afford, _deduct_resources, stochastic_round
 from core.events import EventBus
 from core.log import error
 
@@ -75,13 +75,17 @@ async def advance_megastructure(session_id: int, game_days: float = 0.5) -> dict
 
     The read took no session, so one campaign's tick advanced every campaign's construction sites,
     and a phase that fell due elsewhere was charged to whichever session ran the tick.
+
+    A `paused` site is read as well: no statement anywhere writes `construction` back after the
+    pause, so a read filtered on that one status dropped a site for good the moment it could not
+    afford its next phase, and it was never retried once the treasury recovered.
     """
     tally = {"advanced": 0, "paused": 0, "completed": 0}
     for const in await Database.fetch("""
         SELECT mc.*, mt.construction_phases, mt.name
         FROM maya_rp.megastructure_construction mc
         JOIN maya_rp.megastructure_types mt ON mt.id = mc.megastructure_type_id
-        WHERE mc.status = 'construction' AND mc.session_id = $1
+        WHERE mc.status IN ('construction', 'paused') AND mc.session_id = $1
     """, session_id):
         phases = _j(const.get("construction_phases"))
         if not phases or const["current_phase"] > len(phases):
@@ -90,7 +94,11 @@ async def advance_megastructure(session_id: int, game_days: float = 0.5) -> dict
         phase = phases[const["current_phase"] - 1]
         total_days = phase.get("time_days", 30)
         advance = (game_days / total_days) * 100
-        new_progress = min(100, (const["progress_pct"] or 0) + advance)
+        # `progress_pct` is INTEGER and asyncpg truncates a float into it without a word (measured on
+        # 0.31.0: `SELECT $1::int4` with 0.25 gives 0). A tick adds well under one percent: 0.5 game
+        # days against a 365-day phase is 0.137, so a truncated write stored 0 on every tick and the
+        # site never moved. `int()` truncates the same way and would reproduce the defect in Python.
+        new_progress = min(100, stochastic_round((const["progress_pct"] or 0) + advance))
 
         await Database.execute(
             "UPDATE maya_rp.megastructure_construction SET progress_pct = $1 WHERE id = $2",
@@ -106,22 +114,33 @@ async def advance_megastructure(session_id: int, game_days: float = 0.5) -> dict
                 ok, _ = await _check_afford(session_id, next_cost)
                 if ok:
                     await _deduct_resources(session_id, next_cost)
+                    # The resume rides on the phase this site can now pay for. Writing
+                    # `construction` on the progress update instead flipped a site that still
+                    # cannot afford its next phase back to `construction` on every tick, and it
+                    # logged a resume each time.
                     await Database.execute("""
                         UPDATE maya_rp.megastructure_construction
-                        SET current_phase = $1, progress_pct = 0 WHERE id = $2
+                        SET current_phase = $1, progress_pct = 0, status = 'construction' WHERE id = $2
                     """, const["current_phase"] + 1, const["id"])
+                    if const["status"] == "paused":
+                        await _log(session_id, "megastructure",
+                                   f"▶️ Resumed: {const['name']}",
+                                   "The next phase is affordable again; construction resumed.", 2)
                     await _log(session_id, "megastructure",
                                f"Phase {const['current_phase']+1} Started: {const['name']}",
                                f"Phase {const['current_phase']+1} of {const['name']} begun.", 3)
                 else:
-                    await Database.execute(
-                        "UPDATE maya_rp.megastructure_construction SET status = 'paused' WHERE id = $1",
-                        const["id"]
-                    )
+                    # One write and one entry per stall, not per tick: the paused site is in the
+                    # read set now, so an unguarded branch logged the shortage on every tick.
+                    if const["status"] != "paused":
+                        await Database.execute(
+                            "UPDATE maya_rp.megastructure_construction SET status = 'paused' WHERE id = $1",
+                            const["id"]
+                        )
+                        await _log(session_id, "megastructure",
+                                   f"⏸️ Paused: {const['name']}",
+                                   "Insufficient resources for next phase. Paused.", 2)
                     tally["paused"] += 1
-                    await _log(session_id, "megastructure",
-                               f"⏸️ Paused: {const['name']}",
-                               "Insufficient resources for next phase. Paused.", 2)
             else:
                 # COMPLETE!
                 await Database.execute(

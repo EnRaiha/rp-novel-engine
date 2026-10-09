@@ -36,7 +36,9 @@ async def _find(table: str, columns: str, session_id: int, name: str):
     return rows
 
 async def create_fleet(name: str, formation: str = "spearhead", session_id: int | None = None) -> dict:
-    if session_id is None: session_id = require_session(None)
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if formation not in FORMATION_MULT:
         # The schema allows exactly the six in FORMATION_MULT, and the CLI says so.
         # An unknown name used to be stored and then fight at 1.0/1.0 in silence.
@@ -54,7 +56,9 @@ async def create_fleet(name: str, formation: str = "spearhead", session_id: int 
     return {"fleet": name, "formation": formation}
 
 async def assign_ship(ship_name: str, fleet_name: str, position: int | None = None, session_id: int | None = None) -> dict:
-    if session_id is None: session_id = require_session(None)
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     ships = await _find("ships", "id, name", session_id, ship_name)
     if not ships: return {"error": f"Ship '{ship_name}' not found"}
     if len(ships) > 1:
@@ -79,7 +83,7 @@ async def assign_ship(ship_name: str, fleet_name: str, position: int | None = No
     return {"assigned": True, "ship": ship_name, "fleet": fleet_name, "position": position}
 
 async def list_fleets(session_id: int | None = None) -> list[dict]:
-    if session_id is None: session_id = require_session(None)
+    session_id = require_session(session_id)
     fleets = await Database.fetch(
         "SELECT f.id, f.name, f.formation, f.status, s.name AS flagship "
         "FROM maya_rp.fleets f LEFT JOIN maya_rp.ships s ON f.flagship_id=s.id "
@@ -99,7 +103,9 @@ async def list_fleets(session_id: int | None = None) -> list[dict]:
     return result
 
 async def fleet_battle(fleet_name: str, tactic: str, threat: str, session_id: int | None = None) -> dict:
-    if session_id is None: session_id = require_session(None)
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     fleets = await _find("fleets", "id, name, formation", session_id, fleet_name)
     if not fleets: return {"error": f"Fleet '{fleet_name}' not found"}
     if len(fleets) > 1:
@@ -163,7 +169,7 @@ async def fleet_battle(fleet_name: str, tactic: str, threat: str, session_id: in
             "enemy_power": round(enemy_power)}
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = require_session(None)
+    session_id = require_session(session_id)
     fleets = await list_fleets(session_id)
     info("fleet", f"Tick: {len(fleets)} fleets")
     return {"fleets": len(fleets)}

@@ -3,6 +3,7 @@ import random, json
 from datetime import datetime, timezone, timedelta
 from core.db import Database
 from core.config import Config
+from core.session import require_session
 from modules._economy import InsufficientResources, _check_afford, _deduct_resources, stochastic_round
 from core.events import EventBus
 from core.log import error, warn
@@ -20,6 +21,9 @@ async def get_megastructure_types():
 async def start_construction(session_id: int, megastructure_type_id: int,
                              sector_id: int = None, territory_id: int = None) -> dict:
     """Begin building a megastructure."""
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     mt = await Database.fetchrow(
         "SELECT * FROM maya_rp.megastructure_types WHERE id = $1", megastructure_type_id
     )
@@ -80,6 +84,9 @@ async def advance_megastructure(session_id: int, game_days: float = 0.5) -> dict
     pause, so a read filtered on that one status dropped a site for good the moment it could not
     afford its next phase, and it was never retried once the treasury recovered.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     tally = {"advanced": 0, "paused": 0, "completed": 0}
     for const in await Database.fetch("""
         SELECT mc.*, mt.construction_phases, mt.name
@@ -174,8 +181,7 @@ async def get_megastructure_status(session_id: int | None = None):
     view behind it exposed no `session_id` at all, so playing Arc I listed the frozen campaign's
     construction sites. Migration 129 adds the column; this asks for it.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     return [dict(r) for r in await Database.fetch(
         "SELECT * FROM maya_rp.megastructure_status WHERE session_id = $1"
         " ORDER BY status, estimated_completion", session_id
@@ -235,6 +241,9 @@ async def get_port_types():
 
 async def build_port(session_id: int, territory_id: int, port_type_id: int, name: str = None) -> dict:
     """Construct a port in a territory."""
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     pt = await Database.fetchrow(
         "SELECT * FROM maya_rp.port_types WHERE id = $1", port_type_id
     )
@@ -274,6 +283,9 @@ async def upgrade_port(session_id: int, port_id: int, upgrade_name: str) -> dict
     The port was resolved by id alone, so a campaign could spend its own credits raising another
     campaign's port.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     port = await Database.fetchrow(
         "SELECT * FROM maya_rp.ports WHERE id = $1 AND session_id = $2", port_id, session_id)
     if not port:
@@ -314,8 +326,7 @@ async def upgrade_port(session_id: int, port_id: int, upgrade_name: str) -> dict
 
 async def get_port_overview(session_id: int | None = None):
     """This session's ports."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     return [dict(r) for r in await Database.fetch(
         "SELECT * FROM maya_rp.port_overview WHERE session_id = $1 ORDER BY territory_name, name",
         session_id
@@ -327,10 +338,9 @@ async def get_port_overview(session_id: int | None = None):
 
 async def run_tick(session_id: int | None = None) -> dict:
     """Megastructure + Port tick — advance construction."""
-    if session_id is None:
-        # The default was the literal 3, the frozen reference campaign: a tick run without an
-        # argument advanced that campaign's building sites.
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         return await advance_megastructure(session_id)
     except Exception as e:

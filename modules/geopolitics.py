@@ -8,7 +8,9 @@ from core.log import info
 from core.session import require_session
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = require_session(None)
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     factions = await Database.fetch("SELECT id,name,standing,economic_strength,pirate_fleet_power,reputation FROM maya_rp.factions WHERE session_id=$1 AND name!='Setia Empire' ORDER BY id", session_id)
     events = 0
     for i, fa in enumerate(factions):

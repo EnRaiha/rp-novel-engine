@@ -94,7 +94,7 @@ def _install(monkeypatch, fake):
 
 async def test_gate_toll_income_defaults_to_the_engine_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchval=0))
-    monkeypatch.setattr("modules.economy.Config.SESSION_ID", 77)
+    monkeypatch.setenv("RP_SESSION", "77")
 
     await economy.gate_toll_income()
 
@@ -103,7 +103,7 @@ async def test_gate_toll_income_defaults_to_the_engine_session(monkeypatch):
 
 async def test_run_tick_defaults_to_the_engine_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow={}))
-    monkeypatch.setattr("modules.economy.Config.SESSION_ID", 77)
+    monkeypatch.setenv("RP_SESSION", "77")
 
     await economy.run_tick()
 

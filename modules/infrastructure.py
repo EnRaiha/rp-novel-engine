@@ -2,6 +2,7 @@
 import random, json
 from datetime import datetime, timezone
 from core.config import Config
+from core.session import require_session
 from core.db import Database
 from modules._economy import RESOURCE_COLUMNS, _check_afford, _deduct_resources
 from core.events import EventBus
@@ -18,6 +19,9 @@ async def build_infrastructure(session_id: int, type_id: int,
                                territory_id: int = None, sector_id: int = None,
                                name: str = None) -> dict:
     """Construct an infrastructure facility."""
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     it = await Database.fetchrow(
         "SELECT * FROM maya_rp.infrastructure_types WHERE id = $1", type_id
     )
@@ -88,8 +92,7 @@ async def get_infrastructure(inst_id: int, session_id: int | None = None) -> dic
     playing session 5 listed and opened session 3's facilities. The same leak was fixed in battle and
     pirate aggregates; this is the same class.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     row = await Database.fetchrow(
         "SELECT * FROM maya_rp.infrastructure_overview WHERE id = $1 AND session_id = $2",
         inst_id, session_id
@@ -98,8 +101,7 @@ async def get_infrastructure(inst_id: int, session_id: int | None = None) -> dic
 
 async def list_infrastructure(session_id: int | None = None) -> list:
     """List this session's infrastructure instances."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     return [dict(r) for r in await Database.fetch(
         "SELECT * FROM maya_rp.infrastructure_overview WHERE session_id = $1"
         " ORDER BY territory_name, type_name", session_id
@@ -107,6 +109,9 @@ async def list_infrastructure(session_id: int | None = None) -> list:
 
 async def upgrade_infrastructure(session_id: int, inst_id: int) -> dict:
     """Upgrade infrastructure to next level."""
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     inst = await Database.fetchrow(
         "SELECT * FROM maya_rp.infrastructure_instances WHERE id = $1 AND session_id = $2",
         inst_id, session_id
@@ -178,6 +183,9 @@ async def run_production_tick(session_id: int, game_days: float = 0.5) -> dict:
     that never reached a treasury. One malformed `effects` row is skipped and
     named rather than aborting the whole tick.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     produced = {}
     unlanded = {}
     skipped = []
@@ -229,12 +237,14 @@ async def run_production_tick(session_id: int, game_days: float = 0.5) -> dict:
 async def run_tick(session_id: int = None):
     """Infrastructure tick — run production.
 
-    Defaults to the engine's session (Config.SESSION_ID), not the literal 3: that
-    id is the frozen reference campaign, so a bare tick produced there.
+    Resolves the session with `require_session`: an explicit id, else RP_SESSION or the active arc.
+
+    @raises FrozenSession when the campaign is frozen reference data and maintenance is not armed.
     """
     from core.log import info, error
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         out = await run_production_tick(session_id)
         info("infrastructure", f"Tick: produced {out['produced'] or 'nothing'}")

@@ -45,6 +45,9 @@ async def apply_burn(session_id: int) -> dict:
     treasury cannot cover is left uncharged and recorded as a `fleet_shortfall` event and in the
     `shortfall` key. The day stays claimed, so the unpaid burn is not retried.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     async with Database.transaction() as conn:
         await conn.execute("SELECT pg_advisory_xact_lock(hashtext('fleet_economy'), $1)", session_id)
         day = await conn.fetchval("SELECT COALESCE(game_day, 1) FROM maya_rp.sessions WHERE id=$1", session_id)
@@ -111,7 +114,9 @@ async def generate_caravan(session_id: int) -> dict:
     return {"cargo": cargo, "quantity": qty, "origin": "friendly_territory", "transit_days": random.randint(1, 5)}
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = require_session(None)
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         burn = await apply_burn(session_id)
         info("fleet_economy", f"Tick: burn={burn.get('burn',{}).get('fuel',0)}f {burn.get('burn',{}).get('food',0)}fd")

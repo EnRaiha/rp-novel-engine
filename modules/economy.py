@@ -1,6 +1,7 @@
 """Async economy module — tax, population, trade."""
 from core.db import Database
 from core.config import Config
+from core.session import require_session
 from core.utils import calc_game_days, clamp
 from datetime import datetime, timezone
 from core.log import error, info
@@ -53,11 +54,9 @@ async def gate_toll_income(session_id: int = None) -> int:
     grounded in active trade deals between Setia and non-Setia factions,
     scaled by volume (one crossing per GATE_TOLL_VOLUME_PER_CROSSING units).
 
-    Defaults to the engine's session (Config.SESSION_ID). The literal 3 is the
-    frozen reference campaign, so a bare call read the wrong arc.
+    Resolves the session with `require_session`: an explicit id, else RP_SESSION or the active arc.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     try:
         volume = await Database.fetchval(
             """SELECT COALESCE(SUM(ftd.quantity), 0)
@@ -77,11 +76,13 @@ async def gate_toll_income(session_id: int = None) -> int:
 async def run_tick(session_id: int = None):
     """Tax, population and trade for one campaign.
 
-    Defaults to the engine's session (Config.SESSION_ID), not the literal 3:
-    that id is the frozen reference campaign, so a bare tick wrote there.
+    Resolves the session with `require_session`: an explicit id, else RP_SESSION or the active arc.
+
+    @raises FrozenSession when the campaign is frozen reference data and maintenance is not armed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     row = await Database.fetchrow("SELECT last_tick_at FROM resources WHERE session_id=$1", session_id)
     if not row or not row.get("last_tick_at"):
         return
@@ -271,8 +272,11 @@ async def resolve_intent(session_id: int, action: str, target: str, amount: int 
         the extra keys depend on the branch: `cost` and `credits_remaining` on a
         successful buy, `cost` and `credits_available` on a refused one, `gain`
         on a sell, `invested` on an invest, `error` when there is no treasury.
-        The docstring used to promise a `result` key that no branch ever set.
+    @raises FrozenSession when the campaign is frozen reference data and maintenance is not armed.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     r = await Database.fetchrow(
         "SELECT credits, alloys, fuel FROM maya_rp.resources WHERE session_id=$1", session_id)
     if not r:

@@ -32,8 +32,10 @@ DEFAULT_TAX_TOLERANCE = 0.20
 
 async def get(session_id: int = None) -> dict:
     """The society this campaign has become. Derives and PERSISTS one when no
-    row exists yet, which is why this read can write."""
-    if session_id is None: session_id = require_session(None)
+    row exists yet, which is why this read can write. A frozen campaign is derived
+    and returned without the write."""
+    session_id = require_session(session_id)
+    from core.ooc import _writes_allowed
     state = await Database.fetchrow("SELECT ideology,scores_jsonb FROM maya_rp.ideology_state WHERE session_id=$1", session_id)
     if state:
         profile = IDEOS.get(state["ideology"])
@@ -42,7 +44,7 @@ async def get(session_id: int = None) -> dict:
                              f"{state['ideology']!r} — neutral profile shown, not a guess")
             profile = UNDETERMINED_PROFILE
         return {"ideology":state["ideology"],"scores":_scores(state.get("scores_jsonb")),**profile}
-    return await _recalculate(session_id)
+    return await _recalculate(session_id, persist=_writes_allowed(session_id))
 
 
 def _scores(value) -> dict:
@@ -103,7 +105,9 @@ async def get_prompt(session_id: int = None) -> str:
     return "\n".join(lines)
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = require_session(None)
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         i = await get(session_id)
         # Re-derive once per tick. No evidence keeps the stored society.

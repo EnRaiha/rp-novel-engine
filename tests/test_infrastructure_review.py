@@ -104,7 +104,7 @@ def _instance(sid=1, effects=None, bonus=1.0):
 
 async def test_list_infrastructure_defaults_to_the_engine_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetch=[]))
-    monkeypatch.setattr("modules.infrastructure.Config.SESSION_ID", 77)
+    monkeypatch.setenv("RP_SESSION", "77")
 
     await infra.list_infrastructure()
 
@@ -113,7 +113,7 @@ async def test_list_infrastructure_defaults_to_the_engine_session(monkeypatch):
 
 async def test_get_infrastructure_defaults_to_the_engine_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(fetchrow=None))
-    monkeypatch.setattr("modules.infrastructure.Config.SESSION_ID", 77)
+    monkeypatch.setenv("RP_SESSION", "77")
 
     assert await infra.get_infrastructure(9) == {}
     assert fake.args_for("infrastructure_overview", "fetchrow")[0] == (9, 77)
@@ -129,7 +129,7 @@ async def test_run_tick_defaults_to_the_engine_session(monkeypatch):
         return {"produced": {}}
 
     monkeypatch.setattr("modules.infrastructure.run_production_tick", produce)
-    monkeypatch.setattr("modules.infrastructure.Config.SESSION_ID", 77)
+    monkeypatch.setenv("RP_SESSION", "77")
 
     await infra.run_tick()
 

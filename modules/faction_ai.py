@@ -29,8 +29,9 @@ def _doctrine(group: str) -> tuple:
 
 
 async def run_tick(session_id: int | None = None) -> dict:
-    if session_id is None:
-        session_id = require_session(None)
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         factions = await Database.fetch(
             "SELECT id, name, is_pirate, pirate_fleet_power, treasury, reputation "

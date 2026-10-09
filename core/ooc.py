@@ -156,6 +156,19 @@ def _refuse_frozen(sid: int) -> None:
         )
 
 
+def _writes_allowed(sid) -> bool:
+    """True when a write into `sid` would pass `_refuse_frozen`. Readers that also write use it to skip the write.
+
+    An unreadable frozen list returns False: the reader keeps its answer and skips the write.
+    """
+    from core.session import FrozenListUnreadable, is_frozen
+    try:
+        frozen = is_frozen(sid)
+    except FrozenListUnreadable:
+        return False
+    return not (frozen and not _maintenance_active())
+
+
 def _is_wordish(char: str | None) -> bool:
     return char is not None and (char.isalnum() or char == "_")
 

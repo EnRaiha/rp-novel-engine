@@ -11,6 +11,7 @@ Extracted 2026-10-03 during the caller-less review, when `infrastructure.py` cam
 from __future__ import annotations
 
 from core.db import Database
+from core.session import require_session
 
 #: Every column a cost may name. Interpolated into SQL, so it is a whitelist and not a suggestion.
 #:
@@ -102,7 +103,11 @@ async def _deduct_resources(session_id: int, costs: dict, conn=None) -> dict:
         Refused before any charge.
     @raises InsufficientResources - the treasury is short, or the session has no resources row.
         Nothing is charged.
+    @raises FrozenSession - the campaign is frozen reference data and maintenance is not armed.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     unknown = [res for res in costs if res not in RESOURCE_COLUMNS]
     if unknown:
         raise ValueError(

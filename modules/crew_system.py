@@ -10,6 +10,7 @@ Novel: "Oops! We are short of talent" — bottleneck bukan kapal, tapi CREW.
 from __future__ import annotations
 from core.db import Database
 from core.config import Config
+from core.session import require_session
 from core.log import info
 
 #: A hull in one of these states is not waiting for hands; crewing it would set it back to 'active'.
@@ -29,8 +30,9 @@ def _university_output(research_rate: float, level: int, prestige: int) -> int:
 
 async def produce_crew(session_id: int | None = None) -> dict:
     """Tick production: academy + university → crew_pool."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
     total = 0
     sources = []
@@ -72,8 +74,9 @@ async def consume_crew(session_id: int | None, ship_id: int, required: int) -> d
     The ship row is locked and the pool is debited by one guarded relative UPDATE, in one
     transaction with the hull update. A destroyed or lost hull is refused: launch sets 'active'.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if required < 0:
         return {"error": f"required crew cannot be negative, got {required}"}
     gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
@@ -121,8 +124,9 @@ async def backfill_history(session_id: int | None = None, start_day: int = 26, e
     """Kira semula crew dari era old council (Day 26) sampai sekarang.
     Anggap academy/university beroperasi sejak Day 26 dengan kadar semasa.
     initial_consumption = anggaran crew yang dah dipakai era lama (narrative GM)."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if end_day is None:
         end_day = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 171
 
@@ -161,8 +165,7 @@ async def backfill_history(session_id: int | None = None, start_day: int = 26, e
 
 async def crew_report(session_id: int | None = None) -> dict:
     """Full crew report — dashboard untuk briefing."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     r = await Database.fetchrow(
         "SELECT crew_pool, crew_trained_total, crew_consumed_total FROM maya_rp.resources WHERE session_id=$1",
         session_id)
@@ -213,8 +216,9 @@ async def cmd(sid: int, action: str, params: dict) -> dict:
 
 
 async def run_tick(session_id: int | None = None) -> dict:
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         # 1. Graduation cycle (30 hari cohort — bukan harian)
         g = await graduation_cycle(session_id)
@@ -237,8 +241,9 @@ async def run_tick(session_id: int | None = None) -> dict:
 async def graduation_cycle(session_id: int | None = None) -> dict:
     """Cohort graduat: setiap campus graduat pada cycle 30 hari.
     Bukan harian — realistik macam universiti sebenar."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
     campuses = await Database.fetch(
         "SELECT id, name, research_rate, level, prestige, graduation_cycle_days, last_graduation_day "
@@ -294,8 +299,9 @@ async def ai_allocate_crew(session_id: int | None = None) -> dict:
     UPDATE, roster rows created for what the free roster lacks, rows assigned, ship and log written.
     The pool is the binding limit, not the free roster, so an empty roster still gets crewed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
     pool = await Database.fetchval("SELECT crew_pool FROM maya_rp.resources WHERE session_id=$1", session_id) or 0
     if pool <= 0:
@@ -387,8 +393,9 @@ async def ai_allocate_crew(session_id: int | None = None) -> dict:
 
 async def screen_crew(session_id: int | None, crew_id: int, clearance: int = 5) -> dict:
     """Screen crew untuk C5+ clearance — Kira/Heaven AI vetting."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     cr = await Database.fetchrow(
         "SELECT id, name, loyalty_flag AS loyalty FROM maya_rp.crew_roster WHERE id=$1 AND session_id=$2", crew_id, session_id)
     if not cr:
@@ -401,8 +408,9 @@ async def screen_crew(session_id: int | None, crew_id: int, clearance: int = 5) 
 
 async def set_min_clearance(session_id: int | None, ship_id: int, clearance: int) -> dict:
     """Tetapkan min clearance untuk kapal (C5+ = 5)."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     await Database.execute(
         "UPDATE maya_rp.ships SET min_clearance=$1 WHERE id=$2 AND session_id=$3",
         clearance, ship_id, session_id)

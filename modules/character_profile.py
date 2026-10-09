@@ -12,6 +12,7 @@ import json
 from typing import Any
 from core.db import Database
 from core.config import Config
+from core.session import require_session
 from core.log import info
 
 
@@ -80,8 +81,9 @@ def _require_character(row, character_id: int, session_id: int):
 
 async def update_profile(character_id: int, profile_data: dict, session_id: int = None):
     """Set the static physical profile of a character (face, body, voice)."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if not isinstance(profile_data, dict):
         raise ValueError("profile_data must be a mapping")
     row = await Database.fetchrow(
@@ -118,8 +120,9 @@ async def _append_locked(column: str, entry: dict, character_id: int, session_id
 
 async def add_to_wardrobe(character_id: int, outfit: dict, session_id: int = None):
     """Add a new outfit to a character's closet."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if not isinstance(outfit, dict):
         raise ValueError("outfit must be a mapping")
     await _append_locked("wardrobe_jsonb", outfit, character_id, session_id)
@@ -127,8 +130,9 @@ async def add_to_wardrobe(character_id: int, outfit: dict, session_id: int = Non
 
 async def set_outfit(character_id: int, outfit_id: str, session_id: int = None) -> bool:
     """Put a wardrobe outfit on a character. Returns whether it was found."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     row = await Database.fetchrow(
         "SELECT wardrobe_jsonb FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
         character_id, session_id,
@@ -150,8 +154,9 @@ async def set_outfit(character_id: int, outfit_id: str, session_id: int = None) 
 
 async def add_item(character_id: int, item: dict, session_id: int = None):
     """Add an item to a character's inventory."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if not isinstance(item, dict):
         raise ValueError("item must be a mapping")
     await _append_locked("inventory_jsonb", item, character_id, session_id)
@@ -173,6 +178,9 @@ async def grant(character_id: int, *, item: dict | None = None, outfit: dict | N
     @param wear - an outfit id already in the wardrobe, to put on.
     @returns what changed, keyed by field, for the caller to report.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     applied: dict[str, str] = {}
     if profile is not None:
         await update_profile(character_id, profile, session_id)
@@ -187,7 +195,7 @@ async def grant(character_id: int, *, item: dict | None = None, outfit: dict | N
         if not await set_outfit(character_id, wear, session_id):
             raise ValueError(
                 f"outfit {wear!r} is not in character {character_id}'s wardrobe in session "
-                f"{session_id if session_id is not None else Config.SESSION_ID}"
+                f"{session_id}"
             )
         applied["wearing"] = wear
     if not applied:
@@ -216,8 +224,9 @@ async def auto_dress_for_mode(character_id: int, mode: str, session_id: int = No
     Combat → Armour. Intimate → Casual/Sleepwear. Political → Formal.
     Returns True if outfit was changed.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
 
     wardrobe_raw = await Database.fetchval(
         "SELECT wardrobe_jsonb FROM maya_rp.characters WHERE id = $1 AND session_id = $2",
@@ -258,8 +267,9 @@ async def auto_dress_all_present(session_id: int = None) -> dict:
     Auto-dress all active, present characters based on current pacing mode.
     Called on tick and on scene changes.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
 
     from core.pacing import PacingDirector
     mode_data = await PacingDirector.get_mode(session_id)
@@ -292,8 +302,7 @@ async def get_character_card(character_id: int, session_id: int = None) -> str:
     Generate a compact, LLM-ready string of the character's complete physical state.
     This is what gets injected into the system prompt or used by rp-look.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
 
     row = await Database.fetchrow(
         """SELECT name, role, profile_jsonb, current_outfit, inventory_jsonb
@@ -362,8 +371,7 @@ async def get_character_card_by_name(name: str, session_id: int = None) -> str:
     """Lookup a character by name and return card.
     Tries exact match first, then prefix/LIKE, ordered by bond descending.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     # Try exact match first (case-insensitive)
     row = await Database.fetchrow(
         """SELECT id FROM maya_rp.characters
@@ -388,4 +396,7 @@ async def get_character_card_by_name(name: str, session_id: int = None) -> str:
 
 async def run_tick(session_id: int = None) -> dict:
     """Tick: auto-dress present characters based on pacing mode."""
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     return await auto_dress_all_present(session_id)

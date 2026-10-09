@@ -3,6 +3,7 @@ import random, json
 from datetime import datetime, timezone
 from core.db import Database
 from core.config import Config
+from core.session import require_session
 from modules._economy import InsufficientResources, _deduct_resources, stochastic_round
 from core.events import EventBus
 from core.log import error
@@ -13,6 +14,9 @@ from core.log import error
 
 async def seed_infestation(session_id: int, sector_id: int, territory_id: int = None) -> dict:
     """Seed a new space bug infestation. The horror begins."""
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     existing = await Database.fetchrow(
         "SELECT id FROM maya_rp.infestation_instances WHERE session_id = $1 AND sector_id = $2 "
         "AND status NOT IN ('destroyed','eradicated')",
@@ -51,6 +55,9 @@ async def spread_infestation(session_id: int, game_days: float = 0.5):
     The read took no session, so every campaign's infestations spread on every campaign's tick and
     the writes below landed on rows belonging to the other one. A campaign is its own horror.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     for inst in await Database.fetch("""
         SELECT ii.*, st.spread_rate, st.threat_level, st.name AS stage_name
         FROM maya_rp.infestation_instances ii
@@ -140,6 +147,9 @@ async def get_containment_measures() -> list:
 
 async def apply_containment(session_id: int, infestation_id: int, measure_name: str) -> dict:
     """Apply a containment measure to slow the infestation."""
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     inf = await Database.fetchrow(
         "SELECT * FROM maya_rp.infestation_instances WHERE id = $1 AND session_id = $2",
         infestation_id, session_id
@@ -196,6 +206,9 @@ async def get_bug_war_assets() -> list:
 async def launch_eradication(session_id: int, infestation_id: int,
                               strategy: str = "systematic", assets: list = None) -> dict:
     """Launch a military campaign to eradicate an infestation."""
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     inf = await Database.fetchrow(
         "SELECT * FROM maya_rp.infestation_instances WHERE id = $1 AND session_id = $2",
         infestation_id, session_id
@@ -223,6 +236,9 @@ async def launch_eradication(session_id: int, infestation_id: int,
 
 async def advance_eradication(session_id: int, game_days: float = 0.5):
     """Tick — advance all active eradication campaigns."""
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     for camp in await Database.fetch(
         "SELECT * FROM maya_rp.eradication_campaigns WHERE status = 'active' AND session_id = $1",
         session_id
@@ -314,8 +330,7 @@ async def get_active_threats(session_id: int) -> list:
 
 async def get_infestation_detail(infestation_id: int, session_id: int | None = None) -> dict:
     """Detailed view of one infestation, from this session."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     row = await Database.fetchrow("""
         SELECT ii.*, st.name AS stage, st.threat_level, st.description AS stage_description,
                s.name AS sector_name, t.system_name AS territory_name
@@ -333,10 +348,9 @@ async def get_infestation_detail(infestation_id: int, session_id: int | None = N
 
 async def run_tick(session_id: int | None = None):
     """Full space horror tick — spread, eradicate, seed new."""
-    if session_id is None:
-        # The default was the literal 3, which is the frozen reference campaign: a tick run without
-        # an argument advanced that campaign's horror.
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         gd = 0.5
         await spread_infestation(session_id, gd)

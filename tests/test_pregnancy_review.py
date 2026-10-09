@@ -24,6 +24,8 @@ No database: every test drives a fake Database.
 """
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 import modules.pregnancy as preg
@@ -53,6 +55,10 @@ class FakeDB:
         self.calls.append(("execute", " ".join(sql.split()), args))
         return self.execute_tag
 
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        yield self
+
     def sql(self, kind=None):
         return [c[1] for c in self.calls if kind is None or c[0] == kind]
 
@@ -64,6 +70,7 @@ class FakeDB:
 def _install(monkeypatch, fake):
     for name in ("fetch", "fetchrow", "fetchval", "execute"):
         monkeypatch.setattr("modules.pregnancy.Database." + name, getattr(fake, name))
+    monkeypatch.setattr("modules.pregnancy.Database.transaction", fake.transaction)
     return fake
 
 
@@ -159,10 +166,10 @@ async def test_the_birth_write_carries_the_session(monkeypatch):
     out = await preg.advance(5)
 
     assert len(out["births"]) == 1
-    written = fake.args_for("SET status='birthed'", "execute")[0]
+    written = fake.args_for("SET status='birthed'", "fetchval")[0]
     assert written[0] in ("male", "female")
     assert written[3] == 7 and written[4] == 5
-    assert "AND session_id=$5" in [s for s in fake.sql("execute") if "birthed" in s][0]
+    assert "AND session_id=$5" in [s for s in fake.sql("fetchval") if "birthed" in s][0]
 
 
 # ── Contract the module claims ──────────────────────────────────────────

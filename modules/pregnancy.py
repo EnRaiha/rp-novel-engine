@@ -89,23 +89,32 @@ def _trimester_for(days_pregnant: int) -> int:
     return 3
 
 
-async def _roll_birth(session_id: int, gd: int, preg_id: int, mother_name: str) -> dict:
+async def _roll_birth(session_id: int, gd: int, preg_id: int, mother_name: str) -> dict | None:
+    """Deliver one pregnancy. Returns None when another tick already claimed it.
+
+    The status claim and the birth event commit together: an error on the event
+    leaves the pregnancy open for the next tick.
+    """
     import random
     gender = random.choice(["male", "female"])
     name = random.choice(BABY_NAMES[gender])
-    await Database.execute(
-        """UPDATE maya_rp.pregnancies
-           SET status='birthed', baby_gender=$1, baby_name=$2, birthed_game_day=$3
-           WHERE id=$4 AND session_id=$5""",
-        gender, name, gd, preg_id, session_id,
-    )
-    await Database.execute(
-        """INSERT INTO maya_rp.events (session_id, event_type, title, description, happened_at)
-           VALUES ($1, 'birth', $2, $3, now())""",
-        session_id,
-        f"Birth — {mother_name}",
-        f"{mother_name} gave birth to a {gender} child named {name} on game day {gd}.",
-    )
+    async with Database.transaction() as conn:
+        claimed = await conn.fetchval(
+            """UPDATE maya_rp.pregnancies
+               SET status='birthed', baby_gender=$1, baby_name=$2, birthed_game_day=$3
+               WHERE id=$4 AND session_id=$5 AND status IN ('active','due_soon')
+               RETURNING id""",
+            gender, name, gd, preg_id, session_id,
+        )
+        if claimed is None:
+            return None
+        await conn.execute(
+            """INSERT INTO maya_rp.events (session_id, event_type, title, description, happened_at)
+               VALUES ($1, 'birth', $2, $3, now())""",
+            session_id,
+            f"Birth — {mother_name}",
+            f"{mother_name} gave birth to a {gender} child named {name} on game day {gd}.",
+        )
     info("pregnancy", f"Birth: {mother_name} → {name} ({gender}), day {gd}")
     return {"mother": mother_name, "name": name, "gender": gender, "game_day": gd}
 
@@ -121,23 +130,34 @@ async def advance(session_id: int | None = None) -> dict:
         session_id,
     )
     births = []
+    errors = []
     updated = 0
     for r in rows:
-        days_pregnant = max(0, gd - r["conceived_game_day"])
-        new_status = r["status"]
-        if gd >= r["due_game_day"]:
-            births.append(await _roll_birth(session_id, gd, r["id"], r["mother_name"]))
-            continue
-        if r["due_game_day"] - gd <= DUE_SOON_WINDOW:
-            new_status = "due_soon"
-        trimester = _trimester_for(days_pregnant)
-        if trimester != r["trimester"] or new_status != r["status"]:
-            await Database.execute(
-                "UPDATE maya_rp.pregnancies SET trimester=$1, status=$2 WHERE id=$3",
-                trimester, new_status, r["id"],
-            )
-            updated += 1
-    return {"checked": len(rows), "updated": updated, "births": births}
+        try:
+            days_pregnant = max(0, gd - r["conceived_game_day"])
+            new_status = r["status"]
+            if gd >= r["due_game_day"]:
+                birth = await _roll_birth(session_id, gd, r["id"], r["mother_name"])
+                if birth is not None:
+                    births.append(birth)
+                continue
+            if r["due_game_day"] - gd <= DUE_SOON_WINDOW:
+                new_status = "due_soon"
+            trimester = _trimester_for(days_pregnant)
+            if trimester != r["trimester"] or new_status != r["status"]:
+                tag = await Database.execute(
+                    """UPDATE maya_rp.pregnancies SET trimester=$1, status=$2
+                       WHERE id=$3 AND session_id=$4 AND status IN ('active','due_soon')""",
+                    trimester, new_status, r["id"], session_id,
+                )
+                updated += int(tag.split()[-1])
+        except Exception as e:
+            error("pregnancy", f"pregnancy {r['id']} failed: {e}")
+            errors.append({"id": r["id"], "error": str(e)})
+    out = {"checked": len(rows), "updated": updated, "births": births}
+    if errors:
+        out["errors"] = errors
+    return out
 
 
 async def run_tick(session_id: int = None) -> dict:

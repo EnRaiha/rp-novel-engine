@@ -17,13 +17,24 @@ sys.path.insert(0, str(ROOT))
 
 
 class TestStaleProcessDefault:
-    def test_a_stale_default_names_the_drift(self):
+    def test_a_stale_default_names_the_drift(self, monkeypatch):
+        from core import session
         from core.session import stale_process_default
 
-        # 3 is the legacy session the engine used before the arc moved.
+        # 3 is the legacy session the engine used before the arc moved. The frozen list is data the
+        # owner edits, so the test pins it instead of reading the live file.
+        monkeypatch.setattr(session, "frozen", lambda: [3])
         message = stale_process_default(3)
         assert message is not None, "a process stuck on the old session must be told"
         assert "session 3" in message and "frozen" in message
+
+    def test_a_stale_default_that_is_not_frozen_omits_the_frozen_note(self, monkeypatch):
+        from core import session
+        from core.session import stale_process_default
+
+        monkeypatch.setattr(session, "frozen", lambda: [])
+        message = stale_process_default(3)
+        assert message is not None and "session 3" in message and "frozen" not in message
 
     def test_a_matching_default_says_nothing(self):
         from core.config import Config

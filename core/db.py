@@ -43,7 +43,27 @@ class Database:
     pool: asyncpg.Pool | None = None
     _lock: asyncio.Lock | None = None
     _lock_loop: asyncio.AbstractEventLoop | None = None
+    _pool_loop: asyncio.AbstractEventLoop | None = None
     _fallback_warned: bool = False
+
+    @classmethod
+    def _pool_orphaned(cls) -> bool:
+        """True when the pool was made on an event loop that has since closed.
+
+        Such a pool cannot serve any loop: its connections wait on futures of a loop that no longer
+        runs. A script that calls `asyncio.run` twice, or a test run, meets this after the first run.
+        """
+        return cls.pool is not None and cls._pool_loop is not None and cls._pool_loop.is_closed()
+
+    @classmethod
+    def _drop_orphaned_pool(cls) -> None:
+        """Terminate and forget an orphaned pool. The caller holds `_pool_lock()`."""
+        if cls._pool_orphaned():
+            orphan, cls.pool, cls._pool_loop = cls.pool, None, None
+            try:
+                orphan.terminate()
+            except Exception as exc:  # noqa: BLE001 - a pool on a dead loop failing to die must not block the new one
+                warn("db", f"terminate of orphaned pool failed: {exc}")
 
     @classmethod
     def _pool_lock(cls) -> asyncio.Lock:
@@ -69,9 +89,10 @@ class Database:
 
         @returns the live pool.
         """
-        if cls.pool is not None:
+        if cls.pool is not None and not cls._pool_orphaned():
             return cls.pool
         async with cls._pool_lock():
+            cls._drop_orphaned_pool()
             return await cls._create_locked()
 
     @classmethod
@@ -87,6 +108,7 @@ class Database:
                 max_size=Config.DB_MAX_SIZE,
                 timeout=Config.DB_TIMEOUT,
             )
+            cls._pool_loop = asyncio.get_running_loop()
             # The name generator keeps a module-level connection. `set_global_conn` was its one
             # caller-less function: it had no init hook, so the generator it configures could never be
             # reached without a caller passing a connection in. Imported here rather than at the top to
@@ -130,11 +152,12 @@ class Database:
             except Exception:  # deliberate: a failing close during shutdown must not raise
                 pass
             cls.pool = None
+        cls._pool_loop = None
 
     @classmethod
     async def _ensure_pool(cls) -> asyncpg.Pool:
         """Return pool, reconnecting only if explicitly closed/null."""
-        if cls.pool is not None:
+        if cls.pool is not None and not cls._pool_orphaned():
             return cls.pool
         pool = await cls.init()
         info("db", "Pool initialized.")

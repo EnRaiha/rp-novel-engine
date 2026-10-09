@@ -165,9 +165,14 @@ async def _den_feeding(session_id: int):
         actual = min(bite, (target["treasury"] or 0) - HOARD_FLOOR)
         if actual <= 0:
             continue
-        await Database.execute(
-            "UPDATE maya_rp.pirate_bases SET treasury=treasury-$1 WHERE id=$2",
+        # The bite was sized on a snapshot: the debit re-checks the floor and the
+        # status against the row, so a feeder that lost the race takes nothing.
+        tag = await Database.execute(
+            "UPDATE maya_rp.pirate_bases SET treasury=treasury-$1 WHERE id=$2 AND status='active' "
+            "AND treasury-$1 >= " + str(HOARD_FLOOR),
             actual, target["id"])
+        if tag.split()[-1:] == ["0"]:
+            continue
         await Database.execute(
             "UPDATE maya_rp.factions SET treasury=treasury+$1 WHERE id=$2",
             actual, f["id"])
@@ -218,6 +223,20 @@ async def _spawn_fleet(session_id: int, system_id: int, template: str):
     await Database.execute(
         "INSERT INTO pirate_alerts (session_id, message, severity) VALUES ($1,$2,$3)",
         session_id, f"Pirate {t['name']} detected (system {system_id})!", 2)
+
+async def _take_credits(session_id: int, amount: int) -> int | None:
+    """Take up to `amount`, never below zero. None: the session has no resources row."""
+    async with Database.transaction() as conn:
+        held = await conn.fetchval(
+            "SELECT credits FROM maya_rp.resources WHERE session_id=$1 FOR UPDATE", session_id)
+        if held is None:
+            return None
+        taken = min(int(amount), max(0, int(held)))
+        if taken:
+            await conn.execute(
+                "UPDATE maya_rp.resources SET credits=credits-$1 WHERE session_id=$2", taken, session_id)
+        return taken
+
 
 async def _attack(session_id: int):
     # Simple attack: pick a target, roll, generate loot.
@@ -271,12 +290,13 @@ async def _attack(session_id: int):
         # The raid only takes what the treasury actually holds: a session with
         # no resources row must not be recorded (or banked) as robbed. Charged
         # before the raid row, so the row states what moved.
-        tag = await Database.execute(
-            "UPDATE resources SET credits=credits-$1 WHERE session_id=$2", loot_c, session_id)
-        if isinstance(tag, str) and tag.split()[-1:] == ["0"]:
+        taken = await _take_credits(session_id, loot_c)
+        if taken is None:
             info("pirates", f"session {session_id} has no resources row — "
                             f"{loot_c:,}C raid loss NOT deducted")
             loot_c = 0
+        else:
+            loot_c = taken
     await Database.execute(
         "INSERT INTO pirate_raids (pirate_faction_id, target_territory_id, raid_type, loot_credits, outcome, description) "
         "VALUES ($1,$2,'colony',$3,$4,$5)",
@@ -397,49 +417,103 @@ async def salvage_ship(ship_class: str) -> dict:
         "captured": False,
     }
 
-async def claim_bounty(session_id: int, pirate_faction_id: int) -> dict:
-    """Pay out a bounty on a defeated pirate faction.
+class _NoCoffer(Exception):
+    """The session has no resources row, so a credit has nowhere to land."""
 
-    The bounty row carries no session of its own, so it is reached through its
-    faction: unfiltered, a live-arc claim collected the reference campaign's
-    2,000,000C bounty. The credit is checked before the bounty is marked
-    claimed — otherwise a missing treasury row burned the bounty for nothing.
+
+async def _pay_bounty(session_id: int, pirate_faction_id: int, claimant_id: int) -> int | None:
+    """Mark one open bounty claimed and credit its amount in one transaction.
+
+    The status-guarded UPDATE claims first: a second caller finds no open row and
+    pays nothing. Raises `_NoCoffer` before the commit when the credit has no row,
+    so the bounty stays open. None: no open bounty.
     """
-    b = await Database.fetchrow(
-        "SELECT b.bounty_amount FROM maya_rp.pirate_bounties b "
-        "JOIN maya_rp.factions f ON f.id = b.pirate_faction_id "
-        "WHERE b.pirate_faction_id=$1 AND f.session_id=$2 AND b.claimed_by IS NULL",
-        pirate_faction_id, session_id)
-    if not b: return {"success": False, "error": "No bounty available."}
+    async with Database.transaction() as conn:
+        amount = await conn.fetchval(
+            "UPDATE maya_rp.pirate_bounties SET claimed_by=$2, last_updated=NOW() WHERE id=("
+            "SELECT id FROM maya_rp.pirate_bounties WHERE pirate_faction_id=$1 AND claimed_by IS NULL"
+            " ORDER BY id LIMIT 1) AND claimed_by IS NULL RETURNING COALESCE(bounty_amount, 0)",
+            pirate_faction_id, claimant_id)
+        if amount is None:
+            return None
+        tag = await conn.execute(
+            "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2", amount, session_id)
+        if tag.split()[-1:] == ["0"]:
+            raise _NoCoffer(session_id)
+        return amount
+
+
+async def claim_bounty(session_id: int, pirate_faction_id: int) -> dict:
+    """Pay one open bounty on a defeated pirate faction of this session.
+
+    The bounty row carries no session of its own, so the faction lookup scopes it:
+    a faction that is not a pirate of `session_id` pays nothing. The claimant is
+    the session's first faction named `Setia Empire%`; without one nothing pays.
+    Each call claims one bounty and credits it in one transaction.
+    """
     f = await Database.fetchrow(
         "SELECT status FROM factions WHERE id=$1 AND is_pirate=true AND session_id=$2",
         pirate_faction_id, session_id)
-    if f and f["status"] != "defeated": return {"success": False, "error": "Pirates still active."}
-    tag = await Database.execute(
-        "UPDATE resources SET credits=credits+$1 WHERE session_id=$2",
-        b["bounty_amount"], session_id)
-    if isinstance(tag, str) and tag.split()[-1:] == ["0"]:
-        info("pirates", f"session {session_id} has no resources row — bounty "
-                        f"{b['bounty_amount']:,}C NOT paid, not claimed")
+    if not f:
+        return {"success": False, "error": "Not a pirate faction of this session."}
+    if f["status"] != "defeated":
+        return {"success": False, "error": "Pirates still active."}
+    claimant = await Database.fetchval(
+        "SELECT id FROM maya_rp.factions WHERE session_id=$1 AND name ILIKE 'Setia Empire%' "
+        "ORDER BY id LIMIT 1", session_id)
+    if claimant is None:
+        info("pirates", f"session {session_id} has no Setia faction — bounty on "
+                        f"faction {pirate_faction_id} NOT claimed")
+        return {"success": False,
+                "error": f"No Setia faction in session {session_id}: bounty not claimed."}
+    try:
+        amount = await _pay_bounty(session_id, pirate_faction_id, claimant)
+    except _NoCoffer:
+        info("pirates", f"session {session_id} has no resources row — bounty on "
+                        f"faction {pirate_faction_id} NOT paid, not claimed")
         return {"success": False, "error": "No treasury row for this session."}
-    await Database.execute(
-        "UPDATE pirate_bounties SET claimed_by=(SELECT id FROM factions "
-        "WHERE name='Setia Empire' AND session_id=$2), last_updated=NOW() "
-        "WHERE pirate_faction_id=$1",
-        pirate_faction_id, session_id)
-    return {"success": True, "credits": b["bounty_amount"]}
+    if amount is None:
+        return {"success": False, "error": "No bounty available."}
+    return {"success": True, "credits": amount}
+
+
+async def _seize_hoard(session_id: int, base) -> int | None:
+    """Destroy an active base and credit its hoard in one transaction.
+
+    The status-guarded UPDATE claims first: a second raider finds no active row
+    and seizes nothing. Raises `_NoCoffer` before the commit when the credit has
+    no row, so the base stays standing. None: the base is no longer active.
+    """
+    async with Database.transaction() as conn:
+        hoard = await conn.fetchval(
+            "WITH old AS (SELECT treasury FROM maya_rp.pirate_bases WHERE id=$1 AND status='active' FOR UPDATE)"
+            " UPDATE maya_rp.pirate_bases pb SET status='destroyed', treasury=0 FROM old"
+            " WHERE pb.id=$1 AND pb.status='active' RETURNING COALESCE(old.treasury, 0)", base["id"])
+        if hoard is None:
+            return None
+        tag = await conn.execute(
+            "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2", hoard, session_id)
+        if tag.split()[-1:] == ["0"]:
+            raise _NoCoffer(session_id)
+        await conn.execute(
+            "UPDATE maya_rp.factions SET pirate_fleet_power=GREATEST(0,pirate_fleet_power-$1) WHERE id=$2",
+            int((base["pirate_fleet_power"] or 0) * 0.15), base["faction_id"])
+        await conn.execute(
+            "INSERT INTO maya_rp.pirate_alerts (session_id, message, severity) VALUES ($1,$2,3)",
+            session_id, f"DEN BASE SMASHED: {base['name']} — {hoard:,}C seized!")
+        return hoard
 
 
 async def raid_pirate_base(session_id: int, base_id: int, attack_power: int = 50000) -> dict:
     """Strike a Den base and seize its hoard. attack_power = fleet power sent.
 
     Success → treasury seized into the realm coffer, base destroyed,
-    Den fleet power takes a hit. Failure → base goes to ground. The docstring
-    used to promise fortification and fleet bleeds on both sides; neither was
-    ever written, and a raid now cannot seize one campaign's hoard into
-    another's coffer.
+    Den fleet power takes a hit. Failure → base goes to ground. A raid cannot
+    seize one campaign's hoard into another's coffer.
 
-    The base is only destroyed once the coffer actually took the credits.
+    `_seize_hoard` claims the active base, credits the coffer and logs the alert
+    in one transaction: two raiders seize a hoard once, and a missing coffer
+    leaves the base standing.
     """
     base = await Database.fetchrow(
         "SELECT pb.*, f.pirate_fleet_power FROM maya_rp.pirate_bases pb "
@@ -454,25 +528,16 @@ async def raid_pirate_base(session_id: int, base_id: int, attack_power: int = 50
     success = random.random() < odds
 
     if success:
-        hoard = base["treasury"] or 0
-        tag = await Database.execute(
-            "UPDATE maya_rp.resources SET credits=credits+$1 WHERE session_id=$2",
-            hoard, session_id)
-        if isinstance(tag, str) and tag.split()[-1:] == ["0"]:
+        try:
+            hoard = await _seize_hoard(session_id, base)
+        except _NoCoffer:
             info("pirates", f"session {session_id} has no resources row — hoard "
-                            f"{hoard:,}C NOT seized, base left standing")
+                            f"{(base['treasury'] or 0):,}C NOT seized, base left standing")
             return {"success": False, "base": base["name"], "odds": round(odds, 2),
                     "error": "No treasury row for this session.",
                     "message": f"Raid on {base['name']} found no coffer to receive the hoard."}
-        await Database.execute(
-            "UPDATE maya_rp.pirate_bases SET status='destroyed', treasury=0 WHERE id=$1",
-            base_id)
-        await Database.execute(
-            "UPDATE maya_rp.factions SET pirate_fleet_power=GREATEST(0,pirate_fleet_power-$1) WHERE id=$2",
-            int(base["pirate_fleet_power"] * 0.15), base["faction_id"])
-        await Database.execute(
-            "INSERT INTO maya_rp.pirate_alerts (session_id, message, severity) VALUES ($1,$2,3)",
-            session_id, f"DEN BASE SMASHED: {base['name']} — {hoard:,}C seized!")
+        if hoard is None:
+            return {"success": False, "error": "Base not found or already destroyed."}
         return {"success": True, "base": base["name"], "hoard_seized": hoard,
                 "odds": round(odds, 2), "message": f"{base['name']} destroyed. {hoard:,}C to the coffer."}
     else:

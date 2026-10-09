@@ -18,6 +18,15 @@ from core.config import Config
 
 PHASE_NAMES = ["Opening", "Complication", "Companion Moment", "Turning Point", "Finisher"]
 
+#: Largest value `combat_results.player_power` and `enemy_power` (both `integer`) hold.
+INT32_MAX = 2_147_483_647
+
+
+def _power_total(ships) -> int:
+    """Fleet power as a whole number inside the `integer` column range, never negative."""
+    return max(0, min(int(sum(s.combat_rating for s in ships)), INT32_MAX))
+
+
 @dataclass
 class BattleShip:
     id: int; name: str; ship_type: str; hull: int; shield: int
@@ -54,7 +63,7 @@ class BattleEngine:
         bid = await Database.fetchrow(
             "INSERT INTO combat_results (session_id, player_power, enemy_power, status) "
             "VALUES ($1,$2,$3,'active') RETURNING id",
-            session_id, sum(s.combat_rating for s in pf.ships), sum(s.combat_rating for s in ef.ships))
+            session_id, _power_total(pf.ships), _power_total(ef.ships))
         state = BattleState(battle_id=bid["id"], player=pf, enemy=ef, terrain=terrain,
                             session_id=session_id)
         await cls._save(state, None)
@@ -186,8 +195,8 @@ class BattleEngine:
         await Database.execute(
             "UPDATE combat_results SET outcome=$1, ended_at=NOW(), status='completed', "
             "player_power=$2, enemy_power=$3 WHERE id=$4",
-            outcome, sum(s.combat_rating for s in state.player.ships),
-            sum(s.combat_rating for s in state.enemy.ships), state.battle_id)
+            outcome, _power_total(state.player.ships), _power_total(state.enemy.ships),
+            state.battle_id)
         loot = random.randint(1000, 50000) if outcome == "player_victory" else 0
         rep = 10 if outcome == "player_victory" else -10
         await Database.execute("INSERT INTO battle_aftermath (battle_id, loot_credits, reputation_change, narrative) VALUES ($1,$2,$3,$4)",
@@ -391,7 +400,8 @@ async def run_tick(session_id: int = None):
                 "(session_id, difficulty, encounter_size, player_power, enemy_power, "
                 "ships_lost, ships_damaged, enemy_ships_destroyed, enemy_ships_routed, crew_casualties) "
                 "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-                session_id, "hard", _encounter_size(small_side), player_power, enemy_power,
+                session_id, "hard", _encounter_size(small_side),
+                min(player_power, INT32_MAX), min(enemy_power, INT32_MAX),
                 json.dumps({"hulls": p_loss}), json.dumps({"hulls": max(0, _r.randint(0, int(p_loss * 0.5)))}),
                 e_loss, max(0, e_loss // 2), _r.randint(0, 200))
             await Database.execute(

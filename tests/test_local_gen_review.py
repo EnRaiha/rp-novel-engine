@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Review of `modules/local_gen.py`.
 
-Two defects:
+Four defects:
 
 1. `_strip_think` stripped `slash-any-word`, not a list of artifact tags, so it ate ordinary slash
    writing out of every generated template: "24/7", "he/she", "and/or". The same strip matched
@@ -11,6 +11,10 @@ Two defects:
    that supplies no `readable_hint` computes no vector, so the upsert overwrote a good embedding with
    NULL, and `StreamInterceptor.load_cache` skips every row whose vector is NULL: the template stayed
    servable by exact tag and silently left the semantic tier.
+3. `generate` returned the unscreened text when `check_generation` raised or `modules.guardrails` failed
+   to import. The gate now fails closed with a blocked marker.
+4. `upsert_template` stored empty text or a blocked marker from `generate`, and the interceptor serves a
+   stored template verbatim. It now raises `ValueError`.
 
 No caller passes `readable_hint=""` today, `cli.py cmd_intimacy` always builds one, so the wipe is
 latent. It is reachable through the parameter's own default and it destroys a stored vector, so it is
@@ -83,21 +87,72 @@ class TestGenerateKeepsTheGateItClaims:
         out = await local_gen.generate("anything")
         assert out == "[generation blocked: blocked concept]", out
 
-    async def test_a_broken_guardrail_returns_the_text_and_says_so(self, monkeypatch):
-        """Pinned current behaviour, not an endorsement: the gate is fail-open.
-
-        When `check_generation` itself raises, `generate` logs at error level and returns the
-        unguarded text anyway. Pinned so the ruling on fail-open has a test to change.
-        """
+    async def test_a_broken_guardrail_withholds_the_text(self, monkeypatch):
+        """The gate fails closed: when `check_generation` raises, `generate` logs the error and
+        returns a blocked marker, never the unscreened text."""
         async def fake(*_a, **_kw):
             return "unguarded prose"
 
         def explode(_t):
             raise RuntimeError("guardrail unavailable")
 
+        logged: list[str] = []
         monkeypatch.setattr(local_gen.ds, "generate", fake)
         monkeypatch.setattr(guardrails, "check_generation", explode)
-        assert await local_gen.generate("anything") == "unguarded prose"
+        monkeypatch.setattr(local_gen, "error", lambda _tag, msg: logged.append(msg))
+        out = await local_gen.generate("anything")
+        assert out.startswith("[generation blocked: guardrail unavailable"), out
+        assert "unguarded prose" not in out, out
+        assert any("guardrail unavailable" in m for m in logged), logged
+
+    async def test_a_missing_guardrail_module_withholds_the_text(self, monkeypatch):
+        """A failed import of `modules.guardrails` takes the same closed path as a raising check."""
+        async def fake(*_a, **_kw):
+            return "unguarded prose"
+
+        monkeypatch.setattr(local_gen.ds, "generate", fake)
+        monkeypatch.setitem(sys.modules, "modules.guardrails", None)
+        monkeypatch.setattr(local_gen, "error", lambda _tag, _msg: None)
+        out = await local_gen.generate("anything")
+        assert out.startswith("[generation blocked: guardrail unavailable"), out
+        assert "unguarded prose" not in out, out
+
+
+class TestUpsertRefusesTextTheInterceptorMustNotServe:
+    """The interceptor serves a stored template verbatim, so a marker or empty text never goes in.
+
+    `Database.execute` is stubbed: a refused call writes nothing, and a call the guard fails to
+    refuse still writes nothing.
+    """
+
+    @pytest.fixture
+    def writes(self, monkeypatch):
+        calls: list[tuple] = []
+
+        async def record(*args, **_kw):
+            calls.append(args)
+            return "INSERT 0 1"
+
+        monkeypatch.setattr(local_gen.Database, "execute", record)
+        return calls
+
+    async def test_upsert_refuses_a_blocked_marker(self, writes):
+        with pytest.raises(ValueError, match="blocked-generation marker"):
+            await local_gen.upsert_template(
+                "[T3 MARKER]", "[generation blocked: guardrail unavailable (RuntimeError)]")
+        assert writes == []
+
+    @pytest.mark.parametrize("text", ["", "   "])
+    async def test_upsert_refuses_empty_text(self, writes, text):
+        with pytest.raises(ValueError, match="blocked-generation marker"):
+            await local_gen.upsert_template("[T3 EMPTY]", text)
+        assert writes == []
+
+    async def test_upsert_keeps_the_text_as_passed(self, writes):
+        """The strip is for the check only: the stored value is `expanded_text` untouched."""
+        await local_gen.upsert_template("[T3 KEEP]", "  Steam finds the ceiling.  ")
+        assert len(writes) == 1
+        assert writes[0][2] == "  Steam finds the ceiling.  ", writes[0]
 
 
 class TestUpsertKeepsAVectorItWasNotGiven:

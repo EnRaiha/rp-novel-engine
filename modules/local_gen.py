@@ -22,6 +22,8 @@ from core import deepseek_client as ds
 
 PRIMARY_MODEL = ds.DEFAULT_MODEL
 FAST_MODEL = ds.DEFAULT_MODEL
+#: Start of every marker `generate` returns in place of withheld text. `upsert_template` refuses it.
+BLOCKED_PREFIX = "[generation blocked:"
 
 
 #: Artifact tokens the qwen3 build leaked into prose. The strip is this list, not a blanket
@@ -63,9 +65,10 @@ async def generate(
 
         gate = check_generation(text)
         if not gate.get("allowed"):
-            return "[generation blocked: " + gate.get("reason", "guardrail") + "]"
-    except Exception as e:  # noqa: BLE001 - reported below
-        error("local-gen", f"generate: {e}")
+            return f"{BLOCKED_PREFIX} " + gate.get("reason", "guardrail") + "]"
+    except Exception as e:  # noqa: BLE001 - the gate must fail closed
+        error("local-gen", f"generate: guardrail check raised, text withheld: {e}")
+        return f"{BLOCKED_PREFIX} guardrail unavailable ({type(e).__name__})]"
     return text
 
 
@@ -98,7 +101,16 @@ async def upsert_template(
     readable_hint: str = "",
     required_context: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Upsert a stream template + regenerate its semantic embedding."""
+    """Upsert a stream template + regenerate its semantic embedding.
+
+    Raises `ValueError` for empty text or a `generate` blocked marker: the interceptor serves a
+    stored template verbatim.
+    """
+    text = (expanded_text or "").strip()
+    if not text or text.startswith(BLOCKED_PREFIX):
+        raise ValueError(
+            f"upsert_template refused {trigger_tag!r}: expanded_text is empty or a blocked-generation "
+            f"marker ({text[:60]!r}). Run the generation again once the guardrail answers.")
     if readable_hint:
         from core.memory import _embed
 

@@ -8,15 +8,16 @@ shows WHO lives on each planet:
   - Neutral/faction-governed planets: faction-aligned species dominant + human minority
   - Frontier/abandoned: mixed opportunistic populations
 Species weights respect market_available (only t species seed in volume; f = rare/unique).
+
+  python3 scripts/seed_species_pop.py --session N            # report only
+  python3 scripts/seed_species_pop.py --session N --apply    # replace the session's rows in one transaction
 """
 from __future__ import annotations
 import os
 import asyncio, hashlib, random, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from core.config import Config
 from core.db import Database
-
-SID = Config.SESSION_ID
+from scripts._oneshot import parse, guard
 
 # Faction → dominant species (canon-flavored)
 FACTION_SPECIES = {
@@ -44,7 +45,10 @@ FACTION_SPECIES = {
 SPECIES_ID = {}
 
 
-async def main() -> None:
+async def main(argv=None) -> int:
+    args = parse(__doc__, argv)
+    guard(args)
+    sid = args.session
     await Database.init()
 
     # species catalog
@@ -58,10 +62,9 @@ async def main() -> None:
            FROM maya_rp.planets p
            JOIN maya_rp.territory t ON t.id = p.territory_id
            WHERE p.session_id=$1 AND p.population > 0""",
-        SID)
+        sid)
 
-    await Database.execute("DELETE FROM maya_rp.planet_population WHERE session_id=$1", SID)
-    total_species_rows = 0
+    inserts: list[tuple] = []
 
     for pl in planets:
         pop = pl["population"]
@@ -94,19 +97,32 @@ async def main() -> None:
             cnt = int(round(pop * share))
             if cnt <= 0:
                 continue
-            sid = SPECIES_ID[name]["id"]
-            await Database.execute(
+            inserts.append((sid, pl["id"], SPECIES_ID[name]["id"], name, cnt, round(share * 100, 2),
+                            name == dom_name))
+
+    existing = await Database.fetchval(
+        "SELECT count(*) FROM maya_rp.planet_population WHERE session_id=$1", sid)
+    print(f"SPECIES POP SEED — {len(inserts)} species-pop rows across {len(planets)} populated planets "
+          f"(session {sid} holds {existing} rows now)")
+    if not args.apply:
+        print("DRY RUN — re-run with --apply to replace them.")
+        await Database.close()
+        return 0
+
+    async with Database.transaction() as conn:
+        await conn.execute("DELETE FROM maya_rp.planet_population WHERE session_id=$1", sid)
+        for row in inserts:
+            await conn.execute(
                 """INSERT INTO maya_rp.planet_population
                    (session_id, planet_id, species_id, species_name, count, pct, dominant, updated_at)
                    VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
                    ON CONFLICT (session_id, planet_id, species_id) DO UPDATE
                    SET count=$5, pct=$6, dominant=$7, updated_at=NOW()""",
-                SID, pl["id"], sid, name, cnt, round(share * 100, 2), name == dom_name)
-            total_species_rows += 1
-
-    print(f"SPECIES POP SEED — {total_species_rows} species-pop rows across populated planets")
+                *row)
+    print(f"APPLIED — replaced {existing} rows with {len(inserts)}")
     await Database.close()
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

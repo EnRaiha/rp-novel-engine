@@ -10,19 +10,21 @@ Implements the SOP (Bumi-Hijau/main/reference/fleet-expansion-workflow.md):
   → Phase 6 DOCKYARD ROUTING → Phase 7 REPORT+CHECKPOINT.
 
 Usage:
-  python3 scripts/fleet_expansion.py                       # analyze + recommend only (dry)
-  python3 scripts/fleet_expansion.py --commit              # execute full workflow
-  python3 scripts/fleet_expansion.py --legion "Legion X"   # expand specific legion to 100±20%
-  python3 scripts/fleet_expansion.py --count 2             # build 2 new legions
+  python3 scripts/fleet_expansion.py --session N                       # analyze + recommend only (dry)
+  python3 scripts/fleet_expansion.py --session N --commit              # execute full workflow
+  python3 scripts/fleet_expansion.py --session N --legion "Legion X"   # expand specific legion to 100±20%
+  python3 scripts/fleet_expansion.py --session N --count 2             # build 2 new legions
 
+A legion with a queued `legion_build` is skipped, and each legion is charged and queued in one transaction.
 Standard: 1 legion = 100 ships ±20% (80-120). Cost/crew models in legion_build_program.
 """
 import asyncio, sys, argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from core.config import Config
 from core.db import Database
+from modules._economy import InsufficientResources, _deduct_resources
+from scripts._oneshot import parse, guard
 
-SID = Config.SESSION_ID
+SID = None  # set from --session in main()
 STD_MIN, STD_MAX, STD_TARGET = 80, 120, 100
 WAR_TARGET = 100   # warships per legion — the hard standard (100 ±20%)
 SUP_TARGET = 20    # support ships: AUTO-FILL appropriate number per legion (commander can request more)
@@ -83,14 +85,19 @@ async def fleet_counts(db) -> dict[str, dict]:
     return {r["name"]: {"total": r["n"], "wars": r["wars"], "sup": r["sup"]} for r in rows}
 
 
-async def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--commit", action="store_true", help="execute (default: dry analysis)")
+def _options(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--fill", action="store_true", help="greedy: queue everything affordable in priority order")
     ap.add_argument("--legion", type=str, default=None, help="expand specific legion to standard")
     ap.add_argument("--count", type=int, default=0, help="build N new legions")
     ap.add_argument("--support", type=int, default=0, help="additional support ships per legion (requested, unlimited)")
-    args = ap.parse_args()
+
+
+async def main(argv=None) -> int:
+    global SID
+    args = parse(__doc__, argv, write_flag="--commit", extra=_options)
+    guard(args)
+    args.commit = args.apply
+    SID = args.session
 
     # support ships auto-fill appropriate number (SUP_TARGET); commander requests MORE via --support N
     sup_target = SUP_TARGET if args.support == 0 else args.support
@@ -116,7 +123,7 @@ async def main() -> None:
     if not targets:
         print("No legions found.")
         await Database.close()
-        return
+        return 0
 
     for name, target in targets.items():
         cur = counts.get(name, {"total": 0, "wars": 0, "sup": 0})
@@ -144,7 +151,7 @@ async def main() -> None:
     if not args.commit:
         print("\nDRY RUN — re-run with --commit to execute (queue builds, reserve crew, assign).")
         await Database.close()
-        return
+        return 0
 
     # ── PHASE 2: AFFORDABILITY + QUEUE (greedy --fill in priority order) ──
     print("\n" + "═" * 60)
@@ -165,6 +172,13 @@ async def main() -> None:
     for p in order:
         if p["gap_war"] <= 0 and p["gap_sup"] <= 0:
             continue
+        open_build = await Database.fetchval(
+            "SELECT id FROM maya_rp.build_queue WHERE session_id=$1 AND status='queued' "
+            "AND project_type='legion_build' AND starts_with(project_name, $2)",
+            SID, f"BUILD {p['legion']} —")
+        if open_build:
+            print(f"SKIP {p['legion']} (build {open_build} already queued)")
+            continue
         if args.fill:
             # greedy: check affordability per item, stop when broke
             if res["credits"] < p["cr"] or res["alloys"] < p["al"] or res["crew_pool"] < p["crew"]:
@@ -174,32 +188,40 @@ async def main() -> None:
         elif res["credits"] < p["cr"] or res["alloys"] < p["al"]:
             print(f"NOT AFFORDABLE total: need {tot_cr:,}C/{tot_al:,}A, have {res['credits']:,}C/{res['alloys']:,}A — abort, no writes.")
             await Database.close()
-            return
+            return 1
         if res["crew_pool"] < p["crew"]:
             print(f"CREW SHORT for {p['legion']}: need {p['crew']:,}, pool {res['crew_pool']:,} — abort, no writes.")
             await Database.close()
-            return
-
-        await Database.execute(
-            "UPDATE maya_rp.resources SET credits=credits-$1, alloys=alloys-$2, crew_pool=crew_pool-$3 WHERE session_id=$4",
-            p["cr"], p["al"], p["crew"], SID)
-        res["credits"] -= p["cr"]; res["alloys"] -= p["al"]; res["crew_pool"] -= p["crew"]
+            return 1
 
         desc = ", ".join(f"{c}x {t}" for t, c in p["comp"])
         n_ships = p["gap_war"] + p["gap_sup"]
-        await Database.execute(
-            "INSERT INTO maya_rp.build_queue (session_id, project_name, project_type, status, "
-            "alloy_cost, fuel_cost, credit_cost, build_time_days, created_at) "
-            "VALUES ($1,$2,'legion_build','queued',$3,0,$4,$5,NOW())",
-            SID, f"BUILD {p['legion']} — {n_ships} ships: {desc} | crew {p['crew']}",
-            p["al"], p["cr"], max(COST[t][2] for t, _ in p["comp"]))
+        try:
+            async with Database.transaction() as conn:
+                await _deduct_resources(SID, {"credits": p["cr"], "alloys": p["al"]}, conn=conn)
+                got = await conn.fetchval(
+                    "UPDATE maya_rp.resources SET crew_pool = crew_pool - $1 "
+                    "WHERE session_id=$2 AND crew_pool >= $1 RETURNING crew_pool", p["crew"], SID)
+                if got is None:
+                    raise InsufficientResources(
+                        f"crew pool cannot pay {p['crew']:,} crew for session {SID}")
+                await conn.execute(
+                    "INSERT INTO maya_rp.build_queue (session_id, project_name, project_type, status, "
+                    "alloy_cost, fuel_cost, credit_cost, build_time_days, created_at) "
+                    "VALUES ($1,$2,'legion_build','queued',$3,0,$4,$5,NOW())",
+                    SID, f"BUILD {p['legion']} — {n_ships} ships: {desc} | crew {p['crew']}",
+                    p["al"], p["cr"], max(COST[t][2] for t, _ in p["comp"]))
+        except InsufficientResources as e:
+            print(f"ABORT {p['legion']}: {e}")
+            continue
+        res["credits"] -= p["cr"]; res["alloys"] -= p["al"]; res["crew_pool"] -= p["crew"]
         queued.append(p["legion"])
         print(f"QUEUED {p['legion']}: {p['gap_war']}W+{p['gap_sup']}S ({p['cr']/1e6:.1f}M C, crew {p['crew']:,})")
 
     if not queued:
-        print("Nothing queued — all legions already at standard or unaffordable.")
+        print("Nothing queued — all legions already at standard, already queued, or unaffordable.")
         await Database.close()
-        return
+        return 0
 
     # ── PHASE 3-5: CREW + OFFICER + COMMANDER (reserved; completion-time steps) ──
     print("\n" + "═" * 60)
@@ -241,7 +263,8 @@ async def main() -> None:
     print(f"\nTREASURY AFTER: {after['credits']:,}C / {after['alloys']:,}A / pool {after['crew_pool']:,}")
     print("\nRun: python3 scripts/cli.py save \"fleet expansion\" — then roll100 to advance builds.")
     await Database.close()
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

@@ -7,9 +7,12 @@ so completed legion_build queue items are no-ops in the tick.
 
 Fix: create 120 ships per Legio (100 warships + 20 support, T5 standard from
 fleet_expansion.py: WAR_TARGET=100 +20% / SUP_TARGET=20) and assign to the
-Legio fleets. Duplicate queued builds 82-85 are cancelled.
+Legio fleets. Duplicate queued builds 82-85 are cancelled in the named session.
+A Legio that already has ships is skipped.
 
-Run:  set -a; source ~/.env; set +a; python3 scripts/materialize_legio.py
+Run:  set -a; source ~/.env; set +a
+      python3 scripts/materialize_legio.py --session N            # report only
+      python3 scripts/materialize_legio.py --session N --apply    # write
 """
 import asyncio
 import sys
@@ -17,9 +20,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.config import Config
 from core.db import Database
 from modules.ship_generation import generate_ship
+from scripts._oneshot import parse, guard
 
 # (ship_type, class_name, count) — the 120-ship legion standard template
 TEMPLATE = [
@@ -46,12 +49,13 @@ LEGIOS = [
 ]
 
 TIER = 5
-SESSION = 3
 
 
-async def main() -> None:
+async def main(argv=None) -> int:
+    args = parse(__doc__, argv)
+    guard(args)
+    sid = args.session
     await Database.init()
-    sid = Config.SESSION_ID if Config.SESSION_ID else SESSION
     total = 0
     for legion_name, prefix, loc in LEGIOS:
         fleet_id = await Database.fetchval(
@@ -59,6 +63,14 @@ async def main() -> None:
             legion_name, sid)
         if not fleet_id:
             print(f"!! fleet {legion_name} missing — skipping")
+            continue
+        members = await Database.fetchval(
+            "SELECT count(*) FROM maya_rp.fleet_members WHERE fleet_id=$1", fleet_id)
+        if members:
+            print(f"{legion_name} already has {members} ships, skipping")
+            continue
+        if not args.apply:
+            print(f"{legion_name}: would create {sum(c for *_, c in TEMPLATE)} ships")
             continue
         pos = 0
         for ship_type, class_name, count in TEMPLATE:
@@ -97,18 +109,25 @@ async def main() -> None:
                     fleet_id, ship_id, ((pos - 1) % 10) + 1)
                 total += 1
         print(f"{legion_name}: {pos} ships materialized")
+    if not args.apply:
+        print("DRY RUN — re-run with --apply to write.")
+        await Database.close()
+        return 0
     await Database.execute(
-        "UPDATE maya_rp.build_queue SET status='cancelled' WHERE id BETWEEN 82 AND 85 AND status='queued'")
-    await Database.execute(
-        "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance) "
-        "VALUES ($1,'legion_deploy','Legio I-IV ships materialized',$2,4)",
-        sid,
-        f"Completed builds 31-34 (2026-08-10) never spawned ships — engine bug "
-        f"(ship_building.py has no legion_build handler). {total} hulls created now: "
-        f"120 per Legio (100 warships + 20 support, T5). Duplicate queued builds 82-85 cancelled.")
+        "UPDATE maya_rp.build_queue SET status='cancelled' "
+        "WHERE id BETWEEN 82 AND 85 AND session_id=$1 AND status='queued'", sid)
+    if total > 0:
+        await Database.execute(
+            "INSERT INTO maya_rp.events (session_id, event_type, title, description, importance) "
+            "VALUES ($1,'legion_deploy','Legio I-IV ships materialized',$2,4)",
+            sid,
+            f"Completed builds 31-34 (2026-08-10) never spawned ships — engine bug "
+            f"(ship_building.py has no legion_build handler). {total} hulls created now: "
+            f"120 per Legio (100 warships + 20 support, T5). Duplicate queued builds 82-85 cancelled.")
     await Database.close()
     print(f"TOTAL: {total} ships")
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

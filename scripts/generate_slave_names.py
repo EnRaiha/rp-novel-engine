@@ -10,15 +10,16 @@ Rows land in `maya_rp.slaves` (the table the engine's slave module and the
 roll by name:
 
     SELECT name, species, gender, age, role, cost FROM maya_rp.slaves
-     WHERE session_id=3 AND assigned_to = 'Marlon Bregg — lot 890'
+     WHERE session_id=N AND assigned_to = 'Marlon Bregg — lot 890'
      ORDER BY id;
 
-    python3 scripts/generate_slave_names.py --count 890 --dry-run
-    python3 scripts/generate_slave_names.py --count 890
+A run reports and writes nothing unless `--apply` is given. `--dry-run` is accepted and changes nothing.
+
+    python3 scripts/generate_slave_names.py --session N --count 890
+    python3 scripts/generate_slave_names.py --session N --count 890 --apply
 """
 from __future__ import annotations
 
-import argparse
 import asyncio
 import random
 import sys
@@ -29,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.db import Database  # noqa: E402
 from core import name_gen  # noqa: E402
+from scripts._oneshot import guard, parse  # noqa: E402
 
 # Market stock, not household staff: low loyalty, ordinary bodies, priced by tier.
 SPECIES = (("human", 68), ("alien", 32))
@@ -60,15 +62,17 @@ def stock_row(index: int) -> dict:
     }
 
 
-async def main() -> int:
-    parser = argparse.ArgumentParser(description="Name the individuals of a consignment lot")
-    parser.add_argument("--session", type=int, default=3)
+def _options(parser) -> None:
     parser.add_argument("--count", type=int, default=890, help="lot size (individuals)")
     parser.add_argument("--lot", default="890", help="lot number")
     parser.add_argument("--broker", default="Marlon Bregg")
     parser.add_argument("--dock", default="free dock 7")
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--dry-run", action="store_true", help="no-op: a dry run is the default")
+
+
+async def main(argv=None) -> int:
+    args = parse(__doc__, argv, extra=_options)
+    guard(args)
 
     tag = f"{args.broker} — lot {args.lot}"
     await Database.init()
@@ -106,10 +110,10 @@ async def main() -> int:
                      tag, stock["role"], now, f"{args.dock} — consignment", stock["cost"],
                      "for_sale", now))
 
-    if args.dry_run:
+    if not args.apply:
         for row in rows[:5]:
             print("  ", row[1], "|", row[2], row[3], row[4], "|", row[10], "|", row[13])
-        print(f"DRY — would insert {len(rows)} rows into maya_rp.slaves")
+        print(f"DRY RUN — would insert {len(rows)} rows into maya_rp.slaves. Re-run with --apply to write.")
         await Database.close()
         return 0
 

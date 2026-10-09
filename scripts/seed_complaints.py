@@ -5,17 +5,19 @@ King silent-monitors from the dark. Every Setia planet has a complaint box —
 purpose-made tough, can handle beating. People vent there. These are the REAL
 voices: taxes, food, governors, species friction, war, hope, fear.
 
-Generates N complaints (default 100) across Setia complaint boxes, drawn from
+Generates N complaints (`--count`, default 100) across Setia complaint boxes, drawn from
 live state: tax rate, dev level, sentiment, species mix, EDEN food coverage.
+A session that already has complaints is refused.
+
+  python3 scripts/seed_complaints.py --session N --count 100            # report only
+  python3 scripts/seed_complaints.py --session N --count 100 --apply    # insert in one transaction
 """
 from __future__ import annotations
 import os
 import asyncio, random, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from core.config import Config
 from core.db import Database
-
-SID = Config.SESSION_ID
+from scripts._oneshot import parse, guard
 
 TAX_COMPLAINTS = [
     "Cukai naik lagi tahun ni. Makanan pun mahal. Apa guna box ni kalau cakap pun tak didengar?",
@@ -89,19 +91,30 @@ FACTION_COMPLAINTS = [
 CATEGORIES = ["tax", "food", "governor", "war", "species", "hope", "special", "faction"]
 
 
-async def main() -> None:
+async def main(argv=None) -> int:
+    args = parse(__doc__, argv, extra=lambda parser: parser.add_argument(
+        "--count", type=int, default=100, help="complaints to roll"))
+    guard(args)
+    sid = args.session
+    n = args.count
     await Database.init()
-    n = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 100
     boxes = await Database.fetch(
         """SELECT cb.id, cb.territory_id, t.controlling_faction AS fac
            FROM maya_rp.complaint_boxes cb
            JOIN maya_rp.territory t ON t.id = cb.territory_id
-           WHERE cb.session_id=$1""", SID)
+           WHERE cb.session_id=$1""", sid)
     if not boxes:
-        print("No complaint boxes seeded"); await Database.close(); return
+        print("No complaint boxes seeded")
+        await Database.close()
+        return 1
+    already = await Database.fetchval("SELECT count(*) FROM maya_rp.complaints WHERE session_id=$1", sid)
+    if already:
+        print(f"REFUSED: session {sid} already has {already} complaints")
+        await Database.close()
+        return 1
 
     rng = random.Random(1384)
-    inserted = 0
+    rows: list[tuple] = []
     for _ in range(n):
         box = rng.choice(boxes)
         cat = rng.choices(CATEGORIES, weights=[22, 15, 13, 13, 7, 13, 4, 13])[0]
@@ -119,15 +132,24 @@ async def main() -> None:
             mood = {"tax": "marah", "food": "lapar", "governor": "kecewa", "war": "takut",
                     "species": "harap", "hope": "yakin", "special": "campur"}[cat]
         complaint_text = f"[{fac_name}] {text}" if fac_name else text
-        await Database.execute(
-            """INSERT INTO maya_rp.complaints
-               (session_id, box_id, planet_id, territory_id, complaint, category, mood, anonymous)
-               VALUES ($1,$2,NULL,$3,$4,$5,$6,TRUE)""",
-            SID, box["id"], box["territory_id"], complaint_text, cat, mood)
-        inserted += 1
-    print(f"COMPLAINTS ROLLED — {inserted} aduan dari {len(boxes)} kotak aduan (rakyat + faction)")
+        rows.append((sid, box["id"], box["territory_id"], complaint_text, cat, mood))
+    print(f"COMPLAINTS ROLLED — {len(rows)} aduan dari {len(boxes)} kotak aduan (rakyat + faction)")
+    if not args.apply:
+        print("DRY RUN — re-run with --apply to write.")
+        await Database.close()
+        return 0
+
+    async with Database.transaction() as conn:
+        for row in rows:
+            await conn.execute(
+                """INSERT INTO maya_rp.complaints
+                   (session_id, box_id, planet_id, territory_id, complaint, category, mood, anonymous)
+                   VALUES ($1,$2,NULL,$3,$4,$5,$6,TRUE)""",
+                *row)
+    print(f"APPLIED — inserted {len(rows)} complaints")
     await Database.close()
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+from re import _constants as _sre_const, _parser as _sre_parse
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -34,7 +35,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from core.db import Database
-from core.log import error
+from core.log import error, warn
 from modules.magic_cost import declared_acts, price_acts
 
 # ── Layers (§2) ─────────────────────────────────────────────────────────
@@ -49,6 +50,12 @@ KIND_KNOWLEDGE = "knowledge"
 # ── Bounds (R1: a regex may only ever backtrack over a bounded text) ────
 MAX_AUDIT_CHARS = 20_000
 MAX_PATTERN_CHARS = 400
+#: Parsed repeat node kinds: greedy, lazy, possessive.
+_REPEATS = (_sre_const.MAX_REPEAT, _sre_const.MIN_REPEAT, _sre_const.POSSESSIVE_REPEAT)
+#: A repeat of at most this many iterations is not open-ended.
+_MANY = 10
+#: A repeat count at or above this is refused.
+_COUNT_CAP = 100
 _PATTERN_CACHE: dict[tuple[str, bool], re.Pattern[str]] = {}
 #: Rule ids whose pattern would not compile. Reported once each; the rule is inert.
 _BROKEN_RULES: set[str] = set()
@@ -222,10 +229,104 @@ class OocFinding:
     delta: int
 
 
-def _reject_nested_quantifier(source: str) -> None:
-    """Refuse a pattern whose groups repeat unbounded — the ReDoS shape (R1)."""
-    if re.search(r"\([^)]*[+*][^)]*\)\s*[+*{]", source) or re.search(r"\{\d{3,}", source):
-        raise ValueError(f"pattern risks unbounded backtracking: {source!r}")
+def _sub_patterns(op, av):
+    """Yield the sub-patterns that sit directly inside one parsed node."""
+    if op in _REPEATS:
+        yield av[2]
+    elif op == _sre_const.SUBPATTERN:
+        yield av[3]
+    elif op == _sre_const.BRANCH:
+        yield from av[1]
+    elif op in (_sre_const.ASSERT, _sre_const.ASSERT_NOT):
+        yield av[1]
+    elif op == _sre_const.ATOMIC_GROUP:
+        yield av
+    elif op == _sre_const.GROUPREF_EXISTS:
+        yield av[1]
+        if av[2] is not None:
+            yield av[2]
+
+
+def _nodes(items):
+    """Yield every parsed node under `items`, nested nodes included."""
+    for op, av in items:
+        yield op, av
+        for inner in _sub_patterns(op, av):
+            yield from _nodes(inner)
+
+
+def _is_wide(body) -> bool:
+    """True when a repeat body is `.` or a negated class, which match almost any character."""
+    nodes = list(body)
+    if len(nodes) != 1:
+        return False
+    op, av = nodes[0]
+    return op == _sre_const.ANY or (op == _sre_const.IN and av[0][0] == _sre_const.NEGATE)
+
+
+def _first_char(alternative) -> str | None:
+    """Lower-cased first literal of a branch alternative, or None when it starts with anything else."""
+    nodes = list(alternative)
+    if nodes and nodes[0][0] == _sre_const.LITERAL:
+        return chr(nodes[0][1]).lower()
+    return None
+
+
+def _repeats_same_body_twice(items) -> bool:
+    """True when two open-ended repeats of one body sit side by side, as in `\\w+\\w+`."""
+    previous = None
+    for op, av in items:
+        if op in _REPEATS and av[1] == _sre_const.MAXREPEAT:
+            if previous is not None and list(previous) == list(av[2]):
+                return True
+            previous = av[2]
+        else:
+            previous = None
+        if any(_repeats_same_body_twice(inner) for inner in _sub_patterns(op, av)):
+            return True
+    return False
+
+
+def _reject_nested_quantifier(source: str, flags: int = 0) -> None:
+    """Refuse a pattern that can backtrack without bound (R1).
+
+    The pattern is parsed, so escapes and nested groups cannot hide a quantifier. Refused shapes:
+    - a counted repeat of 100 or more,
+    - an open-ended repeat around a variable repeat: `(a+)+`, `((a+))+`, `(a?){30}`,
+    - an open-ended repeat around alternatives that can start alike: `(a|aa)+`, `(a|a)+`,
+    - two open-ended wildcard repeats in one pattern: `.*x.*y`,
+    - two open-ended repeats of one body side by side: `\\w+\\w+`.
+    A repeat of 10 or fewer iterations is not open-ended.
+
+    @param source - pattern text, inline flags already hoisted into `flags`.
+    @param flags - compile flags, needed to parse a verbose pattern.
+    @raises ValueError - the pattern has a refused shape.
+    @raises re.error - the pattern is not valid regex syntax.
+    """
+    parsed = _sre_parse.parse(source, flags)
+    refusal = ValueError(f"pattern risks unbounded backtracking: {source!r}")
+    open_wildcards = 0
+    for op, av in _nodes(parsed):
+        if op not in _REPEATS:
+            continue
+        low, high, body = av
+        unbounded = high == _sre_const.MAXREPEAT
+        if low >= _COUNT_CAP or (not unbounded and high >= _COUNT_CAP):
+            raise refusal
+        if not unbounded and high <= _MANY:
+            continue
+        inside = list(_nodes(body))
+        if any(i_op in _REPEATS and i_av[1] > i_av[0] for i_op, i_av in inside):
+            raise refusal
+        for i_op, i_av in inside:
+            if i_op == _sre_const.BRANCH:
+                firsts = [_first_char(alternative) for alternative in i_av[1]]
+                if None in firsts or len(set(firsts)) != len(firsts):
+                    raise refusal
+        if unbounded and _is_wide(body):
+            open_wildcards += 1
+    if open_wildcards > 1 or _repeats_same_body_twice(parsed):
+        raise refusal
 
 
 def compile_rule(rule: OocRule) -> re.Pattern[str]:
@@ -253,7 +354,7 @@ def compile_rule(rule: OocRule) -> re.Pattern[str]:
         for letter in inline.group(1):
             flags |= flag_bits.get(letter, 0)
         source = source[inline.end():]
-    _reject_nested_quantifier(source)
+    _reject_nested_quantifier(source, flags)
     compiled = re.compile(rf"(?<![A-Za-z0-9_])(?:{source})(?![A-Za-z0-9_])", flags)
     _PATTERN_CACHE[key] = compiled
     return compiled
@@ -515,9 +616,13 @@ async def audit(
     @param preview - answer what the text *would* cost without writing anything
         (the harness `ooc_audit` tool is a free preview by contract).
     @returns the audit result: findings, new deviation, stage, debuff, award,
-        and any scripted beats this turn's prose proved (§6.3).
+        any scripted beats this turn's prose proved (§6.3),
+        and `truncated_chars`, the count of characters past the cap that were not audited.
     """
     sid = _session_key(session_id)
+    cut = max(0, len(text or "") - MAX_AUDIT_CHARS)
+    if cut:
+        warn("ooc", f"session {sid}: audit text is {len(text)} chars, the last {cut} are not audited")
     if not preview:
         _refuse_frozen(sid)
     # GM MAYA maintenance: the register guard stands down, so no rule bills this
@@ -571,6 +676,7 @@ async def audit(
             "session_id": sid,
             "stage": stage,
             "layer": layer,
+            "truncated_chars": cut,
             "rules": len(rules),
             "findings": [
                 {"rule_id": f.rule_id, "kind": f.kind, "layer": f.layer, "match": f.match, "delta": f.delta}
@@ -670,6 +776,7 @@ async def audit(
         "session_id": sid,
         "stage": stage,
         "layer": layer,
+        "truncated_chars": cut,
         "rules": len(rules),
         "findings": [
             {"rule_id": f.rule_id, "kind": f.kind, "layer": f.layer, "match": f.match, "delta": f.delta}

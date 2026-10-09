@@ -177,3 +177,65 @@ async def test_a_status_message_is_read_and_writes_nothing(watcher):
     assert await Database.fetchval(
         "SELECT count(*) FROM maya_rp.terms WHERE session_id=$1", watcher["session"]) == 0
     assert tw.read_watermark()["last_id"] == 4, "it still advances: the turn was read"
+
+
+# ── the freeze door ──────────────────────────────────────────────────────────
+
+def test_a_frozen_session_is_not_writable(watcher, monkeypatch):
+    """The watcher calls `scene_tracker` and `terms` directly, so it never passed `core/session.py`
+    and never met `is_frozen`. Installed 2026-10-04, frozen 2026-10-05, and the service kept
+    running: the last write preceded the freeze by 44 minutes, which is the only reason no frozen
+    row was written. Turn 233 would have been."""
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: True)
+    monkeypatch.setattr("core.ooc._maintenance_active", lambda: False)
+
+    assert tw._session_is_writable(5) is False
+
+
+def test_maintenance_makes_it_writable_again(watcher, monkeypatch):
+    """Maintenance armed means the operator is repairing the campaign, which is the one way in."""
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: True)
+    monkeypatch.setattr("core.ooc._maintenance_active", lambda: True)
+
+    assert tw._session_is_writable(5) is True
+
+
+def test_an_unreadable_freeze_list_writes_nothing(watcher, monkeypatch):
+    """`is_frozen` is fail-closed and raises on an unreadable list. A watcher that treated that as
+    writable would write into a campaign it cannot prove is reference-only."""
+    def explode(sid):
+        raise RuntimeError("frozen_sessions is unreadable")
+
+    monkeypatch.setattr("core.session.is_frozen", explode)
+    monkeypatch.setattr("core.ooc._maintenance_active", lambda: False)
+
+    assert tw._session_is_writable(5) is False
+
+
+async def test_a_pass_over_a_frozen_session_writes_nothing(watcher, monkeypatch):
+    watcher["turns"].append(_turn(9, TURN_WITH_TERMS))
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: True)
+    monkeypatch.setattr("core.ooc._maintenance_active", lambda: False)
+
+    code = await tw.once(session_id=watcher["session"], label="x", apply=True, limit=10,
+                         skip_failed=False)
+
+    assert code == 0, "refusing a frozen campaign is not an error; the poll keeps running"
+    assert tw.read_watermark()["last_id"] == 0, "the cursor did not move over a frozen campaign"
+    assert await Database.fetchval(
+        "SELECT count(*) FROM maya_rp.terms WHERE session_id=$1", watcher["session"]) == 0
+
+
+async def test_a_frozen_session_is_reported_once_not_every_poll(watcher, monkeypatch):
+    """The service polls every 60 seconds. A notice per pass is a flooded journal."""
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: True)
+    monkeypatch.setattr("core.ooc._maintenance_active", lambda: False)
+    monkeypatch.setattr(tw, "_FREEZE_NOTICE", "")
+
+    seen = []
+    monkeypatch.setattr(tw, "info", lambda tag, msg: seen.append(msg))
+
+    for _ in range(5):
+        tw._session_is_writable(5)
+
+    assert len(seen) == 1, f"the freeze was announced {len(seen)} times: {seen}"

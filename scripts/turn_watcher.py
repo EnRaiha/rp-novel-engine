@@ -47,6 +47,9 @@ from core.log import error, info, warn  # noqa: E402
 WATERMARK = Path.home() / ".cache" / "rp-turn-watcher.json"
 DEFAULT_LABEL = "tkg-play"
 
+# The last freeze message reported, so a 60-second poll states a frozen campaign once.
+_FREEZE_NOTICE = ""
+
 
 def read_watermark() -> dict:
     """The last turn id processed, or a fresh one. A corrupt file is reported, not fatal."""
@@ -77,6 +80,45 @@ async def new_turns(label: str, after: int, limit: int) -> list[dict]:
         label, after, limit)]
 
 
+def _session_is_writable(session_id: int) -> bool:
+    """Whether this watcher may write into `session_id`, reported once per state change.
+
+    THE FREEZE DOOR WAS OPEN HERE AND THIS CLOSES IT. The watcher calls `scene_tracker` and `terms`
+    directly, so it never passed `core/session.py` and never met `is_frozen`. Installed 2026-10-04,
+    the freeze landed 2026-10-05 11:16, and the service kept running: the last write was 10:32 that
+    morning, 44 minutes before, which is the only reason no frozen row was written. Turn 233 would
+    have.
+
+    A frozen campaign is read-only reference, so a pass over one writes nothing and says so once
+    rather than every 60 seconds. The poll keeps running, so unfreezing resumes it without a restart.
+    `is_frozen` is fail-closed: an unreadable list raises, and this treats that as not writable.
+    """
+    global _FREEZE_NOTICE
+    from core.ooc import _maintenance_active
+    from core.session import is_frozen
+
+    try:
+        frozen = is_frozen(session_id) and not _maintenance_active()
+    except Exception as e:  # noqa: BLE001 - an unreadable freeze list must not fail open
+        if _FREEZE_NOTICE != f"unreadable:{e}":
+            _FREEZE_NOTICE = f"unreadable:{e}"
+            warn("turn-watcher", f"the frozen list cannot be read ({e}); writing nothing")
+        return False
+
+    if frozen:
+        if _FREEZE_NOTICE != "frozen":
+            _FREEZE_NOTICE = "frozen"
+            info("turn-watcher",
+                 f"session {session_id} is frozen reference; the watcher writes nothing until it is"
+                 " removed from frozen_sessions")
+        return False
+
+    if _FREEZE_NOTICE:
+        _FREEZE_NOTICE = ""
+        info("turn-watcher", f"session {session_id} is writable again; resuming")
+    return True
+
+
 async def process_one(session_id: int, turn: dict, *, write: bool) -> dict:
     """Track what one turn declares. Returns what was found, whether or not it was written."""
     from core import scene_tracker, terms
@@ -99,6 +141,8 @@ async def process_one(session_id: int, turn: dict, *, write: bool) -> dict:
 async def once(*, session_id: int, label: str, apply: bool, limit: int,
                skip_failed: bool) -> int:
     """One pass. Returns the exit code: 0 always ran, 3 something could not be processed."""
+    if apply and not _session_is_writable(session_id):
+        return 0
     state = read_watermark()
     start = state["last_id"]
     turns = await new_turns(label, start, limit)

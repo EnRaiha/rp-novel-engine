@@ -5,10 +5,18 @@ import asyncio
 import pathlib
 import sys
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.physical_state as ps  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _writable(monkeypatch):
+    """The real frozen list must not decide these tests: they name session 3 or 5."""
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: False)
 
 
 def _run(coro):

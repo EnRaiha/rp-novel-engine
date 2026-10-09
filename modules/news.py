@@ -15,6 +15,7 @@ import re
 from core.db import Database
 from core.config import Config
 from core.log import info, error
+from core.session import require_session
 
 NEWS_TEMPLATES = {
     "fleet": [
@@ -119,7 +120,9 @@ async def _recent_templates(session_id: int, gd: int, window: int) -> set[str]:
 
 
 async def generate(session_id: int | None = None) -> list[dict]:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     gd = await _game_day(session_id)
     systems = await Database.fetch("SELECT system_name FROM maya_rp.territory WHERE session_id=$1 ORDER BY RANDOM() LIMIT 3", session_id)
     factions = await Database.fetch("SELECT name FROM maya_rp.factions WHERE session_id=$1 ORDER BY RANDOM() LIMIT 3", session_id)
@@ -203,7 +206,9 @@ async def roll_news(session_id: int | None = None, limit: int = 5, top_up: bool 
     top_up=True: if the pool of fresh unread news is thinner than `limit`,
     generate new articles on the spot so there is always news to serve.
     """
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if limit < 0:
         raise ValueError(f"limit cannot be negative, got {limit}")
     gd = await _game_day(session_id)
@@ -246,7 +251,9 @@ async def mark_read(session_id: int | None = None, article_id: int | None = None
     Scoped by session in both branches: `WHERE id=$1` alone retired another
     campaign's article. Returns whether it retired anything.
     """
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if article_id is not None:
         return await _retire(
             "UPDATE maya_rp.news_articles SET read = true WHERE session_id=$1 AND id=$2",
@@ -259,7 +266,9 @@ async def mark_read(session_id: int | None = None, article_id: int | None = None
 
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         articles = await generate(session_id)
         info("news", f"Generated {len(articles)} articles")

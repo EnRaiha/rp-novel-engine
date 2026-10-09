@@ -18,16 +18,16 @@ from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import info
+from core.session import require_session
 
 
 def _sid(session_id: int | None) -> int:
     """The session for this call, resolved at call time.
 
-    This module used to hold `SID = Config.SESSION_ID` at import. A module-level copy freezes on the
-    session that was current when the module was first imported, so every default path read and wrote
-    that campaign for the life of the process.
+    A module-level copy of `Config.SESSION_ID` freezes on the session that was current at import, so
+    every default path will read and write that campaign for the life of the process.
     """
-    return Config.SESSION_ID if session_id is None else session_id
+    return require_session(session_id)
 
 # Weighted drivers (all clamped -100..100 / 0..100)
 W_MORALE  = 0.30
@@ -49,6 +49,8 @@ def _clamp(v: float, lo: int = -100, hi: int = 100) -> int:
 async def init_for_territory(session_id: int | None = None) -> int:
     """Ensure every territory has baseline rows (governor faction + Setia Empire)."""
     session_id = _sid(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     n = 0
     for t in await Database.fetch(
             "SELECT id, controlling_faction FROM maya_rp.territory WHERE session_id=$1", session_id):
@@ -77,6 +79,8 @@ async def refresh(session_id: int | None = None, territory_id: int | None = None
     several ticks. `dry_run` writes nothing and returns the planned moves under `deltas`.
     """
     session_id = _sid(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     rows = await Database.fetch(
         """SELECT ps.id, ps.territory_id, ps.faction_name,
                   ps.sentiment, ps.approval, ps.fear, ps.trust,
@@ -146,6 +150,8 @@ async def shift(session_id: int | None, territory_id: int, faction_name: str,
                 delta: int, reason: str) -> dict:
     """Manual/narrative shift (news, events, decrees). Clamped. One statement, so a concurrent write cannot be lost."""
     session_id = _sid(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     row = await Database.fetchrow(
         """UPDATE maya_rp.population_sentiment SET
                sentiment = GREATEST(-100, LEAST(100, sentiment + $4::int)),
@@ -163,6 +169,8 @@ async def shift(session_id: int | None, territory_id: int, faction_name: str,
 async def apply_news_bias(session_id: int | None = None, limit: int = 50) -> int:
     """Pull recent news faction_bias into sentiment shifts."""
     session_id = _sid(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     news = await Database.fetch(
         """SELECT id, headline, faction_bias, game_day FROM maya_rp.news_articles
            WHERE session_id=$1 ORDER BY id DESC LIMIT $2""",
@@ -201,6 +209,8 @@ async def apply_news_bias(session_id: int | None = None, limit: int = 50) -> int
 async def run_tick(session_id: int | None = None) -> dict:
     """Tick hook: refresh all + apply news bias."""
     session_id = _sid(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     await init_for_territory(session_id)  # ensure rows
     ref = await refresh(session_id)
     nb = await apply_news_bias(session_id)

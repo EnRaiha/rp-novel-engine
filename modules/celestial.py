@@ -24,6 +24,7 @@ from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import error, info
+from core.session import require_session
 
 
 # ─── Visibility Levels ──────────────────────────────────────────
@@ -354,6 +355,9 @@ async def reveal_system(session_id: int, system_name: str, level: str = "scanned
     reveal that raised the level from one that changed nothing, and the territory write below is a
     political status, not only a visibility one.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     existing = await get_visibility(session_id, system_name)
     old_level = existing.get("level", "uncharted")
     old_idx = VIS_ORDER.index(old_level)
@@ -530,7 +534,7 @@ async def get_system_detail(session_id: int, system_name: str) -> dict | None:
 
 async def run_tick(session_id: int | None = None) -> dict[str, Any]:
     """Celestial module tick: log universe stats."""
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     try:
         stats = await get_universe_stats(session_id)
         info("celestial", f"Tick: {stats['systems']} systems, {stats['planets']} planets, {stats['colonies']} colonies")

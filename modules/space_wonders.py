@@ -5,6 +5,7 @@ from core.db import Database
 from core.config import Config
 from core.events import EventBus
 from core.log import error, info
+from core.session import require_session
 
 # Loot key → maya_rp.resources column. Keys outside this map are not resources
 # and are reported back to the caller instead of being dropped in silence.
@@ -74,8 +75,9 @@ async def survey_planet(planet_id: int, session_id: int | None = None) -> dict:
     The planet is read and written inside one session, so a survey cannot reach
     another campaign's planet.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     p = await Database.fetchrow("""
         SELECT p.*, pt.description AS type_desc, pt.special_events
         FROM maya_rp.planets p
@@ -154,14 +156,15 @@ async def encounter_animal(system_id: int, animal_id: int = None,
                            session_id: int | None = None) -> dict:
     """Generate a random animal encounter in a system.
 
-    The encounter belongs to the system's campaign unless the caller names one.
+    The encounter belongs to the system's campaign unless the caller names one. The campaign is
+    resolved first, then guarded, so a frozen campaign is refused before any write.
     """
-    if session_id is None:
-        session_id = await Database.fetchval(
-            "SELECT session_id FROM maya_rp.sectors WHERE id = $1", system_id
-        )
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    campaign = session_id if session_id is not None else await Database.fetchval(
+        "SELECT session_id FROM maya_rp.sectors WHERE id = $1", system_id
+    )
+    session_id = require_session(campaign)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if not animal_id:
         animal = await Database.fetchrow(
             "SELECT * FROM maya_rp.space_animals ORDER BY random() LIMIT 1"
@@ -205,8 +208,9 @@ async def encounter_animal(system_id: int, animal_id: int = None,
 async def hunt_animal(encounter_id: int, fleet_power: int = 100,
                       session_id: int | None = None) -> dict:
     """Hunt a space animal for resources."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if int(fleet_power) <= 0:
         return {"error": f"fleet_power must be positive, got {fleet_power}."}
     enc = await Database.fetchrow(
@@ -275,8 +279,9 @@ async def hunt_animal(encounter_id: int, fleet_power: int = 100,
 async def tame_animal(encounter_id: int, trainer_skill: int = 5,
                       session_id: int | None = None) -> dict:
     """Attempt to tame a space animal as a companion/asset."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     enc = await Database.fetchrow(
         "SELECT * FROM maya_rp.animal_encounters WHERE id = $1 AND status = 'active'"
         " AND session_id = $2",
@@ -338,14 +343,15 @@ async def discover_anomaly(system_id: int, trigger: str = "scan_low",
                            session_id: int | None = None) -> dict:
     """Discover a space anomaly in a system.
 
-    The discovery belongs to the system's campaign unless the caller names one.
+    The discovery belongs to the system's campaign unless the caller names one. The campaign is
+    resolved first, then guarded, so a frozen campaign is refused before any write.
     """
-    if session_id is None:
-        session_id = await Database.fetchval(
-            "SELECT session_id FROM maya_rp.sectors WHERE id = $1", system_id
-        )
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    campaign = session_id if session_id is not None else await Database.fetchval(
+        "SELECT session_id FROM maya_rp.sectors WHERE id = $1", system_id
+    )
+    session_id = require_session(campaign)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     anomaly = await Database.fetchrow("""
         SELECT * FROM maya_rp.space_anomalies
         WHERE active = TRUE AND discovery_trigger = $1
@@ -386,8 +392,9 @@ async def discover_anomaly(system_id: int, trigger: str = "scan_low",
 async def explore_anomaly(discovery_id: int, fleet_power: int = 100,
                           session_id: int | None = None) -> dict:
     """Explore a discovered anomaly for rewards or danger."""
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if int(fleet_power) <= 0:
         return {"error": f"fleet_power must be positive, got {fleet_power}."}
     disc = await Database.fetchrow(
@@ -464,8 +471,7 @@ async def get_wonders_overview(session_id: int | None = None) -> dict:
     The planets are session-scoped; the animal and anomaly catalogues are not, because they describe
     the galaxy rather than one campaign in it.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     planets = await Database.fetch("""
         SELECT id, name, planet_type, habitability, surveyed
         FROM maya_rp.planets WHERE session_id = $1 ORDER BY name
@@ -497,8 +503,9 @@ async def run_tick(session_id: int = None):
     frozen reference campaign.
     """
     from core.log import error
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     spawned = discovered = surveyed = 0
     try:
         gd = 0.5  # simplified game days
@@ -556,8 +563,7 @@ async def _log(sid, category, title, content, importance=2):
     The old COALESCE($1, 3) fell back to the frozen reference campaign, so a
     session 5 hunt wrote its story into session 3.
     """
-    if sid is None:
-        sid = Config.SESSION_ID
+    sid = require_session(sid)
     try:
         await Database.execute("""
             INSERT INTO maya_rp.story_log (session_id, category, title, content, importance, happened_at)

@@ -13,19 +13,20 @@ from core.db import Database
 from core.events import EventBus
 from core.log import error, info
 from core.utils import calc_game_days
+from core.session import require_session
 
 # ── WAR MACHINE ──
 
 async def run_tick(session_id: int = None) -> dict:
     """Main pirate tick — spawn, move, attack, alert, hoard income, den regen.
 
-    Defaults to the engine's session (Config.SESSION_ID), not the literal 3:
-    the legacy TKG id is the frozen reference campaign, so a bare call used to
-    write into a campaign nobody chose. The orchestrator treats an `error` dict
-    as a failed module, which is why the failure is no longer only printed.
+    A missing session resolves per call through `require_session`, never to the legacy TKG id 3,
+    which is the frozen reference campaign. The orchestrator treats an `error` dict as a failed
+    module, so a tick error is returned and not only logged.
     """
-    if session_id is None:
-        session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         await _spawn(session_id)
         await _attack(session_id)
@@ -451,6 +452,9 @@ async def claim_bounty(session_id: int, pirate_faction_id: int) -> dict:
     the session's first faction named `Setia Empire%`; without one nothing pays.
     Each call claims one bounty and credits it in one transaction.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     f = await Database.fetchrow(
         "SELECT status FROM factions WHERE id=$1 AND is_pirate=true AND session_id=$2",
         pirate_faction_id, session_id)
@@ -515,6 +519,9 @@ async def raid_pirate_base(session_id: int, base_id: int, attack_power: int = 50
     in one transaction: two raiders seize a hoard once, and a missing coffer
     leaves the base standing.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     base = await Database.fetchrow(
         "SELECT pb.*, f.pirate_fleet_power FROM maya_rp.pirate_bases pb "
         "JOIN maya_rp.factions f ON f.id = pb.faction_id "

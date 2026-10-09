@@ -15,6 +15,7 @@ from core.events import EventBus
 from core.log import info
 from core.utils import calc_game_days
 from core.config import Config
+from core.session import require_session
 
 PHASE_NAMES = ["Opening", "Complication", "Companion Moment", "Turning Point", "Finisher"]
 
@@ -50,6 +51,9 @@ class BattleEngine:
     async def init(cls, session_id: int, player_ships: List[int],
                    enemy_faction: str, terrain_id: int = None) -> BattleState:
         """Initialize a new battle."""
+        session_id = require_session(session_id)
+        from core.ooc import _refuse_frozen
+        _refuse_frozen(session_id)
         pf = await cls._make_fleet(player_ships, "Setia Empire", session_id)
         ef = await cls._make_enemy_fleet(enemy_faction, session_id=session_id)
         # One argument list per query: passing terrain_id into the "random()"
@@ -73,6 +77,8 @@ class BattleEngine:
 
     @classmethod
     async def resolve_turn(cls, state: BattleState, tactic: str) -> BattleState:
+        from core.ooc import _refuse_frozen
+        _refuse_frozen(state.session_id)
         state.turn += 1; state.player_tactic = tactic
         state.enemy_tactic = await cls._ai_tactic(state)
         pm = await cls._tactic_mult(tactic); em = await cls._tactic_mult(state.enemy_tactic)
@@ -126,8 +132,7 @@ class BattleEngine:
         for session 3 against 246 for session 5), so an unfiltered read handed
         this campaign the frozen campaign's entire order of battle.
         """
-        if session_id is None:
-            session_id = Config.SESSION_ID
+        session_id = require_session(session_id)
         rows = await Database.fetch(
             "SELECT id, ship_name, ship_type, hull, speed, power_rating FROM maya_rp.faction_ships "
             "WHERE faction_name=$1 AND status='active' AND session_id=$2 "
@@ -261,7 +266,12 @@ class BattleEngine:
         A name outside the catalogue raises. It used to write nothing and
         return None, so a typo left the battle at its previous formation with
         the caller told nothing.
+
+        The battle row names its session, which the guard checks before anything else.
         """
+        sid = await Database.fetchval("SELECT session_id FROM maya_rp.combat_results WHERE id=$1", battle_id)
+        from core.ooc import _refuse_frozen
+        _refuse_frozen(sid)
         r = await Database.fetchrow(
             "SELECT name FROM maya_rp.fleet_formations WHERE LOWER(name)=LOWER($1)", formation)
         if r is None:
@@ -278,6 +288,8 @@ class BattleEngine:
         the caller was told, so the battle record disagreed with the return.
         """
         state = await cls._load_state(battle_id)
+        from core.ooc import _refuse_frozen
+        _refuse_frozen(state.session_id if state else None)
         if not state: return {"success": False, "error": "Not found"}
         spd = sum(s.speed for s in state.player.ships) / max(1, len(state.player.ships))
         eva = sum(s.evasion for s in state.player.ships) / max(1, len(state.player.ships))
@@ -359,7 +371,9 @@ async def run_tick(session_id: int = None):
     war.advance() owns phase progression.
     """
     from core.log import info, error
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         from modules.tactics import formation_bonus, roll_terrain
         import random as _r
@@ -480,6 +494,10 @@ async def resolve_intent(session_id: int, action: str, target: str, fleet_name: 
     receives the item; kilo_bridge.py calls (session_id, action, target, fleet).
     The two callers disagree about which string lands in `target`.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
+
     # Simple combat resolution: TKG forces vs target
     from core import campaign
 

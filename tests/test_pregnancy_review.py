@@ -31,6 +31,12 @@ import pytest
 import modules.pregnancy as preg
 
 
+@pytest.fixture(autouse=True)
+def _writable(monkeypatch):
+    """The real frozen list must not decide these tests: they name session 3 or 5."""
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: False)
+
+
 class FakeDB:
     def __init__(self, fetch=None, fetchrow=None, fetchval=100, execute_tag="UPDATE 1"):
         self.fetch_rows = fetch if fetch is not None else []

@@ -36,6 +36,12 @@ import pytest
 import modules.pirates as pirates
 
 
+@pytest.fixture(autouse=True)
+def _writable(monkeypatch):
+    """The real frozen list must not decide these tests: they name session 3 or 5."""
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: False)
+
+
 class FakeDB:
     def __init__(self, fetch=None, rows=None, fetchval=None, execute_tag="UPDATE 1"):
         self.fetch_rows = fetch if fetch is not None else []
@@ -98,7 +104,7 @@ async def test_run_tick_defaults_to_the_engine_session_not_the_frozen_id(monkeyp
 
     for name in ("_spawn", "_attack", "_alerts", "_hoard_tick", "_den_feeding", "_den_regen"):
         monkeypatch.setattr("modules.pirates." + name, step)
-    monkeypatch.setattr("modules.pirates.Config.SESSION_ID", 77)
+    monkeypatch.setenv("RP_SESSION", "77")
 
     out = await pirates.run_tick()
 

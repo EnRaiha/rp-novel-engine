@@ -16,6 +16,12 @@ from core.db import Database  # noqa: E402
 from modules import population_sentiment as ps  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _writable(monkeypatch):
+    """The real frozen list must not decide these tests: they name session 3 or 5."""
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: False)
+
+
 async def _territory(sid, name="review sentiment system", morale=50, tax=0.05, crisis=0,
                 performance=50):
     # The id is taken well above max(id): a concurrent run can insert into this table between the
@@ -87,9 +93,9 @@ class TestTheSessionIsResolvedAtCallTime:
             return []
 
         monkeypatch.setattr(ps.Database, "fetch", fake_fetch)
-        monkeypatch.setattr(ps.Config, "SESSION_ID", 5)
+        monkeypatch.setenv("RP_SESSION", "5")
         await ps.status()
-        monkeypatch.setattr(ps.Config, "SESSION_ID", 3)
+        monkeypatch.setenv("RP_SESSION", "3")
         await ps.status()
         assert seen == [5, 3], seen
 

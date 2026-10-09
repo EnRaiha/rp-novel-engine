@@ -15,6 +15,7 @@ import json, random
 from core.db import Database
 from core.config import Config
 from core.log import info
+from core.session import require_session
 
 # ── Outcome tiers (pure) ────────────────────────────────────────────────
 
@@ -231,6 +232,9 @@ async def memorialize(
     session_id: int, domain: str, value: int, total: int, dc: int
 ) -> str:
     """Record a legendary roll (100/1) in roll_hall + events. Returns the name."""
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     name = memorial_name(domain, value)
     gd = (
         await Database.fetchval(
@@ -300,6 +304,9 @@ async def consume_blessing(session_id: int, blessing: str) -> bool:
     WHERE repeats the usable check, so a concurrent spend of the last charge
     re-checks the new row version and loses instead of spending it twice.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     gd = (
         await Database.fetchval(
             "SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id
@@ -337,6 +344,9 @@ async def open_pool(session_id: int, name: str, dc: int) -> dict:
     column, so resolution is driven by the caller's `king_won`; dc is checked
     here because a pool opened against a nonsense target is a caller error.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if not (name or "").strip():
         raise ValueError("open_pool: pool name is empty")
     if int(dc) <= 0:
@@ -405,6 +415,9 @@ async def resolve_pool(session_id: int, king_won: bool) -> dict:
     and the report says so instead of clamping the loss to zero. `crown_credited`
     says whether the crown fee reached a resources row; a fee of 0 is never paid.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     pool = await Database.fetchrow(
         "SELECT id, pool_name, credits_in_pool FROM maya_rp.roll_pools "
         "WHERE session_id=$1 AND status='open' ORDER BY id DESC LIMIT 1",
@@ -479,7 +492,11 @@ async def plant_ripple(session_id: int, domain: str, tier: str, dc: int) -> None
     """Partial/fumble rolls plant consequence seeds (wired to consequences.py).
 
     A success or an unrecognised tier plants nothing and says so on the log.
+    A frozen campaign is refused first, so the early return cannot hide the refusal.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if tier not in ("partial", "fumble"):
         info("roll_theater", f"Ripple skipped: tier '{tier}' plants nothing")
         return

@@ -6,6 +6,7 @@ from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import info
+from core.session import require_session
 
 ARCHETYPES = {
     "loyalist": {"reaction":"slow","social":"low","ambition":"low","fear":"stand_firm","off_screen":["maintains_equipment","trains","writes_reports"]},
@@ -19,7 +20,9 @@ ARCHETYPES = {
 EVENT_REACTIONS = {"combat_victory":{"m":2,"f":-1,"l":1},"combat_defeat":{"m":-3,"f":3,"l":-2},"crew_death":{"m":-2,"f":2,"l":-1},"prisoner_escape":{"m":-1,"f":1,"l":-1},"resource_crisis":{"m":-2,"f":2,"l":-1},"cabinet_scandal":{"m":-1,"f":0,"l":-2},"diplomatic_success":{"m":2,"f":-1,"l":1},"holiday":{"m":3,"f":-1,"l":0},"brutality_revealed":{"m":-3,"f":4,"l":-3}}
 
 async def react_to_event(event_type: str, session_id: int = None) -> list[dict]:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     shifts = EVENT_REACTIONS.get(event_type)
     if not shifts: return []
     npcs = await Database.fetch("SELECT c.id,c.name,c.archetype,nis.personal_morale,nis.personal_fear,nis.personal_loyalty,nis.current_mood FROM maya_rp.characters c LEFT JOIN maya_rp.npc_internal_state nis ON nis.character_id=c.id AND nis.session_id=$1 WHERE c.session_id=$1 AND c.status='active' AND c.role NOT IN ('wife','player')", session_id)
@@ -74,7 +77,9 @@ async def _generate_off_screen(session_id: int) -> list[dict]:
     return interactions
 
 async def discover_off_screen(session_id: int = None) -> dict | None:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     r = await Database.fetchrow("SELECT * FROM maya_rp.npc_offscreen_interactions WHERE session_id=$1 AND discovered=false ORDER BY game_day ASC LIMIT 1", session_id)
     if not r: return None
     await Database.execute("UPDATE maya_rp.npc_offscreen_interactions SET discovered=true WHERE id=$1", r["id"])
@@ -87,7 +92,9 @@ async def discover_off_screen(session_id: int = None) -> dict | None:
     return {"type":r["interaction_type"],"description":r["description"],"discovery":random.choice([f"You overhear {an} and {bn} talking in low voices.",f"You notice {an} and {bn} exchanging a look.",f"A crewman mentions {an} and {bn} have been spending time together."]),"characters":[an,bn]}
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     interactions = await _generate_off_screen(session_id)
     await Database.execute("UPDATE maya_rp.npc_internal_state SET personal_fear=GREATEST(0,personal_fear-1),personal_morale=LEAST(100,personal_morale+1) WHERE session_id=$1", session_id)
     anx = await Database.fetch("SELECT c.name FROM maya_rp.npc_internal_state nis JOIN maya_rp.characters c ON c.id=nis.character_id WHERE nis.session_id=$1 AND nis.personal_fear>60", session_id)

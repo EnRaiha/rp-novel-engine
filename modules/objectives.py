@@ -6,9 +6,10 @@ from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import info, error
+from core.session import require_session
 
 async def get_active(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     obj = {"critical":[],"urgent":[],"active":[],"background":[]}
     for r in await Database.fetch("SELECT hook_type,description,status FROM maya_rp.narrative_hooks WHERE session_id=$1 AND status='active'", session_id):
         obj["active"].append({"source":"hook","title":r["hook_type"],"detail":(r.get("description")or"")[:80],"icon":"\U0001f4cc"})
@@ -37,7 +38,9 @@ async def objectives_to_prompt(session_id: int = None) -> str:
     return "\n".join(lines)
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         # The EventBus auto-tracking existed and was never registered, so a
         # quarterly task could only advance when a caller pushed it by hand.
@@ -96,7 +99,9 @@ async def generate_quarterly_tasks(session_id: int = None) -> dict:
     A quarter that holds tasks in any status is left alone, so a finished quarter is not minted again.
     The four inserts share one transaction.
     """
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id)
     quarter = (gd or 1) // 90
     existing = await Database.fetchval(
@@ -158,7 +163,9 @@ async def _advance_task(session_id: int, task_id: int, amount: int) -> dict | No
 
 async def update_quarterly_progress(session_id: int = None, kind: str = None, amount: int = 1) -> dict:
     """Kemaskini progress tasks ikut kind (kills/survey/trade/credits/duels/wrecks/dev/crew)."""
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if not kind:
         return {"error": "kind required (kills/survey/trade/credits/duels/wrecks/dev/crew)"}
     amount = int(amount)
@@ -184,7 +191,7 @@ async def update_quarterly_progress(session_id: int = None, kind: str = None, am
 
 async def quarterly_tasks_view(session_id: int = None) -> dict:
     """View aktif quarterly tasks (format novel 【Quarterly Tasks】)."""
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id)
     quarter = (gd or 1) // 90
     tasks = await Database.fetch(
@@ -236,7 +243,11 @@ async def _bump_kind(session_id: int, kind: str, amount: int = 1) -> dict:
 
     Shares the matcher (the pool's own kind mapping) and the advance-and-pay step with
     `update_quarterly_progress`, so the EventBus path pays the same reward as the manual path.
+    The event bus calls it directly, so it carries its own guard.
     """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     titles = task_titles_for(kind)
     tasks = await Database.fetch(
         "SELECT id, title FROM maya_rp.quarterly_tasks WHERE session_id=$1 AND status='active' "

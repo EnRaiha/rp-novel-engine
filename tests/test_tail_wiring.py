@@ -65,9 +65,10 @@ class TestTheGenerators:
         assert isinstance(out, dict) and out.get("scene_type"), out
         await Database.close()
 
-    async def test_the_physical_state_reader_answers(self):
+    async def test_the_physical_state_reader_answers(self, campaign_row, scratch_session):
+        """The reader heals the wounds that come due, so it runs in a scratch campaign."""
         await Database.init()
-        out = await physical_state.get_state(1, 5)
+        out = await physical_state.get_state(1, scratch_session)
         assert isinstance(out, dict), out
         await Database.close()
 

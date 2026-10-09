@@ -11,6 +11,7 @@ from __future__ import annotations
 from core.db import Database
 from core.config import Config
 from core.log import info, error
+from core.session import require_session
 
 TRIMESTER_DAYS = [90, 180, 270]          # ends of trimester 1, 2, 3
 DUE_SOON_WINDOW = 30                      # days before due → status 'due_soon'
@@ -30,7 +31,9 @@ async def register(session_id: int, mother_name: str, mother_id: int | None = No
                    conceived_game_day: int | None = None, gestation_days: int = 270,
                    father_name: str = "King Izzat", notes: str = "") -> int:
     """Register a new pregnancy. Returns pregnancy id."""
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if not str(mother_name or "").strip():
         raise ValueError(f"mother_name must be a non-empty string, got {mother_name!r}")
     if gestation_days < 1:
@@ -60,7 +63,7 @@ async def status(session_id: int | None = None) -> list[dict]:
     pregnancy lost its day count, ETA and percentage at exactly the moment it
     became `due_soon`.
     """
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
     gd = await _game_day(session_id)
     rows = await Database.fetch(
         """SELECT id, mother_name, father_name, conceived_game_day, due_game_day,
@@ -121,7 +124,9 @@ async def _roll_birth(session_id: int, gd: int, preg_id: int, mother_name: str) 
 
 async def advance(session_id: int | None = None) -> dict:
     """Tick: progress trimesters, flag due_soon, fire births. Returns summary."""
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     gd = await _game_day(session_id)
     rows = await Database.fetch(
         """SELECT id, mother_name, conceived_game_day, due_game_day, gestation_days, trimester, status
@@ -161,7 +166,9 @@ async def advance(session_id: int | None = None) -> dict:
 
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     try:
         result = await advance(session_id)
         info("pregnancy", f"Advanced: {result['checked']} tracked, {len(result['births'])} births")

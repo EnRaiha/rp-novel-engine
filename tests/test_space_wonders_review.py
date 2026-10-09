@@ -16,8 +16,13 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.space_wonders as sw  # noqa: E402
-from core.config import Config  # noqa: E402
 from core.db import Database  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _writable(monkeypatch):
+    """The real frozen list must not decide these tests: they name session 3 or 5."""
+    monkeypatch.setattr("core.session.is_frozen", lambda sid: False)
 
 
 def _run(coro):
@@ -84,11 +89,11 @@ def test_session_defaults_resolve_without_a_name(monkeypatch):
 def test_story_log_uses_the_callers_session(monkeypatch):
     stub = _StubDB()
     monkeypatch.setattr(sw, "Database", stub)
+    monkeypatch.setenv("RP_SESSION", "77")
     _run(sw._log(5, "exploration", "title", "content"))
     _run(sw._log(None, "exploration", "title", "content"))
     assert stub.writes[0][1][0] == 5
-    assert stub.writes[1][1][0] == Config.SESSION_ID
-    assert stub.writes[1][1][0] is not None
+    assert stub.writes[1][1][0] == 77
 
 
 # ── Loot is paid, and what cannot be paid is named ──────────────────────

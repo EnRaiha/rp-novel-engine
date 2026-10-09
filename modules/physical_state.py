@@ -6,11 +6,17 @@ from typing import Any
 from core.db import Database
 from core.config import Config
 from core.log import info
+from core.session import require_session
+
+#: The wounds that are due to heal, shared by the healing UPDATE and the frozen-campaign SELECT.
+_DUE = "WHERE session_id=$1 AND character_id=$2 AND status='active' AND heal_by_game_day<=$3"
 
 SEVERITY = {"minor":{"heal":3,"scar":0.1},"moderate":{"heal":10,"scar":0.4},"severe":{"heal":30,"scar":0.8},"permanent":{"heal":999,"scar":1.0}}
 
 async def apply(character_id: int, desc: str, severity: str = "moderate", body: str = "unspecified", cause: str = "combat", session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     if not str(desc or "").strip(): return {"error": "description is required"}
     if severity not in SEVERITY:
         # An unknown word used to read as "moderate" while the row stored the word
@@ -28,10 +34,15 @@ async def apply(character_id: int, desc: str, severity: str = "moderate", body: 
     return {"injury_id":iid,"description":desc,"severity":severity,"heals_in":cfg["heal"],"will_scar":scar,"narrative":f"{desc} on the {body}. {'This will leave a mark.' if scar else 'Should heal cleanly.'}"}
 
 async def get_state(character_id: int, session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _writes_allowed
     gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)
     # Heal first, so a wound that comes due in this call reads as a scar or a healed wound, never as active.
-    healed = await Database.fetch("UPDATE maya_rp.character_injuries SET status=CASE WHEN became_scar THEN 'scar' ELSE 'healed' END WHERE session_id=$1 AND character_id=$2 AND status='active' AND heal_by_game_day<=$3 RETURNING id", session_id,character_id,gd)
+    # A frozen campaign keeps its rows: the due wounds are counted with a SELECT and not healed.
+    if _writes_allowed(session_id):
+        healed = await Database.fetch("UPDATE maya_rp.character_injuries SET status=CASE WHEN became_scar THEN 'scar' ELSE 'healed' END " + _DUE + " RETURNING id", session_id,character_id,gd)
+    else:
+        healed = await Database.fetch("SELECT id FROM maya_rp.character_injuries " + _DUE, session_id,character_id,gd)
     injuries = await Database.fetch("SELECT description,body_part,severity,heal_by_game_day FROM maya_rp.character_injuries WHERE session_id=$1 AND character_id=$2 AND status='active' AND heal_by_game_day>$3", session_id,character_id,gd)
     scars = await Database.fetch("SELECT description,body_part FROM maya_rp.character_injuries WHERE session_id=$1 AND character_id=$2 AND status='scar'", session_id,character_id)
     parts = []
@@ -42,7 +53,9 @@ async def get_state(character_id: int, session_id: int = None) -> dict:
     return {"active_injuries":[dict(i) for i in injuries],"scars":[dict(s) for s in scars],"healed":len(healed),"visual":("They bear "+parts[0]+".") if len(parts)==1 else ("They bear "+", ".join(parts[:-1])+f", and {parts[-1]}.") if parts else None}
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
     gd = await Database.fetchval("SELECT COALESCE(game_day,1) FROM maya_rp.sessions WHERE id=$1", session_id)
     # execute() returns PostgreSQL's status tag ("UPDATE 12"), which the tick used to
     # report as a count. RETURNING gives the rows themselves.

@@ -55,6 +55,18 @@ class FakeDB:
         self.calls.append(("execute", " ".join(sql.split()), args))
         return self.execute_tag
 
+    def transaction(self):
+        fake = self
+
+        class _Tx:
+            async def __aenter__(self):
+                return fake
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Tx()
+
     def sql(self, kind=None):
         return [c[1] for c in self.calls if kind is None or c[0] == kind]
 
@@ -66,6 +78,7 @@ class FakeDB:
 def _install(monkeypatch, fake):
     for name in ("fetch", "fetchval", "execute"):
         monkeypatch.setattr("modules.logistics.Database." + name, getattr(fake, name))
+    monkeypatch.setattr("modules.logistics.Database.transaction", fake.transaction)
     return fake
 
 

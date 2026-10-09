@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 from typing import Any
 from core.db import Database
-from core.config import Config
 from core.log import info, error
+from core.session import require_session
 
 IDEOS = {
     "military_dictatorship":{"values":["order","strength","hierarchy","duty"],"bonuses":{"combat_power":1.2},"penalties":{"research":0.8},"recruits":"soldiers, ex-military","tone":"The fleet is a sword. Sharp, rigid, unforgiving."},
@@ -33,7 +33,7 @@ DEFAULT_TAX_TOLERANCE = 0.20
 async def get(session_id: int = None) -> dict:
     """The society this campaign has become. Derives and PERSISTS one when no
     row exists yet, which is why this read can write."""
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     state = await Database.fetchrow("SELECT ideology,scores_jsonb FROM maya_rp.ideology_state WHERE session_id=$1", session_id)
     if state:
         profile = IDEOS.get(state["ideology"])
@@ -57,9 +57,17 @@ def _scores(value) -> dict:
     return value or {}
 
 
-async def _recalculate(session_id: int) -> dict:
+async def _persist(session_id: int, winner: str, scores: dict) -> None:
+    await Database.execute(
+        "INSERT INTO maya_rp.ideology_state(session_id,ideology,scores_jsonb) VALUES($1,$2,$3) "
+        "ON CONFLICT(session_id)DO UPDATE SET ideology=$2,scores_jsonb=$3,set_at=NOW()",
+        session_id, winner, json.dumps(scores))
+
+
+async def _recalculate(session_id: int, persist: bool = True) -> dict:
+    """Derive the society from `player_action_log`. `persist` False derives without writing."""
     scores = {k:0 for k in IDEOS}
-    actions = await Database.fetch("SELECT action_category,SUM(count) as t FROM maya_rp.player_action_log WHERE session_id=$1 GROUP BY action_category", session_id)
+    actions = await Database.fetch("SELECT action_category,COALESCE(SUM(count),0) as t FROM maya_rp.player_action_log WHERE session_id=$1 GROUP BY action_category", session_id)
     dist = {a["action_category"]:a["t"] for a in actions}
     total = sum(dist.values()) or 1
     if dist.get("combat",0)/total>0.4: scores["military_dictatorship"]+=3
@@ -73,7 +81,7 @@ async def _recalculate(session_id: int) -> dict:
                          f"undetermined rather than derived from a tie at zero")
         return {"ideology":UNDETERMINED_IDEOLOGY,"scores":scores,**UNDETERMINED_PROFILE}
     winner = max(scores, key=scores.get)
-    await Database.execute("INSERT INTO maya_rp.ideology_state(session_id,ideology,scores_jsonb) VALUES($1,$2,$3) ON CONFLICT(session_id)DO UPDATE SET ideology=$2,scores_jsonb=$3", session_id,winner,json.dumps(scores))
+    if persist: await _persist(session_id, winner, scores)
     cfg = IDEOS[winner]
     return {"ideology":winner,"scores":scores,**cfg}
 
@@ -95,9 +103,15 @@ async def get_prompt(session_id: int = None) -> str:
     return "\n".join(lines)
 
 async def run_tick(session_id: int = None) -> dict:
-    if session_id is None: session_id = Config.SESSION_ID
+    if session_id is None: session_id = require_session(None)
     try:
         i = await get(session_id)
+        # Re-derive once per tick. No evidence keeps the stored society.
+        fresh = await _recalculate(session_id, persist=False)
+        if fresh["ideology"] != UNDETERMINED_IDEOLOGY and (fresh["ideology"], fresh["scores"]) != (i["ideology"], i["scores"]):
+            await _persist(session_id, fresh["ideology"], fresh["scores"])
+            info("ideology", f"session {session_id}: {i['ideology']} -> {fresh['ideology']}")
+            i = fresh
         return {"ideology":i["ideology"]}
     except Exception as e:
         error("ideology", f"tick error: {e}")

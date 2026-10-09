@@ -115,9 +115,8 @@ async def advance_megastructure(session_id: int, game_days: float = 0.5) -> dict
                 if ok:
                     await _deduct_resources(session_id, next_cost)
                     # The resume rides on the phase this site can now pay for. Writing
-                    # `construction` on the progress update instead flipped a site that still
-                    # cannot afford its next phase back to `construction` on every tick, and it
-                    # logged a resume each time.
+                    # `construction` on the progress update instead flipped the site back a tick
+                    # early, so the next tick paused it again: one stall, two log entries.
                     await Database.execute("""
                         UPDATE maya_rp.megastructure_construction
                         SET current_phase = $1, progress_pct = 0, status = 'construction' WHERE id = $2

@@ -3,9 +3,9 @@ import random, json
 from datetime import datetime, timezone, timedelta
 from core.db import Database
 from core.config import Config
-from modules._economy import _check_afford, _deduct_resources, stochastic_round
+from modules._economy import InsufficientResources, _check_afford, _deduct_resources, stochastic_round
 from core.events import EventBus
-from core.log import error
+from core.log import error, warn
 
 # ============================================================
 # Megastructure Operations
@@ -100,37 +100,35 @@ async def advance_megastructure(session_id: int, game_days: float = 0.5) -> dict
         # site never moved. `int()` truncates the same way and would reproduce the defect in Python.
         new_progress = min(100, stochastic_round((const["progress_pct"] or 0) + advance))
 
+        # Bound to the phase read above: a stale snapshot cannot overwrite a site another tick moved on.
         await Database.execute(
-            "UPDATE maya_rp.megastructure_construction SET progress_pct = $1 WHERE id = $2",
-            new_progress, const["id"]
+            "UPDATE maya_rp.megastructure_construction SET progress_pct = $1"
+            " WHERE id = $2 AND current_phase = $3",
+            new_progress, const["id"], const["current_phase"]
         )
         tally["advanced"] += 1
 
         if new_progress >= 100:
             if const["current_phase"] < len(phases):
-                # Advance to next phase
-                next_phase = phases[const["current_phase"]]
-                next_cost = next_phase.get("cost", {})
-                ok, _ = await _check_afford(session_id, next_cost)
-                if ok:
-                    await _deduct_resources(session_id, next_cost)
-                    # The resume rides on the phase this site can now pay for. Writing
-                    # `construction` on the progress update instead flipped the site back a tick
-                    # early, so the next tick paused it again: one stall, two log entries.
-                    await Database.execute("""
-                        UPDATE maya_rp.megastructure_construction
-                        SET current_phase = $1, progress_pct = 0, status = 'construction' WHERE id = $2
-                    """, const["current_phase"] + 1, const["id"])
-                    if const["status"] == "paused":
-                        await _log(session_id, "megastructure",
-                                   f"▶️ Resumed: {const['name']}",
-                                   "The next phase is affordable again; construction resumed.", 2)
-                    await _log(session_id, "megastructure",
-                               f"Phase {const['current_phase']+1} Started: {const['name']}",
-                               f"Phase {const['current_phase']+1} of {const['name']} begun.", 3)
-                else:
+                next_cost = phases[const["current_phase"]].get("cost", {})
+                moved, short = False, None
+                # Claim the phase, then charge it, in one transaction. A charge that raises rolls the
+                # claim back, and a tick that loses the claim pays nothing. `construction` is written
+                # with the claim, so a paused site resumes only once it has paid for the next phase.
+                try:
+                    async with Database.transaction() as conn:
+                        moved = (await conn.fetchval(
+                            "UPDATE maya_rp.megastructure_construction SET current_phase = $1,"
+                            " progress_pct = 0, status = 'construction' WHERE id = $2 AND current_phase = $3"
+                            " AND status IN ('construction', 'paused') RETURNING id",
+                            const["current_phase"] + 1, const["id"], const["current_phase"])) is not None
+                        if moved:
+                            await _deduct_resources(session_id, next_cost, conn=conn)
+                except ValueError as exc:   # InsufficientResources is a ValueError
+                    short = exc
+                if short is not None:
                     # One write and one entry per stall, not per tick: the paused site is in the
-                    # read set now, so an unguarded branch logged the shortage on every tick.
+                    # read set, so an unguarded branch logged the shortage on every tick.
                     if const["status"] != "paused":
                         await Database.execute(
                             "UPDATE maya_rp.megastructure_construction SET status = 'paused' WHERE id = $1",
@@ -139,15 +137,31 @@ async def advance_megastructure(session_id: int, game_days: float = 0.5) -> dict
                         await _log(session_id, "megastructure",
                                    f"⏸️ Paused: {const['name']}",
                                    "Insufficient resources for next phase. Paused.", 2)
+                    if not isinstance(short, InsufficientResources):
+                        error("megastructures-ports",
+                              f"phase cost of {const['name']} cannot be charged: {short}")
                     tally["paused"] += 1
+                elif moved:
+                    if const["status"] == "paused":
+                        await _log(session_id, "megastructure",
+                                   f"▶️ Resumed: {const['name']}",
+                                   "The next phase is affordable again; construction resumed.", 2)
+                    await _log(session_id, "megastructure",
+                               f"Phase {const['current_phase']+1} Started: {const['name']}",
+                               f"Phase {const['current_phase']+1} of {const['name']} begun.", 3)
             else:
-                # COMPLETE!
-                await Database.execute(
-                    "UPDATE maya_rp.megastructure_construction SET status = 'completed' WHERE id = $1",
-                    const["id"]
-                )
+                # Completion and benefits commit together: a benefit that raises leaves the site
+                # unfinished, and a tick that loses the claim applies nothing.
+                async with Database.transaction() as conn:
+                    done = await conn.fetchval(
+                        "UPDATE maya_rp.megastructure_construction SET status = 'completed'"
+                        " WHERE id = $1 AND status IN ('construction', 'paused') RETURNING id",
+                        const["id"])
+                    if done is not None:
+                        await _apply_benefits(session_id, const, conn)
+                if done is None:
+                    continue
                 tally["completed"] += 1
-                await _apply_benefits(session_id, const)
                 await _log(session_id, "megastructure",
                            f"🎉 Megastructure Complete: {const['name']}",
                            f"The {const['name']} is fully operational!", 5)
@@ -167,9 +181,17 @@ async def get_megastructure_status(session_id: int | None = None):
         " ORDER BY status, estimated_completion", session_id
     )]
 
-async def _apply_benefits(session_id: int, const: dict):
-    """Apply completion benefits to the session."""
-    mt = await Database.fetchrow(
+async def _apply_benefits(session_id: int, const: dict, conn=None):
+    """Apply completion benefits to the session.
+
+    @param conn - the completion's transaction connection, so the benefits commit or roll back with
+        the status. Omitted: the pool.
+
+    `production_mult` has no representation in the ledger and applies nothing. `morale_bonus` reaches
+    the site's own territory only. A `*_production` key adds its whole value to the matching column.
+    """
+    run = conn or Database
+    mt = await run.fetchrow(
         "SELECT benefits FROM maya_rp.megastructure_types WHERE id = $1",
         const["megastructure_type_id"]
     )
@@ -178,26 +200,25 @@ async def _apply_benefits(session_id: int, const: dict):
     benefits = _j(mt.get("benefits"))
     for key, val in benefits.items():
         if key == "production_mult":
-            # Apply multiplier to resource production
-            resources = await Database.fetchrow(
-                "SELECT alloys FROM maya_rp.resources WHERE session_id = $1", session_id
-            )
-            if resources:
-                await Database.execute(
-                    "UPDATE maya_rp.resources SET alloys = GREATEST(alloys, alloys * $1) WHERE session_id = $2",
-                    val, session_id
-                )
+            warn("megastructures-ports", f"benefit production_mult={val} has no representation; nothing applied")
+            continue
         elif key == "morale_bonus":
-            await Database.execute(
-                "UPDATE maya_rp.territory SET morale = LEAST(100, morale + $1) WHERE session_id = $2",
-                val, session_id
+            territory_id = const.get("territory_id")
+            if territory_id is None:
+                warn("megastructures-ports",
+                     f"benefit morale_bonus={val} needs a territory and {const.get('name')} has none; nothing applied")
+                continue
+            await run.execute(
+                "UPDATE maya_rp.territory SET morale = LEAST(100, morale + $1)"
+                " WHERE session_id = $2 AND id = $3",
+                int(val), session_id, territory_id
             )
         elif key.endswith("_production"):
             res = key.replace("_production", "")
             col = res if res in ("credits", "alloys", "fuel", "dream_essence",
                                   "rare_earth", "starsteel", "void_crystal") else None
             if col:
-                await Database.execute(
+                await run.execute(
                     f"UPDATE maya_rp.resources SET {col} = {col} + $1 WHERE session_id = $2",
                     int(val), session_id
                 )
@@ -220,24 +241,26 @@ async def build_port(session_id: int, territory_id: int, port_type_id: int, name
     if not pt:
         return {"error": "Port type not found."}
 
-    # Check and deduct cost
     cost = pt["build_cost_credits"]
     res_costs = _j(pt.get("build_cost_resources"))
     total_cost = {"credits": cost}
     for k, v in res_costs.items():
         total_cost[k] = v
-    ok, msg = await _check_afford(session_id, total_cost)
-    if not ok:
-        return {"error": f"Insufficient resources: {msg}"}
-    charged = await _deduct_resources(session_id, total_cost)
 
     if not name:
         name = f"{pt['name']} {random.randint(100, 999)}"
 
-    rid = await Database.fetchrow("""
-        INSERT INTO maya_rp.ports (session_id, territory_id, port_type_id, name, level, built_at, status)
-        VALUES ($1, $2, $3, $4, 1, NOW(), 'active') RETURNING id
-    """, session_id, territory_id, port_type_id, name)
+    # Charge and insert share one transaction: an insert that raises (a bad territory) rolls the
+    # charge back, and the charge itself refuses a short treasury.
+    async with Database.transaction() as conn:
+        try:
+            charged = await _deduct_resources(session_id, total_cost, conn=conn)
+        except ValueError as exc:   # short treasury, a resource the ledger lacks, a bad quantity
+            return {"error": f"Insufficient resources: {exc}"}
+        rid = await conn.fetchrow("""
+            INSERT INTO maya_rp.ports (session_id, territory_id, port_type_id, name, level, built_at, status)
+            VALUES ($1, $2, $3, $4, 1, NOW(), 'active') RETURNING id
+        """, session_id, territory_id, port_type_id, name)
 
     await _log(session_id, "infrastructure",
                f"🏗️ Port Built: {name}",
@@ -263,23 +286,25 @@ async def upgrade_port(session_id: int, port_id: int, upgrade_name: str) -> dict
         return {"error": f"Upgrade '{upgrade_name}' not available for this port type."}
 
     cost = 100000 * port["level"]
-    ok, _ = await _check_afford(session_id, {"credits": cost})
-    if not ok:
+
+    # Claim the level, then charge, in one transaction. The claim is bound to the level the cost was
+    # priced on, so a second upgrade of the same level pays nothing, and a charge or insert that raises
+    # rolls the level back.
+    try:
+        async with Database.transaction() as conn:
+            new_level = await conn.fetchval(
+                "UPDATE maya_rp.ports SET level = level + 1, upgrades_applied ="
+                " COALESCE(upgrades_applied, '[]'::jsonb) || to_jsonb($1::text)"
+                " WHERE id = $2 AND session_id = $3 AND level = $4 RETURNING level",
+                upgrade_name, port_id, session_id, port["level"])
+            if new_level is not None:
+                await _deduct_resources(session_id, {"credits": cost}, conn=conn)
+                await conn.execute("INSERT INTO maya_rp.port_upgrades (port_id, upgrade_name, cost_credits)"
+                                   " VALUES ($1, $2, $3)", port_id, upgrade_name, cost)
+    except ValueError:   # InsufficientResources is a ValueError
         return {"error": "Insufficient credits."}
-    await _deduct_resources(session_id, {"credits": cost})
-
-    new_level = port["level"] + 1
-    upgrades = list(_j(port.get("upgrades_applied")) or [])
-    upgrades.append(upgrade_name)
-
-    await Database.execute(
-        "UPDATE maya_rp.ports SET level = $1, upgrades_applied = $2 WHERE id = $3",
-        new_level, json.dumps(upgrades), port_id
-    )
-    await Database.execute(
-        "INSERT INTO maya_rp.port_upgrades (port_id, upgrade_name, cost_credits) VALUES ($1, $2, $3)",
-        port_id, upgrade_name, cost
-    )
+    if new_level is None:
+        return {"error": f"Port {port_id} changed level while the upgrade ran. Retry the upgrade."}
 
     await _log(session_id, "infrastructure",
                f"⬆️ Port Upgraded: {port['name']}",

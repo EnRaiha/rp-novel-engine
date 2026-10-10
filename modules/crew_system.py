@@ -43,17 +43,19 @@ async def produce_crew(session_id: int | None = None) -> dict:
         total += out
         sources.append((f"academy:{a['name']}", out))
 
-    # University campuses (Chen, Bisik, Vein, Ghost Signal)
-    for u in await Database.fetch("SELECT name, research_rate, level, prestige FROM maya_rp.university_campuses"):
+    # University campuses (Chen, Bisik, Vein, Ghost Signal). Migration 138 binds a campus to a
+    # session, so this tick reads its own campuses and not the reference campaign's.
+    for u in await Database.fetch(
+            "SELECT name, research_rate, level, prestige FROM maya_rp.university_campuses"
+            " WHERE session_id=$1", session_id):
         out = _university_output(u["research_rate"] or 1.0, u["level"] or 1, u["prestige"] or 50)
         total += out
         sources.append((f"university:{u['name']}", out))
 
     if total > 0:
-        # The campuses are a global catalogue with no session_id, so the rate is the same for every
-        # campaign. What is not global is the pool it credits, and a session with no resources row used
-        # to be told it had produced crew that went nowhere: the UPDATE matched nothing and returned no
-        # error. It says so now.
+        # The pool belongs to the campaign. A session with no resources row used to be told it had
+        # produced crew that went nowhere: the UPDATE matched nothing and returned no error. It says
+        # so now.
         pool = await Database.fetchval(
             "UPDATE maya_rp.resources SET crew_pool=crew_pool+$1, crew_trained_total=crew_trained_total+$1 "
             "WHERE session_id=$2 RETURNING crew_pool", total, session_id)
@@ -132,7 +134,9 @@ async def backfill_history(session_id: int | None = None, start_day: int = 26, e
 
     # Kadar harian semasa
     acad = await Database.fetch("SELECT max_students, prestige FROM maya_rp.academy_campuses")
-    univ = await Database.fetch("SELECT research_rate, level, prestige FROM maya_rp.university_campuses")
+    univ = await Database.fetch(
+        "SELECT research_rate, level, prestige FROM maya_rp.university_campuses WHERE session_id=$1",
+        session_id)
     daily = sum(_academy_output(0, a["max_students"] or 100, a["prestige"] or 50) for a in acad)
     daily += sum(_university_output(u["research_rate"] or 1.0, u["level"] or 1, u["prestige"] or 50) for u in univ)
 
@@ -240,14 +244,19 @@ async def run_tick(session_id: int | None = None) -> dict:
 
 async def graduation_cycle(session_id: int | None = None) -> dict:
     """Cohort graduat: setiap campus graduat pada cycle 30 hari.
-    Bukan harian — realistik macam universiti sebenar."""
+    Bukan harian — realistik macam universiti sebenar.
+
+    The campus and its `last_graduation_day` marker belong to one campaign (M4). A read that skipped
+    `session_id` graduated the reference campaign's campuses on this campaign's clock and moved their
+    marker to this campaign's game day, so they never graduated again on their own.
+    """
     session_id = require_session(session_id)
     from core.ooc import _refuse_frozen
     _refuse_frozen(session_id)
     gd = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 1
     campuses = await Database.fetch(
         "SELECT id, name, research_rate, level, prestige, graduation_cycle_days, last_graduation_day "
-        "FROM maya_rp.university_campuses")
+        "FROM maya_rp.university_campuses WHERE session_id=$1", session_id)
     total = 0
     graduated = []
     for c in campuses:
@@ -261,8 +270,9 @@ async def graduation_cycle(session_id: int | None = None) -> dict:
             total += cohort
             graduated.append((c["name"], cohort))
             await Database.execute(
-                "UPDATE maya_rp.university_campuses SET last_graduation_day=$1 WHERE id=$2",
-                gd, c["id"])
+                "UPDATE maya_rp.university_campuses SET last_graduation_day=$1"
+                " WHERE id=$2 AND session_id=$3",
+                gd, c["id"], session_id)
     if total > 0:
         await Database.execute(
             "UPDATE maya_rp.resources SET crew_pool=crew_pool+$1, crew_trained_total=crew_trained_total+$1 "

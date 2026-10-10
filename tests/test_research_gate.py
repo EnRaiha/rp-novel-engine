@@ -89,6 +89,12 @@ class _GateDatabase:
             if args[0] in self.catalogue:
                 return {"unlocked": self.catalogue[args[0]]}
             return None
+        if "FOR UPDATE" in sql:
+            # `start_construction` holds its campaign row for the whole build.
+            return {"locked": 1}
+        if "AS site_id" in sql:
+            # No site of this type yet, so the duplicate guard opens.
+            return None
         for needle, row in self.rows.items():
             if needle in sql:
                 return dict(row)
@@ -414,9 +420,15 @@ async def test_the_rename_removes_the_only_duplicate_name():
 async def test_the_migration_refuses_a_catalogue_with_a_duplicate_name():
     """Step 4 stops the file when two rows share a name that no map row references."""
     async def check(conn):
-        await conn.execute(
-            "UPDATE maya_rp.research_projects SET name ="
-            " (SELECT name FROM maya_rp.research_projects WHERE id = 60) WHERE id = 61")
+        try:
+            await conn.execute(
+                "UPDATE maya_rp.research_projects SET name ="
+                " (SELECT name FROM maya_rp.research_projects WHERE id = 60) WHERE id = 61")
+        except PostgresError as exc:
+            # Once 140 is applied its own unique constraint refuses the duplicate at the update,
+            # which is the guarantee step 5 adds. Before the apply the file's step 4 must catch it.
+            assert "research_projects_name_key" in str(exc), exc
+            return
         with pytest.raises(PostgresError) as raised:
             await conn.execute(_migration_body())
         assert "duplicate project names remain" in str(raised.value), raised.value

@@ -60,7 +60,7 @@ SHADOW_PATH_LINE = "SET LOCAL search_path TO pg_temp, maya_rp, public;"
 
 #: Every table the two files name. Each gets an empty `pg_temp` copy before the file runs.
 SHADOWED = (
-    "academy_campuses", "colonies", "pirate_zones", "pool_bets", "production_lines",
+    "academy_campuses", "colonies", "novels", "pirate_zones", "pool_bets", "production_lines",
     "research_labs", "resource_production", "sectors", "sessions", "ships",
     "trait_assignments", "university_campuses",
 )
@@ -420,6 +420,9 @@ async def test_the_137_dry_run_binds_the_sessions_and_the_novels():
     before = await _binding_fingerprint()
 
     async def seed(conn):
+        # An applied 137 leaves `novel_id` on the live table, and `LIKE` copies the column without its
+        # foreign key. Drop the copy so the file always runs against its own pre-137 shape.
+        await conn.execute("ALTER TABLE sessions DROP COLUMN IF EXISTS novel_id")
         await conn.execute(
             "INSERT INTO sessions (id, name, status) VALUES"
             " (3, 'TKG', 'active'), (5, 'TKG — Arc I: The Sunrise', 'active'),"

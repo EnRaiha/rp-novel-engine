@@ -1,6 +1,6 @@
 -- 110: widen ooc_rules.layer to carry an explicit `tool` authoring.
 -- Additive only. Owner: maya.
---   Apply: PGPASSWORD=REDACTED psql -h 100.65.243.60 -U maya -d maya_memory -f <this>
+--   Apply: PGPASSWORD=$MAYA_PASS psql -h 100.65.243.60 -U maya -d maya_memory -f <this>
 --
 -- Why: migration 108 allowed layer IN ('somatic','dialogue','both'), which left
 -- the tool surface unreachable by design — any `both` rule then saw tool

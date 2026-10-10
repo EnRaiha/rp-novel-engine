@@ -1,6 +1,6 @@
 -- 109: OOC resolver cascade — the ruleset one session actually lives under.
 -- Additive only. Owner: maya.
---   Apply: PGPASSWORD=REDACTED psql -h 100.65.243.60 -U maya -d maya_memory -f <this>
+--   Apply: PGPASSWORD=$MAYA_PASS psql -h 100.65.243.60 -U maya -d maya_memory -f <this>
 --
 -- Design: wiki/rp-dev/OOC-SYSTEM-DESIGN-2026-09-19.md §8 (D2) — the cascade
 -- (campaign rows + session rows, filtered to the persona's trait composition) is

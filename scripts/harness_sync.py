@@ -8,15 +8,17 @@ and the route_log summary rows.
 
 Runs as maya owner (rp_engine role lacks grants on public.opencode_sessions).
 Usage:
-  python3 scripts/harness_sync.py          # sync + print summary
-  python3 scripts/harness_sync.py --days 7 # window filter
+  MAYA_PASS=... python3 scripts/harness_sync.py          # sync + print summary
+  MAYA_PASS=... python3 scripts/harness_sync.py --days 7 # window filter
   (register with cron for hourly sync)
 """
 import argparse, os, subprocess, sys
 
 HOST = os.environ.get("POSTGRES_HOST", "100.65.243.60")
 DB = "maya_memory"
-MAYA_PASS = "REDACTED"
+#: The `maya` role's password, read from the environment. This file ships in the public repo, so a
+#: literal here is a published credential. Export `MAYA_PASS` (or `PGPASSWORD`) before a run.
+MAYA_PASS = os.environ.get("PGPASSWORD") or os.environ.get("MAYA_PASS")
 
 SQL = """
 INSERT INTO harness.budget
@@ -40,6 +42,8 @@ ON CONFLICT (session_id) DO UPDATE SET
 """
 
 def run_sql(sql: str) -> str:
+    if not MAYA_PASS:
+        sys.exit("set MAYA_PASS (or PGPASSWORD) for the maya role; it is read from the environment")
     env = dict(os.environ)
     env["PGPASSWORD"] = MAYA_PASS
     r = subprocess.run(

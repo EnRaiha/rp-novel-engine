@@ -15,8 +15,13 @@ The target session belongs to one novel, and `--novel` names it. The clone puts 
 cast inside another campaign, so a target that already plays another novel is refused. A
 target that does not exist yet is created with that novel.
 
-    python3 scripts/relive_session.py --from 3 --to 5 --novel tkg-the-sunrise --dry-run
-    python3 scripts/relive_session.py --from 3 --to 5 --novel tkg-the-sunrise
+The source binds to `--novel` the same way. A source session whose `novel_id` differs from
+`--novel` is refused before the target is touched, and so is a source with no `sessions` row.
+`--allow-cross-novel` overrides a differing source and prints a warning that names both novels.
+
+    python3 scripts/relive_session.py --from 5 --to 6 --novel tkg-the-sunrise --dry-run
+    python3 scripts/relive_session.py --from 5 --to 6 --novel tkg-the-sunrise
+    python3 scripts/relive_session.py --from 3 --to 6 --novel tkg-the-sunrise --allow-cross-novel
 """
 from __future__ import annotations
 
@@ -55,6 +60,8 @@ async def main() -> int:
     parser.add_argument("--from", dest="source", type=int, required=True)
     parser.add_argument("--to", dest="target", type=int, required=True)
     parser.add_argument("--novel", required=True, help="novel_id of the session being relived")
+    parser.add_argument("--allow-cross-novel", action="store_true",
+                        help="clone a source session that plays a novel other than --novel")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -65,6 +72,22 @@ async def main() -> int:
         print(f"refused: maya_rp.novels holds no novel {args.novel!r}", file=sys.stderr)
         await Database.close()
         return 2
+    source_novel = await Database.fetchval(
+        "SELECT novel_id FROM maya_rp.sessions WHERE id=$1", args.source)
+    if source_novel is None:
+        print(f"refused: maya_rp.sessions holds no session {args.source}, so its novel is unknown",
+              file=sys.stderr)
+        await Database.close()
+        return 2
+    if source_novel != args.novel:
+        if not args.allow_cross_novel:
+            print(f"refused: source session {args.source} plays novel {source_novel!r},"
+                  f" not {args.novel!r}; pass --allow-cross-novel to clone its cast anyway",
+                  file=sys.stderr)
+            await Database.close()
+            return 2
+        print(f"warning: --allow-cross-novel clones source session {args.source}"
+              f" (novel {source_novel!r}) into novel {args.novel!r}", file=sys.stderr)
     target_novel = await Database.fetchval(
         "SELECT novel_id FROM maya_rp.sessions WHERE id=$1", args.target)
     if target_novel is None:

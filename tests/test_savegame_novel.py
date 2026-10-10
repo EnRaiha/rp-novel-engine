@@ -292,9 +292,14 @@ class TestASessionFiveFileCarriesOneSession:
 class _FakeDb:
     """Stands in for `core.db.Database`: canned answers, recorded writes, no connection."""
 
-    def __init__(self, *, novel_exists: bool = True, target_novel: str | None = None):
+    #: Every test here passes `--from 3`, so a `sessions` lookup of id 3 reads the source's novel.
+    source_id = 3
+
+    def __init__(self, *, novel_exists: bool = True, target_novel: str | None = None,
+                 source_novel: str | None = SUNRISE):
         self.novel_exists = novel_exists
         self.target_novel = target_novel
+        self.source_novel = source_novel
         self.executed: list[str] = []
         self.closed = 0
 
@@ -308,7 +313,7 @@ class _FakeDb:
         if "FROM maya_rp.novels" in sql:
             return args[0] if self.novel_exists else None
         if "FROM maya_rp.sessions" in sql:
-            return self.target_novel
+            return self.source_novel if args[0] == self.source_id else self.target_novel
         return 0
 
     async def fetch(self, sql, *args):

@@ -12,6 +12,22 @@ Fixes the stale display (was showing template pops 1.2M) with the new model:
 DELETE removes this session's tax rows alone, and every row written names the session. A session with
 no taxable territory stops the run before the DELETE.
 
+Gate. The run refuses when `tax_rows` is empty: the session holds no territory with `population > 0`
+and a daily tax of 1 or more. The gate runs before the `production_lines` and `ships` reads, so a
+refused session gets no line row and no EDEN row, in a dry run and with `--apply`. Do not narrow it
+unless a campaign needs those rows. Reasons, checked 2026-10-10:
+  - Line and EDEN rows are display only. Nothing in `modules/` reads `resource_production`, and
+    `setia_governor_model.py` and `redo_faction_model.py` sum the tax sources alone.
+  - Their amounts are fixed constants (alloys 150000, fuel 120000, else 200000, times efficiency;
+    150000 food per EDEN ship), not recipes. A campaign with no territory has no empire to describe.
+  - No live session needs them. Session 3 passes the gate. Session 5 refuses, and it holds 0 lines
+    and 0 EDEN ships, so the gate withholds nothing.
+  - An empty `tax_rows` with tax rows already stored means the DELETE drops them and writes none.
+When a campaign holds `production_lines` and no territory, and the operator needs the display rows,
+narrow the gate: refuse only when `tax_rows` is empty and the session holds tax rows, or when `rows` is
+empty. That moves the `doomed` read above the gate and adds an empty-`rows` branch. It needs a test
+beside `test_rebuild_production_refuses_a_session_without_territory`.
+
   python3 scripts/rebuild_production.py --session N            # report only
   python3 scripts/rebuild_production.py --session N --apply    # delete and insert in one transaction
 """

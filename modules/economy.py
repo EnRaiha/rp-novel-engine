@@ -5,7 +5,7 @@ from core.session import require_session
 from core.utils import calc_game_days, clamp
 from datetime import datetime, timezone
 from core.log import error, info
-from modules._economy import InsufficientResources, _deduct_resources
+from modules._economy import InsufficientResources, _deduct_resources, stochastic_round
 
 # Progressive marginal tax brackets — PERCENTAGE rates that thin with world size.
 # Big worlds still pay more absolute tax (they are huge), but a smaller
@@ -47,30 +47,47 @@ GATE_TOLL_RATE = 25000            # fair toll per crossing — third parties pay
 GATE_TOLL_VOLUME_PER_CROSSING = 40  # units of trade volume = one crossing
 
 
-async def gate_toll_income(session_id: int = None) -> int:
+async def gate_toll_income(session_id: int = None, game_days: float = 1.0) -> int:
     """Foreign-faction gate tolls → Setia treasury (2026-08-15 Izzat canon).
 
-    Setia uses its own gates FREE. Third parties pay the fair toll; income is
-    grounded in active trade deals between Setia and non-Setia factions,
-    scaled by volume (one crossing per GATE_TOLL_VOLUME_PER_CROSSING units).
+    Setia uses its own gates FREE. Third parties pay the fair toll. Income is
+    grounded in active trade deals between Setia and non-Setia factions.
+
+    `quantity` is the volume of the whole deal over `duration_days` game days, so a deal flows
+    `quantity / duration_days` units per game day. The period tolls `flow * game_days` units, one
+    crossing per GATE_TOLL_VOLUME_PER_CROSSING. A part crossing rounds with `stochastic_round`, which
+    keeps the long-run toll exact. A deal with a NULL or 0 `duration_days` has no flow and pays 0.
+
+    A deal pays only while its term runs: `duration_days` game days from `signed_at`, at
+    `Config.TIME_MULTIPLIER` game days per real day. The query derives this on every read, so no
+    column or job ends a deal. A NULL `signed_at` has no start and pays 0. The tick that finds the term
+    over pays nothing for its own period, which loses at most one tick's flow per deal.
+    `signed_at` is a `timestamp` in the server's local time, so the query measures it against
+    LOCALTIMESTAMP, not against a UTC clock.
 
     Resolves the session with `require_session`: an explicit id, else RP_SESSION or the active arc.
+
+    @param game_days - game days since the last tick, as `run_tick` measures them.
+    @returns the toll in credits, a multiple of GATE_TOLL_RATE.
     """
     session_id = require_session(session_id)
     try:
-        volume = await Database.fetchval(
-            """SELECT COALESCE(SUM(ftd.quantity), 0)
+        flow = await Database.fetchval(
+            """SELECT COALESCE(SUM(ftd.quantity::numeric / NULLIF(ftd.duration_days, 0)), 0)
                FROM maya_rp.faction_trade_deals ftd
                JOIN maya_rp.factions fa ON fa.id = ftd.faction_a_id
                JOIN maya_rp.factions fb ON fb.id = ftd.faction_b_id
                WHERE ftd.active
                  AND ftd.session_id = $1
-                 AND ((fa.name ILIKE '%Setia%') <> (fb.name ILIKE '%Setia%'))""",
-            int(session_id))
+                 AND ((fa.name ILIKE '%Setia%') <> (fb.name ILIKE '%Setia%'))
+                 AND EXTRACT(EPOCH FROM (LOCALTIMESTAMP - ftd.signed_at)) / 86400.0 * $2
+                     < ftd.duration_days""",
+            int(session_id), Config.TIME_MULTIPLIER)
     except Exception as e:
         error("economy", f"gate_toll_income: {e}")
-        volume = 0
-    return (int(volume or 0) // GATE_TOLL_VOLUME_PER_CROSSING) * GATE_TOLL_RATE
+        flow = 0
+    crossings = stochastic_round(float(flow or 0) * game_days / GATE_TOLL_VOLUME_PER_CROSSING)
+    return crossings * GATE_TOLL_RATE
 
 
 async def run_tick(session_id: int = None):
@@ -249,8 +266,8 @@ async def run_tick(session_id: int = None):
     # Setia uses its own gates FREE (infrastructure). THIRD PARTIES pay the
     # fair toll (25,000C per crossing). Income = foreign factions' traffic
     # through the gates — grounded in active trade deals with non-Setia
-    # factions, scaled by traffic volume.
-    toll_income = await gate_toll_income(session_id)
+    # factions, scaled by each deal's flow over this period.
+    toll_income = await gate_toll_income(session_id, gd)
     if toll_income:
         inc_c += toll_income
 

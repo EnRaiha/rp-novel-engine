@@ -98,7 +98,8 @@ async def test_gate_toll_income_defaults_to_the_engine_session(monkeypatch):
 
     await economy.gate_toll_income()
 
-    assert fake.args_for("faction_trade_deals", "fetchval")[0] == (77,)
+    # $1 is the session, $2 the game days per real day that end a deal's term.
+    assert fake.args_for("faction_trade_deals", "fetchval")[0] == (77, economy.Config.TIME_MULTIPLIER)
 
 
 async def test_run_tick_defaults_to_the_engine_session(monkeypatch):
@@ -110,6 +111,26 @@ async def test_run_tick_defaults_to_the_engine_session(monkeypatch):
     assert fake.args_for("last_tick_at")[0] == (77,)
 
 
+async def test_run_tick_tolls_the_period_it_pays_tax_for(monkeypatch):
+    # The toll is a flow per game day, so the tick must hand it the same `gd` it scales the tax by.
+    _install(monkeypatch, FakeDB(
+        rows=[("last_tick_at", {"last_tick_at": datetime.now(timezone.utc)}),
+              ("ideology_state", {"ideology": "benevolent_democracy"})],
+        fetch=[], fetchval=50))
+    asked = []
+
+    async def toll(session_id=None, game_days=1.0):
+        asked.append((session_id, game_days))
+        return 0
+
+    monkeypatch.setattr("modules.economy.gate_toll_income", toll)
+    monkeypatch.setattr("modules.economy.calc_game_days", lambda when: 2.5)
+
+    await economy.run_tick(3)
+
+    assert asked == [(3, 2.5)]
+
+
 # ── 2. A stored zero population is zero ──────────────────────────────────
 
 async def _one_tick(monkeypatch, territory, morale=50):
@@ -118,7 +139,7 @@ async def _one_tick(monkeypatch, territory, morale=50):
               ("ideology_state", {"ideology": "benevolent_democracy"})],
         fetch=[territory], fetchval=morale))
 
-    async def no_toll(_session_id=None):
+    async def no_toll(_session_id=None, _game_days=1.0):
         return 0
 
     # The toll path is not the subject here, and it shares the fetchval the

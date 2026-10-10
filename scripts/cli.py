@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unified CLI — single entry point for everything RP."""
 
-import asyncio, json, os, sys
+import asyncio, json, os, re, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -10,7 +10,24 @@ from core.db import Database
 from core.state import StateManager
 from scripts.orchestrator import run_full_tick, MODULE_MAP
 
-SID = Config.SESSION_ID  # process default; the __main__ block re-resolves per run
+SID = Config.SESSION_ID  # process default; `_session_id()` resolves the arc per run
+
+#: The `--session` value `__main__` pulled out of argv, or None when the caller passed none.
+#: `_session_id()` resolves through it, so a direct call can hold one session for one call.
+EXPLICIT_SESSION: str | None = None
+
+
+def _session_id() -> int:
+    """The session this call is for, resolved at call time through `core.session`.
+
+    `Config.SESSION_ID` is fixed at import, so a long-lived process kept answering for the session it
+    started on. `require_session` answers per call, and refuses rather than guessing.
+    """
+    from core.session import require_session
+
+    if EXPLICIT_SESSION is None:
+        return require_session(None)
+    return require_session(EXPLICIT_SESSION)
 
 
 def take_session_flag(argv: list[str]) -> tuple[str | None, list[str]]:
@@ -29,23 +46,27 @@ def take_session_flag(argv: list[str]) -> tuple[str | None, list[str]]:
     return explicit, rest
 
 
-async def cmd_status():
-    await Database.init()
-    s = await Database.fetchrow("SELECT name, status FROM sessions WHERE id=$1", SID)
+async def print_status(session: int) -> None:
+    """Print the status headline of one session. The pool must be open; the caller closes it.
+
+    `cmd_status` and `continue` share this print, so the loadout lines `main/reference/rp-loadout.md`
+    names for `cli.py status` come from one place and cannot drift apart.
+    """
+    s = await Database.fetchrow("SELECT name, status FROM sessions WHERE id=$1", session)
     r = await Database.fetchrow(
-        "SELECT credits, alloys, fuel FROM resources WHERE session_id=$1", SID
+        "SELECT credits, alloys, fuel FROM resources WHERE session_id=$1", session
     )
     t = await Database.fetchval(
         "SELECT COUNT(*) FROM territory WHERE session_id=$1 AND controlling_faction='Setia Empire'",
-        SID,
+        session,
     )
-    sh = await Database.fetchval("SELECT COUNT(*) FROM ships WHERE session_id=$1", SID)
+    sh = await Database.fetchval("SELECT COUNT(*) FROM ships WHERE session_id=$1", session)
     v = await Database.fetchrow(
         "SELECT progress FROM victory_tracking WHERE faction_id=(SELECT id FROM factions WHERE name='Setia Empire') AND victory_type='score'"
     )
     print(f"\n{'RP Engine Status':^50}")
     print(
-        f"  Session:    {s['name'] if s else 'N/A'} (id={SID}) | Status: {s['status'] if s else 'N/A'}"
+        f"  Session:    {s['name'] if s else 'N/A'} (id={session}) | Status: {s['status'] if s else 'N/A'}"
     )
     if r:
         print(f"  Resources:  {r['credits']:,}C / {r['alloys']:,}A / {r['fuel']:,}F")
@@ -54,6 +75,11 @@ async def cmd_status():
     print(
         f"  Modules:     {len(Config.active_modules())} active ({len([k for k, v in Config.MODULES.items() if v])} enabled)"
     )
+
+
+async def cmd_status():
+    await Database.init()
+    await print_status(_session_id())
     await Database.close()
 
 
@@ -1749,6 +1775,317 @@ async def cmd_export():
     await Database.init()
     md = await StateManager.export_md(SID)
     print(md)
+    await Database.close()
+
+
+# ── continue: take a novel title, land in its session ────────────────────────────────────────────
+#
+# `continue` replaces the ritual in `main/rp-continue-session.md`: read the novel's title, find the
+# session that plays it, point the arc file at it, print the status headline. A title is resolved
+# against `novels.title`; `novels.novel_id` then names the session through `sessions.novel_id`.
+
+class NovelNotFound(RuntimeError):
+    """No novel carries the title, or several do. `candidates` holds the matches, empty when none."""
+
+    def __init__(self, asked: str, candidates: list[tuple[str, str]]):
+        self.asked = asked
+        self.candidates = candidates
+        if not candidates:
+            what = f"no novel is titled {asked!r}"
+        else:
+            names = ", ".join(f"{title!r} ({novel_id})" for novel_id, title in candidates)
+            what = f"{asked!r} matches {len(candidates)} novels: {names}"
+        RuntimeError.__init__(self, what)
+
+
+async def _read_novels() -> list:
+    """Every novel with the sessions that play it, in reading order.
+
+    The join answers the list form of `continue` and the "no session" refusal in one read. A
+    superseded novel keeps its row, so it stays visible here.
+    """
+    return await Database.fetch(
+        "SELECT n.novel_id, n.title, n.status, n.supersedes, n.adventures_dir,"
+        " s.id AS session_id, s.name AS session_name, s.status AS session_status,"
+        " s.game_day AS game_day"
+        " FROM maya_rp.novels n LEFT JOIN maya_rp.sessions s ON s.novel_id = n.novel_id"
+        " ORDER BY n.story_order NULLS LAST, n.novel_id, s.id"
+    )
+
+
+async def _find_novel(title: str) -> tuple[str, str]:
+    """Resolve a title to `(novel_id, title)`: an exact case-insensitive match first, then a prefix.
+
+    @param title - the title the caller typed.
+    @returns the one match.
+    @raises NovelNotFound - no match, or several; `candidates` names them.
+    """
+    # LIKE has its own wildcards, so a title holding them must not widen the search.
+    escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    exact = await Database.fetch(
+        "SELECT novel_id, title FROM maya_rp.novels WHERE lower(title) = lower($1) ORDER BY novel_id",
+        title,
+    )
+    if len(exact) == 1:
+        return exact[0]["novel_id"], exact[0]["title"]
+    if len(exact) > 1:
+        raise NovelNotFound(title, [(row["novel_id"], row["title"]) for row in exact])
+    prefix = await Database.fetch(
+        "SELECT novel_id, title FROM maya_rp.novels"
+        " WHERE title ILIKE $1 ESCAPE '\\' ORDER BY title",
+        escaped + "%",
+    )
+    found = [(row["novel_id"], row["title"]) for row in prefix]
+    if len(found) == 1:
+        return found[0]
+    raise NovelNotFound(title, found)
+
+
+async def _find_session(novel_id: str) -> list:
+    """The sessions that play one novel, oldest first."""
+    return await Database.fetch(
+        "SELECT s.id, s.name, s.status, s.game_day, s.novel_id, s.story_path FROM maya_rp.sessions s"
+        " WHERE s.novel_id = $1 ORDER BY s.id",
+        novel_id,
+    )
+
+
+def _frozen_reason(session_id: int) -> str | None:
+    """Why a write into `session_id` is refused, or None when the campaign is writable.
+
+    An unreadable frozen list is not a licence to write: it refuses with its own reason.
+    """
+    from core.session import FrozenListUnreadable, is_frozen
+
+    try:
+        if is_frozen(session_id):
+            return "it is frozen for reference; arm GM MAYA maintenance to write it"
+    except FrozenListUnreadable as exc:
+        return f"the frozen list is unreadable ({exc}), so no campaign is writable"
+    return None
+
+
+def print_novels(rows) -> None:
+    """One block per novel: novel id, title, status, then the sessions that play it."""
+    order: list = []
+    sessions: dict[str, list] = {}
+    for row in rows:
+        novel_id = row["novel_id"]
+        if novel_id not in sessions:
+            order.append(row)
+            sessions[novel_id] = []
+        if row["session_id"] is not None:
+            sessions[novel_id].append(row)
+    print(f"novels — {len(order)}")
+    for novel in order:
+        novel_id = novel["novel_id"]
+        print(f"  {novel_id:18s} {novel['title']}  [{novel['status']}]"
+              + (f"  supersedes {novel['supersedes']}" if novel["supersedes"] else ""))
+        if not sessions[novel_id]:
+            print("      (no session plays this novel)")
+        for played in sessions[novel_id]:
+            print(f"      session {played['session_id']:<5} {played['session_name']}"
+                  f"  [{played['session_status']}]  day {played['game_day']}")
+
+
+async def cmd_continue():
+    """continue ["<novel title>"] — play the novel: set the arc, print the loadout.
+
+    With no title the novels and their sessions are listed, which is the answer when the operator
+    has forgotten the exact title.
+    """
+    await Database.init()
+    title = sys.argv[2] if len(sys.argv) > 2 else ""
+    if not title:
+        print_novels(await _read_novels())
+        await Database.close()
+        return
+
+    try:
+        novel_id, resolved_title = await _find_novel(title)
+    except NovelNotFound as exc:
+        if exc.candidates:
+            names = ", ".join(f"{shown!r} ({novel_id})" for novel_id, shown in exc.candidates)
+            print(f"no novel matches {title!r}; candidates: {names}", file=sys.stderr)
+        else:
+            print(f"no novel is titled {title!r}; run `cli.py continue` for the list", file=sys.stderr)
+        await Database.close()
+        sys.exit(1)
+
+    novel = await Database.fetchrow(
+        "SELECT novel_id, title, status, supersedes, adventures_dir FROM maya_rp.novels"
+        " WHERE novel_id = $1",
+        novel_id,
+    )
+    if novel_id == "scratch":
+        print("refused: `scratch` is no novel; its sessions take --session=<id> instead",
+              file=sys.stderr)
+        await Database.close()
+        sys.exit(1)
+    if novel["status"] == "superseded":
+        successor = await Database.fetchrow(
+            "SELECT novel_id, title FROM maya_rp.novels WHERE supersedes = $1"
+            " ORDER BY story_order NULLS LAST, novel_id LIMIT 1",
+            novel_id,
+        )
+        if successor:
+            print(f"refused: {resolved_title!r} is superseded by {successor['title']!r}"
+                  f" ({successor['novel_id']}); continue that novel instead", file=sys.stderr)
+        else:
+            print(f"refused: {resolved_title!r} is superseded, and no novel names it as its"
+                  " predecessor", file=sys.stderr)
+        await Database.close()
+        sys.exit(1)
+
+    rows = await _find_session(novel_id)
+    if not rows:
+        print(f"refused: novel {novel_id!r} ({resolved_title!r}) has no session to continue",
+              file=sys.stderr)
+        await Database.close()
+        sys.exit(1)
+    if len(rows) > 1:
+        listed = ", ".join(f"{row['id']} ({row['name']})" for row in rows)
+        print(f"refused: novel {novel_id!r} is played by {len(rows)} sessions: {listed};"
+              " pass one with --session=<id>", file=sys.stderr)
+        await Database.close()
+        sys.exit(1)
+
+    session_id = int(rows[0]["id"])
+    reason = _frozen_reason(session_id)
+    if reason:
+        print(f"refused: session {session_id} cannot be continued: {reason}", file=sys.stderr)
+        await Database.close()
+        sys.exit(1)
+
+    # The novel and its session are read before anything moves: a refused title must not move the arc.
+    from core.session import set_active_arc
+
+    set_active_arc(session_id)
+    print(f"\ncontinued: {resolved_title} ({novel_id}) → session {session_id}")
+    await print_status(session_id)
+    print(f"  Game day:    {rows[0]['game_day']}")
+    print("  Command:     cd /home/maya/Bumi-Hijau/rp-engine-py && python3 scripts/cli.py status")
+    print(f"  Brief:       {rows[0]['story_path'] or _brief_from_dir(novel['adventures_dir'])}")
+    await Database.close()
+
+
+def _brief_from_dir(adventures_dir: str | None) -> str:
+    """The brief path a novel without `sessions.story_path` falls back to."""
+    if not adventures_dir:
+        return "none: this novel names no adventures directory"
+    return adventures_dir.rstrip("/") + "/story.md"
+
+
+# ── clear: delete play-state clutter, never world or cast ────────────────────────────────────────
+#
+# Nine tables hold what a run produced (events, logs, news). A clear removes only those rows, for one
+# session. Dry run by default: the operator sees the counts before anything is deleted.
+
+#: The nine play-state tables `clear` owns. Not one more.
+PLAY_STATE_TABLES: tuple[str, ...] = (
+    "events",
+    "story_log",
+    "news_articles",
+    "tick_summaries",
+    "adjutant_prompts",
+    "morale_history",
+    "crew_production_log",
+    "pirate_alerts",
+    "npc_offscreen_interactions",
+)
+
+_DELETE_FROM = re.compile(r"^\s*delete\s+from\s+(?:maya_rp\.)?\"?([\w]+)\"?", re.I)
+
+
+def _deleted_rows(status: str) -> int:
+    """The row count in a `DELETE n` status tag; 0 when the tag carries no count."""
+    parts = str(status).split()
+    return int(parts[-1]) if parts and parts[-1].isdigit() else 0
+
+
+async def _play_state_counts(session: int) -> dict[str, int]:
+    """Current row count of each play-state table for one session.
+
+    @param session - campaign whose rows are counted.
+    """
+    counts = {}
+    for table in PLAY_STATE_TABLES:
+        sql = f'SELECT COUNT(*) FROM maya_rp."{table}" WHERE session_id = $1'
+        counts[table] = await Database.fetchval(sql, session)
+    return counts
+
+
+def _session_flag(argv: list[str]) -> str | None:
+    """The `--session` value of one command's own argv, or None.
+
+    `__main__` strips the flag and leaves it in `EXPLICIT_SESSION`; a direct call does not go through
+    that, so both forms are read here.
+    """
+    rest = list(argv)
+    for index, item in enumerate(rest):
+        if item.startswith("--session="):
+            return item.split("=", 1)[1]
+        if item == "--session" and index + 1 < len(rest):
+            return rest[index + 1]
+    return None
+
+
+async def cmd_clear():
+    """clear [--session N] [--yes] — remove the play-state rows of one session.
+
+    Dry run by default. `--yes` exports a `.sav` first and refuses to delete when that export
+    fails, so the rows are always recoverable.
+    """
+    await Database.init()
+    own = _session_flag(sys.argv[2:])
+    try:
+        # The flag on this call wins; otherwise resolve the arc the way every other verb does.
+        from core.session import require_session
+
+        session = _session_id() if own is None else require_session(own)
+    except (RuntimeError, ValueError) as exc:
+        print(f"session: {exc}", file=sys.stderr)
+        await Database.close()
+        sys.exit(2)
+
+    reason = _frozen_reason(session)
+    if reason:
+        print(f"refused: clear on session {session}: {reason}", file=sys.stderr)
+        await Database.close()
+        sys.exit(1)
+
+    counts = await _play_state_counts(session)
+    total = sum(counts.values())
+    for table in PLAY_STATE_TABLES:
+        print(f"  {table:28s} {counts[table]:>8,}")
+    print(f"  {'TOTAL':28s} {total:>8,}   session {session}")
+
+    if "--yes" not in sys.argv[2:]:
+        print("dry run: nothing deleted. Pass --yes to export a .sav and then delete these rows.")
+        await Database.close()
+        return
+
+    from core.savegame import export_sav
+
+    try:
+        sav = await export_sav(session)
+    except Exception as exc:  # noqa: BLE001 - every export failure must abort before the delete
+        print(f"refused: .sav export failed ({type(exc).__name__}: {exc}); nothing deleted",
+              file=sys.stderr)
+        await Database.close()
+        sys.exit(1)
+    print(f"savegame: {sav}")
+
+    deleted: dict[str, int] = {}
+    async with Database.transaction() as conn:
+        for table in PLAY_STATE_TABLES:
+            status = await conn.execute(
+                f'DELETE FROM maya_rp."{table}" WHERE session_id = $1', session)
+            deleted[table] = _deleted_rows(status)
+    for table in PLAY_STATE_TABLES:
+        print(f"  deleted {table:28s} {deleted[table]:>8,}")
+    print(f"cleared session {session}: {sum(deleted.values()):,} rows from"
+          f" {len(PLAY_STATE_TABLES)} play-state tables")
     await Database.close()
 
 
@@ -3618,6 +3955,7 @@ async def cmd_ooc():
 
 if __name__ == "__main__":
     explicit, sys.argv = take_session_flag(sys.argv)
+    EXPLICIT_SESSION = explicit
     try:
         from core.session import resolve_session
 
@@ -3631,7 +3969,7 @@ if __name__ == "__main__":
     SID = int(resolved)
     if len(sys.argv) < 2:
         print(
-            "Usage: python3 scripts/cli.py {status|tick|save|export|config|health|modules|run|query} [args]"
+            "Usage: python3 scripts/cli.py {status|continue|clear|tick|save|export|config|health|modules|run|query} [args]"
         )
         sys.exit(1)
     cmd = sys.argv[1]
@@ -3643,6 +3981,10 @@ if __name__ == "__main__":
         asyncio.run(cmd_health())
     elif cmd == "status":
         asyncio.run(cmd_status())
+    elif cmd == "continue":
+        asyncio.run(cmd_continue())
+    elif cmd == "clear":
+        asyncio.run(cmd_clear())
     elif cmd == "tick":
         asyncio.run(cmd_tick())
     elif cmd == "save":
@@ -3771,5 +4113,5 @@ if __name__ == "__main__":
         asyncio.run(cmd_encounter())
     else:
         print(
-            f"Unknown: {cmd}\nTry: status, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"
+            f"Unknown: {cmd}\nTry: status, continue, clear, tick, save, export, config, health, modules, run, query, briefing, economy, intel, romance, roll, templates, stream, memories, intimacy, roll100, schema, sync-pack"
         )

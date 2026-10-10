@@ -274,6 +274,26 @@ def _insert_session_item(stmt: str) -> tuple[str | None, bool]:
     return items[index], not rest.lstrip().startswith(",")
 
 
+def _insert_session_numbers(stmt: str) -> set[int]:
+    """Every `$n` that fills `session_id` in an INSERT, one per `VALUES` tuple.
+
+    The `VALUES` clause is read as a flat `$n` token stream, so a multi-row statement yields one
+    placeholder per tuple at the column's stride. A clause whose items are not one placeholder each
+    does not divide evenly and yields nothing, which leaves the caller its wider fallback.
+    """
+    head = _INSERT_HEAD.search(stmt)
+    if not head:
+        return set()
+    columns = [c.strip().strip('"').lower() for c in head.group(1).split(",")]
+    if "session_id" not in columns or not columns:
+        return set()
+    numbers = [int(n) for n in _PLACEHOLDER.findall(stmt[head.end():])]
+    if not numbers or len(numbers) % len(columns):
+        return set()
+    index = columns.index("session_id")
+    return {numbers[position] for position in range(index, len(numbers), len(columns))}
+
+
 def _literal_live_session(stmt: str) -> int | None:
     """The live session id written as a SQL literal in `stmt`, else None."""
     match = _SESSION_EQ.search(stmt)
@@ -303,6 +323,13 @@ def _session_placeholders(stmt: str) -> tuple[set[int], int]:
     if item is not None and single and _PLAIN_VALUE.match(item):
         explained += 1
         numbers.update(int(n) for n in _PLACEHOLDER.findall(item))
+    else:
+        # A multi-row `VALUES` list binds one session per tuple; `_insert_session_numbers` reads the
+        # column stride so a live session in any tuple is caught.
+        per_tuple = _insert_session_numbers(stmt)
+        if per_tuple:
+            explained += 1
+            numbers.update(per_tuple)
     return numbers, explained
 
 

@@ -19,7 +19,7 @@
 -- session, a ship row its ship's session, and a row whose target is absent takes 3. All nine ship
 -- rows name ship 7, 16 or 17, which are not in `ships`.
 --
--- NOT APPLIED. Safe to run twice: each column is guarded, the key swap compares the key definition
+-- APPLIED 2026-10-10 as `maya`, recorded in maya_rp._migrations. Safe to run twice: each column is guarded, the key swap compares the key definition
 -- first, and each backfill matches only a NULL. `PENDING_BINDING` in `core/binding.py` names the
 -- state tables this file does not bind.
 --

@@ -3,7 +3,7 @@
 -- modules/news.py raised InvalidColumnReference on a database built from migrations/.
 -- The live database already has this index, so applying the file there changes nothing.
 --
--- NOT APPLIED. The CREATE fails while duplicate rows exist.
+-- APPLIED 2026-10-10 as `maya`, recorded in maya_rp._migrations. The CREATE fails while duplicate rows exist.
 -- Check: SELECT session_id, territory_id, faction_name, count(*) FROM maya_rp.population_sentiment GROUP BY 1,2,3 HAVING count(*) > 1;
 BEGIN;
 SET search_path TO maya_rp;

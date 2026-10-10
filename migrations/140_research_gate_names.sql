@@ -19,7 +19,7 @@
 -- `ringworld_tech` takes `Frontier Expansion` because a Ringworld raises population capacity and
 -- that project raises max population; the earlier pick, `Matter Synthesis`, has no population link.
 --
--- NOT APPLIED. Safe to run twice: a value that already names its project matches no slug, the
+-- APPLIED 2026-10-10 as `maya`, recorded in maya_rp._migrations. Safe to run twice: a value that already names its project matches no slug, the
 -- rename is a no-op once done, and the constraint is added only when absent.
 --
 -- Rollback: read the map below in reverse (set each column back to the slug), rename id 27 back to

@@ -19,6 +19,8 @@ scratch row the fixture deletes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import json
 import pathlib
 import sys
@@ -31,6 +33,7 @@ sys.path.insert(0, str(ROOT))
 from core import savegame  # noqa: E402
 from core import session  # noqa: E402
 from core.db import Database  # noqa: E402
+from scripts import cli  # noqa: E402
 from scripts import gm_maint  # noqa: E402
 from scripts import relive_session  # noqa: E402
 
@@ -38,6 +41,48 @@ from scripts import relive_session  # noqa: E402
 SETIA = "tkg-setia-kingdom"
 SUNRISE = "tkg-the-sunrise"
 SCRATCH = "scratch"
+
+
+class _LoadDatabase:
+    """`Database` for `cli.py load`: no pool is opened, and every close is counted."""
+
+    def __init__(self):
+        self.opened = 0
+        self.closed = 0
+
+    async def init(self):
+        self.opened += 1
+
+    async def close(self):
+        self.closed += 1
+
+
+def _arm_load(monkeypatch, argv, behaviour):
+    """Run `cli.cmd_load` against a recording `import_sav` and a pool-free `Database`.
+
+    @param behaviour - what the stub does: return a result dict, or raise.
+    @returns `(the keyword arguments the loader passed, the stub Database, stdout, exit code)`.
+    """
+    seen: dict = {}
+    db = _LoadDatabase()
+
+    async def fake_import(path, **kwargs):
+        seen.update({"path": path, **kwargs})
+        return await behaviour(path, **kwargs)
+
+    monkeypatch.setattr(cli, "Database", db)
+    monkeypatch.setattr(savegame, "import_sav", fake_import)
+    own_argv = cli.sys.argv
+    cli.sys.argv = ["cli.py", *argv]
+    out, code = io.StringIO(), None
+    try:
+        with contextlib.redirect_stdout(out):
+            asyncio.run(cli.cmd_load())
+    except SystemExit as exc:
+        code = exc.code
+    finally:
+        cli.sys.argv = own_argv
+    return seen, db, out.getvalue(), code
 
 
 def _sav(tmp_path: pathlib.Path, *, session_id, novel_id=None, tables: dict | None = None,
@@ -119,6 +164,47 @@ class TestAnotherNovelIsRefused:
                                            allow_novel_mismatch=True)
         assert result["ok"] is True
         assert result["session_id"] == scratch_campaign
+
+    def test_the_cli_load_verb_refuses_the_other_novel_by_default(self, monkeypatch, tmp_path):
+        """`NovelMismatch` names `--allow-novel-mismatch`; the verb must offer that switch.
+
+        The refusal arrives through the loader's own handler, so the operator reads it as a refused
+        load rather than a traceback. `--allow-session-mismatch` is passed here and does not cover it:
+        the two switches are separate refusals.
+        """
+        path = _sav(tmp_path, session_id=3, novel_id=SETIA)
+
+        async def refuse(_path, **kwargs):
+            raise savegame.NovelMismatch(SETIA, 201, SUNRISE)
+
+        seen, db, out, code = _arm_load(
+            monkeypatch, ["load", path, "--allow-session-mismatch"], refuse)
+
+        assert code is None, "a refusal is reported, not raised out of the verb"
+        assert "LOAD REFUSED" in out, out
+        assert SETIA in out and SUNRISE in out, out
+        assert db.closed == 1, "the loader left the pool open"
+        assert seen["allow_novel_mismatch"] is False, seen
+        assert seen["allow_session_mismatch"] is True, seen
+        assert seen["path"] == path
+
+    def test_the_cli_load_verb_passes_the_flag_through(self, monkeypatch, tmp_path):
+        """With the switch the loader asks the restore for the crossing, and reports it."""
+        path = _sav(tmp_path, session_id=3, novel_id=SETIA)
+
+        async def restore(_path, **kwargs):
+            return {"ok": True, "restored_rows": 12, "session_id": 201, "game_day": 34}
+
+        seen, db, out, code = _arm_load(
+            monkeypatch, ["load", path, "--keep-session", "--allow-session-mismatch",
+                          "--allow-novel-mismatch"], restore)
+
+        assert code is None and "LOADED: 12 rows" in out, out
+        assert seen["allow_novel_mismatch"] is True, seen
+        assert seen["wipe"] is False, "the verb calls --keep-session wipe=False"
+        assert seen["allow_session_mismatch"] is True, seen
+        assert seen["force"] is False, seen
+        assert db.closed == 1
 
     async def test_a_file_whose_novel_the_session_left_is_refused(self, scratch_campaign,
                                                                   tmp_path):

@@ -5,9 +5,14 @@ play-state tables are never deleted. The arc file is a temp path in every test, 
 `continue` writes it: the autouse fixture below applies before the CLI module runs, so even the red
 proof against the unfixed tree cannot move the live arc.
 
-`clear --yes` runs against a fake transaction that records every DELETE. The assertion is the scope
-itself: exactly the nine play-state tables, nothing else. A dry run that deletes, or an export
+`clear --yes` runs against a fake transaction that holds the session's rows and applies every
+statement to them. The assertion is the scope itself: the nine play-state tables, and one UPDATE that
+releases the `roll_history` reference to `events`, nothing else. A dry run that deletes, or an export
 failure that still deletes, fails here rather than in the live database.
+
+One test reaches the server: the `roll_history.context_event_id` release, whose failure mode is a
+foreign key violation and cannot be proved against a stub alone. It writes only inside its own
+`scratch_campaign`, and it stubs the export.
 
 Reading: `main/reference/rp-loadout.md` section 3 names `cli.py status` as the engine-state line, so
 the status headline `continue` prints is the same print `cmd_status` makes.
@@ -17,11 +22,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import re
 
 import pytest
 
 from core import session
+from core.db import Database
 from scripts import cli
+
+#: The statement `clear` must run before it deletes `events`. Roll rows carry the reference; the
+#: events they name are what `clear` removes, so the column is what gives way.
+CLEAR_REFERENCE_SQL = ("UPDATE maya_rp.roll_history SET context_event_id = NULL "
+                       "WHERE session_id = $1")
 
 
 # ── stubs ────────────────────────────────────────────────────────────────────────────────────────
@@ -168,19 +180,63 @@ class FakeTx:
 
 
 class ClearConnection:
-    """The connection `clear` deletes through. Records every statement and every table."""
+    """The connection `clear` deletes through, holding the session's rows the way Postgres holds them.
 
-    def __init__(self, deleted: int):
+    `execute` is a small Postgres: it parses the table and the bound session out of every DELETE and
+    UPDATE, applies it to `rows`, and raises where the server would. The one constraint modelled is
+    the one that aborts a real `clear`: `maya_rp.roll_history.context_event_id` references
+    `events(id)` with NO ACTION, so deleting an `events` row a roll row still names is a foreign key
+    violation. A stub that only recorded statements cannot tell the two orders apart.
+
+    The SQL is read from a normalised copy: the statement text itself stays verbatim in `sql`.
+    """
+
+    _SESSION = re.compile(r"session_id\s*=\s*\$1")
+    _CLEAR_REFERENCE = re.compile(
+        r"^\s*UPDATE\s+(?:\w+\.)?\"?roll_history\"?\s+SET\s+context_event_id\s*=\s*NULL\s+WHERE\s+")
+    _EVENTS = re.compile(r"^\s*DELETE\s+FROM\s+(?:\w+\.)?\"?events\"?\s+WHERE\s+")
+
+    def __init__(self, deleted: int, rows=None):
         self.deleted = deleted
+        #: `(table, id, context_event_id)` for every row the database logically holds.
+        self.rows = list(rows or [])
         self.sql: list[str] = []
         self.tables: list[str] = []
+        self.deletes: list[str] = []
 
     async def execute(self, sql, *args):
-        self.sql.append(" ".join(sql.split()))
+        flat = " ".join(sql.split())
+        self.sql.append(flat)
         match = cli._DELETE_FROM.match(sql)
         if match:
             self.tables.append(match.group(1))
+            self.deletes.append(flat)
+        self._apply(flat, args)
         return f"DELETE {self.deleted}"
+
+    def _apply(self, flat, args) -> None:
+        """Apply one statement to `rows`, raising where Postgres would."""
+        session = args[0] if args else None
+        if self._EVENTS.match(flat) and self._SESSION.search(flat):
+            named = {row[1] for row in self.rows
+                     if row[0] == "roll_history" and row[2] is not None}
+            hit = sorted(named & {row[1] for row in self.rows if row[0] == "events"})
+            if hit:
+                raise AssertionError(
+                    f"foreign key violation: {len(hit)} roll_history row(s) still name event(s) "
+                    f"{hit} in session {session}, so the delete of this transaction fails and "
+                    f"nothing is removed")
+            self.rows = [row for row in self.rows if row[0] != "events"]
+            return
+        if self._CLEAR_REFERENCE.match(flat) and self._SESSION.search(flat):
+            self.rows = [(table, id_, None if table == "roll_history" else event_id)
+                         for table, id_, event_id in self.rows]
+            return
+        if match := cli._DELETE_FROM.match(flat):
+            if self._SESSION.search(flat):
+                table = match.group(1).strip('"')
+                self.rows = [row for row in self.rows if row[0] != table]
+            return
 
 
 # ── fixtures ─────────────────────────────────────────────────────────────────────────────────────
@@ -208,16 +264,18 @@ def fake_db(monkeypatch):
     return db
 
 
-def _arm_clear(monkeypatch, fake_db, argv, explicit, deleted: int = 0, export=None):
+def _arm_clear(monkeypatch, fake_db, argv, explicit, deleted: int = 0, export=None, rows=None):
     """Install the clear stubs, hold `EXPLICIT_SESSION` for one call, and capture both streams.
 
     `EXPLICIT_SESSION` is read at call time, so it is put back by hand. The refusal message is the
     assertion in three of these tests, so `stderr` is captured at the source rather than through
     `capsys`.
 
+    @param rows - the session's rows as `(table, id, context_event_id)`; the connection applies every
+        statement to them, so a delete the server would refuse raises here.
     @returns `(connection, export_calls, stdout, stderr, exit code)`.
     """
-    conn = ClearConnection(deleted)
+    conn = ClearConnection(deleted, rows)
     calls: list[tuple[str, tuple]] = []
     out, errors = io.StringIO(), io.StringIO()
 
@@ -476,12 +534,108 @@ def test_clear_yes_exports_first_then_deletes_only_the_nine(fake_db, monkeypatch
     assert code is None and err == ""
     assert calls == [("export", (918,))], calls
     assert conn.tables == list(cli.PLAY_STATE_TABLES), conn.tables
+    # The transaction holds one statement that is not a DELETE: the reference release below. Every
+    # other statement must be a DELETE of the nine, so a scope that grew past the list fails here.
+    assert [text for text in conn.sql if not cli._DELETE_FROM.match(text)] == [CLEAR_REFERENCE_SQL]
     for statement in conn.sql:
         match = cli._DELETE_FROM.match(statement)
-        assert match and match.group(1) in cli.PLAY_STATE_TABLES, statement
+        assert not match or match.group(1) in cli.PLAY_STATE_TABLES, statement
     assert "savegame: /tmp/backup/tkg.sav" in out
     assert "cleared session 918" in out
     assert not fake_db.writes
+
+
+def test_clear_releases_the_roll_history_reference_before_it_deletes_events(fake_db, monkeypatch):
+    """E1: a roll row that names an event aborts the delete of the whole transaction.
+
+    `maya_rp.roll_history.context_event_id` references `events(id)` with NO ACTION, so the order of
+    the two statements decides whether `clear --yes` removes anything. The connection applies every
+    statement to the session's rows and raises where the server would.
+    """
+    fake_db.counts = {table: 0 for table in cli.PLAY_STATE_TABLES}
+    rows = [("events", 42, None), ("roll_history", 7, 42)]
+    conn, calls, out, err, code = _arm_clear(
+        monkeypatch, fake_db, ["clear", "--yes"], "918", deleted=1, rows=rows)
+
+    assert code is None and err == "", err
+    assert conn.sql[0] == CLEAR_REFERENCE_SQL, conn.sql
+    assert conn.sql.index(CLEAR_REFERENCE_SQL) < conn.sql.index(conn.deletes[0])
+    assert conn.rows == [("roll_history", 7, None)], conn.rows
+    assert "cleared session 918" in out
+    assert not fake_db.writes
+
+
+def test_clear_keeps_the_roll_row_and_drops_only_the_reference(fake_db, monkeypatch):
+    """The roll history is not play state: `clear` releases the reference and leaves the row."""
+    fake_db.counts = {table: 0 for table in cli.PLAY_STATE_TABLES}
+    rows = [("events", 42, None), ("roll_history", 7, 42)]
+    conn, _, _, _, code = _arm_clear(
+        monkeypatch, fake_db, ["clear", "--yes"], "918", deleted=1, rows=rows)
+
+    assert code is None
+    assert conn.rows == [("roll_history", 7, None)], conn.rows
+    for table in cli.PLAY_STATE_TABLES:
+        assert table not in {row[0] for row in conn.rows}, table
+
+
+def test_clear_runs_the_roll_history_release_on_a_real_database(scratch_campaign, monkeypatch):
+    """E1 against the server: one event, one roll row naming it, then `clear --yes`.
+
+    The stub above cannot fail the way the server fails. This arm reaches the real constraint: an
+    `events` row with a `roll_history` row pointing at it, deleted through `Database.transaction()`.
+    The export is stubbed, so no backup file is written and nothing outside this scratch session is
+    read or written.
+    """
+    event_id = 0
+
+    async def seed():
+        await Database.init()
+        nonlocal event_id
+        event_id = await Database.fetchval(
+            "INSERT INTO maya_rp.events (session_id, event_type, title) VALUES ($1, $2, $3)"
+            " RETURNING id", scratch_campaign, "test", "clear reference scratch")
+        roll_id = await Database.fetchval(
+            "INSERT INTO maya_rp.roll_history"
+            " (session_id, roll_code, source_table, source_id, dice_used, raw_roll, final_score,"
+            "  dc, outcome, context_event_id)"
+            " VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
+            scratch_campaign, "clear-fk", "events", int(event_id), "1d100", 50, 50, 50, "success",
+            int(event_id))
+        await Database.close()
+        return int(event_id), int(roll_id)
+
+    async def read_back():
+        await Database.init()
+        events = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.events WHERE id = $1",
+                                        int(event_id))
+        roll = await Database.fetchrow(
+            "SELECT context_event_id FROM maya_rp.roll_history WHERE session_id = $1",
+            scratch_campaign)
+        await Database.close()
+        return events, roll
+
+    event_id, roll_id = asyncio.run(seed())
+    assert event_id and roll_id
+    # The nine counts, the reference release and the nine deletes all run against the server: the
+    # point of this arm is the constraint itself. Only `export_sav` is stubbed, so no file is written
+    # and the export cannot fail the test for a reason of its own.
+    async def export_without_a_file(session_id, out_dir=None):
+        return "/tmp/backup/scratch.sav"
+
+    monkeypatch.setattr("core.savegame.export_sav", export_without_a_file)
+    before, cli.EXPLICIT_SESSION = cli.EXPLICIT_SESSION, str(scratch_campaign)
+    own_argv = cli.sys.argv
+    cli.sys.argv = ["cli.py", "clear", "--yes"]
+    try:
+        asyncio.run(cli.cmd_clear())
+    finally:
+        cli.EXPLICIT_SESSION = before
+        cli.sys.argv = own_argv
+
+    events, roll = asyncio.run(read_back())
+    assert events == 0, "the event survived, so the delete did not complete"
+    assert roll is not None, "the roll history row was deleted; clear releases the reference only"
+    assert roll["context_event_id"] is None, "the reference still points at a deleted event"
 
 
 def test_clear_takes_the_space_form_of_the_session_flag(fake_db, monkeypatch):

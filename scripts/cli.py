@@ -1747,16 +1747,22 @@ async def cmd_load():
     """load <file.sav> [--keep-session] — restore PG from a .sav snapshot."""
     await Database.init()
     if len(sys.argv) < 3:
-        print("Usage: cli.py load <file.sav> [--keep-session] [--allow-session-mismatch] [--force]")
+        print("Usage: cli.py load <file.sav> [--keep-session] [--allow-session-mismatch]"
+              " [--allow-novel-mismatch] [--force]")
         await Database.close()
         return
     from core.savegame import DetachRefused, RestoreIncomplete, SessionMismatch, import_sav
 
     wipe = "--keep-session" not in sys.argv
     forced = "--allow-session-mismatch" in sys.argv
+    # A novel mismatch is its own refusal: `NovelMismatch` names this switch in its message, so a
+    # loader without it strands the operator on a refusal whose remedy the CLI does not offer. The
+    # default stays a refusal.
+    other_novel = "--allow-novel-mismatch" in sys.argv
     # --force restores a file whose checksum does not match; it is a separate switch from the session check.
     try:
-        r = await import_sav(sys.argv[2], wipe=wipe, allow_session_mismatch=forced, force="--force" in sys.argv)
+        r = await import_sav(sys.argv[2], wipe=wipe, allow_session_mismatch=forced,
+                             allow_novel_mismatch=other_novel, force="--force" in sys.argv)
     except (DetachRefused, RestoreIncomplete, SessionMismatch) as exc:
         # Each of these refuses before a write commits; say so instead of a traceback.
         print(f"LOAD REFUSED: {exc}")
@@ -2015,29 +2021,18 @@ async def _play_state_counts(session: int) -> dict[str, int]:
     return counts
 
 
-def _session_flag(argv: list[str]) -> str | None:
-    """The `--session` value of one command's own argv, or None.
-
-    `__main__` strips the flag and leaves it in `EXPLICIT_SESSION`; a direct call does not go through
-    that, so both forms are read here.
-    """
-    rest = list(argv)
-    for index, item in enumerate(rest):
-        if item.startswith("--session="):
-            return item.split("=", 1)[1]
-        if item == "--session" and index + 1 < len(rest):
-            return rest[index + 1]
-    return None
-
-
 async def cmd_clear():
     """clear [--session N] [--yes] — remove the play-state rows of one session.
 
     Dry run by default. `--yes` exports a `.sav` first and refuses to delete when that export
     fails, so the rows are always recoverable.
+
+    `--session` is read through `take_session_flag`, the same reader `__main__` uses. A second
+    reader here kept the first flag where that one keeps the last, so `clear --session=919
+    --session=918` cleared a different campaign than the one the rest of the process resolved.
     """
     await Database.init()
-    own = _session_flag(sys.argv[2:])
+    own, _ = take_session_flag(sys.argv[2:])
     try:
         # The flag on this call wins; otherwise resolve the arc the way every other verb does.
         from core.session import require_session
@@ -2078,6 +2073,14 @@ async def cmd_clear():
 
     deleted: dict[str, int] = {}
     async with Database.transaction() as conn:
+        # `maya_rp.roll_history.context_event_id` references `events(id)` with NO ACTION, and
+        # `events` is one of the nine tables above. A roll row that names an event of this session
+        # refuses the delete of that event, which fails the transaction. The reference is released
+        # first, in the same transaction: the roll rows stay, and the events they named go with the
+        # rest of the play state.
+        await conn.execute(
+            "UPDATE maya_rp.roll_history SET context_event_id = NULL WHERE session_id = $1",
+            session)
         for table in PLAY_STATE_TABLES:
             status = await conn.execute(
                 f'DELETE FROM maya_rp."{table}" WHERE session_id = $1', session)

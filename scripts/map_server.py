@@ -184,7 +184,11 @@ def load_map_data():
                          "LEFT JOIN maya_rp.fleet_members fm ON fm.fleet_id=f.id "
                          "LEFT JOIN maya_rp.ships s ON s.id=fm.ship_id "
                          "WHERE f.session_id=3 AND f.name NOT LIKE 'TKG Defense%' GROUP BY f.id, f.name, f.formation"),
-        "zones": q(cur, "SELECT system_id, danger_level FROM maya_rp.pirate_zones WHERE active=true"),
+        # The map draws the reference campaign's world: session 5 holds no territories. The zone
+        # layer names session 3 rather than pooling every campaign's zones, matching the payload's
+        # session-bound reads. The spy, treaty and sector layers stay unfiltered.
+        "zones": q(cur, "SELECT system_id, danger_level FROM maya_rp.pirate_zones"
+                        " WHERE active=true AND session_id=3"),
         "megas": q(cur, "SELECT id, current_phase, progress_pct, status, territory_id FROM maya_rp.megastructure_construction WHERE session_id=3"),
         "quests": q(cur, "SELECT id, title, quest_type, status, giver FROM maya_rp.quests WHERE session_id=3 AND status='active'"),
         "arcs": q(cur, "SELECT id, title, theme, phase, status FROM maya_rp.story_arcs WHERE session_id=3 AND status='active'"),

@@ -123,7 +123,8 @@ async def _hoard_tick(session_id: int):
         session_id) or 0
     if destroyed > 0 and random.random() < 0.15:
         zone = await Database.fetchrow(
-            "SELECT system_id FROM pirate_zones WHERE active=true AND protected=false ORDER BY random() LIMIT 1")
+            "SELECT system_id FROM pirate_zones WHERE active=true AND protected=false"
+            " AND session_id=$1 ORDER BY random() LIMIT 1", session_id)
         if zone:
             await Database.execute(
                 "UPDATE maya_rp.pirate_bases SET status='active', treasury=$1, hidden=TRUE, defenses=50 "
@@ -183,8 +184,11 @@ async def _den_feeding(session_id: int):
 
 async def _spawn(session_id: int):
     # King's rule: pirates pop up ANYWHERE — but never near the capital.
-    # Protected zones (capital vicinity) never spawn pirate fleets.
-    zones = await Database.fetch("SELECT * FROM pirate_zones WHERE active=true AND protected=false")
+    # Protected zones (capital vicinity) never spawn pirate fleets, and migration 138 binds a zone to
+    # one campaign: a live tick spawns in its own zones, never in the frozen reference's.
+    zones = await Database.fetch(
+        "SELECT * FROM pirate_zones WHERE active=true AND protected=false AND session_id=$1",
+        session_id)
     for z in zones:
         if random.random() < z["danger_level"] * 0.03:  # 3-15% per tick
             tl = "patrol" if z["danger_level"] <= 2 else "raiding" if z["danger_level"] <= 3 else "invasion"

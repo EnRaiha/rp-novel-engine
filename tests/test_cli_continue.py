@@ -218,7 +218,8 @@ class ClearConnection:
         """Apply one statement to `rows`, raising where Postgres would."""
         session = args[0] if args else None
         if self._EVENTS.match(flat) and self._SESSION.search(flat):
-            named = {row[1] for row in self.rows
+            # `row[2]` is the reference a roll row carries: its own id proves nothing.
+            named = {row[2] for row in self.rows
                      if row[0] == "roll_history" and row[2] is not None}
             hit = sorted(named & {row[1] for row in self.rows if row[0] == "events"})
             if hit:

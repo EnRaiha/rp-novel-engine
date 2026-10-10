@@ -37,8 +37,12 @@ async def produce_crew(session_id: int | None = None) -> dict:
     total = 0
     sources = []
 
-    # Academy campuses (Karunia, Pelabuhan, Stasiun TKG, Heaven AI)
-    for a in await Database.fetch("SELECT name, student_slots_used, max_students, prestige FROM maya_rp.academy_campuses"):
+    # Academy campuses. Migration 138 binds a campus to a session, so this tick reads its own
+    # campuses and not the reference campaign's. A campaign with no academy campus contributes
+    # nothing here, which is the answer it must get.
+    for a in await Database.fetch(
+            "SELECT name, student_slots_used, max_students, prestige FROM maya_rp.academy_campuses"
+            " WHERE session_id=$1", session_id):
         out = _academy_output(a["student_slots_used"] or 0, a["max_students"] or 100, a["prestige"] or 50)
         total += out
         sources.append((f"academy:{a['name']}", out))
@@ -132,8 +136,10 @@ async def backfill_history(session_id: int | None = None, start_day: int = 26, e
     if end_day is None:
         end_day = await Database.fetchval("SELECT game_day FROM maya_rp.sessions WHERE id=$1", session_id) or 171
 
-    # Kadar harian semasa
-    acad = await Database.fetch("SELECT max_students, prestige FROM maya_rp.academy_campuses")
+    # Kadar harian semasa. Both campus reads carry the calling session, so another campaign's
+    # academy never sets this campaign's rate.
+    acad = await Database.fetch(
+        "SELECT max_students, prestige FROM maya_rp.academy_campuses WHERE session_id=$1", session_id)
     univ = await Database.fetch(
         "SELECT research_rate, level, prestige FROM maya_rp.university_campuses WHERE session_id=$1",
         session_id)

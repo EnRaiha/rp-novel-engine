@@ -3,6 +3,7 @@ import random, json
 from datetime import datetime, timezone
 from core.db import Database
 from core.config import Config
+from core.research_gate import check_gate
 from core.session import require_session
 from modules._economy import InsufficientResources, _deduct_resources, stochastic_round
 from core.events import EventBus
@@ -163,14 +164,11 @@ async def apply_containment(session_id: int, infestation_id: int, measure_name: 
     if not measure:
         return {"error": "Containment measure not found."}
 
-    # Check research
-    if measure.get("research_required"):
-        researched = await Database.fetchrow(
-            "SELECT unlocked FROM maya_rp.research_projects WHERE name = $1",
-            measure["research_required"]
-        )
-        if not researched or not researched["unlocked"]:
-            return {"error": f'Research "{measure["research_required"]}" required.'}
+    # Check research. `Database` is passed in so a test that replaces the module attribute still
+    # reaches the gate.
+    refused = await check_gate(measure.get("research_required"), Database)
+    if refused:
+        return {"error": refused}
 
     cost = {"credits": measure["cost_credits"]}
     res_costs = _j(measure.get("cost_resources"))

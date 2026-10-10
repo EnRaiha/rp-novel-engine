@@ -227,9 +227,9 @@ class TestTheDoors:
 class _GateOpenDatabase:
     """Answers the research gate; every other statement still runs on the real pool.
 
-    All six `megastructure_types` name a `research_required` project and none of those names exists
-    in the live `research_projects` catalogue, so the gate refuses every type before the charge. The
-    seeded alternative is a global row in the live tech catalogue, which this test will not write.
+    The stub isolates the phase-1 charge from the global `unlocked` flag: `research_projects` is one
+    catalogue shared by both campaigns and this test will not write it, so the gate opens here
+    whatever the live flag holds. `check_gate` reads the statement this stub answers.
     """
 
     @staticmethod

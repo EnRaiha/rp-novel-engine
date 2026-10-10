@@ -3,6 +3,7 @@ import random, json
 from datetime import datetime, timezone, timedelta
 from core.db import Database
 from core.config import Config
+from core.research_gate import check_gate
 from core.session import require_session
 from modules._economy import InsufficientResources, _check_afford, _deduct_resources, stochastic_round
 from core.events import EventBus
@@ -30,14 +31,11 @@ async def start_construction(session_id: int, megastructure_type_id: int,
     if not mt:
         return {"error": "Megastructure type not found."}
 
-    # Check research requirement
-    if mt.get("research_required"):
-        researched = await Database.fetchrow(
-            "SELECT unlocked FROM maya_rp.research_projects WHERE name = $1",
-            mt["research_required"]
-        )
-        if not researched or not researched["unlocked"]:
-            return {"error": f'Research "{mt["research_required"]}" required.'}
+    # Check research requirement. `Database` is passed in so a test that replaces the module
+    # attribute still reaches the gate.
+    refused = await check_gate(mt.get("research_required"), Database)
+    if refused:
+        return {"error": refused}
 
     # Check phase 1 cost affordability
     phases = _j(mt.get("construction_phases"))

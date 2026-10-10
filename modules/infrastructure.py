@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from core.config import Config
 from core.session import require_session
 from core.db import Database
+from core.research_gate import check_gate
 from modules._economy import RESOURCE_COLUMNS, _check_afford, _deduct_resources
 from core.events import EventBus
 from core.log import error
@@ -46,13 +47,11 @@ async def build_infrastructure(session_id: int, type_id: int,
 
     # Check research gate. `research_projects` carries no session of its own — it
     # is the global tech catalogue, so an unfiltered name lookup is correct here.
-    if it.get("required_tech"):
-        researched = await Database.fetchrow(
-            "SELECT unlocked FROM maya_rp.research_projects WHERE name = $1",
-            it["required_tech"]
-        )
-        if not researched or not researched["unlocked"]:
-            return {"error": f'Research "{it["required_tech"]}" required.'}
+    # `Database` is passed in so a test that replaces the module attribute still
+    # reaches the gate.
+    refused = await check_gate(it.get("required_tech"), Database)
+    if refused:
+        return {"error": refused}
 
     # `build_cost_credits` is nullable: NULL costs nothing.
     cost = {"credits": it["build_cost_credits"] or 0}

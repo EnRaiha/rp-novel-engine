@@ -14,7 +14,9 @@ from core.log import error, info
 async def run_tick(session_id: int | None = None) -> dict:
     """Count campuses and labs, and graduate scientists on every 30th game day.
 
-    The session and freeze check resolve before the `try`: a frozen campaign raises instead of
+    The campuses, the labs and the graduation record belong to one campaign. `research_projects` is
+    a galaxy-wide catalogue and carries no session of its own, so its counts stay unfiltered. The
+    session and freeze check resolve before the `try`: a frozen campaign raises instead of
     being reported as a tick error. A read or write error inside is logged at error level and
     returned as `{"error"}`; it was logged at info, below the level anyone watches.
 
@@ -29,20 +31,17 @@ async def run_tick(session_id: int | None = None) -> dict:
     try:
         total = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.research_projects") or 0
         finished = await Database.fetchval("SELECT COUNT(*) FROM maya_rp.research_projects WHERE unlocked=true") or 0
-        # Campuses link via territory_id (or colony_id → colonies); labs via colony_id.
+        # Migration 138 gives `university_campuses` and `research_labs` their own `session_id`, so a
+        # campus belongs to a campaign directly. The territory and colony lookups it replaces were
+        # blind to a campus with neither, and counted a campus whose territory sat in another campaign.
         campuses = await Database.fetchval(
-            """SELECT COUNT(*) FROM maya_rp.university_campuses uc
-               WHERE uc.territory_id IN (SELECT id FROM maya_rp.territory WHERE session_id=$1)
-                  OR uc.colony_id IN (SELECT id FROM maya_rp.colonies WHERE session_id=$1)""",
+            "SELECT COUNT(*) FROM maya_rp.university_campuses uc WHERE uc.session_id=$1",
             session_id) or 0
         labs = await Database.fetchval(
-            """SELECT COUNT(*) FROM maya_rp.research_labs rl
-               JOIN maya_rp.colonies c ON c.id = rl.colony_id
-               WHERE c.session_id=$1""", session_id) or 0
+            "SELECT COUNT(*) FROM maya_rp.research_labs rl WHERE rl.session_id=$1", session_id) or 0
         rate = await Database.fetchval(
             """SELECT COALESCE(SUM(uc.research_rate),0) FROM maya_rp.university_campuses uc
-               WHERE uc.territory_id IN (SELECT id FROM maya_rp.territory WHERE session_id=$1)
-                  OR uc.colony_id IN (SELECT id FROM maya_rp.colonies WHERE session_id=$1)""",
+               WHERE uc.session_id=$1""",
             session_id) or 0
         # Graduation cycle: every 30 game days, campuses graduate scientists.
         gd = await Database.fetchval(

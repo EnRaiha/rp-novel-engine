@@ -1421,24 +1421,45 @@ async def cmd_horror():
 
 
 async def cmd_mega():
-    """mega {types | status | start <type-id> [sector-id] [territory-id] | port-types | ports |
-    build-port <territory-id> <port-type-id> [name] | upgrade-port <port-id> <upgrade>}
+    """mega {types | status | ports | advance <days> | start <type-id> [sector-id] [territory-id] |
+    port-types | build-port <territory-id> <port-type-id> [name] | upgrade-port <port-id> <upgrade>}
 
-    Seven entry points of `modules/megastructures_ports.py` had no caller: the two catalogues, the two
-    status readers, the two builders and the port upgrader. `run_tick` advanced megastructures that
-    nothing could start.
+    `types` answers what a build costs before it is attempted, and names the research gate the
+    catalogue holds. `status` and `ports` print the rows they counted. `advance` is the only verb
+    that moves a site in a play session. Nothing here cancels a build: no refund, no delete.
     """
     await Database.init()
-    usage = ("Usage: cli.py mega types | status | start <type-id> [sector-id] [territory-id]\n"
-             "       cli.py mega port-types | ports\n"
+    usage = ("Usage: cli.py mega types | status | ports | advance <days>\n"
+             "       cli.py mega start <type-id> [sector-id] [territory-id]\n"
+             "       cli.py mega port-types\n"
              "       cli.py mega build-port <territory-id> <port-type-id> [name]\n"
              "       cli.py mega upgrade-port <port-id> <upgrade-name>")
     sid = SID
     action = sys.argv[2] if len(sys.argv) > 2 else "status"
     from modules import megastructures_ports as mp
     if action == "types":
+        from core.research_gate import check_gate
+        from modules._economy import _check_afford
+        ledger_row = await Database.fetchrow(
+            "SELECT 1 AS present FROM maya_rp.resources WHERE session_id = $1", sid)
         for row in await mp.get_megastructure_types():
-            print(f"  #{row['id']} {row['name']} · tier {row.get('fantasy_tier')}")
+            gate = row.get("research_required") or "none"
+            if gate == "none":
+                gate_state = "ungated"
+            else:
+                # `check_gate` keeps a catalogue miss and a lock apart; both print as `locked`.
+                gate_state = "locked" if await check_gate(gate) else "unlocked"
+            phases = mp._j(row.get("construction_phases"))
+            days = sum(p.get("time_days", 0) for p in phases)
+            cost = phases[0].get("cost", {}) if phases else {}
+            if not ledger_row:
+                ledger = "no ledger row"
+            else:
+                ok, why = await _check_afford(sid, cost)
+                ledger = "can charge" if ok else f"short: {why}"
+            print(f"  #{row['id']} {row['name']} · tier {row.get('fantasy_tier')}"
+                  f" · research {gate} ({gate_state}) · phase 1 {cost}"
+                  f" · total days {days} · ledger {ledger}")
         await Database.close(); return
     if action == "port-types":
         for row in await mp.get_port_types():
@@ -1461,10 +1482,31 @@ async def cmd_mega():
             print(usage); await Database.close(); return
         out = await mp.upgrade_port(sid, int(sys.argv[3]), sys.argv[4])
     elif action == "ports":
-        out = {"ports": len(await mp.get_port_overview(sid))}
+        rows = await mp.get_port_overview(sid)
+        print(f"  ports: {len(rows)}")
+        for row in rows:
+            print(f"  #{row['id']} {row['name']} · {row.get('port_type')}"
+                  f" · {'L' + str(row.get('level'))} · {row.get('status')}"
+                  f" · {row.get('territory_name') or 'no territory'}")
+        await Database.close(); return
+    elif action == "advance":
+        if len(sys.argv) < 4:
+            print(usage); await Database.close(); return
+        out = await mp.advance_megastructure(sid, float(sys.argv[3]))
     else:
-        out = {"megastructures": len(await mp.get_megastructure_status(sid)),
-               "ports": len(await mp.get_port_overview(sid))}
+        rows = await mp.get_megastructure_status(sid)
+        print(f"  megastructures: {len(rows)}")
+        for row in rows:
+            print(f"  #{row['id']} {row['name']} · phase {row.get('current_phase')}"
+                  f" · {row.get('progress_pct')}% · {row.get('status')}"
+                  f" · {row.get('territory_name') or 'no territory'}")
+        rows = await mp.get_port_overview(sid)
+        print(f"  ports: {len(rows)}")
+        for row in rows:
+            print(f"  #{row['id']} {row['name']} · {row.get('port_type')}"
+                  f" · {'L' + str(row.get('level'))} · {row.get('status')}"
+                  f" · {row.get('territory_name') or 'no territory'}")
+        await Database.close(); return
     for key, value in (out or {}).items():
         print(f"  {key}: {value}")
     await Database.close()

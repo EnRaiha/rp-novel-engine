@@ -294,12 +294,29 @@ class TestTheCharge:
             await Database.close()
 
     async def test_a_failed_insert_leaves_the_treasury_whole(self, scratch_session, monkeypatch):
-        """Sector 999999999 breaks `megastructure_construction_sector_id_fkey` after the debit.
+        """A timestamp the column cannot take fails the insert after the debit.
 
-        The base class is caught so this test stays about the rollback: a tz-aware timestamp also
-        raises a `PostgresError` from the same insert, and the sibling test owns that property.
+        A foreign `sector_id` no longer reaches the insert: `start_construction` refuses it before
+        the charge, and the wiring tests own that case. The bind is the reachable fault left. The
+        base class is caught so this test stays about the rollback.
         """
+
+        class _BadTimestamp:
+            """Stands in for the clock value: its naive form binds to the timestamp column as text."""
+
+            def __add__(self, other):
+                return self
+
+            def replace(self, **kwargs):
+                return "not-a-timestamp"
+
+        class _BadNow:
+            @staticmethod
+            def now(tz=None):
+                return _BadTimestamp()
+
         monkeypatch.setattr(mp, "Database", _GateOpenDatabase)
+        monkeypatch.setattr(mp, "datetime", _BadNow)
         await Database.init()
         await _seed_session(scratch_session)
         try:
@@ -307,7 +324,7 @@ class TestTheCharge:
                 "INSERT INTO maya_rp.resources (session_id, credits, alloys, fuel, dream_essence) "
                 "VALUES ($1, 0, 200000, 100000, 200)", scratch_session)
             with pytest.raises(PostgresError):
-                await mp.start_construction(scratch_session, TYPE_ID, sector_id=999999999)
+                await mp.start_construction(scratch_session, TYPE_ID)
             row = await Database.fetchrow(
                 "SELECT alloys, fuel, dream_essence FROM maya_rp.resources WHERE session_id = $1",
                 scratch_session)
@@ -327,6 +344,8 @@ class TestTheCharge:
 
         class _Conn:
             async def fetchrow(self, sql, *args):
+                if "INSERT INTO maya_rp.megastructure_construction" not in sql:
+                    return None
                 recorded["estimated"] = args[4]
                 return {"id": 1}
 

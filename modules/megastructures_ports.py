@@ -21,7 +21,15 @@ async def get_megastructure_types():
 
 async def start_construction(session_id: int, megastructure_type_id: int,
                              sector_id: int = None, territory_id: int = None) -> dict:
-    """Begin building a megastructure."""
+    """Begin building a megastructure.
+
+    @param session_id - the campaign that pays; a frozen campaign is refused.
+    @param megastructure_type_id - the catalogue row to build.
+    @param sector_id - optional placement; must belong to this session.
+    @param territory_id - optional placement; must belong to this session.
+    @returns `{construction_id, name, estimated_completion, charged}`, or `{"error": ...}`.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
     session_id = require_session(session_id)
     from core.ooc import _refuse_frozen
     _refuse_frozen(session_id)
@@ -36,6 +44,22 @@ async def start_construction(session_id: int, megastructure_type_id: int,
     refused = await check_gate(mt.get("research_required"), Database)
     if refused:
         return {"error": refused}
+
+    # Placement is checked before the charge. The foreign keys reach `territory` and `sectors`,
+    # which both carry a session, so without this a site hung off the other campaign's world.
+    # Placement stays optional: a campaign with no world builds a placeless site.
+    if territory_id is not None:
+        row = await Database.fetchrow(
+            "SELECT EXISTS (SELECT 1 FROM maya_rp.territory WHERE id = $1 AND session_id = $2)"
+            " AS owned", territory_id, session_id)
+        if not (row or {}).get("owned"):
+            return {"error": f"Territory {territory_id} is not in session {session_id}."}
+    if sector_id is not None:
+        row = await Database.fetchrow(
+            "SELECT EXISTS (SELECT 1 FROM maya_rp.sectors WHERE id = $1 AND session_id = $2)"
+            " AS owned", sector_id, session_id)
+        if not (row or {}).get("owned"):
+            return {"error": f"Sector {sector_id} is not in session {session_id}."}
 
     # Check phase 1 cost affordability
     phases = _j(mt.get("construction_phases"))
@@ -54,7 +78,27 @@ async def start_construction(session_id: int, megastructure_type_id: int,
     estimated = (datetime.now(timezone.utc) + timedelta(days=total_days)).replace(tzinfo=None)
 
     async with Database.transaction() as conn:
-        charged = await _deduct_resources(session_id, phase1_cost, conn)
+        # One build of a type at a time. A duplicate read on the pool answers before either caller
+        # has charged, so two calls that arrive together both pass it and both insert; the row lock
+        # serialises them, and the second then reads the first site. No index forbids a repeat.
+        # The locked row is `resources`: the same row the charge updates, so a second verb that takes
+        # `resources` first and reaches `sessions` through a foreign key keeps the same lock order.
+        await conn.fetchrow("SELECT 1 FROM maya_rp.resources WHERE session_id = $1 FOR UPDATE",
+                            session_id)
+        held = await conn.fetchrow(
+            "SELECT (SELECT id FROM maya_rp.megastructure_construction"
+            " WHERE session_id = $1 AND megastructure_type_id = $2"
+            " AND status IN ('construction', 'paused') ORDER BY id LIMIT 1) AS site_id",
+            session_id, megastructure_type_id)
+        existing = held.get("site_id") if held is not None else None
+        if isinstance(existing, int):
+            return {"error": f"{mt['name']} is already under construction (site #{existing})."}
+        try:
+            charged = await _deduct_resources(session_id, phase1_cost, conn=conn)
+        except ValueError as exc:
+            # The affordability read above is stale the moment it returns. A charge that cannot be
+            # paid answers an error here instead of raising out of the verb.
+            return {"error": f"Insufficient resources: {exc}"}
         cid = await conn.fetchrow("""
             INSERT INTO maya_rp.megastructure_construction
                 (session_id, megastructure_type_id, sector_id, territory_id,
@@ -171,6 +215,84 @@ async def advance_megastructure(session_id: int, game_days: float = 0.5) -> dict
                            f"🎉 Megastructure Complete: {const['name']}",
                            f"The {const['name']} is fully operational!", 5)
     return tally
+
+# ─── Action Parser: resolve_intent ───────────────────────────────────────
+
+#: The actions a player intent can name. `advance` is absent: time belongs to the tick.
+CONSTRUCTION_ACTIONS = {"start": "start", "build": "start", "begin": "start", "construct": "start",
+                        "status": "status"}
+
+
+async def _named_type(target: str):
+    """The type a target names, or the refusal that names the candidates.
+
+    `megastructure_types` is the global catalogue and carries no session.
+
+    @returns `(type_row, None)` for one match, else `(None, error dict)`.
+    """
+    rows = await Database.fetch(
+        "SELECT id, name FROM maya_rp.megastructure_types"
+        " WHERE LOWER(name) LIKE LOWER($1) ESCAPE '\\' ORDER BY id", _contains(target))
+    if len(rows) == 1:
+        return rows[0], None
+    names = ", ".join(row["name"] for row in rows)
+    return None, {"error": f"Construction target '{target}' matches {len(rows)} type(s): {names}."}
+
+
+async def resolve_intent(session_id: int, action: str, target: str, territory: str = "") -> dict:
+    """Resolve a construction intent from a player.
+
+    @param session_id - the campaign that pays; a frozen campaign is refused.
+    @param action - `start` (`build`, `begin`, `construct`) or `status`, any case.
+    @param target - megastructure type name fragment, matched literally (`%` is not a wildcard).
+    @param territory - optional territory id for the site, as a string from the caller.
+    @returns a dict shaped {domain, success, narrative_hook, ...}. A refusal carries the reason in
+        `narrative_hook`. `start` adds `construction_id`, `charged` and `estimated_completion`.
+    @raises core.ooc.FrozenSession - the campaign is frozen and maintenance is not armed.
+    """
+    session_id = require_session(session_id)
+    from core.ooc import _refuse_frozen
+    _refuse_frozen(session_id)
+
+    act = CONSTRUCTION_ACTIONS.get(str(action or "").strip().lower())
+    if act is None:
+        return {"domain": "construction", "success": False,
+                "narrative_hook": f"Unknown construction action '{action}'. Supported: start, status."}
+    if not str(target or "").strip():
+        return {"domain": "construction", "success": False,
+                "narrative_hook": "No megastructure named. Name a type, for example 'Dyson Sphere'."}
+
+    site, refused = await _named_type(target)
+    if refused:
+        return {"domain": "construction", "success": False,
+                "narrative_hook": refused["error"]}
+
+    if act == "status":
+        rows = [row for row in await get_megastructure_status(session_id)
+                if row.get("name") == site["name"]]
+        return {"domain": "construction", "success": True, "target": site["name"],
+                "sites": rows,
+                "narrative_hook": f"{site['name']}: {len(rows)} site(s) on this campaign."}
+
+    # A placement id arrives as text from the intent payload, where `0` and `""` mean "none".
+    placement = None
+    if str(territory or "").strip() not in ("", "0"):
+        try:
+            placement = int(territory)
+        except (TypeError, ValueError):
+            return {"domain": "construction", "success": False,
+                    "narrative_hook": f"Territory '{territory}' is not an id."}
+
+    out = await start_construction(session_id, site["id"], territory_id=placement)
+    if "error" in out:
+        return {"domain": "construction", "success": False, "target": site["name"],
+                "narrative_hook": out["error"]}
+    return {"domain": "construction", "success": True, "target": site["name"],
+            "construction_id": out["construction_id"], "charged": out["charged"],
+            "estimated_completion": out["estimated_completion"],
+            "narrative_hook": (f"{site['name']} construction begun. "
+                               f"Estimated {out['estimated_completion'][:10]}.")}
+
 
 async def get_megastructure_status(session_id: int | None = None):
     """This session's megastructures, in construction or completed.
@@ -355,6 +477,16 @@ def _j(v):
     if isinstance(v, str):
         return json.loads(v)
     return v if v else {}
+
+def _contains(text: str) -> str:
+    """LIKE pattern matching `text` as a literal substring (pair with `ESCAPE '\\'`).
+
+    A target of `%` used to act as a wildcard and resolve to the first type by id.
+
+    @param text - user text.
+    @returns the escaped `%text%` pattern.
+    """
+    return "%" + str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 async def _log(sid, category, title, content, importance=2):
     """Write narrative entry."""

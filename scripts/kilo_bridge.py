@@ -818,6 +818,14 @@ async def handle(action: str, params: dict = None) -> dict:
                 )
                 result["data"] = outcome
                 result["status"] = "ok"
+            elif domain == "construction":
+                from modules.megastructures_ports import resolve_intent
+
+                outcome = await resolve_intent(
+                    sid, intent_action, target, params.get("territory", "")
+                )
+                result["data"] = outcome
+                result["status"] = "ok"
             else:
                 result["data"] = {
                     "error": f"Unknown domain: {domain}",
@@ -826,6 +834,7 @@ async def handle(action: str, params: dict = None) -> dict:
                         "economy",
                         "diplomacy",
                         "character",
+                        "construction",
                     ],
                 }
 

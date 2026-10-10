@@ -227,6 +227,28 @@ def require_session(explicit=None) -> int:
     return sid
 
 
+async def novel_of(session_id=None) -> str:
+    """The novel one campaign belongs to.
+
+    `require_session` answers which session a call is for. This answers which novel that session is
+    canon for, so a caller that needs both resolves the session once and passes it here.
+
+    @param session_id - session id from the caller; resolves like `require_session` when absent.
+    @returns the `novel_id` slug.
+    @raises RuntimeError when no session resolves, or when maintenance is armed and resolves none.
+    @raises ValueError when the session has no `sessions` row, or its `novel_id` is NULL.
+    """
+    from core.db import Database
+
+    sid = require_session(session_id)
+    row = await Database.fetchrow("SELECT novel_id FROM maya_rp.sessions WHERE id = $1", sid)
+    if row is None:
+        raise ValueError(f"session {sid} has no row in maya_rp.sessions, so it names no novel")
+    if row["novel_id"] is None:
+        raise ValueError(f"session {sid} holds a NULL novel_id; migration 137 sets it NOT NULL")
+    return row["novel_id"]
+
+
 def mode_label() -> str:
     try:
         from core import maintenance

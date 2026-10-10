@@ -363,13 +363,15 @@ async def test_rebuild_production_refuses_a_session_without_territory(sid, capsy
 
 
 async def test_rebuild_production_apply_rolls_back(sid, monkeypatch):
-    """The only test that reaches the table-global DELETE. It runs in a transaction that never commits."""
+    """The DELETE and the INSERTs run in a transaction that never commits."""
     mod = _script("rebuild_production")
     count = "SELECT count(*) FROM maya_rp.resource_production"
     taxes = ("SELECT count(*) FROM maya_rp.resource_production"
-             " WHERE source ILIKE '%Tax Revenue%' OR source ILIKE '%Collective Tax%'")
+             " WHERE (source ILIKE '%Tax Revenue%' OR source ILIKE '%Collective Tax%')")
     await Database.init()
     before = await _count(count)
+    others = await _count(f"{taxes} AND session_id <> $1", sid)
+    assert others > 0, "no other campaign holds a tax row, so the scoping claim has nothing to test"
     await Database.execute(
         "INSERT INTO maya_rp.territory (session_id, system_name, controlling_faction, population, tax_rate)"
         " VALUES ($1, 'Scratch Prime', 'Setia Empire', 5000000, 0.05)", sid)
@@ -391,10 +393,10 @@ async def test_rebuild_production_apply_rolls_back(sid, monkeypatch):
             patch.setattr(Database, "close", keep_open)
             assert await mod.main(_argv(sid, "--apply")) == 0
         mine = await conn.fetch(
-            "SELECT source FROM maya_rp.resource_production WHERE source LIKE 'Scratch Prime%'")
+            "SELECT source FROM maya_rp.resource_production WHERE session_id = $1", sid)
         assert [row["source"] for row in mine] == ["Scratch Prime — Tax Revenue"]
-        # The DELETE ran inside the sandbox: every other tax row is gone from this view of the table.
-        assert int(await conn.fetchval(taxes)) == 1
+        # The DELETE names the session: every other campaign's tax row survives it.
+        assert int(await conn.fetchval(f"{taxes} AND session_id <> $1", sid)) == others
     finally:
         await tx.rollback()
         await pool.release(conn)

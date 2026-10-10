@@ -8,9 +8,9 @@ Fixes the stale display (was showing template pops 1.2M) with the new model:
   - Strategic: Dream Essence (Heaven), rare earth mines, EDEN food
   - Species-adjusted: none (tax is pop-based, already correct)
 
-`resource_production` has no `session_id`. The DELETE of tax rows therefore removes every
-session's tax display, and the rows rebuilt here come from `--session` only. `source` is the
-primary key, so a production line or EDEN row that already exists is updated in place.
+`resource_production` carries `session_id` (migration 138) and its key is `(session_id, source)`. The
+DELETE removes this session's tax rows alone, and every row written names the session. A session with
+no taxable territory stops the run before the DELETE.
 
   python3 scripts/rebuild_production.py --session N            # report only
   python3 scripts/rebuild_production.py --session N --apply    # delete and insert in one transaction
@@ -73,14 +73,15 @@ async def main(argv=None) -> int:
                          f"Aggregated tax from territories governed by {fac}."))
 
     if not tax_rows:
-        print(f"REFUSED: session {sid} has no taxable territory, "
-              "the DELETE would empty the tax display for every session")
+        print(f"REFUSED: session {sid} has no taxable territory, so the rebuild would drop its tax "
+              "rows and write none. No row was touched.")
         await Database.close()
         return 1
     rows = list(tax_rows)
 
     # Production lines
-    lines = await Database.fetch("SELECT id, name, efficiency FROM maya_rp.production_lines")
+    lines = await Database.fetch(
+        "SELECT id, name, efficiency FROM maya_rp.production_lines WHERE session_id=$1", sid)
     for ln in lines:
         eff = float(ln["efficiency"] or 1.0)
         rtype = "alloys" if "lloy" in ln["name"] else "fuel" if "uel" in ln["name"] else "credits"
@@ -97,24 +98,28 @@ async def main(argv=None) -> int:
 
     print(f"PRODUCTION REBUILD — {n_terr_rows} territories · Setia tax {setia_total:,.0f}/day · "
           f"{len(faction_income)} factions · {len(lines)} lines · {eden} EDEN")
-    doomed = await Database.fetchval(f"SELECT count(*) FROM maya_rp.resource_production WHERE {TAX_PREDICATE}")
+    doomed = await Database.fetchval(
+        f"SELECT count(*) FROM maya_rp.resource_production WHERE session_id=$1 AND ({TAX_PREDICATE})",
+        sid)
     if not args.apply:
-        print(f"DRY RUN — would delete {doomed} rows (the table has no session_id, so this means every session) "
+        print(f"DRY RUN: would delete {doomed} tax rows of session {sid} "
               f"and insert {len(rows)}. Re-run with --apply to write.")
         await Database.close()
         return 0
 
     async with Database.transaction() as conn:
-        await conn.execute(f"DELETE FROM maya_rp.resource_production WHERE {TAX_PREDICATE}")
+        await conn.execute(
+            f"DELETE FROM maya_rp.resource_production WHERE session_id=$1 AND ({TAX_PREDICATE})",
+            sid)
         for source, resource_type, amount, description in rows:
             await conn.execute(
                 """INSERT INTO maya_rp.resource_production
-                   (source, resource_type, amount_per_day, description, resource_id)
-                   VALUES ($1,$2,$3,$4,NULL)
-                   ON CONFLICT (source) DO UPDATE SET resource_type=EXCLUDED.resource_type,
+                   (session_id, source, resource_type, amount_per_day, description, resource_id)
+                   VALUES ($1,$2,$3,$4,$5,NULL)
+                   ON CONFLICT (session_id, source) DO UPDATE SET resource_type=EXCLUDED.resource_type,
                        amount_per_day=EXCLUDED.amount_per_day, description=EXCLUDED.description""",
-                source, resource_type, amount, description)
-    print(f"APPLIED — deleted {doomed} rows, inserted {len(rows)}")
+                sid, source, resource_type, amount, description)
+    print(f"APPLIED — deleted {doomed} tax rows of session {sid}, inserted {len(rows)}")
     await Database.close()
     return 0
 

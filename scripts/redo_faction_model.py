@@ -10,15 +10,19 @@ from the new layers:
   - Neutrals: diplomatic power from territory count + sentiment
 
 Deterministic, rerun-safe. Setia Empire (user) untouched.
+
+The script reads one campaign and writes one campaign: every statement names `--session`, including
+the two faction UPDATEs. It reports by default and writes only with `--apply`.
+
+  python3 scripts/redo_faction_model.py --session N            # report only
+  python3 scripts/redo_faction_model.py --session N --apply    # write the faction rows
 """
 from __future__ import annotations
 import os
 import asyncio, json, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from core.config import Config
 from core.db import Database
-
-SID = Config.SESSION_ID
+from scripts._oneshot import parse, guard
 
 # Faction → dominant species (from canon mapping)
 FACTION_SPECIES = {
@@ -43,12 +47,15 @@ STANDING_TONE = {
 }
 
 
-async def main() -> None:
+async def main(argv=None) -> int:
+    args = parse(__doc__, argv)
+    guard(args)
+    sid = args.session
     await Database.init()
     factions = await Database.fetch(
         """SELECT id, name, is_pirate, standing, treasury, reputation, diplomatic_power,
                   economic_strength, trade_aggressiveness, pirate_fleet_power, pirate_aggressiveness, status
-           FROM maya_rp.factions WHERE session_id=$1 AND id != 1 ORDER BY id""", SID)
+           FROM maya_rp.factions WHERE session_id=$1 AND id != 1 ORDER BY id""", sid)
     updated = 0
 
     for f in factions:
@@ -57,13 +64,15 @@ async def main() -> None:
             continue  # leave defeated factions alone
 
         # ── 1. Territory income → treasury ───────────────────────────
+        # `resource_production` carries `session_id`: another campaign's row can hold the same
+        # source text, so the sum names the campaign.
         tax = float(await Database.fetchval(
             """SELECT COALESCE(SUM(amount_per_day),0) FROM maya_rp.resource_production
-               WHERE source ILIKE $1 AND resource_type='credits'""",
-            f"{name} — Collective Tax%") or 0)
+               WHERE session_id=$1 AND source ILIKE $2 AND resource_type='credits'""",
+            sid, f"{name} — Collective Tax%") or 0)
         terr_count = await Database.fetchval(
             """SELECT COUNT(*) FROM maya_rp.territory
-               WHERE session_id=$1 AND controlling_faction=$2""", SID, name) or 0
+               WHERE session_id=$1 AND controlling_faction=$2""", sid, name) or 0
 
         # ── 2. Species population → economic strength ────────────────
         species_list = FACTION_SPECIES.get(name, [])
@@ -71,16 +80,16 @@ async def main() -> None:
         if species_list:
             sp = float(await Database.fetchval(
                 """SELECT COALESCE(SUM(count),0) FROM maya_rp.planet_population
-                   WHERE session_id=$1 AND species_name = ANY($2::text[])""", SID, species_list) or 0)
+                   WHERE session_id=$1 AND species_name = ANY($2::text[])""", sid, species_list) or 0)
         econ = max(0.5, round(sp / 2e9, 2)) if sp else max(0.5, round(terr_count * 0.05, 2))
 
         # ── 3. Sentiment → reputation ────────────────────────────────
         sent = float(await Database.fetchval(
             """SELECT COALESCE(AVG(sentiment),0) FROM maya_rp.population_sentiment
-               WHERE session_id=$1 AND faction_name=$2""", SID, name) or 0)
+               WHERE session_id=$1 AND faction_name=$2""", sid, name) or 0)
         fear = float(await Database.fetchval(
             """SELECT COALESCE(AVG(fear),0) FROM maya_rp.population_sentiment
-               WHERE session_id=$1 AND faction_name=$2""", SID, name) or 5)
+               WHERE session_id=$1 AND faction_name=$2""", sid, name) or 5)
         rep = max(-100, min(100, int(sent)))
 
         # ── 4. Treasury from tax (income × 30-day reserve) ───────────
@@ -103,11 +112,12 @@ async def main() -> None:
             personality = {"personality": STANDING_TONE.get(f["standing"], "opportunistic"),
                            "tier": 5 if terr_count > 0 else 3,
                            "governed_territories": terr_count, "fear_generated": round(fear, 1)}
-            await Database.execute(
-                """UPDATE maya_rp.factions SET pirate_fleet_power=$2, pirate_aggressiveness=$3,
-                   treasury=$4, reputation=$5, ai_personality=$6::jsonb, ai_goals=$7::jsonb
-                   WHERE id=$1""",
-                f["id"], fleet, agg, treasury, rep, json.dumps(personality), json.dumps(goals))
+            if args.apply:
+                await Database.execute(
+                    """UPDATE maya_rp.factions SET pirate_fleet_power=$2, pirate_aggressiveness=$3,
+                       treasury=$4, reputation=$5, ai_personality=$6::jsonb, ai_goals=$7::jsonb
+                       WHERE id=$1 AND session_id=$8""",
+                    f["id"], fleet, agg, treasury, rep, json.dumps(personality), json.dumps(goals), sid)
             print(f"PIR {name}: terr {terr_count} · tax {tax:,.0f}/d · fleet {fleet} · agg {agg:.2f} · sent {sent:.0f}")
 
         # ── 6. Neutrals/AI: econ + diplomacy + personality ───────────
@@ -123,18 +133,25 @@ async def main() -> None:
             personality = {"personality": STANDING_TONE.get(f["standing"], "pragmatic"),
                            "tier": 3, "species_backing": species_list,
                            "governed_territories": terr_count}
-            await Database.execute(
-                """UPDATE maya_rp.factions SET economic_strength=$2, treasury=$3, reputation=$4,
-                   diplomatic_power=$5, trade_aggressiveness=$6, ai_personality=$7::jsonb,
-                   ai_goals=$8::jsonb WHERE id=$1""",
-                f["id"], econ, treasury, rep, dip, trade_agg, json.dumps(personality), json.dumps(goals))
+            if args.apply:
+                await Database.execute(
+                    """UPDATE maya_rp.factions SET economic_strength=$2, treasury=$3, reputation=$4,
+                       diplomatic_power=$5, trade_aggressiveness=$6, ai_personality=$7::jsonb,
+                       ai_goals=$8::jsonb WHERE id=$1 AND session_id=$9""",
+                    f["id"], econ, treasury, rep, dip, trade_agg, json.dumps(personality),
+                    json.dumps(goals), sid)
             print(f"NEU {name}: terr {terr_count} · tax {tax:,.0f}/d · species {sp:,.0f} · econ {econ} · sent {sent:.0f} · dip {dip}")
 
         updated += 1
 
-    print(f"FACTION MODEL REDO — {updated} non-Setia factions rebuilt from live parameters")
+    if args.apply:
+        print(f"FACTION MODEL REDO — {updated} non-Setia factions rebuilt from live parameters")
+    else:
+        print(f"DRY RUN: session {sid} holds {updated} rebuildable non-Setia factions; nothing written. "
+              "Re-run with --apply to write.")
     await Database.close()
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

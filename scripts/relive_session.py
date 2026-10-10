@@ -11,8 +11,12 @@ World tables (fleets, economy, decrees, events, relationships…) are deliberate
 **not** copied: a relived arc starts with an empty ledger, and the engine creates
 defaults per session as they are needed.
 
-    python3 scripts/relive_session.py --from 3 --to 5 --dry-run
-    python3 scripts/relive_session.py --from 3 --to 5
+The target session belongs to one novel, and `--novel` names it. The clone puts one story's
+cast inside another campaign, so a target that already plays another novel is refused. A
+target that does not exist yet is created with that novel.
+
+    python3 scripts/relive_session.py --from 3 --to 5 --novel tkg-the-sunrise --dry-run
+    python3 scripts/relive_session.py --from 3 --to 5 --novel tkg-the-sunrise
 """
 from __future__ import annotations
 
@@ -50,15 +54,29 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description="Clone a session's cast for a relived arc")
     parser.add_argument("--from", dest="source", type=int, required=True)
     parser.add_argument("--to", dest="target", type=int, required=True)
+    parser.add_argument("--novel", required=True, help="novel_id of the session being relived")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     await Database.init()
-    exists = await Database.fetchrow("SELECT id FROM maya_rp.sessions WHERE id=$1", args.target)
-    if not exists:
+    novel = await Database.fetchval(
+        "SELECT novel_id FROM maya_rp.novels WHERE novel_id=$1", args.novel)
+    if novel is None:
+        print(f"refused: maya_rp.novels holds no novel {args.novel!r}", file=sys.stderr)
+        await Database.close()
+        return 2
+    target_novel = await Database.fetchval(
+        "SELECT novel_id FROM maya_rp.sessions WHERE id=$1", args.target)
+    if target_novel is None:
         await Database.execute(
-            "INSERT INTO maya_rp.sessions (id, name, status, game_day)"
-            " VALUES ($1, $2, 'active', 1)", args.target, f"Relived from session {args.source}")
+            "INSERT INTO maya_rp.sessions (id, name, status, game_day, novel_id)"
+            " VALUES ($1, $2, 'active', 1, $3)",
+            args.target, f"Relived from session {args.source}", args.novel)
+    elif target_novel != args.novel:
+        print(f"refused: session {args.target} plays novel {target_novel!r},"
+              f" not {args.novel!r}; pass --novel {target_novel}", file=sys.stderr)
+        await Database.close()
+        return 2
 
     columns = [
         row["column_name"] for row in await Database.fetch(
@@ -72,7 +90,7 @@ async def main() -> int:
     already = await Database.fetchval(
         "SELECT count(*) FROM maya_rp.characters WHERE session_id=$1", args.target)
     print(f"source session {args.source}: {len(roster)} characters"
-          f" | target session {args.target}: {already} already")
+          f" | target session {args.target} (novel {args.novel}): {already} already")
 
     if args.dry_run:
         sample = dict(roster[0]) if roster else {}

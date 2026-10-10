@@ -10,9 +10,13 @@ Design (common game engine pattern):
 Layout:
   {
     "header": {"format": "tkg-sav", "version": 2, "game_day": N, "saved_at": "...",
-               "session_id": 3, "checksum": "sha256-of-content"},
+               "session_id": 3, "novel_id": "tkg-setia-kingdom",
+               "checksum": "sha256-of-content"},
     "tables": { "<table>": [ {row}, ... ], ... }
   }
+
+The header names the novel its session plays, so a file says which story it belongs to. The novel
+lives on `sessions` alone and every scoped row inherits it through `session_id`.
 
 QA fix 2026-08-14 (BUG-1/2/3):
   - Snapshot tables are now derived DYNAMICALLY from the live schema
@@ -433,7 +437,7 @@ async def export_sav(session_id: int = 3, out_dir: str | None = None) -> str:
 
 async def _export(session_id: int, out_dir: str | None) -> str:
     session_row = await Database.fetchrow(
-        "SELECT id, game_day FROM maya_rp.sessions WHERE id=$1", session_id)
+        "SELECT id, game_day, novel_id FROM maya_rp.sessions WHERE id=$1", session_id)
     if session_row is None:
         # Every session-scoped table would come back empty, the file would still look like a
         # checkpoint, and the restore path trusts it. Refuse by name, the way an audit of a session
@@ -522,6 +526,9 @@ async def _export(session_id: int, out_dir: str | None) -> str:
             "game_day": session_row["game_day"],
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "session_id": session_id,
+            # The novel this campaign is canon for, read from the session row. A restore into another
+            # novel is refused by default: the wipe merges two stories the engine keeps apart.
+            "novel_id": session_row.get("novel_id"),
             # A restore must not touch a table this file carries only in part, or the wipe deletes
             # rows the file cannot put back.
             "partial_tables": partial,
@@ -573,6 +580,28 @@ class SessionMismatch(RuntimeError):
             f"is really what you want.")
 
 
+class NovelMismatch(SessionMismatch):
+    """A save belongs to a novel the target session does not play.
+
+    `sessions.novel_id` is the one place a campaign names its novel, so a restore into another novel
+    merges two stories the engine keeps apart. The guard also catches a file whose stored novel no
+    longer matches the session it names, which is what a binding moved after the write leaves behind.
+
+    A `SessionMismatch` subclass on purpose: a caller that refuses a foreign session refuses a foreign
+    novel the same way, and `scripts/cli.py load` reports both through the one handler.
+    """
+
+    def __init__(self, file_novel: str, requested: int, target_novel: str):
+        self.file_novel = file_novel
+        self.requested = requested
+        self.target_novel = target_novel
+        RuntimeError.__init__(
+            self,
+            f"this save belongs to novel {file_novel!r}, but session {requested} plays "
+            f"{target_novel!r}. Pass allow_novel_mismatch=True (CLI: --allow-novel-mismatch) if that "
+            f"is really what you want.")
+
+
 class RestoreIncomplete(RuntimeError):
     """Rows of a .sav could not be restored, so the whole import rolled back.
 
@@ -590,9 +619,49 @@ class RestoreIncomplete(RuntimeError):
             f"Pass allow_partial=True to commit the partial restore.")
 
 
+async def _session_novel(session_id: int | None) -> str | None:
+    """The novel one session plays, or None when the session has no row.
+
+    @param session_id - a session id, or None.
+    @returns the `novel_id` slug; None when the row is absent.
+    """
+    if session_id is None:
+        return None
+    row = await Database.fetchrow(
+        "SELECT novel_id FROM maya_rp.sessions WHERE id=$1", int(session_id))
+    return None if row is None else row.get("novel_id")
+
+
+async def _refuse_novel_mismatch(header: dict, file_session, sid: int, allow: bool) -> None:
+    """Refuse a file whose novel differs from the novel of the session it restores into.
+
+    The file's novel is the header's when it carries one. A file written before the header carried a
+    novel names none, so it resolves through its own `session_id`: that row is where the export came
+    from, and refusing every checkpoint older than this change strands the backups it protects.
+    A file and a target that name one session need no read while the file names no novel, because
+    one row answers for both.
+
+    @param header - the file's header.
+    @param file_session - the session the file names; None when it names none.
+    @param sid - the session the restore targets.
+    @param allow - the caller accepted a cross-novel restore.
+    @raises NovelMismatch - both novels are known and differ.
+    """
+    if allow:
+        return
+    file_novel = header.get("novel_id")
+    if not file_novel:
+        if file_session is not None and int(file_session) == int(sid):
+            return
+        file_novel = await _session_novel(file_session)
+    target_novel = await _session_novel(sid)
+    if file_novel and target_novel and str(file_novel) != str(target_novel):
+        raise NovelMismatch(str(file_novel), int(sid), str(target_novel))
+
+
 async def import_sav(path: str, session_id: int | None = None, wipe: bool = True,
                      allow_session_mismatch: bool = False, force: bool = False,
-                     allow_partial: bool = False) -> dict:
+                     allow_partial: bool = False, allow_novel_mismatch: bool = False) -> dict:
     """Restore PG from a .sav file. wipe=True resets ALL current session/catalog
     tables to the snapshot (FK-safe ordered DELETE, no TRUNCATE CASCADE).
 
@@ -606,8 +675,10 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
     @param allow_session_mismatch - restore another session's file on purpose.
     @param force - restore a file whose checksum does not match.
     @param allow_partial - commit even when rows could not be restored.
+    @param allow_novel_mismatch - restore another novel's file on purpose.
     @returns {"ok": True, "restored_rows", ...}, or {"ok": False, "error"} for a file refused before any DB access.
-    @raises SessionMismatch, SaveIncomplete - file refused before any DB access.
+    @raises SessionMismatch - the file names another session; NovelMismatch extends it for a foreign
+    novel. Both refuse before any write.
     @raises DetachRefused - the wipe would reach other sessions' rows; nothing written.
     @raises RestoreIncomplete - rows could not be restored and allow_partial is False; rolled back.
     @raises ValueError - a table or column name in the file is not a safe known identifier; rolled back.
@@ -654,6 +725,11 @@ async def import_sav(path: str, session_id: int | None = None, wipe: bool = True
     created = Database.pool is None
     await Database.init()
     try:
+        # Outside the transaction: a cross-novel file is refused with no row written, and the pool
+        # this call opened still closes on the way out. The guard reads two session rows, the file's
+        # and the target's; neither read is a write.
+        await _refuse_novel_mismatch(data.get("header", {}), file_session, sid,
+                                     allow_novel_mismatch)
         return await _restore(data, tables, sid, wipe, allow_partial, checksum_ok)
     finally:
         if created:

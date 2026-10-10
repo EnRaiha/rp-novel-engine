@@ -92,6 +92,9 @@ class TestSessionMismatch:
                               "session_id": 3}, "tables": {}}
         path = tmp_path / "three.sav"
         path.write_text(json.dumps(payload), encoding="utf-8")
+        # Session 3 plays tkg-setia-kingdom and session 5 plays tkg-the-sunrise, so the file crosses
+        # both guards and the caller names both.
         result = await savegame.import_sav(str(path), session_id=5, wipe=False,
-                                           allow_session_mismatch=True)
+                                           allow_session_mismatch=True,
+                                           allow_novel_mismatch=True)
         assert result.get("session_id") == 5

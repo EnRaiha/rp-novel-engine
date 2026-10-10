@@ -1450,9 +1450,11 @@ async def cmd_mega():
     """mega {types | status | ports | advance <days> | start <type-id> [sector-id] [territory-id] |
     port-types | build-port <territory-id> <port-type-id> [name] | upgrade-port <port-id> <upgrade>}
 
-    `types` answers what a build costs before it is attempted, and names the research gate the
-    catalogue holds. `status` and `ports` print the rows they counted. `advance` is the only verb
-    that moves a site in a play session. Nothing here cancels a build: no refund, no delete.
+    `types` answers what a build costs before it is attempted, names the research gate the catalogue
+    holds, and prints the reason that gate refuses: `catalogue-miss` when the value names no
+    `research_projects` row, `locked` when the row exists and is not unlocked. `status` and `ports`
+    print the rows they counted. `advance` is the only verb that moves a site in a play session.
+    Nothing here cancels a build: no refund, no delete.
     """
     await Database.init()
     usage = ("Usage: cli.py mega types | status | ports | advance <days>\n"
@@ -1464,7 +1466,7 @@ async def cmd_mega():
     action = sys.argv[2] if len(sys.argv) > 2 else "status"
     from modules import megastructures_ports as mp
     if action == "types":
-        from core.research_gate import check_gate
+        from core.research_gate import CATALOGUE_MISS, LOCKED, check_gate
         from modules._economy import _check_afford
         ledger_row = await Database.fetchrow(
             "SELECT 1 AS present FROM maya_rp.resources WHERE session_id = $1", sid)
@@ -1473,8 +1475,19 @@ async def cmd_mega():
             if gate == "none":
                 gate_state = "ungated"
             else:
-                # `check_gate` keeps a catalogue miss and a lock apart; both print as `locked`.
-                gate_state = "locked" if await check_gate(gate) else "unlocked"
+                # The gate answers one text per reason, and the CLI must read which one arrived. A
+                # catalogue value that names no project and a project that exists but is locked both
+                # answer truthy, so both printed as `locked`, and a catalogue fault read as a lock.
+                # A text matching neither is not called locked either: it names no reason here.
+                refusal = await check_gate(gate)
+                if refusal is None:
+                    gate_state = "unlocked"
+                elif refusal == CATALOGUE_MISS.format(gate):
+                    gate_state = "catalogue-miss"
+                elif refusal == LOCKED.format(gate):
+                    gate_state = "locked"
+                else:
+                    gate_state = "gated"
             phases = mp._j(row.get("construction_phases"))
             days = sum(p.get("time_days", 0) for p in phases)
             cost = phases[0].get("cost", {}) if phases else {}

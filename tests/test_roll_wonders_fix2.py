@@ -244,8 +244,8 @@ class TestOneCallPaysAndTheOtherLoses:
             "VALUES ($1, 'P', '1:1', 1000) RETURNING id", sid)
         for name, side in (("A", "king"), ("B", "house")):
             await Database.execute(
-                "INSERT INTO maya_rp.pool_bets (pool_id, bettor_name, bet_credits, bet_side) "
-                "VALUES ($1, $2, 500, $3)", pool, name, side)
+                "INSERT INTO maya_rp.pool_bets (session_id, pool_id, bettor_name, bet_credits, bet_side) "
+                "VALUES ($1, $2, $3, 500, $4)", sid, pool, name, side)
         monkeypatch.setattr(rt, "Database", delay_after("status='open'"))
 
         results = await asyncio.gather(rt.resolve_pool(sid, True), rt.resolve_pool(sid, True))

@@ -74,9 +74,11 @@ async def _colony(session_id=SESSION, name="review colony"):
 
 
 async def _lab(colony_id, name="review lab"):
+    """A lab on `colony_id`. `research_labs` carries `session_id`: the lab takes the colony's."""
     return await Database.fetchval(
-        "INSERT INTO maya_rp.research_labs (id, colony_id, name, level, research_field, research_rate) "
-        "VALUES ((SELECT COALESCE(MAX(id), 0) + 500000 FROM maya_rp.research_labs), $1, $2, 1, 'physics', 1.0) "
+        "INSERT INTO maya_rp.research_labs (id, session_id, colony_id, name, level, research_field, research_rate) "
+        "SELECT (SELECT COALESCE(MAX(id), 0) + 500000 FROM maya_rp.research_labs),"
+        " c.session_id, c.id, $2, 1, 'physics', 1.0 FROM maya_rp.colonies c WHERE c.id = $1 "
         "RETURNING id",
         colony_id, name)
 
@@ -107,7 +109,7 @@ async def _drop(lab_id, character_id, colony_id):
 
 class TestTheLabBelongsToItsCampaign:
     async def test_another_campaigns_lab_is_refused(self):
-        """`research_labs` carries no session_id; the bare id check let a scientist cross campaigns."""
+        """The lab names its own session and its colony's; a scientist from another campaign is refused."""
         colony = lab = character = None
         try:
             colony = await _colony(session_id=OTHER, name="review colony other")
@@ -171,7 +173,7 @@ class TestTheReads:
         assert await tech_tree.view_tech(SESSION) == [], "a scratch session lists technologies"
         assert await tech_tree.tech_info("anything", SESSION) is None
 
-    async def test_listing_labs_is_scoped_through_the_colony(self):
+    async def test_listing_labs_is_scoped_to_its_session(self):
         colony = lab = None
         try:
             colony = await _colony()

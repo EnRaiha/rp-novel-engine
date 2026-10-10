@@ -160,7 +160,7 @@ async def test_the_consumption_write_carries_the_session(monkeypatch):
     assert "session_id=$3" in [s for s in fake.sql("execute") if "quantity=quantity-$1" in s][0]
 
 
-async def test_the_blocked_write_carries_the_colony(monkeypatch):
+async def test_the_blocked_write_carries_the_colony_and_the_session(monkeypatch):
     fake = _install(monkeypatch, FakeDB(
         fetch={"production_lines": [_line(1)], "material_stockpiles": []},
         rows={"recipes WHERE id=$1": _recipe({"ore": 10}, {"alloy": 1})}, fetchval=0))
@@ -169,7 +169,8 @@ async def test_the_blocked_write_carries_the_colony(monkeypatch):
 
     assert out["blocked"] == 1
     blocked = fake.args_for("SET status='blocked'", "execute")[0]
-    assert blocked == (1, 3)
+    assert blocked == (1, 3, 5)
+    assert "session_id=$3" in [s for s in fake.sql("execute") if "SET status='blocked'" in s][0]
 
 
 async def test_the_line_query_joins_the_colony_session(monkeypatch):
@@ -178,7 +179,8 @@ async def test_the_line_query_joins_the_colony_session(monkeypatch):
     await mf.run_tick(5)
 
     sql = fake.sql("fetch")[0]
-    assert "c.session_id=$1" in sql and "pl.status IN ('running','blocked')" in sql
+    assert "pl.session_id=$1" in sql and "c.session_id=$1" in sql
+    assert "pl.status IN ('running','blocked')" in sql
     assert fake.args_for("production_lines", "fetch")[0] == (5,)
 
 

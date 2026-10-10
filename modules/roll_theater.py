@@ -8,12 +8,14 @@
 • Hall of legendary rolls (100s and 1s get named + memorialized)
 • Consequence ripples: partial/fumble rolls plant seeds (wired)
 • Telegram-native dice mapping (dice emoji 1-6 → d100 bands)
+
+`pool_bets` carries `session_id` since migration 138: a pool and its book belong to the campaign that
+opened them, and `resolve_pool` reads and pays only that campaign's bets.
 """
 
 from __future__ import annotations
 import json, random
 from core.db import Database
-from core.config import Config
 from core.log import info
 from core.session import require_session
 
@@ -387,8 +389,9 @@ async def open_pool(session_id: int, name: str, dc: int) -> dict:
         side = random.choice(["king", "house"])
         bet = random.choice([50, 100, 200, 500])
         await Database.execute(
-            "INSERT INTO maya_rp.pool_bets (pool_id, bettor_name, bet_credits, bet_side) "
-            "VALUES ($1,$2,$3,$4)",
+            "INSERT INTO maya_rp.pool_bets (session_id, pool_id, bettor_name, bet_credits, bet_side) "
+            "VALUES ($1,$2,$3,$4,$5)",
+            session_id,
             pid,
             bettor["name"],
             bet,
@@ -396,7 +399,8 @@ async def open_pool(session_id: int, name: str, dc: int) -> dict:
         )
         total_in += bet
     await Database.execute(
-        "UPDATE maya_rp.roll_pools SET credits_in_pool=$1 WHERE id=$2", total_in, pid
+        "UPDATE maya_rp.roll_pools SET credits_in_pool=$1 WHERE id=$2 AND session_id=$3",
+        total_in, pid, session_id
     )
     return {
         "pool_id": pid,
@@ -425,17 +429,21 @@ async def resolve_pool(session_id: int, king_won: bool) -> dict:
     )
     if not pool:
         return {"resolved": False}
-    # Claim first: a second resolver reads the same open pool and loses here.
+    # Claim first: a second resolver reads the same open pool and loses here. The id was read under
+    # this session, so the session predicate costs no row the claim would otherwise take.
     claimed = await Database.fetchrow(
-        "UPDATE maya_rp.roll_pools SET result=$1, status='closed' WHERE id=$2 AND status='open' RETURNING id",
+        "UPDATE maya_rp.roll_pools SET result=$1, status='closed' "
+        "WHERE id=$2 AND session_id=$3 AND status='open' RETURNING id",
         "king" if king_won else "house",
         pool["id"],
+        session_id,
     )
     if claimed is None:
         return {"resolved": False}
     bets = await Database.fetch(
-        "SELECT id, bettor_name, bet_credits, bet_side FROM maya_rp.pool_bets WHERE pool_id=$1",
-        pool["id"],
+        "SELECT id, bettor_name, bet_credits, bet_side FROM maya_rp.pool_bets"
+        " WHERE pool_id=$1 AND session_id=$2",
+        pool["id"], session_id,
     )
     house_keeps = 0  # stakes kept off the losers
     paid = 0
@@ -446,7 +454,8 @@ async def resolve_pool(session_id: int, king_won: bool) -> dict:
         paid += payout
         if payout:
             await Database.execute(
-                "UPDATE maya_rp.pool_bets SET payout=$1 WHERE id=$2", payout, b["id"]
+                "UPDATE maya_rp.pool_bets SET payout=$1 WHERE id=$2 AND session_id=$3",
+                payout, b["id"], session_id
             )
     # Net, not gross: paying 1.8 on the winners can put an upset pool underwater.
     house_keeps = (pool["credits_in_pool"] or 0) - paid

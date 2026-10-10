@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Manufacturing — Ported from Rust manufacturing.rs. Production lines, recipes, tick."""
+"""Manufacturing — Ported from Rust manufacturing.rs. Production lines, recipes, tick.
+
+`production_lines` takes `session_id` from migration 138, `material_stockpiles` from the baseline
+schema, so every read and every write names the campaign. `recipes` is a catalogue and stays
+unscoped.
+"""
 from __future__ import annotations
 import json
 from typing import Any
 from core.db import Database
-from core.config import Config
 from core.log import info, error
 from core.session import require_session
 
@@ -18,10 +22,12 @@ async def run_tick(session_id: int | None = None) -> dict:
     from core.ooc import _refuse_frozen
     _refuse_frozen(session_id)
     try:
+        # Both the line and its colony must name this campaign. A line whose colony sits elsewhere is
+        # a defect the pair refuses, and the pair is what every write below matches on.
         lines = await Database.fetch(
             "SELECT pl.id, pl.colony_id, pl.recipe_id, pl.efficiency, pl.status "
             "FROM maya_rp.production_lines pl JOIN maya_rp.colonies c ON pl.colony_id=c.id "
-            "WHERE c.session_id=$1 AND pl.status IN ('running','blocked')", session_id)
+            "WHERE pl.session_id=$1 AND c.session_id=$1 AND pl.status IN ('running','blocked')", session_id)
         events = []
         blocked = 0
         unblocked = 0
@@ -52,8 +58,9 @@ async def run_tick(session_id: int | None = None) -> dict:
             if not sufficient:
                 if l["status"] != "blocked":
                     await Database.execute(
-                        "UPDATE maya_rp.production_lines SET status='blocked' WHERE id=$1 AND colony_id=$2",
-                        l["id"], l["colony_id"])
+                        "UPDATE maya_rp.production_lines SET status='blocked' "
+                        "WHERE id=$1 AND colony_id=$2 AND session_id=$3",
+                        l["id"], l["colony_id"], session_id)
                     blocked += 1
                     events.append(f"line {l['id']} blocked: {rname}")
                 continue
@@ -96,13 +103,15 @@ async def run_tick(session_id: int | None = None) -> dict:
                             await conn.execute("INSERT INTO maya_rp.material_stockpiles (session_id, colony_id, material_name, quantity) VALUES ($1,$2,$3,$4)", session_id, l["colony_id"], mat, q)
                     if l["status"] == "blocked":
                         await conn.execute(
-                            "UPDATE maya_rp.production_lines SET status='running' WHERE id=$1 AND colony_id=$2",
-                            l["id"], l["colony_id"])
+                            "UPDATE maya_rp.production_lines SET status='running' "
+                            "WHERE id=$1 AND colony_id=$2 AND session_id=$3",
+                            l["id"], l["colony_id"], session_id)
             except _StockShort:
                 if l["status"] != "blocked":
                     await Database.execute(
-                        "UPDATE maya_rp.production_lines SET status='blocked' WHERE id=$1 AND colony_id=$2",
-                        l["id"], l["colony_id"])
+                        "UPDATE maya_rp.production_lines SET status='blocked' "
+                        "WHERE id=$1 AND colony_id=$2 AND session_id=$3",
+                        l["id"], l["colony_id"], session_id)
                     blocked += 1
                     events.append(f"line {l['id']} blocked: {rname}")
                 continue

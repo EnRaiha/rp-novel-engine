@@ -98,10 +98,11 @@ async def _stock(session_id, colony, name, qty):
         "VALUES ($1, $2, $3, $4)", session_id, colony, name, qty)
 
 
-async def _line(colony):
+async def _line(colony, session_id):
+    """A running line. `production_lines` carries `session_id`: the line names its own campaign."""
     return await Database.fetchval(
-        "INSERT INTO maya_rp.production_lines (colony_id, recipe_id, status, efficiency) "
-        "VALUES ($1, $2, 'running', 1.0) RETURNING id", colony, RECIPE)
+        "INSERT INTO maya_rp.production_lines (session_id, colony_id, recipe_id, status, efficiency) "
+        "VALUES ($1, $2, $3, 'running', 1.0) RETURNING id", session_id, colony, RECIPE)
 
 
 async def _total(session_id, name):
@@ -119,7 +120,7 @@ async def _rows(session_id, name):
 async def _smelter(session_id):
     """A colony with a running line and the stock for exactly one batch of recipe 9."""
     colony = await _colony(session_id)
-    await _line(colony)
+    await _line(colony, session_id)
     await _stock(session_id, colony, "Raw Ore", 5)
     await _stock(session_id, colony, "Power Cell", 1)
     return colony

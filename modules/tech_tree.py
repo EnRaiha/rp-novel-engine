@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Tech Tree — Ported from Rust tech_tree.rs. Tech view, labs, assign scientists, research tick."""
+"""Tech Tree — Ported from Rust tech_tree.rs. Tech view, labs, assign scientists, research tick.
+
+`research_labs` carries `session_id` (migration 138), so a lab is read and written with the campaign
+that owns it. The lab also keeps its colony join: a lab on another campaign's colony is not this
+campaign's, whichever marker it carries. `scientist_assignments` takes its binding from the lab.
+"""
 from __future__ import annotations
 import json
 from typing import Any
@@ -89,8 +94,9 @@ async def build_lab(colony: str, name: str, field: str, session_id: int | None =
             if _tag_count(tag) == 0:
                 raise _Refuse({"error": "Need 2000 credits"})
             lab_id = await conn.fetchval(
-                "INSERT INTO maya_rp.research_labs (colony_id, name, research_field) VALUES ($1,$2,$3) RETURNING id",
-                col["id"], name, field)
+                "INSERT INTO maya_rp.research_labs (session_id, colony_id, name, research_field) "
+                "VALUES ($1,$2,$3,$4) RETURNING id",
+                session_id, col["id"], name, field)
     except _Refuse as refused:
         return refused.out
     info("tech_tree", f"Built lab '{name}' on {col['name']}")
@@ -100,7 +106,7 @@ async def assign_scientist(character: str, lab_id: int, specialty: str, session_
     """Put a character in one of this campaign's labs.
 
     @param character - literal character name fragment.
-    @param lab_id - lab id; it must belong to this campaign through its colony.
+    @param lab_id - lab id; it must carry this campaign's session and sit on its colony.
     @param specialty - scientist specialty.
     @param session_id - session key; the active session when None.
     @returns the assignment, or {"error": ...}.
@@ -114,11 +120,12 @@ async def assign_scientist(character: str, lab_id: int, specialty: str, session_
         session_id, _contains(character))
     if not char: return {"error": f"Character '{character}' not found"}
     lab = await Database.fetchval(
-        # `research_labs` carries no session_id: ownership runs through the colony that hosts it.
-        # The bare id check let one campaign put its scientist in another campaign's lab.
+        # `research_labs` carries its own `session_id` since migration 138, so a lab is this
+        # campaign's directly. The colony join stays as the second check: a lab row on another
+        # campaign's colony is a defect the id alone would not catch.
         "SELECT rl.id FROM maya_rp.research_labs rl "
         "JOIN maya_rp.colonies col ON rl.colony_id = col.id AND col.session_id=$2 "
-        "WHERE rl.id=$1",
+        "WHERE rl.id=$1 AND rl.session_id=$2",
         lab_id, session_id)
     if not lab: return {"error": f"Lab #{lab_id} not found in session {session_id}"}
     await Database.execute(
@@ -137,9 +144,10 @@ async def list_labs(session_id: int | None = None) -> list[dict]:
         "SELECT rl.id, rl.name, rl.level, rl.research_field, rl.research_rate, "
         "c.name AS scientist, sa.specialty, sa.bonus "
         "FROM maya_rp.research_labs rl "
-        "JOIN maya_rp.colonies col ON rl.colony_id = col.id AND col.session_id=$1 "
+        "JOIN maya_rp.colonies col ON rl.colony_id = col.id "
         "LEFT JOIN maya_rp.scientist_assignments sa ON sa.lab_id=rl.id "
         "LEFT JOIN maya_rp.characters c ON c.id=sa.character_id "
+        "WHERE rl.session_id=$1 AND col.session_id=$1 "
         "ORDER BY rl.id", session_id)
     return [dict(r) for r in rows]
 
@@ -173,8 +181,9 @@ async def run_tick(session_id: int | None = None) -> dict:
 
         total_rate = await Database.fetchval(
             "SELECT COALESCE(SUM(rl.research_rate + COALESCE(sa.bonus,0.0)),0.0) FROM maya_rp.research_labs rl "
-            "JOIN maya_rp.colonies col ON rl.colony_id=col.id AND col.session_id=$1 "
-            "LEFT JOIN maya_rp.scientist_assignments sa ON sa.lab_id=rl.id", session_id) or 0
+            "JOIN maya_rp.colonies col ON rl.colony_id=col.id "
+            "LEFT JOIN maya_rp.scientist_assignments sa ON sa.lab_id=rl.id "
+            "WHERE rl.session_id=$1 AND col.session_id=$1", session_id) or 0
         # research_rate is numeric and arrives as Decimal; Decimal + float raises TypeError.
         base = max(1, min(30, (res["tech_score"] or 0) / 5))
         edu_mult = 1.0  # simplified

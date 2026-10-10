@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Async tick orchestrator — runs all modules in dependency order with concurrency guard."""
 import asyncio, json, sys, os, time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 sys.path.insert(0, str(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -140,6 +141,35 @@ def guard_session(session_id: int | None = None, verbose: bool = True, label: st
 #: A session's events older than 180 days move to `events_archive` once it holds more rows than this.
 EVENTS_ARCHIVE_MIN_ROWS = 5000
 
+#: The events one archive pass moves: this session's rows older than the cutoff. The count, the
+#: release and the move read it from one place, so the references an archive clears belong to the
+#: same rows it deletes.
+OLD_EVENTS_PREDICATE = "session_id=$1 AND happened_at < NOW() - INTERVAL '180 days'"
+
+#: `maya_rp.roll_history.context_event_id` references `events(id)` with NO ACTION and is not
+#: deferrable, so one roll row that names an event this pass moves aborts the move. The reference
+#: gives way first, inside the same transaction, and only for the rows being moved: a roll row whose
+#: event stays in `events` keeps its reference.
+RELEASE_EVENT_REFERENCE_SQL = (
+    "UPDATE maya_rp.roll_history SET context_event_id = NULL WHERE context_event_id IN "
+    f"(SELECT id FROM maya_rp.events WHERE {OLD_EVENTS_PREDICATE})")
+
+
+@asynccontextmanager
+async def _archive_connection():
+    """Yield what an archive pass writes through, inside one transaction when the pool offers one.
+
+    The release must share the move's transaction. A release that commits on its own drops the
+    reference while the move aborts, so the roll history forgets an event that stayed in `events`.
+    A statement recorder that offers no `transaction()` is taken at its word; it runs each call on
+    its own, and the statements it records in order are what its assertions read.
+    """
+    if not hasattr(Database, "transaction"):
+        yield Database
+        return
+    async with Database.transaction() as conn:
+        yield conn
+
 
 async def archive_old_events(session_id: int) -> int:
     """Move one session's events older than 180 days into `events_archive`.
@@ -148,22 +178,26 @@ async def archive_old_events(session_id: int) -> int:
     the events of another, frozen campaigns included. The move is one statement, so a row cannot
     be deleted without landing in the archive.
 
+    A roll row that names a moved event aborts the move on the foreign key, so the reference is
+    released first and both statements share one transaction: an archive that fails leaves the roll
+    history as it was.
+
     @param session_id - the session this tick runs on.
     @returns the number of rows archived; 0 when nothing is old or the session is under the threshold.
     """
-    old = await Database.fetchval(
-        "SELECT COUNT(*) FROM maya_rp.events "
-        "WHERE session_id=$1 AND happened_at < NOW() - INTERVAL '180 days'", session_id)
-    total = await Database.fetchval(
-        "SELECT COUNT(*) FROM maya_rp.events WHERE session_id=$1", session_id)
-    if not old or not total or total <= EVENTS_ARCHIVE_MIN_ROWS:
-        return 0
-    return await Database.fetchval(
-        "WITH moved AS ("
-        "DELETE FROM maya_rp.events "
-        "WHERE session_id=$1 AND happened_at < NOW() - INTERVAL '180 days' RETURNING *), "
-        "archived AS (INSERT INTO maya_rp.events_archive SELECT * FROM moved RETURNING 1) "
-        "SELECT COUNT(*) FROM archived", session_id)
+    async with _archive_connection() as conn:
+        old = await conn.fetchval(
+            f"SELECT COUNT(*) FROM maya_rp.events WHERE {OLD_EVENTS_PREDICATE}", session_id)
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM maya_rp.events WHERE session_id=$1", session_id)
+        if not old or not total or total <= EVENTS_ARCHIVE_MIN_ROWS:
+            return 0
+        await conn.execute(RELEASE_EVENT_REFERENCE_SQL, session_id)
+        return await conn.fetchval(
+            "WITH moved AS ("
+            f"DELETE FROM maya_rp.events WHERE {OLD_EVENTS_PREDICATE} RETURNING *), "
+            "archived AS (INSERT INTO maya_rp.events_archive SELECT * FROM moved RETURNING 1) "
+            "SELECT COUNT(*) FROM archived", session_id)
 
 
 async def run_full_tick(session_id: int = None, verbose: bool = True):

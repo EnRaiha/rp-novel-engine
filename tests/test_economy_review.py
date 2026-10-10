@@ -98,8 +98,9 @@ async def test_gate_toll_income_defaults_to_the_engine_session(monkeypatch):
 
     await economy.gate_toll_income()
 
-    # $1 is the session, $2 the game days per real day that end a deal's term.
-    assert fake.args_for("faction_trade_deals", "fetchval")[0] == (77, economy.Config.TIME_MULTIPLIER)
+    # $1 is the session, $2 the standings that count as a severed diplomacy.
+    assert fake.args_for("faction_trade_deals", "fetchval")[0] == (
+        77, list(economy.GATE_TOLL_BROKEN_STANDINGS))
 
 
 async def test_run_tick_defaults_to_the_engine_session(monkeypatch):

@@ -1,6 +1,5 @@
 """Async economy module — tax, population, trade."""
 from core.db import Database
-from core.config import Config
 from core.session import require_session
 from core.utils import calc_game_days, clamp
 from datetime import datetime, timezone
@@ -46,6 +45,11 @@ def _territory_tax(pop, rate, dev_mult, crisis_pen, market_mult: float = 1.0):
 GATE_TOLL_RATE = 25000            # fair toll per crossing — third parties pay
 GATE_TOLL_VOLUME_PER_CROSSING = 40  # units of trade volume = one crossing
 
+#: A standing in one of these states is a severed diplomacy: the deal's toll stops.
+#: `modules.diplomacy.STANDING_MAP` climbs enemy → hostile → neutral → friendly → allied, so these
+#: are the two names at the broken end. Every other standing keeps the toll running.
+GATE_TOLL_BROKEN_STANDINGS = ("hostile", "enemy")
+
 
 async def gate_toll_income(session_id: int = None, game_days: float = 1.0) -> int:
     """Foreign-faction gate tolls → Setia treasury (2026-08-15 Izzat canon).
@@ -58,12 +62,16 @@ async def gate_toll_income(session_id: int = None, game_days: float = 1.0) -> in
     crossing per GATE_TOLL_VOLUME_PER_CROSSING. A part crossing rounds with `stochastic_round`, which
     keeps the long-run toll exact. A deal with a NULL or 0 `duration_days` has no flow and pays 0.
 
-    A deal pays only while its term runs: `duration_days` game days from `signed_at`, at
-    `Config.TIME_MULTIPLIER` game days per real day. The query derives this on every read, so no
-    column or job ends a deal. A NULL `signed_at` has no start and pays 0. The tick that finds the term
-    over pays nothing for its own period, which loses at most one tick's flow per deal.
-    `signed_at` is a `timestamp` in the server's local time, so the query measures it against
-    LOCALTIMESTAMP, not against a UTC clock.
+    The toll runs while the deal's diplomacy stands. A deal stops paying when the standing of its
+    faction pair in `faction_relations` is broken (`GATE_TOLL_BROKEN_STANDINGS`). The relation is
+    matched in either column order, because a pair is stored one way. The row written in the deal's
+    own order wins, as in `modules.geopolitics`. A missing relation row, or a NULL standing, is not a
+    break: the deal keeps paying on the 'neutral' reading the diplomacy tick uses.
+
+    `ftd.active` is the deal's own switch, unchanged. Only an explicit true pays, so a deal with a
+    NULL `active` pays nothing. No calendar term ends a deal: `signed_at` and `duration_days` set the
+    flow, never the stop. Traffic that is not a diplomatic trade pays once per fleet trip instead
+    (`modules.voyage.gate_crossing_toll`).
 
     Resolves the session with `require_session`: an explicit id, else RP_SESSION or the active arc.
 
@@ -80,9 +88,13 @@ async def gate_toll_income(session_id: int = None, game_days: float = 1.0) -> in
                WHERE ftd.active
                  AND ftd.session_id = $1
                  AND ((fa.name ILIKE '%Setia%') <> (fb.name ILIKE '%Setia%'))
-                 AND EXTRACT(EPOCH FROM (LOCALTIMESTAMP - ftd.signed_at)) / 86400.0 * $2
-                     < ftd.duration_days""",
-            int(session_id), Config.TIME_MULTIPLIER)
+                 AND COALESCE((SELECT r.standing FROM maya_rp.faction_relations r
+                                WHERE r.session_id = ftd.session_id
+                                  AND ((r.faction_a = ftd.faction_a_id AND r.faction_b = ftd.faction_b_id)
+                                    OR (r.faction_a = ftd.faction_b_id AND r.faction_b = ftd.faction_a_id))
+                                ORDER BY (r.faction_a = ftd.faction_a_id) DESC, r.id
+                                LIMIT 1), 'neutral') <> ALL($2::text[])""",
+            int(session_id), list(GATE_TOLL_BROKEN_STANDINGS))
     except Exception as e:
         error("economy", f"gate_toll_income: {e}")
         flow = 0

@@ -519,6 +519,26 @@ async def gate_crossing(z1, z2, session_id: int | None = None) -> dict:
             "pirate_density": float(r.get("pirate_density") or 0.0)}
 
 
+def gate_crossing_toll(toll_credits, *, own_fleet: bool = True) -> int:
+    """The toll one fleet trip pays at a gate, charged once at the crossing.
+
+    Traffic that is not a diplomatic trade deal pays a single toll per fleet trip. The crossing owns
+    that one-off: `register` books it once per voyage, and the travel days do not scale it. A
+    diplomatic trade deal is never charged here. `modules.economy.gate_toll_income` collects its flow
+    per game day while the deal's diplomacy stands.
+
+    Setia's own fleet crosses at the internal cost, a smaller share of the lane price that covers gate
+    maintenance and garrison. Other traffic pays the lane price in full, the standardized public
+    price, and that credit is the gate owner's income.
+
+    @param toll_credits - the gate lane price (`sector_connections.toll_credits`). NULL or 0 pays 0.
+    @param own_fleet - True when the gate owner's own fleet makes the trip.
+    @returns the credits the one trip pays.
+    """
+    price = int(toll_credits or 0)
+    return int(price * GATE_INTERNAL_COST_SHARE) if own_fleet else price
+
+
 async def _debit_treasury(conn, amount: int, session_id: int) -> bool:
     """Take `amount` from the treasury in one guarded statement, on the caller's connection.
 
@@ -576,6 +596,7 @@ async def register(
     slingshot: str | None = None,
     fleet: str | None = None,
     void: bool = False,
+    own_fleet: bool = True,
 ) -> dict:
     """Register a voyage. Books travel days into the clock via game_day + travel_days.
 
@@ -592,6 +613,11 @@ async def register(
     second, so a duplicate (session, name, depart_day) hit the unique index after the debit and the
     credits were gone with no voyage. The debit is a guarded statement: it never takes credits below 0.
 
+    A gate crossing pays one toll for this trip, at `gate_crossing_toll`: the owner's own fleet pays
+    the internal cost and other traffic pays the public price. The charge does not scale with
+    `travel_days`, and a diplomatic trade deal is never charged here.
+
+    @param own_fleet - True when the gate owner's own fleet makes the trip.
     @param session_id - session to book into; None resolves the active arc.
     @returns the booked voyage: id, arrive_day, lane_type, toll_paid, toll_charged and the rest.
     @raises core.ooc.FrozenSession when the session is frozen.
@@ -670,8 +696,8 @@ async def register(
     #     operating expense (maintenance + garrison). Internal cost is SMALLER
     #     than the public price; the public price is standardized at 25,000C
     #     (see modules/economy.py GATE_TOLL_RATE).
-    #   · Common people / anyone else: pay the standardized public price —
-    #     that income arrives via the economy tick (gate_toll_income).
+    #   · Common people / anyone else: pay the standardized public price once, at the crossing.
+    #     The economy tick collects the diplomatic trade's flow instead (gate_toll_income).
     #   · Gates need NO exotic matter — that's wormholes only.
     lane_type = t.get("lane_type") or (transit_kind if transit_kind != "regular" else "standard")
     # exotic transits own their lane label (void/wormhole/slingshot) even if
@@ -680,17 +706,13 @@ async def register(
         lane_type = transit_kind
     elif t.get("lane_type") == "hidden_thread":
         lane_type = "hidden_thread"
-    # internal fleet cost = smaller share of the public price (20%)
-    # only GATE lanes carry the toll — exotic transits (void/wormhole/slingshot)
-    # and hidden threads are toll-free
-    internal_gate_cost = 0
-    if lane_type == "gate":
-        internal_gate_cost = int((t.get("toll_credits") or 0) * GATE_INTERNAL_COST_SHARE)
-    toll_paid = internal_gate_cost
+    # One toll for the trip, charged at the crossing. Only GATE lanes carry it. Exotic transits
+    # (void/wormhole/slingshot) and hidden threads are toll-free.
+    toll_paid = gate_crossing_toll(t.get("toll_credits"), own_fleet=own_fleet) if lane_type == "gate" else 0
     toll_charged = False
     try:
         async with Database.transaction() as conn:
-            if lane_type == "gate" and toll_paid > 0:
+            if toll_paid > 0 and own_fleet:
                 # treasury absorbs the internal cost (Setia fleet free, treasury pays).
                 # No resources row = no money moved: report the toll as uncharged
                 # rather than booking a cost the treasury never paid.
@@ -703,6 +725,14 @@ async def register(
                             f"{toll_paid:,}C for the internal gate toll")
                     info("voyage", f"{voyage_name}: session {session_id} has no resources row — "
                                    f"{toll_paid:,}C internal gate toll NOT charged")
+                    toll_paid = 0
+            elif toll_paid > 0:
+                # Other traffic pays the public price to the gate owner. The payer holds no ledger
+                # row in this campaign, so the crossing books the income only.
+                toll_charged = await _credit_treasury(conn, toll_paid, session_id)
+                if not toll_charged:
+                    info("voyage", f"{voyage_name}: session {session_id} has no resources row, "
+                                   f"{toll_paid:,}C public gate toll NOT credited")
                     toll_paid = 0
 
             vid = await conn.fetchval(

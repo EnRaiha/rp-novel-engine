@@ -1,5 +1,5 @@
 -- TKG Galaxy Beauties Artifacts
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 INSERT INTO maya_rp.artifacts (session_id, name, type, rarity, description, bonus) VALUES
     (3, 'Seraphina Vey - Starchild Compass', 'relic', 'legendary', 'Navigates by instinct. Can predict solar activity.', 15),
     (3, 'Mira - Vein Station Echo', 'data_core', 'epic', 'Omniscient within Vein Network. Knows every transit.', 12),

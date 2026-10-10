@@ -19,7 +19,7 @@
 -- session, a ship row its ship's session, and a row whose target is absent takes 3. All nine ship
 -- rows name ship 7, 16 or 17, which are not in `ships`.
 --
--- APPLIED 2026-10-10 as `maya`, recorded in maya_rp._migrations. Safe to run twice: each column is guarded, the key swap compares the key definition
+-- APPLIED 2026-10-10 as `maya`, recorded in `_migrations`. Safe to run twice: each column is guarded, the key swap compares the key definition
 -- first, and each backfill matches only a NULL. `PENDING_BINDING` in `core/binding.py` names the
 -- state tables this file does not bind.
 --
@@ -27,7 +27,7 @@
 -- PRIMARY KEY (source) on resource_production; UPDATE sectors SET session_id = NULL WHERE id BETWEEN
 -- 1751 AND 1799. No value is lost: every backfilled value is 3 except the 3 colony rows that take 5.
 BEGIN;
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 -- 1. The default is right only while every row points into Setia Kingdom. A row that points
 --    elsewhere stops the file here, before a column is added, instead of taking a wrong label.

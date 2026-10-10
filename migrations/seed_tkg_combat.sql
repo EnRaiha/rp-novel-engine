@@ -1,5 +1,5 @@
 -- TKG Combat & Fleet Seed
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 -- Faction ships: NPC vessels for each faction
 INSERT INTO maya_rp.faction_ships (session_id, faction_id, class_name, tier, hull, speed, count) VALUES

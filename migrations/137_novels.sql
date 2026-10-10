@@ -12,12 +12,12 @@
 -- `prequel-the-twenty-four.md`, and those chunks belong to the prequel, not to Setia Kingdom. No
 -- chunk row moves here.
 --
--- APPLIED 2026-10-10 as `maya`, recorded in maya_rp._migrations. Safe to run twice: the table and the column are guarded, the insert conflicts on the
+-- APPLIED 2026-10-10 as `maya`, recorded in `_migrations`. Safe to run twice: the table and the column are guarded, the insert conflicts on the
 -- primary key, and each UPDATE touches only a session still on the `scratch` default.
 --
 -- Rollback: ALTER TABLE sessions DROP COLUMN novel_id; DROP TABLE novels; No row is lost.
 BEGIN;
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 CREATE TABLE IF NOT EXISTS novels (
     novel_id text PRIMARY KEY,

@@ -16,7 +16,7 @@
 -- Kept on the same small scale as `aggro`, because the carryover names both in the same breath.
 -- ═══════════════════════════════════════════════════════════════════
 BEGIN;
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS affection integer NOT NULL DEFAULT 0;
 

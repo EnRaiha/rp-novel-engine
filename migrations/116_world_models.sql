@@ -3,7 +3,7 @@
 -- Applied to production 2026-10-02; this file makes it reproducible.
 -- ═══════════════════════════════════════════════════════════════════
 BEGIN;
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 ALTER TABLE factions ADD COLUMN IF NOT EXISTS systems_held integer DEFAULT 0;
 ALTER TABLE factions ADD COLUMN IF NOT EXISTS scale_class text;

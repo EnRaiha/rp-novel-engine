@@ -55,7 +55,7 @@ PENDING_BASELINE = frozenset({
     "weapon_upgrades", "weapons",
 })
 
-SEARCH_PATH_LINE = "SET search_path TO maya_rp;"
+SEARCH_PATH_LINE = "SET LOCAL search_path TO maya_rp;"
 SHADOW_PATH_LINE = "SET LOCAL search_path TO pg_temp, maya_rp, public;"
 
 #: Every table the two files name. Each gets an empty `pg_temp` copy before the file runs.

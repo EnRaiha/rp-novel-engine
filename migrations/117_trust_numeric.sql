@@ -6,7 +6,7 @@
 -- Backup of the raw vocabulary: ~/backups/trust-vocabulary-*.json
 -- ═══════════════════════════════════════════════════════════════════
 BEGIN;
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 ALTER TABLE factions ALTER COLUMN trust DROP DEFAULT;
 ALTER TABLE factions ALTER COLUMN trust TYPE integer

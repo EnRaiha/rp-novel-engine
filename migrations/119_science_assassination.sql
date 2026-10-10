@@ -20,7 +20,7 @@
 -- maya_rp.resources row and factions.treasury is 0 for TKG.
 -- ═══════════════════════════════════════════════════════════════════
 BEGIN;
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 -- ── Fasa 2.3: the programme ────────────────────────────────────────
 ALTER TABLE research_queue ADD COLUMN IF NOT EXISTS faction_id integer REFERENCES factions(id);

@@ -1,7 +1,7 @@
 -- A weapon upgrade had nowhere to record that it was applied, so `apply_upgrade` charged the
 -- treasury and left no trace: call it twice and the King pays twice for one fitting.
 BEGIN;
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 ALTER TABLE weapon_upgrades ADD COLUMN IF NOT EXISTS applied_at timestamptz;
 COMMENT ON COLUMN weapon_upgrades.applied_at IS

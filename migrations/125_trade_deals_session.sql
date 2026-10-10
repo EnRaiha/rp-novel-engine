@@ -10,7 +10,7 @@
 -- filtering on all along.
 -- ═══════════════════════════════════════════════════════════════════
 BEGIN;
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 ALTER TABLE faction_trade_deals ADD COLUMN IF NOT EXISTS session_id integer NOT NULL DEFAULT 3;
 

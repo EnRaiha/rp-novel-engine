@@ -4,7 +4,7 @@
 -- ═══════════════════════════════════════════════════════════════════
 
 BEGIN;
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 -- ═══════════════════════════════════════════════════════════════════
 -- 1. WEAPONS — expanded from Book 05 Bug War + TKG fleet

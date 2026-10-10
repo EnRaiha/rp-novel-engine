@@ -9,6 +9,30 @@ from core.log import info
 
 DESTRUCTIVE = ("DROP TABLE", "DROP COLUMN", "TRUNCATE", "DELETE FROM", "UPDATE ")
 
+#: The search path every migration runs on, set once per file rather than per connection.
+#:
+#: `SET LOCAL` ends with the transaction, so the path cannot outlive the file that set it. A pooled
+#: connection handed to the next user keeps the DSN's path, never a migration's.
+SEARCH_PATH = "SET LOCAL search_path TO maya_rp;"
+
+
+def migration_script(sql: str) -> str:
+    """The SQL sent for one migration: its own text, behind this runner's search path.
+
+    The two go in ONE statement string. asyncpg runs a bounded multi-statement string inside an
+    implicit transaction, and `SET LOCAL` outside a transaction block does nothing, so splitting
+    them into two calls would leave the path unset and the second call would warn to the client.
+    A file that opens its own `BEGIN;` keeps the setting alive across its own `COMMIT;` too: the
+    setting is transaction-scoped, and the file's commit ends that transaction.
+
+    The newline separates the file's first line from this one. The file's own `SET LOCAL` follows
+    and agrees with it; nothing else in the file changes.
+
+    @param sql - the migration file's text, verbatim.
+    @returns the statement string to execute.
+    """
+    return f"{SEARCH_PATH}\n{sql}"
+
 
 def classify(files: list, recorded: set, newest_recorded: str | None) -> tuple[list, list]:
     """Split migration files into the ones to run and the ones that must not be run blind.
@@ -76,7 +100,7 @@ async def run_migrations():
             continue
         try:
             sql = f.read_text()
-            await Database.execute(sql)
+            await Database.execute(migration_script(sql))
             await Database.execute("INSERT INTO maya_rp._migrations (name) VALUES ($1)", f.name)
             print(f"  ✅ {f.name}")
             count += 1

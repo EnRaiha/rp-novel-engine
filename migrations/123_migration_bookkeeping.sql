@@ -7,7 +7,7 @@
 -- Nothing else changes. No schema, no data beyond the ledger rows.
 -- ═══════════════════════════════════════════════════════════════════
 BEGIN;
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 INSERT INTO _migrations (name) VALUES
   ('119_science_assassination.sql'),

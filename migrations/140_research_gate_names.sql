@@ -19,13 +19,13 @@
 -- `ringworld_tech` takes `Frontier Expansion` because a Ringworld raises population capacity and
 -- that project raises max population; the earlier pick, `Matter Synthesis`, has no population link.
 --
--- APPLIED 2026-10-10 as `maya`, recorded in maya_rp._migrations. Safe to run twice: a value that already names its project matches no slug, the
+-- APPLIED 2026-10-10 as `maya`, recorded in `_migrations`. Safe to run twice: a value that already names its project matches no slug, the
 -- rename is a no-op once done, and the constraint is added only when absent.
 --
 -- Rollback: read the map below in reverse (set each column back to the slug), rename id 27 back to
 -- 'Hyperdrive Calibration', then drop constraint research_projects_name_key.
 BEGIN;
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 -- 1. The 36 slugs and their projects. Weak rows carry `-- W`.
 CREATE TEMP TABLE IF NOT EXISTS _research_gate_map (

@@ -12,7 +12,7 @@
 -- Every row that exists today was rendered bust, so that is the backfill.
 -- ═══════════════════════════════════════════════════════════════════
 BEGIN;
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 ALTER TABLE character_assets ADD COLUMN IF NOT EXISTS framing text NOT NULL DEFAULT 'bust';
 

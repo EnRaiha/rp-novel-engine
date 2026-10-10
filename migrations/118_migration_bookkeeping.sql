@@ -21,7 +21,7 @@
 -- the printed line is misleading.
 -- ═══════════════════════════════════════════════════════════════════
 BEGIN;
-SET search_path TO maya_rp;
+SET LOCAL search_path TO maya_rp;
 
 INSERT INTO _migrations (name) VALUES
   ('111-character-assets.sql'),

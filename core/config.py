@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 import sys
 import os
+import pathlib
 from typing import ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
@@ -47,27 +48,39 @@ def _default_session() -> int:
         return 3  # no arc file and no override: the legacy TKG campaign
 
 
-#: Built-in DSN. It holds the `rp_engine` password, so `RP_ENGINE_DSN` can replace it.
+#: Built-in DSN. It carries no password: this file is published, so a secret here is a secret in the
+#: open. `RP_ENGINE_DSN` replaces it, and `~/.config/rp-engine/dsn` (mode 600) carries the password on
+#: a host that needs one.
 _DEFAULT_DSN = (
-    "postgres://rp_engine:REDACTED@postgresql.tail73711d.ts.net:5432/maya_memory"
+    "postgres://rp_engine@postgresql.tail73711d.ts.net:5432/maya_memory"
     "?search_path=maya_rp,public"
 )
+#: Where a host keeps its own DSN, password included. Outside every repository.
+_DSN_FILE = pathlib.Path.home() / ".config" / "rp-engine" / "dsn"
 _DB_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}")
 
 
-def _resolve_dsn(environ=None) -> tuple[str, bool]:
-    """Resolve the database DSN from the environment.
+def _resolve_dsn(environ=None, dsn_file=None) -> tuple[str, bool]:
+    """Resolve the database DSN from the environment, then from the host's own file.
 
-    `RP_ENGINE_DSN` replaces the built-in DSN. `RP_ENGINE_DB` then replaces the database name in
-    whichever DSN applies. `OC_PG_*` is not read: on this host it names a superuser, and the engine
-    must keep running as `rp_engine`.
+    `RP_ENGINE_DSN` replaces the built-in DSN. With no environment DSN, `~/.config/rp-engine/dsn` is
+    read, so a password lives on the host and never in this repository. `RP_ENGINE_DB` then replaces
+    the database name in whichever DSN applies. `OC_PG_*` is not read: on this host it names a
+    superuser, and the engine must keep running as `rp_engine`.
 
     @param environ - mapping to read, `os.environ` by default.
-    @returns `(dsn, used_default)`. `used_default` is true when the environment named no DSN.
+    @param dsn_file - path to read when the environment names no DSN. `_DSN_FILE` by default.
+    @returns `(dsn, used_default)`. `used_default` is true only when neither source named a DSN.
     @raises RuntimeError - `RP_ENGINE_DB` is not a plain database name. The message never carries a DSN.
     """
     env = os.environ if environ is None else environ
     given = (env.get("RP_ENGINE_DSN") or "").strip()
+    if not given:
+        path = _DSN_FILE if dsn_file is None else dsn_file
+        try:
+            given = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            given = ""
     dsn = given or _DEFAULT_DSN
     name = (env.get("RP_ENGINE_DB") or "").strip()
     if name:

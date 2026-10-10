@@ -10,18 +10,34 @@ import pytest
 from urllib.parse import urlsplit
 
 from core import db
+import pathlib
+
 from core.config import _DEFAULT_DSN, Config, _resolve_dsn
+
+#: A path that cannot exist, so the built-in branch is the one under test.
+_NO_FILE = pathlib.Path("/nonexistent/rp-engine-dsn")
 from core.db import Database
 
-_PASSWORD = urlsplit(_DEFAULT_DSN).password
 
 
-def test_the_default_dsn_carries_a_password_to_guard():
-    assert _PASSWORD, "the leak checks below need a password to look for"
+def test_the_published_default_dsn_carries_no_password():
+    """The repository is public: a password here is published. The host file carries it instead."""
+    assert not urlsplit(_DEFAULT_DSN).password, "the built-in DSN must carry no credential"
+
+
+def test_a_host_file_supplies_the_dsn_when_the_environment_is_empty(tmp_path):
+    path = tmp_path / "dsn"
+    path.write_text("postgres://u:p@h:1/from_file\n", encoding="utf-8")
+    assert _resolve_dsn({}, dsn_file=path) == ("postgres://u:p@h:1/from_file", False)
+
+
+def test_an_unreadable_host_file_falls_back_to_the_built_in_dsn():
+    dsn, used_default = _resolve_dsn({}, dsn_file=_NO_FILE)
+    assert dsn == _DEFAULT_DSN and used_default is True
 
 
 def test_no_environment_uses_the_built_in_dsn():
-    dsn, used_default = _resolve_dsn({})
+    dsn, used_default = _resolve_dsn({}, dsn_file=_NO_FILE)
     same = dsn == _DEFAULT_DSN
     assert same
     assert used_default is True
@@ -34,19 +50,19 @@ def test_no_environment_uses_the_built_in_dsn():
 @pytest.mark.parametrize("blank", [None, "", "  "])
 def test_a_blank_dsn_counts_as_unset(blank):
     environ = {} if blank is None else {"RP_ENGINE_DSN": blank}
-    dsn, used_default = _resolve_dsn(environ)
+    dsn, used_default = _resolve_dsn(environ, dsn_file=_NO_FILE)
     same = dsn == _DEFAULT_DSN
     assert same
     assert used_default is True
 
 
 def test_a_dsn_in_the_environment_replaces_the_default():
-    assert _resolve_dsn({"RP_ENGINE_DSN": "postgres://u:p@h:1/x"}) == ("postgres://u:p@h:1/x", False)
+    assert _resolve_dsn({"RP_ENGINE_DSN": "postgres://u:p@h:1/x"}, dsn_file=_NO_FILE) == ("postgres://u:p@h:1/x", False)
 
 
 def test_a_database_name_replaces_only_the_database():
     base = urlsplit(_DEFAULT_DSN)
-    dsn, used_default = _resolve_dsn({"RP_ENGINE_DB": "rp_test_42"})
+    dsn, used_default = _resolve_dsn({"RP_ENGINE_DB": "rp_test_42"}, dsn_file=_NO_FILE)
     parts = urlsplit(dsn)
     assert used_default is True
     assert parts.path == "/rp_test_42"
@@ -58,38 +74,39 @@ def test_a_database_name_replaces_only_the_database():
 
 
 def test_a_database_name_over_a_given_dsn_swaps_only_the_path():
-    dsn, used_default = _resolve_dsn({"RP_ENGINE_DSN": "postgres://u:p@h:1/x?a=b", "RP_ENGINE_DB": "other"})
+    dsn, used_default = _resolve_dsn({"RP_ENGINE_DSN": "postgres://u:p@h:1/x?a=b", "RP_ENGINE_DB": "other"}, dsn_file=_NO_FILE)
     assert (dsn, used_default) == ("postgres://u:p@h:1/other?a=b", False)
 
 
 @pytest.mark.parametrize("bad", ["x; DROP", "1abc", "a-b", "a b", "a" * 64])
 def test_a_bad_database_name_is_refused_without_the_dsn(bad):
     with pytest.raises(RuntimeError) as caught:
-        _resolve_dsn({"RP_ENGINE_DB": bad})
+        _resolve_dsn({"RP_ENGINE_DB": bad}, dsn_file=_NO_FILE)
     text = str(caught.value)
-    leaked = _PASSWORD in text or "postgres://" in text
+    leaked = "postgres://" in text or "password" in text.lower()
     assert not leaked
     assert "RP_ENGINE_DB" in text
 
 
 def test_a_bad_database_name_over_a_given_dsn_leaks_nothing():
     with pytest.raises(RuntimeError) as caught:
-        _resolve_dsn({"RP_ENGINE_DSN": "postgres://u:hunter2@h:1/x", "RP_ENGINE_DB": "a-b"})
+        _resolve_dsn({"RP_ENGINE_DSN": "postgres://u:hunter2@h:1/x", "RP_ENGINE_DB": "a-b"}, dsn_file=_NO_FILE)
     leaked = "hunter2" in str(caught.value) or "postgres://" in str(caught.value)
     assert not leaked
 
 
 def test_config_follows_the_resolver():
-    dsn, used_default = _resolve_dsn()
+    # The same call `Config` makes at import: whatever the host supplies, the config agrees with it.
+    dsn, used_default = _resolve_dsn({})
     same = Config.DSN == dsn
     assert same
     assert Config.DSN_FALLBACK_USED is used_default
 
 
-def test_the_summary_never_prints_the_password():
+def test_the_summary_never_prints_a_password(monkeypatch):
+    monkeypatch.setattr(Config, "DSN", "postgres://u:hunter2@h:1/x")
     text = Config.summary()
-    leaked = _PASSWORD in text
-    assert not leaked
+    assert "hunter2" not in text
     assert urlsplit(Config.DSN).path.lstrip("/") in text
 
 
